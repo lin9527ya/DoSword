@@ -1,0 +1,71 @@
+/* 基础样式与设计变量：深色控制台 + 酸绿强调色 + IBM Plex Mono 字号体系 */
+:root {
+  font-family: Manrope, system-ui, sans-serif;
+  color: #e8e8e5;
+  background: #111310;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --accent: #b6d77d;
+  --bg: #111310;
+  --panel: #181a17;
+  --panel-2: #1c1f1a;
+  --border: #30332d;
+  --border-soft: #282b25;
+  --text: #e8e8e5;
+  --text-dim: #989d93;
+  --text-faint: #6d7369;
+  --mono: "IBM Plex Mono", monospace;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  min-width: 980px;
+  min-height: 100vh;
+  background: var(--bg);
+}
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+button {
+  color: inherit;
+}
+h1,
+h2,
+p {
+  margin: 0;
+}
+h1 {
+  margin-top: 4px;
+  font-size: 27px;
+  letter-spacing: -0.04em;
+}
+h2 {
+  margin-top: 3px;
+  font-size: 16px;
+  letter-spacing: -0.02em;
+}
+code {
+  font-family: var(--mono);
+}
+.mono {
+  font-family: var(--mono);
+}
+.muted {
+  color: var(--text-faint);
+}
+.pad {
+  padding: 18px;
+}
+.spin {
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

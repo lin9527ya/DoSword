@@ -1,0 +1,869 @@
+use base64::Engine;
+use std::sync::Arc;
+use tauri::{AppHandle, Manager, State};
+use url::Url;
+
+use crate::auth;
+use crate::{
+    AppState,
+    domain::{
+        AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
+        CreateWorkspace, Dashboard, DirListing, FileContent, ProbeResult, ProtocolMeta,
+        SessionInfo, ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
+    },
+    protocol::{Protocol, ProtocolError, SessionState},
+};
+
+fn validate_text(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!("{field} 不能为空"))
+    } else {
+        Ok(())
+    }
+}
+
+/// 解析并验证 Shell 的 endpoint。
+fn parse_endpoint(endpoint: &str) -> Result<Url, String> {
+    Url::parse(endpoint).map_err(|_| "Endpoint 必须是有效 URL".to_string())
+}
+
+// --- 通用辅助：锁内取数，锁外网络 ---
+
+/// 命令统一调度：把同步命令体放到阻塞线程池执行，避免主线程冻结。
+/// 命令层因此可以自由持有 `std::sync::Mutex` 而不会跨越 await。
+async fn blocking<T, F>(app: AppHandle, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&AppState) -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        f(&state)
+    })
+    .await
+    .map_err(|error| format!("任务调度失败：{error}"))?
+}
+
+/// 读取 Shell 配置与全局设置（锁内完成，不跨网络）。
+fn load_shell_and_settings(state: &AppState, shell_id: &str) -> Result<(ShellProfile, AppSettings), String> {
+    let database = state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())?;
+    let shell = database
+        .shell(shell_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Shell 不存在".to_string())?;
+    let settings = database.get_settings().map_err(|error| error.to_string())?;
+    Ok((shell, settings))
+}
+
+/// 审计辅助：成功/失败事件落库（失败审计吞掉写库错误，不掩盖原始错误）。
+fn audit(
+    state: &AppState,
+    workspace_id: &str,
+    shell_id: Option<&str>,
+    action: &str,
+    outcome: &str,
+    detail: &str,
+) {
+    let _ = state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())
+        .and_then(|database| {
+            database
+                .record_audit(Some(workspace_id), shell_id, action, outcome, detail)
+                .map_err(|error| error.to_string())
+        });
+}
+
+/// 审计失败并把协议错误转成 String。
+fn audit_fail(
+    state: &AppState,
+    shell: &ShellProfile,
+    action: &str,
+    error: ProtocolError,
+) -> String {
+    let message = error.to_string();
+    audit(state, &shell.workspace_id, Some(&shell.id), action, "error", &message);
+    message
+}
+
+/// 对真实网络协议做完整授权检查；Mock 协议直接放行。
+/// 返回校验方式说明（供审计追溯）。
+fn require_authorized_for(state: &AppState, shell: &ShellProfile, settings: &AppSettings) -> Result<String, String> {
+    let protocol = state
+        .protocols
+        .get(&shell.protocol_id)
+        .ok_or_else(|| format!("未知协议：{}", shell.protocol_id))?;
+    if protocol.requires_network() {
+        if !settings.http_enabled {
+            return Err("真实网络协议未启用：请先在「设置」中开启并确认授权声明".into());
+        }
+        let database = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?;
+        auth::require_authorized(&database, shell)
+    } else {
+        Ok("Mock 协议（本地）".to_string())
+    }
+}
+
+// --- 基础 CRUD ---
+
+#[tauri::command]
+pub async fn dashboard(app: AppHandle) -> Result<Dashboard, String> {
+    blocking(app, move |state| {
+        state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .dashboard()
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn create_workspace(
+    input: CreateWorkspace,
+    app: AppHandle,
+) -> Result<Workspace, String> {
+    blocking(app, move |state| {
+        validate_text(&input.name, "名称")?;
+        validate_text(&input.authorization_scope, "授权范围")?;
+        state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .create_workspace(input)
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn create_shell(
+    input: CreateShell,
+    app: AppHandle,
+) -> Result<ShellProfile, String> {
+    blocking(app, move |state| {
+        validate_text(&input.name, "名称")?;
+        validate_text(&input.workspace_id, "Workspace")?;
+        let endpoint = parse_endpoint(&input.endpoint)?;
+
+        let protocol = state
+            .protocols
+            .get(&input.protocol_id)
+            .ok_or_else(|| format!("未知协议：{}", input.protocol_id))?;
+
+        // 安全门：真实网络协议必须全局开启 + 授权范围覆盖 + 勾选确认
+        if protocol.requires_network() {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            let settings = database.get_settings().map_err(|error| error.to_string())?;
+            if !settings.http_enabled {
+                return Err("真实网络协议未启用：请先在「设置」中开启并确认授权声明".into());
+            }
+            let workspace = database
+                .workspace(&input.workspace_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Workspace 不存在".to_string())?;
+            auth::check_workspace_authorized(Some(&workspace))?;
+            let (allowed, _reason) = auth::scope_allows(&workspace.authorization_scope, &endpoint);
+            if !allowed {
+                return Err("目标不在 Workspace 授权范围内，请检查授权范围或端点地址".into());
+            }
+            if !input.confirm_network {
+                return Err("请勾选「我已确认目标位于授权范围内」后再登记 Shell".into());
+            }
+        }
+
+        let profile = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .create_shell(input, protocol.id())
+            .map_err(|error| error.to_string())?;
+        audit(
+            state,
+            &profile.workspace_id,
+            Some(&profile.id),
+            "shell.create",
+            "success",
+            &format!("登记 Shell：{}（协议 {}）", profile.endpoint, profile.protocol_id),
+        );
+        Ok(profile)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn update_workspace(
+    input: UpdateWorkspace,
+    app: AppHandle,
+) -> Result<Workspace, String> {
+    blocking(app, move |state| {
+        validate_text(&input.name, "名称")?;
+        validate_text(&input.authorization_scope, "授权范围")?;
+        let workspace = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .update_workspace(&input)
+            .map_err(|error| error.to_string())?;
+        audit(
+            state,
+            &workspace.id,
+            None,
+            "workspace.update",
+            "success",
+            &format!("更新 Workspace：{}（范围 {}）", workspace.name, workspace.authorization_scope),
+        );
+        Ok(workspace)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_workspace(workspace_id: String, app: AppHandle) -> Result<(), String> {
+    blocking(app, move |state| {
+        let name = {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            let workspace = database
+                .workspace(&workspace_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Workspace 不存在".to_string())?;
+            database
+                .delete_workspace(&workspace_id)
+                .map_err(|error| error.to_string())?;
+            workspace.name
+        };
+        // 清理该 Workspace 下的全部活跃会话
+        state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?
+            .remove_by_workspace(&workspace_id);
+        audit(state, &workspace_id, None, "workspace.delete", "success", &format!("删除 Workspace：{name}"));
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn update_shell(input: UpdateShell, app: AppHandle) -> Result<ShellProfile, String> {
+    blocking(app, move |state| {
+        validate_text(&input.name, "名称")?;
+        let previous = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .shell(&input.id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Shell 不存在".to_string())?;
+
+        // 端点变更时重跑授权范围校验（真实网络协议）
+        if previous.endpoint != input.endpoint {
+            let endpoint = parse_endpoint(&input.endpoint)?;
+            let protocol = state
+                .protocols
+                .get(&previous.protocol_id)
+                .ok_or_else(|| format!("未知协议：{}", previous.protocol_id))?;
+            if protocol.requires_network() {
+                let database = state
+                    .database
+                    .lock()
+                    .map_err(|_| "数据库锁异常".to_string())?;
+                let settings = database.get_settings().map_err(|error| error.to_string())?;
+                if !settings.http_enabled {
+                    return Err("真实网络协议未启用：请先在「设置」中开启并确认授权声明".into());
+                }
+                let workspace = database
+                    .workspace(&previous.workspace_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "Workspace 不存在".to_string())?;
+                auth::check_workspace_authorized(Some(&workspace))?;
+                let (allowed, _reason) = auth::scope_allows(&workspace.authorization_scope, &endpoint);
+                if !allowed {
+                    return Err("目标不在 Workspace 授权范围内，请检查授权范围或端点地址".into());
+                }
+            }
+        }
+
+        let profile = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .update_shell(&input)
+            .map_err(|error| error.to_string())?;
+        audit(
+            state,
+            &profile.workspace_id,
+            Some(&profile.id),
+            "shell.update",
+            "success",
+            &format!("更新 Shell：{} → {}", previous.endpoint, profile.endpoint),
+        );
+        Ok(profile)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_shell(shell_id: String, app: AppHandle) -> Result<(), String> {
+    blocking(app, move |state| {
+        let (workspace_id, endpoint) = {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            let shell = database
+                .shell(&shell_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Shell 不存在".to_string())?;
+            database
+                .delete_shell(&shell_id)
+                .map_err(|error| error.to_string())?;
+            (shell.workspace_id, shell.endpoint)
+        };
+        // 清理该 Shell 的活跃会话
+        state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?
+            .remove_by_profile(&shell_id);
+        audit(state, &workspace_id, None, "shell.delete", "success", &format!("删除 Shell：{endpoint}"));
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn probe_shell(shell_id: String, app: AppHandle) -> Result<ProbeResult, String> {
+    blocking(app, move |state| {
+        let (shell, settings) = load_shell_and_settings(state, &shell_id)?;
+        let _auth_reason = require_authorized_for(state, &shell, &settings)?;
+
+        let protocol = state
+            .protocols
+            .get(&shell.protocol_id)
+            .ok_or_else(|| format!("未知协议：{}", shell.protocol_id))?;
+
+        let result = protocol.probe(&shell, &settings).map_err(|error| {
+            // 失败也更新状态并记录审计
+            let _ = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())
+                .and_then(|database| {
+                    database
+                        .record_probe(&shell, "error", &error.to_string())
+                        .map_err(|db_error| db_error.to_string())
+                });
+            audit_fail(state, &shell, "shell.probe", error)
+        })?;
+
+        state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .record_probe(&shell, "online", &result.message)
+            .map_err(|error| error.to_string())?;
+        audit(state, &shell.workspace_id, Some(&shell.id), "shell.probe", "success", &result.message);
+        Ok(result)
+    })
+    .await
+}
+
+// --- 设置 ---
+
+/// 将本地数据（如导出的 CSV）写入用户选择的路径。
+#[tauri::command]
+pub async fn write_local_file(path: String, content_b64: String, app: AppHandle) -> Result<(), String> {
+    blocking(app, move |_state| {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&content_b64)
+            .map_err(|_| "内容不是合法 Base64".to_string())?;
+        std::fs::write(&path, &bytes).map_err(|error| format!("写入本地文件失败：{error}"))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_audit(filter: AuditFilter, app: AppHandle) -> Result<AuditPage, String> {
+    blocking(app, move |state| {
+        let database = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?;
+        let (total, events) = database
+            .query_audit(&filter)
+            .map_err(|error| error.to_string())?;
+        Ok(AuditPage { total, events })
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn list_protocols(state: State<'_, AppState>) -> Vec<ProtocolMeta> {
+    state.protocols.list()
+}
+
+#[tauri::command]
+pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
+    blocking(app, move |state| {
+        state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .get_settings()
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn update_settings(input: AppSettings, app: AppHandle) -> Result<(), String> {
+    blocking(app, move |state| {
+        let previous = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .get_settings()
+            .map_err(|error| error.to_string())?;
+        state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .update_settings(&input)
+            .map_err(|error| error.to_string())?;
+        // 网络开关状态变化记入审计（系统级事件，无 Workspace 归属）
+        if previous.http_enabled != input.http_enabled {
+            let detail = if input.http_enabled {
+                "真实网络协议已启用（授权声明已确认）".to_string()
+            } else {
+                "真实网络协议已关闭".to_string()
+            };
+            audit(state, "system", None, "settings.update", "success", &detail);
+        }
+        Ok(())
+    })
+    .await
+}
+
+// --- 会话 ---
+
+#[tauri::command]
+pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectResult, String> {
+    blocking(app, move |state| {
+        let (shell, settings) = load_shell_and_settings(state, &shell_id)?;
+        let _auth_reason = require_authorized_for(state, &shell, &settings)?;
+
+        let protocol = state
+            .protocols
+            .get(&shell.protocol_id)
+            .ok_or_else(|| format!("未知协议：{}", shell.protocol_id))?;
+
+        let (session_state, probe) = protocol
+            .connect(&shell, &settings)
+            .map_err(|error| audit_fail(state, &shell, "shell.connect", error))?;
+
+        let session_id = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?
+            .insert(
+                &shell.id,
+                &shell.workspace_id,
+                &shell.protocol_id,
+                Arc::from(session_state),
+                probe.clone(),
+            );
+
+        // 连接成功刷新在线状态
+        let _ = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())
+            .and_then(|database| {
+                database
+                    .record_probe(&shell, "online", "连接成功")
+                    .map_err(|error| error.to_string())
+            });
+        audit(state, &shell.workspace_id, Some(&shell.id), "shell.connect", "success", &format!("连接成功：{}", shell.endpoint));
+
+        Ok(ConnectResult::from_probe(session_id, probe))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn disconnect_shell(session_id: String, app: AppHandle) -> Result<(), String> {
+    blocking(app, move |state| {
+        if let Some(session) = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?
+            .remove(&session_id)
+        {
+            audit(
+                state,
+                &session.workspace_id,
+                Some(&session.profile_id),
+                "shell.disconnect",
+                "success",
+                "断开连接",
+            );
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_sessions(app: AppHandle) -> Result<Vec<SessionInfo>, String> {
+    blocking(app, move |state| {
+        let sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?;
+        Ok(sessions
+            .list()
+            .into_iter()
+            .map(|(session_id, profile_id, server, last_used_at)| SessionInfo {
+                session_id,
+                profile_id,
+                server,
+                last_used_at,
+            })
+            .collect())
+    })
+    .await
+}
+
+// --- 命令执行与文件操作 ---
+//
+// 统一模式：锁内取出会话 + Shell + 设置，并做授权轻量复查；锁外执行网络调用；
+// 最后锁内写审计。
+
+/// 会话命令上下文：会话、所属 Shell 与全局设置（已通过授权复查）。
+struct SessionCtx<'a> {
+    workspace_id: String,
+    shell: ShellProfile,
+    settings: AppSettings,
+    protocol: &'a dyn Protocol,
+}
+
+/// 从会话 ID 解析出会话命令上下文。
+/// 锁内完成：会话取出 → Shell 查询 → 授权轻量复查（仅过期检查）→ 协议解析。
+fn session_ctx<'a>(state: &'a AppState, session_id: &str) -> Result<SessionCtx<'a>, String> {
+    let (profile_id, protocol_id) = {
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?;
+        let session = sessions.get_mut(session_id)?;
+        (session.profile_id.clone(), session.protocol_id.clone())
+    };
+
+    let database = state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())?;
+    let shell = database
+        .shell(&profile_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Shell 配置不存在".to_string())?;
+    auth::require_session_alive(&database, &shell)?;
+    let settings = database.get_settings().map_err(|error| error.to_string())?;
+    drop(database);
+
+    let protocol = state
+        .protocols
+        .get(&protocol_id)
+        .ok_or_else(|| format!("未知协议：{protocol_id}"))?;
+
+    Ok(SessionCtx {
+        workspace_id: shell.workspace_id.clone(),
+        shell,
+        settings,
+        protocol,
+    })
+}
+
+/// 短锁取出会话的协议状态（`Arc` 克隆），在锁外执行 `f`。
+/// 网络调用不持有全局会话锁：单个慢请求不再阻塞其他会话。
+fn with_session<T>(
+    state: &AppState,
+    session_id: &str,
+    f: impl FnOnce(&dyn SessionState) -> Result<T, ProtocolError>,
+) -> Result<T, String> {
+    let session = {
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?;
+        let session = sessions.get_mut(session_id)?;
+        session.state.clone()
+    };
+    f(session.as_ref()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn execute_command(
+    session_id: String,
+    command: String,
+    app: AppHandle,
+) -> Result<CommandOutput, String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        let output = with_session(state, &session_id, |session| {
+            ctx.protocol.execute_command(session, &command, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "shell.exec", "error", &error);
+            error
+        })?;
+        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "shell.exec", "success", &format!("执行命令：{command}"));
+        Ok(output)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_dir(
+    session_id: String,
+    path: String,
+    app: AppHandle,
+) -> Result<DirListing, String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        let listing = with_session(state, &session_id, |session| {
+            ctx.protocol.list_dir(session, &path, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.list", "error", &error);
+            error
+        })?;
+        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.list", "success", &format!("浏览目录：{path}"));
+        Ok(listing)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn read_file(
+    session_id: String,
+    path: String,
+    app: AppHandle,
+) -> Result<FileContent, String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        let bytes = with_session(state, &session_id, |session| {
+            ctx.protocol.read_file(session, &path, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.read", "error", &error);
+            error
+        })?;
+        let content_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let name = path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&path)
+            .to_string();
+        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.read", "success", &format!("读取文件：{path}"));
+        Ok(FileContent {
+            name,
+            size: bytes.len() as u64,
+            content_b64,
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn write_file(
+    session_id: String,
+    path: String,
+    content_b64: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    blocking(app, move |state| {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&content_b64)
+            .map_err(|_| "文件内容不是合法 Base64".to_string())?;
+        let ctx = session_ctx(state, &session_id)?;
+        with_session(state, &session_id, |session| {
+            ctx.protocol.write_file(session, &path, &bytes, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "error", &error);
+            error
+        })?;
+        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "success", &format!("写入文件：{path}（{} 字节）", bytes.len()));
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn upload_file(
+    session_id: String,
+    remote_path: String,
+    content_b64: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    blocking(app, move |state| {
+        // 上传复用写入通道，审计动作修正为 file.upload
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&content_b64)
+            .map_err(|_| "文件内容不是合法 Base64".to_string())?;
+        let ctx = session_ctx(state, &session_id)?;
+        with_session(state, &session_id, |session| {
+            ctx.protocol.write_file(session, &remote_path, &bytes, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.upload", "error", &error);
+            error
+        })?;
+        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.upload", "success", &format!("上传文件：{remote_path}（{} 字节）", bytes.len()));
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn write_chunk(
+    session_id: String,
+    path: String,
+    content_b64: String,
+    offset: u64,
+    app: AppHandle,
+) -> Result<(), String> {
+    blocking(app, move |state| {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&content_b64)
+            .map_err(|_| "文件内容不是合法 Base64".to_string())?;
+        let ctx = session_ctx(state, &session_id)?;
+        with_session(state, &session_id, |session| {
+            ctx.protocol.write_chunk(session, &path, &bytes, offset, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "error", &error);
+            error
+        })?;
+        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "success", &format!("写入文件：{path}（偏移 {offset}，{} 字节）", bytes.len()));
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn download_file(
+    session_id: String,
+    remote_path: String,
+    local_path: String,
+    app: AppHandle,
+) -> Result<u64, String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        // 分块拉取（每块 4MB），避免大文件一次性占用内存与超时
+        const CHUNK: u64 = 4 * 1024 * 1024;
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let chunk = with_session(state, &session_id, |session| {
+                ctx.protocol
+                    .read_chunk(session, &remote_path, bytes.len() as u64, CHUNK, &ctx.settings)
+            })
+            .map_err(|error| {
+                audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.download", "error", &error);
+                error
+            })?;
+            if chunk.is_empty() {
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+            if (chunk.len() as u64) < CHUNK {
+                break;
+            }
+        }
+        std::fs::write(&local_path, &bytes)
+            .map_err(|error| format!("写入本地文件失败：{error}"))?;
+        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.download", "success", &format!("下载文件：{remote_path} → {local_path}（{} 字节）", bytes.len()));
+        Ok(bytes.len() as u64)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_path(
+    session_id: String,
+    path: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        with_session(state, &session_id, |session| {
+            ctx.protocol.delete_path(session, &path, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.delete", "error", &error);
+            error
+        })?;
+        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.delete", "success", &format!("删除：{path}"));
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn rename_path(
+    session_id: String,
+    from: String,
+    to: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        with_session(state, &session_id, |session| {
+            ctx.protocol.rename_path(session, &from, &to, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.rename", "error", &error);
+            error
+        })?;
+        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.rename", "success", &format!("重命名：{from} → {to}"));
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn create_dir(
+    session_id: String,
+    path: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        with_session(state, &session_id, |session| {
+            ctx.protocol.create_dir(session, &path, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.mkdir", "error", &error);
+            error
+        })?;
+        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.mkdir", "success", &format!("新建目录：{path}"));
+        Ok(())
+    })
+    .await
+}
