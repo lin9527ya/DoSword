@@ -1,26 +1,44 @@
 import { useEffect, useState } from "react";
-import { Blocks, Save, ShieldAlert, ShieldCheck } from "lucide-react";
+import { Blocks, Moon, Save, ShieldAlert, ShieldCheck, Sun } from "lucide-react";
 import { api, errorText } from "../api";
 import type { AppSettings, PluginManifest } from "../api";
 import { Dialog } from "../components/Dialog";
 import { ErrorBanner, Panel } from "../components/common";
+import { applyTheme, THEME_KEY, currentTheme } from "../theme";
 
 export function SettingsView() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [plugins, setPlugins] = useState<PluginManifest[]>([]);
+  const [theme, setTheme] = useState<"light" | "dark">(currentTheme());
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState(false);
 
+  function changeTheme(next: "light" | "dark") {
+    setTheme(next);
+    try {
+      localStorage.setItem(THEME_KEY, next);
+    } catch {
+      // 忽略存储失败
+    }
+    applyTheme();
+  }
+
   useEffect(() => {
-    void api
-      .getSettings()
-      .then(setSettings)
-      .catch((cause) => setError(errorText(cause)));
-    void api
-      .listPlugins()
-      .then(setPlugins)
-      .catch(() => {});
+    void (async () => {
+      try {
+        setSettings(await api.getSettings());
+      } catch (cause) {
+        setError(errorText(cause));
+      }
+    })();
+    void (async () => {
+      try {
+        setPlugins(await api.listPlugins());
+      } catch {
+        // 插件列表失败不阻塞设置页
+      }
+    })();
   }, []);
 
   async function save() {
@@ -131,6 +149,25 @@ export function SettingsView() {
               }
             />
           </label>
+        </div>
+      </Panel>
+
+      <Panel eyebrow="APPEARANCE" title="主题">
+        <div className="theme-switch">
+          <button
+            className={`theme-option ${theme === "light" ? "active" : ""}`}
+            onClick={() => changeTheme("light")}
+          >
+            <Sun size={16} />
+            明亮
+          </button>
+          <button
+            className={`theme-option ${theme === "dark" ? "active" : ""}`}
+            onClick={() => changeTheme("dark")}
+          >
+            <Moon size={16} />
+            暗色
+          </button>
         </div>
       </Panel>
 

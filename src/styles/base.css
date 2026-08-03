@@ -1,20 +1,54 @@
-/* 基础样式与设计变量：深色控制台 + 酸绿强调色 + IBM Plex Mono 字号体系 */
+/* 基础样式与设计变量：明亮主题（默认）与暗色主题可切换（设置页选择，localStorage 持久化）
+   酸绿强调色 + IBM Plex Mono 字号体系 */
 :root {
   font-family: Manrope, system-ui, sans-serif;
-  color: #e8e8e5;
-  background: #111310;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  --mono: "IBM Plex Mono", monospace;
+
+  /* 明亮主题（默认） */
+  --accent: #6f9c33;
+  --bg: #f4f6f2;
+  --panel: #ffffff;
+  --panel-2: #ebeee8;
+  --input-bg: #ffffff;
+  --code-bg: #f1f3ee;
+  --border: #c9cec4;
+  --border-soft: #dde1d8;
+  --text: #1e241b;
+  --text-dim: #57604f;
+  --text-faint: #8b9385;
+  --hover: #e4e8e0;
+  --ok: #5d8a2e;
+  --warn: #b08a1f;
+  --err: #c04a3c;
+  --ok-tint: #ecf3e2;
+  --ok-border: #b9cd9a;
+  --err-tint: #f7e7e3;
+  --err-border: #d8a89e;
+  --on-accent: #ffffff;
+}
+:root[data-theme="dark"] {
   --accent: #b6d77d;
   --bg: #111310;
   --panel: #181a17;
   --panel-2: #1c1f1a;
+  --input-bg: #161a14;
+  --code-bg: #12150f;
   --border: #30332d;
   --border-soft: #282b25;
   --text: #e8e8e5;
   --text-dim: #989d93;
   --text-faint: #6d7369;
-  --mono: "IBM Plex Mono", monospace;
+  --hover: #242720;
+  --ok: #a9d36a;
+  --warn: #d0c66a;
+  --err: #d47568;
+  --ok-tint: #1e2619;
+  --ok-border: #3a4a30;
+  --err-tint: #2e1c19;
+  --err-border: #77463f;
+  --on-accent: #14170f;
 }
 * {
   box-sizing: border-box;

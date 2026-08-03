@@ -14,7 +14,7 @@
   display: flex;
   flex-direction: column;
   background: var(--panel);
-  border-right: 1px solid #2a2d27;
+  border-right: 1px solid var(--border);
 }
 .brand {
   display: flex;
@@ -30,7 +30,7 @@
 }
 .workspace-label,
 .eyebrow {
-  color: #777d70;
+  color: var(--text-dim);
   font: 600 10px/1.4 var(--mono);
   letter-spacing: 0.13em;
 }
@@ -57,8 +57,8 @@ nav {
 }
 .nav-item:hover,
 .nav-item.active {
-  background: #242720;
-  color: #f0f1ed;
+  background: var(--hover);
+  color: var(--text);
 }
 .nav-item.active {
   box-shadow: inset 2px 0 var(--accent);
@@ -67,8 +67,8 @@ nav {
   margin-left: auto;
   font: 600 9px var(--mono);
   font-style: normal;
-  color: #6a705f;
-  border: 1px solid #34392f;
+  color: var(--text-faint);
+  border: 1px solid var(--border-soft);
   border-radius: 3px;
   padding: 1px 5px;
 }
@@ -80,9 +80,9 @@ nav {
   gap: 9px;
   margin: 16px 4px 0;
   padding: 11px;
-  border: 1px solid #34392f;
-  background: #1e211c;
-  color: #8d9387;
+  border: 1px solid var(--border-soft);
+  background: var(--panel-2);
+  color: var(--text-dim);
   font-size: 10px;
   line-height: 1.55;
 }
@@ -116,7 +116,7 @@ nav {
   padding: 0 11px;
   border: 1px solid var(--border);
   background: var(--panel);
-  color: #777d70;
+  color: var(--text-dim);
 }
 .search input {
   width: 170px;
@@ -143,24 +143,24 @@ nav {
   justify-content: center;
   gap: 7px;
   padding: 0 13px;
-  border: 1px solid #3a3e36;
-  background: #22251f;
+  border: 1px solid var(--border);
+  background: var(--input-bg);
   border-radius: 4px;
   cursor: pointer;
   font-size: 12px;
   font-weight: 600;
 }
 .button:hover {
-  border-color: #606757;
+  border-color: var(--text-faint);
 }
 .button.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #14170f;
+  color: var(--on-accent);
 }
 .button.secondary {
-  background: #1b1d1a;
-  color: #adb1a8;
+  background: var(--panel-2);
+  color: var(--text-dim);
 }
 .button.compact {
   min-height: 31px;
@@ -173,7 +173,7 @@ nav {
   min-height: 30px;
   padding: 0 10px;
   background: transparent;
-  border-color: #3a4a30;
+  border-color: var(--ok-border);
   color: var(--accent);
 }
 .icon-button {
@@ -181,33 +181,33 @@ nav {
   height: 31px;
   display: grid;
   place-items: center;
-  border: 1px solid #363a32;
-  background: #20231e;
-  color: #b5baaf;
+  border: 1px solid var(--border);
+  background: var(--input-bg);
+  color: var(--text-dim);
   cursor: pointer;
   border-radius: 4px;
 }
 .icon-button:hover {
-  border-color: #606757;
+  border-color: var(--text-faint);
 }
 .icon-button.danger:hover {
-  border-color: #77463f;
-  color: #e08a7d;
+  border-color: var(--err-border);
+  color: var(--err);
 }
 .error-banner {
   margin-bottom: 14px;
   padding: 11px 13px;
-  border: 1px solid #77463f;
-  background: #2e1c19;
-  color: #e8aaa0;
+  border: 1px solid var(--err-border);
+  background: var(--err-tint);
+  color: var(--err);
   font-size: 12px;
   white-space: pre-wrap;
 }
 .success-banner {
   margin-bottom: 14px;
   padding: 11px 13px;
-  border: 1px solid #3a4a30;
-  background: #1e2619;
+  border: 1px solid var(--ok-border);
+  background: var(--ok-tint);
   color: var(--accent);
   font-size: 12px;
 }
@@ -224,10 +224,10 @@ nav {
   display: flex;
   flex-direction: column;
   padding: 18px 20px;
-  background: #191b18;
+  background: var(--panel);
 }
 .metric span {
-  color: #7f8578;
+  color: var(--text-dim);
   font: 600 10px var(--mono);
   letter-spacing: 0.1em;
 }
@@ -236,7 +236,7 @@ nav {
   font: 500 29px var(--mono);
 }
 .metric small {
-  color: #696f65;
+  color: var(--text-faint);
   font-size: 11px;
 }
 .metric.accent strong {
