@@ -6,11 +6,24 @@
 //!   IPv4/IPv6 字面量、CIDR（`10.0.0.0/8`）、裸通配（`*`）
 //! - 无法解析的条目按"人工已确认"放行，审计中注明无法自动校验
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate};
 use url::Url;
 
 use dosword_sdk::domain::{ShellProfile, Workspace};
 use crate::storage::Database;
+
+/// 解析授权到期时间：优先 RFC3339；兼容历史数据中的 `YYYY-MM-DD`（按当天 23:59:59 计）。
+fn parse_expiry(expires_at: &str) -> Result<DateTime<Local>, String> {
+    DateTime::parse_from_rfc3339(expires_at)
+        .map(|dt| dt.with_timezone(&Local))
+        .or_else(|_| {
+            NaiveDate::parse_from_str(expires_at, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(23, 59, 59))
+                .and_then(|naive| naive.and_local_timezone(Local).single())
+                .ok_or_else(|| "授权到期时间格式异常，已按禁止处理".to_string())
+        })
+}
 
 /// 检查 Shell 所属 Workspace 的授权状态。
 /// 返回 Err 表示授权过期或不存在。
@@ -19,10 +32,9 @@ pub fn check_workspace_authorized(
 ) -> Result<(), String> {
     let workspace = workspace.ok_or("Shell 所属的 Workspace 不存在，已禁止操作")?;
     if let Some(expires_at) = &workspace.expires_at {
-        let expires = DateTime::parse_from_rfc3339(expires_at)
-            .map_err(|_| "授权到期时间格式异常，已按禁止处理".to_string())?;
+        let expires = parse_expiry(expires_at)?;
         let now = Local::now();
-        if now > expires.with_timezone(&Local) {
+        if now > expires {
             return Err(format!(
                 "授权已于 {} 过期，禁止继续操作",
                 expires_at
@@ -212,6 +224,22 @@ mod tests {
         let result = require_authorized(&db, &shell);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("过期"));
+    }
+
+    #[test]
+    fn date_only_expiry_is_tolerated() {
+        // 历史数据中的 YYYY-MM-DD 格式也应能校验（容错解析）
+        let db = db_with_workspace("localhost", Some("2030-01-01".into()));
+        let shell = shell_for(&db, "http://localhost/a.php");
+        assert!(
+            require_authorized(&db, &shell).is_ok(),
+            "未来日期（YYYY-MM-DD）应放行"
+        );
+
+        let db_expired = db_with_workspace("localhost", Some("2000-01-01".into()));
+        let shell2 = shell_for(&db_expired, "http://localhost/a.php");
+        let result = require_authorized(&db_expired, &shell2);
+        assert!(result.is_err(), "过去日期（YYYY-MM-DD）应拒绝");
     }
 
     #[test]

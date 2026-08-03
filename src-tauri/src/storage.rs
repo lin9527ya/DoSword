@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use chrono::Utc;
+use chrono::{Local, NaiveDate, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -69,6 +69,25 @@ const MIGRATIONS: &[&str] = &[
 
 const SETTINGS_KEY: &str = "app";
 
+/// 规范化授权到期时间：前端日期输入是 `YYYY-MM-DD`，而授权校验用 RFC3339。
+/// 纯日期转成当天 23:59:59 + 本地时区（到期日当天仍有效）；已是 RFC3339 的原样保留。
+fn normalize_expiry(expires_at: Option<String>) -> Option<String> {
+    let value = expires_at?;
+    let is_date_only = value.len() == 10
+        && value.as_bytes().get(4) == Some(&b'-')
+        && value.as_bytes().get(7) == Some(&b'-');
+    if is_date_only {
+        if let Some(dt) = NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+            .ok()
+            .and_then(|date| date.and_hms_opt(23, 59, 59))
+            .and_then(|naive| naive.and_local_timezone(Local).single())
+        {
+            return Some(dt.to_rfc3339());
+        }
+    }
+    Some(value)
+}
+
 pub struct Database {
     connection: Connection,
 }
@@ -97,7 +116,7 @@ impl Database {
             id: Uuid::new_v4().to_string(),
             name: input.name,
             authorization_scope: input.authorization_scope,
-            expires_at: input.expires_at,
+            expires_at: normalize_expiry(input.expires_at),
             created_at: Utc::now().to_rfc3339(),
         };
         let transaction = self.connection.transaction()?;
@@ -191,7 +210,7 @@ impl Database {
             params![
                 input.name,
                 input.authorization_scope,
-                input.expires_at,
+                normalize_expiry(input.expires_at.clone()),
                 input.id
             ],
         )?;
@@ -577,6 +596,30 @@ mod tests {
         assert_eq!(loaded.default_timeout_secs, 20);
         assert_eq!(loaded.proxy.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(loaded.max_file_size_mb, 64);
+    }
+
+    #[test]
+    fn expiry_date_only_is_normalized_to_rfc3339() {
+        let mut db = Database::open(":memory:").unwrap();
+        // 前端日期输入：YYYY-MM-DD
+        let workspace = db
+            .create_workspace(CreateWorkspace {
+                name: "Lab".into(),
+                authorization_scope: "localhost".into(),
+                expires_at: Some("2030-12-31".into()),
+            })
+            .unwrap();
+        // 写入后必须是 RFC3339，可被授权校验解析
+        let stored = workspace.expires_at.clone().expect("应有到期日");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&stored);
+        assert!(parsed.is_ok(), "到期日应规范化为 RFC3339：{workspace:?}");
+        assert!(stored.contains("T23:59:59"), "应为当天最后时刻：{stored}");
+
+        // 已规范化的值原样保留
+        let normalized = normalize_expiry(Some("2026-01-01T10:00:00+08:00".into()));
+        assert_eq!(normalized.as_deref(), Some("2026-01-01T10:00:00+08:00"));
+        // None 保持
+        assert_eq!(normalize_expiry(None), None);
     }
 
     #[test]
