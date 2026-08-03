@@ -22,3 +22,4 @@ md-5 = "0.10"
 aes = "0.8"
 des = "0.8"
 cbc = { version = "0.1", features = ["block-padding", "alloc"] }
+crc32fast = "1.4"

@@ -19,3 +19,4 @@ md-5.workspace = true
 aes.workspace = true
 des.workspace = true
 cbc.workspace = true
+crc32fast.workspace = true

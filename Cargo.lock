@@ -902,6 +902,7 @@ dependencies = [
  "base64 0.22.1",
  "cbc",
  "chrono",
+ "crc32fast",
  "des",
  "md-5",
  "serde",
