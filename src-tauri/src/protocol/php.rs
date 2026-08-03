@@ -926,20 +926,52 @@ mod tests {
                     .map(|(_, v)| v.clone())
                     .unwrap_or_default();
                 let code = {
-                    // 支持两种编码：裸 base64（含 PHP 特征）或 XOR+base64（key=md5 密码）
-                    let raw = B64.decode(&x).unwrap_or_default();
-                    // 8 字节连续特征串，XOR 乱码命中概率可忽略
-                    let is_plain = raw.windows(8).any(|w| w == b"@ini_set");
-                    if is_plain {
-                        String::from_utf8_lossy(&raw).to_string()
-                    } else {
-                        let key = md5_hex("secret").into_bytes();
-                        let restored: Vec<u8> = raw
-                            .iter()
-                            .enumerate()
-                            .map(|(index, byte)| byte ^ key[index % key.len()])
+                    // 支持多种编码：裸 base64 / XOR / AES-128-ECB / CHAR / OBFUSCATE
+                    // （CHAR/OBFUSCATE 不经 base64，stub 直接 eval，先检查原文）
+                    if x.contains("array_map('chr',array(") {
+                        let numbers = x.rsplit("array(").next().unwrap_or("");
+                        let restored: Vec<u8> = numbers
+                            .split(')')
+                            .next()
+                            .unwrap_or("")
+                            .split(',')
+                            .filter_map(|item| item.trim().parse::<u8>().ok())
                             .collect();
                         String::from_utf8_lossy(&restored).to_string()
+                    } else if x.contains("strrev('") {
+                        let reversed = x
+                            .split("strrev('")
+                            .nth(1)
+                            .and_then(|part| part.split("')").next())
+                            .unwrap_or("");
+                        let b64: String = reversed.chars().rev().collect();
+                        let restored = B64.decode(&b64).unwrap_or_default();
+                        String::from_utf8_lossy(&restored).to_string()
+                    } else {
+                        let raw = B64.decode(&x).unwrap_or_default();
+                        // 8 字节连续特征串，XOR/AES 密文命中概率可忽略
+                        let is_plain = raw.windows(8).any(|w| w == b"@ini_set");
+                        if is_plain {
+                            String::from_utf8_lossy(&raw).to_string()
+                        } else {
+                            let mut restored = Vec::new();
+                            // XOR
+                            let key = md5_hex("secret").into_bytes();
+                            restored = raw
+                                .iter()
+                                .enumerate()
+                                .map(|(index, byte)| byte ^ key[index % key.len()])
+                                .collect();
+                            if !restored.windows(8).any(|w| w == b"@ini_set") {
+                                // AES-128-ECB
+                                restored = dosword_sdk::encoder::aes_ecb_decrypt(
+                                    &raw,
+                                    &dosword_sdk::encoder::aes_key("secret"),
+                                )
+                                .unwrap_or_default();
+                            }
+                            String::from_utf8_lossy(&restored).to_string()
+                        }
                     }
                 };
                 let _ = tx.send((k.clone(), code.clone()));
@@ -1009,8 +1041,63 @@ mod tests {
     }
 
     #[test]
-    fn xor_base64_round_trip() {
-        // 服务端按 XOR+Base64 解码（对应 XOR_BASE64 stub 的解码逻辑）
+    fn aes128_ecb_round_trip() {
+        // 服务端按 AES-128-ECB 解密（对应 aes128_ecb stub 的 openssl 逻辑）
+        let (url, rx) = spawn_fake_server(|_code, _k| {
+            Some(json!({"ok": true, "data": {"stdout": base64::engine::general_purpose::STANDARD.encode("aes-ok")}}))
+        });
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"aes128_ecb"}"#.into();
+        let settings = settings();
+        let (session, _) = PhpProtocol.connect(&profile, &settings).unwrap();
+        let output = PhpProtocol
+            .execute_command(session.as_ref(), "id", &settings)
+            .expect("执行应成功");
+        assert_eq!(output.stdout, "aes-ok");
+
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到 probe 请求");
+        let (k, code) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到 exec 请求");
+        assert_eq!(k, "secret");
+        assert!(code.contains("shell_exec"), "AES 载荷应能被服务端解密还原");
+    }
+
+    #[test]
+    fn char_and_obfuscate_round_trip() {
+        // CHAR：stub 为裸 eval，载荷是 chr 混淆代码（不经 base64）
+        let (url, rx) = spawn_fake_server(|_code, _k| {
+            Some(json!({"ok": true, "data": {"stdout": base64::engine::general_purpose::STANDARD.encode("char-ok")}}))
+        });
+        let mut p = profile(&url);
+        p.protocol_params = r#"{"encoder":"char"}"#.into();
+        let settings = settings();
+        let (session, _) = PhpProtocol.connect(&p, &settings).unwrap();
+        let output = PhpProtocol
+            .execute_command(session.as_ref(), "id", &settings)
+            .expect("CHAR 执行应成功");
+        assert_eq!(output.stdout, "char-ok");
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到 probe 请求");
+        let (k, code) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到 exec 请求");
+        assert_eq!(k, "secret");
+        assert!(code.contains("shell_exec"), "CHAR 载荷应能被还原");
+
+        // OBFUSCATE：同理
+        let (url2, rx2) = spawn_fake_server(|_code, _k| {
+            Some(json!({"ok": true, "data": {"stdout": base64::engine::general_purpose::STANDARD.encode("obf-ok")}}))
+        });
+        let mut p2 = profile(&url2);
+        p2.protocol_params = r#"{"encoder":"php_obfuscate"}"#.into();
+        let (session2, _) = PhpProtocol.connect(&p2, &settings).unwrap();
+        let output2 = PhpProtocol
+            .execute_command(session2.as_ref(), "id", &settings)
+            .expect("OBFUSCATE 执行应成功");
+        assert_eq!(output2.stdout, "obf-ok");
+        let _ = rx2.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到 probe 请求");
+        let (_, code2) = rx2.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到 exec 请求");
+        assert!(code2.contains("shell_exec"), "OBFUSCATE 载荷应能被还原");
+    }
+
+    #[test]
+    fn xor_base64_round_trip() {        // 服务端按 XOR+Base64 解码（对应 XOR_BASE64 stub 的解码逻辑）
         let (url, rx) = spawn_fake_server(|_code, _k| {
             Some(json!({"ok": true, "data": {"stdout": base64::engine::general_purpose::STANDARD.encode("xor-ok")}}))
         });

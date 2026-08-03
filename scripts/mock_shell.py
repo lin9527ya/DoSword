@@ -35,14 +35,53 @@ def decode_param(value: str) -> str:
 
 
 def decode_payload(x: str) -> str:
-    """解码客户端载荷：支持裸 base64（含 PHP 特征）或 XOR+base64（key=md5 密码）。"""
+    """解码客户端载荷。注意：CHAR/OBFUSCATE 载荷不经 base64（stub 直接 eval），
+    其余编码器（base64/xor/aes/des）经 base64。特征串 @ini_set 判断。"""
+    # 1) 明文混淆载荷（CHAR / OBFUSCATE）
+    if "array_map('chr',array(" in x:
+        numbers = x.rsplit("array(", 1)[1].split(")")[0]
+        restored = bytes(int(n) for n in numbers.split(",") if n.strip())
+        if b"@ini_set" in restored:
+            return restored.decode("utf-8", errors="replace")
+    if "strrev('" in x:
+        reversed_b64 = x.split("strrev('")[1].split("')")[0]
+        restored = base64.b64decode(reversed_b64[::-1])
+        if b"@ini_set" in restored:
+            return restored.decode("utf-8", errors="replace")
+
+    # 2) base64 载荷（裸 / XOR / AES / DES）
     raw = base64.b64decode(x)
+    key = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
     if b"@ini_set" in raw:
         return raw.decode("utf-8", errors="replace")
-    key = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
-    restored = bytes(c ^ key[i % len(key)] for i, c in enumerate(raw))
-    if b"@ini_set" in restored:
-        return restored.decode("utf-8", errors="replace")
+    xored = bytes(c ^ key[i % len(key)] for i, c in enumerate(raw))
+    if b"@ini_set" in xored:
+        return xored.decode("utf-8", errors="replace")
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives import padding as sym_padding
+
+        hex_key = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
+        schemes = [
+            (algorithms.AES(hex_key[:16]), "aes-ecb"),
+            (algorithms.AES(hex_key[:16]), "aes-cbc"),
+            (algorithms.DES(hex_key[:8]), "des-ecb"),
+        ]
+        for algo, name in schemes:
+            try:
+                if name == "aes-cbc":
+                    dec = Cipher(algo, modes.CBC(hex_key[16:])).decryptor()
+                else:
+                    dec = Cipher(algo, modes.ECB()).decryptor()
+                padded = dec.update(raw) + dec.finalize()
+                unpadder = sym_padding.PKCS7(algo.block_size).unpadder()
+                restored = unpadder.update(padded) + unpadder.finalize()
+                if b"@ini_set" in restored:
+                    return restored.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+    except ImportError:
+        pass
     raise ValueError("无法识别的载荷编码")
 
 

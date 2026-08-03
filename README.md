@@ -8,8 +8,11 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
 - Shell Profile 本地持久化（SQLite，含密码明文——工具惯例，keyring 加密留待后续），支持标签、删除/编辑
 - 审计日志贯穿所有操作（连接 / 命令 / 文件 / 设置），分页查询与 CSV 导出
 - **标准 PHP WebShell 协议**（类蚁剑）：探测、连接、命令执行、文件浏览/读写/上传/下载/删除/重命名/建目录
-- **编码器体系**（哥斯拉风格）：XOR_BASE64 / BASE64，载荷按编码器发送、密钥由密码 md5 派生
-- **生成 Webshell**：PHP / ASP / ASPX / JSP 四种语言 × 编码器生成服务端 stub（当前连接协议仅 PHP 可用）
+- **编码器体系**（哥斯拉风格，7 种）：
+  - `base64` 经典裸编码 / `xor_base64` 异或混淆 + Base64
+  - `aes128_ecb` / `aes128_cbc` / `des` 自加密（密钥由密码 md5 派生并内嵌 stub，载荷为密文）
+  - `char` 字符数组混淆 / `php_obfuscate` base64+反转混淆（无密钥，混淆在载荷内）
+- **生成 Webshell**：PHP / ASP / ASPX / JSP 四种语言 × 编码器生成服务端 stub（自加密 stub 含 openssl 解密逻辑；当前连接协议仅 PHP 可用）
 - 分块上传下载（4MB 块 + fseek），上传带进度条
 - **数据库管理**（PDO，MySQL / PostgreSQL / SQLite）：连接探测、数据库/表浏览、SQL 执行、结果网格
 - **请求调试**（协议帧检查器）：进程内环缓冲记录每条协议载荷与响应，密码自动脱敏

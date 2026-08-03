@@ -505,6 +505,7 @@ function ShellDialog({
 }) {
   const [protocols, setProtocols] = useState<ProtocolMeta[]>([]);
   const [protocolId, setProtocolId] = useState(initial?.protocolId ?? "builtin.mock.v1");
+  const [encoders, setEncoders] = useState<[string, string][]>([]);
   const [encoderId, setEncoderId] = useState("xor_base64");
   const [settings, setSettings] = useState<{ httpEnabled: boolean }>({ httpEnabled: false });
   const [busy, setBusy] = useState(false);
@@ -512,6 +513,7 @@ function ShellDialog({
 
   useEffect(() => {
     void api.listProtocols().then(setProtocols);
+    void api.listEncoders().then(setEncoders).catch(() => {});
     void api.getSettings().then(setSettings).catch(() => {});
   }, []);
 
@@ -633,8 +635,11 @@ function ShellDialog({
               <label>
                 编码方式
                 <select value={encoderId} onChange={(event) => setEncoderId(event.target.value)}>
-                  <option value="xor_base64">XOR_BASE64（需对应 stub）</option>
-                  <option value="base64">BASE64（经典裸编码）</option>
+                  {encoders.map(([id, displayName]) => (
+                    <option key={id} value={id}>
+                      {displayName}
+                    </option>
+                  ))}
                 </select>
                 <span className="field-hint">
                   与目标 stub 的解码方式一致；可在「生成 Webshell」中生成配套 stub。
