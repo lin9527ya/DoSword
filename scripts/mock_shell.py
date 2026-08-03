@@ -222,12 +222,17 @@ def handle_code(code: str) -> dict:
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", 0))
-        params = parse_qs(self.rfile.read(length).decode("utf-8"))
-        # 标准参数（k/x）与业务伪装参数（token/data）均支持
+        raw_body = self.rfile.read(length).decode("utf-8", errors="replace")
+        params = parse_qs(raw_body)
+        # 标准参数（k/x）、业务伪装参数（token/data）与 body 直传（php_stream）均支持
         k = params.get("k", [""])[0] or params.get("token", [""])[0]
         x = params.get("x", [""])[0] or params.get("data", [""])[0]
+        if x == "" and k == "":
+            # body 直传模式（php_stream）：无表单参数，stub 无鉴权
+            x = raw_body
 
-        if k != PASSWORD:
+        if k != PASSWORD and not (k == "" and x != ""):
+            # 仅当存在密码参数且不匹配时拒绝；body 直传模式（php_stream）无鉴权
             body = b"AUTH_FAIL"
         else:
             try:

