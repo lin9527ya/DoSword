@@ -13,6 +13,7 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
   - `aes128_ecb` / `aes128_cbc` / `des` 自加密（密钥由密码 md5 派生并内嵌 stub，载荷为密文）
   - `char` 字符数组混淆 / `php_obfuscate` base64+反转混淆（无密钥，混淆在载荷内）
   - `php_stream` 零敏感函数 stub（`INCLUDE("php://filter/...php://input")` 一行，需 allow_url_include=On）
+  - `xor_body` Godzilla 风格请求体 XOR 直传（`file_get_contents('php://input')`，默认配置可用）
 - **OPSEC 业务伪装**：PHP stub 整体形如正常业务文件（「会话状态查询接口」），
   webshell 功能隐藏在业务函数中（函数名带随机前缀防与站点业务函数冲突）；
   敏感函数名（base64_decode / openssl_decrypt）完全不在代码中出现——运行时

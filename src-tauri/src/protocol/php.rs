@@ -1376,6 +1376,7 @@ mod tests {
             "char",
             "php_obfuscate",
             "php_stream",
+            "xor_body",
         ];
         let settings = settings();
         for encoder_id in encoders {
@@ -1480,7 +1481,8 @@ mod tests {
             listener.local_addr().unwrap().port()
         };
         let mut command = std::process::Command::new("php");
-        if encoder.body_mode() {
+        if encoder_id == "php_stream" {
+            // 仅 include 流方案需要 allow_url_include；xor_body 用 file_get_contents 无需
             command.arg("-d").arg("allow_url_include=1");
         }
         let child = command

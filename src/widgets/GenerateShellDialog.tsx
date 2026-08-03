@@ -131,9 +131,10 @@ export function GenerateShellDialog({
               当前连接协议仅 PHP 可用，ASP / ASPX / JSP 的客户端协议规划中。
             </p>
             <p className="form-note">
-              OPSEC：PHP stub 已做业务伪装（形如「会话状态查询接口」，无小写
-              eval(/base64_decode( 等敏感词）；PHP_STREAM 编码器为一行 INCLUDE
-              stub（零敏感函数），但需目标环境开启 allow_url_include=On。
+              OPSEC：PHP stub 已做业务伪装（形如业务接口，敏感函数经 crc32b
+              哈希查表解析，无小写 eval(/base64_decode( 等敏感词）；
+              XOR_BODY 编码器为请求体 XOR 直传（Godzilla 风格），默认配置可用；
+              PHP_STREAM 为一行 INCLUDE stub（零敏感函数），需 allow_url_include=On。
             </p>
           </div>
         )}
