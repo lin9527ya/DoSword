@@ -223,8 +223,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", 0))
         params = parse_qs(self.rfile.read(length).decode("utf-8"))
-        k = params.get("k", [""])[0]
-        x = params.get("x", [""])[0]
+        # 标准参数（k/x）与业务伪装参数（token/data）均支持
+        k = params.get("k", [""])[0] or params.get("token", [""])[0]
+        x = params.get("x", [""])[0] or params.get("data", [""])[0]
 
         if k != PASSWORD:
             body = b"AUTH_FAIL"

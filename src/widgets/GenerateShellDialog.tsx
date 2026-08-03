@@ -130,6 +130,11 @@ export function GenerateShellDialog({
               部署到授权目标后，创建对应语言的 Shell 并选择相同编码方式与密码即可连接。
               当前连接协议仅 PHP 可用，ASP / ASPX / JSP 的客户端协议规划中。
             </p>
+            <p className="form-note">
+              OPSEC：PHP stub 已做业务伪装（形如「会话状态查询接口」，无小写
+              eval(/base64_decode( 等敏感词）；PHP_STREAM 编码器为一行 INCLUDE
+              stub（零敏感函数），但需目标环境开启 allow_url_include=On。
+            </p>
           </div>
         )}
       </div>
