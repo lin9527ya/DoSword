@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Layout } from "./components/Layout";
 import { DashboardView } from "./views/DashboardView";
 import { SessionsView } from "./views/SessionsView";
+import { RequestDebugView } from "./views/RequestDebugView";
 import { SettingsView } from "./views/SettingsView";
 import { AuditView } from "./views/AuditView";
 import { ShellDetailView } from "./shells/ShellDetailView";
@@ -25,6 +26,7 @@ function App() {
         />
       )}
       {view.kind === "sessions" && <SessionsView onNavigate={setView} />}
+      {view.kind === "debug" && <RequestDebugView />}
       {view.kind === "audit" && <AuditView />}
       {view.kind === "settings" && <SettingsView />}
     </Layout>

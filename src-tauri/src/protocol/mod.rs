@@ -4,7 +4,7 @@
 //! 调度到阻塞线程池执行，因此可以自由持有 `std::sync::Mutex` 而不会跨越 await。
 
 mod mock;
-mod php;
+pub mod php;
 mod transport;
 
 use std::any::Any;

@@ -420,6 +420,87 @@
   color: var(--text-dim);
 }
 
+/* 请求调试页 */
+.debug-list {
+  display: grid;
+}
+.debug-item {
+  border-bottom: 1px solid var(--border-soft);
+}
+.debug-item:last-child {
+  border-bottom: none;
+}
+.debug-head {
+  display: grid;
+  grid-template-columns: 52px 90px minmax(180px, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  width: 100%;
+  padding: 11px 18px;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.debug-head:hover {
+  background: rgba(182, 215, 125, 0.04);
+}
+.debug-status {
+  font: 600 10px var(--mono);
+  padding: 2px 8px;
+  border-radius: 4px;
+  text-align: center;
+}
+.debug-status.ok {
+  color: #a9d36a;
+  background: rgba(169, 211, 106, 0.08);
+}
+.debug-status.err {
+  color: #d47568;
+  background: rgba(212, 117, 104, 0.1);
+}
+.debug-action {
+  font: 500 11px var(--mono);
+  color: #b6d77d;
+}
+.debug-endpoint {
+  overflow: hidden;
+  color: #747a70;
+  font: 11px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.debug-meta {
+  color: #666c62;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.debug-body {
+  display: grid;
+  gap: 12px;
+  padding: 0 18px 14px;
+}
+.debug-block h3 {
+  margin: 0 0 6px;
+  font: 600 10px var(--mono);
+  letter-spacing: 0.08em;
+  color: #777d70;
+}
+.debug-block pre {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  background: #12150f;
+  color: #b9c2ae;
+  font: 11px var(--mono);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 280px;
+  overflow: auto;
+}
+
 /* 占位视图 */
 .placeholder-panel {
   min-height: 420px;

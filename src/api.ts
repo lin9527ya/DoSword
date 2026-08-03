@@ -19,6 +19,7 @@ import type {
   DbConnection,
   DbProbeResult,
   DbQueryResult,
+  RequestRecord,
 } from "./generated/domain";
 
 export type * from "./generated/domain";
@@ -92,6 +93,9 @@ export const api = {
     invoke<DbProbeResult>("db_probe", { sessionId, connection }),
   dbQuery: (sessionId: string, connection: DbConnection, sql: string) =>
     invoke<DbQueryResult>("db_query", { sessionId, connection, sql }),
+  listRequestLog: (endpoint?: string | null) =>
+    invoke<RequestRecord[]>("list_request_log", { endpoint: endpoint ?? null }),
+  clearRequestLog: () => invoke<void>("clear_request_log"),
 };
 
 // --- Base64 工具（编辑器/上传下载用） ---

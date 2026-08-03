@@ -14,7 +14,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: "dashboard", label: "总览", icon: <LayoutDashboard size={18} />, view: { kind: "dashboard" } },
   { key: "sessions", label: "终端会话", icon: <TerminalSquare size={18} />, view: { kind: "sessions" } },
   { key: "files", label: "文件传输", icon: <FileCode2 size={18} />, soon: true },
-  { key: "debug", label: "请求调试", icon: <Braces size={18} />, soon: true },
+  { key: "debug", label: "请求调试", icon: <Braces size={18} />, view: { kind: "debug" } },
   { key: "database", label: "数据库", icon: <Boxes size={18} />, soon: true },
 ];
 

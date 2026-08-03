@@ -9,8 +9,8 @@ use crate::{
     domain::{
         AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
         CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing,
-        FileContent, ProbeResult, ProtocolMeta, SessionInfo, ShellProfile, UpdateShell,
-        UpdateWorkspace, Workspace,
+        FileContent, ProbeResult, ProtocolMeta, RequestRecord, SessionInfo, ShellProfile,
+        UpdateShell, UpdateWorkspace, Workspace,
     },
     protocol::{Protocol, ProtocolError, SessionState},
 };
@@ -870,6 +870,26 @@ pub async fn create_dir(
 }
 
 // --- 数据库管理 ---
+
+#[tauri::command]
+pub async fn list_request_log(
+    endpoint: Option<String>,
+    app: AppHandle,
+) -> Result<Vec<RequestRecord>, String> {
+    blocking(app, move |_state| {
+        Ok(crate::protocol::php::list_requests(endpoint.as_deref()))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn clear_request_log(app: AppHandle) -> Result<(), String> {
+    blocking(app, move |_state| {
+        crate::protocol::php::clear_requests();
+        Ok(())
+    })
+    .await
+}
 
 #[tauri::command]
 pub async fn db_probe(

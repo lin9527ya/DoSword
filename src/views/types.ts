@@ -4,5 +4,6 @@ export type View =
   | { kind: "dashboard" }
   | { kind: "shell"; shellId: string; sessionId?: string }
   | { kind: "sessions" }
+  | { kind: "debug" }
   | { kind: "audit" }
   | { kind: "settings" };

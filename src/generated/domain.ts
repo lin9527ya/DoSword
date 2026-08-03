@@ -71,3 +71,20 @@ rows: Array<Array<string | null>>,
  * 非查询语句的影响行数。
  */
 affected: number, durationMs: number, };
+export type RequestRecord = { id: number, 
+/**
+ * 目标端点。
+ */
+endpoint: string, 
+/**
+ * 操作类型（probe / exec / list_dir / read_file / ... / db_probe / db_query）。
+ */
+action: string, createdAt: string, status: number, durationMs: number, 
+/**
+ * base64 解码后的 PHP 载荷（密码已脱敏，截断 2KB）。
+ */
+payload: string, 
+/**
+ * 响应体（截断 2KB）。
+ */
+response: string, };

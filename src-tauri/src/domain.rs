@@ -274,6 +274,29 @@ pub struct DbQueryResult {
     pub duration_ms: u64,
 }
 
+// --- 请求调试器（V2.0） ---
+
+/// 一条协议请求记录（内存环缓冲，仅调试用途，不落盘）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestRecord {
+    #[ts(type = "number")]
+    pub id: u64,
+    /// 目标端点。
+    pub endpoint: String,
+    /// 操作类型（probe / exec / list_dir / read_file / ... / db_probe / db_query）。
+    pub action: String,
+    pub created_at: String,
+    #[ts(type = "number")]
+    pub status: u16,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+    /// base64 解码后的 PHP 载荷（密码已脱敏，截断 2KB）。
+    pub payload: String,
+    /// 响应体（截断 2KB）。
+    pub response: String,
+}
+
 // ---------------------------------------------------------------------------
 // TS 类型生成：将全部 DTO 导出为 src/generated/domain.ts，前端 api.ts 复用，
 // 避免前后端类型手工重复维护导致的漂移。
@@ -309,6 +332,7 @@ mod ts_bindings {
             ("DbConnection", DbConnection::decl()),
             ("DbProbeResult", DbProbeResult::decl()),
             ("DbQueryResult", DbQueryResult::decl()),
+            ("RequestRecord", RequestRecord::decl()),
         ];
         types
     }

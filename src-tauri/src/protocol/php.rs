@@ -11,6 +11,9 @@
 //! 本协议只生成白名单模板，不提供任意 PHP 代码透传入口。
 
 use std::any::Any;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -19,7 +22,7 @@ use serde_json::Value;
 
 use crate::domain::{
     AppSettings, CommandOutput, DbConnection, DbProbeResult, DbQueryResult, DirListing, FileEntry,
-    ProbeResult, ShellProfile,
+    ProbeResult, RequestRecord, ShellProfile,
 };
 
 use super::transport::build_client;
@@ -85,6 +88,84 @@ $__r=array('ok'=>true,'data'=>array('columns'=>$cols,'rows'=>$rows,'affected'=>0
 }catch(Exception $e){$__r=array('ok'=>false,'error'=>'数据库操作失败：'.$e->getMessage());}
 echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';"#;
 
+// ---------------------------------------------------------------------------
+// 请求调试：进程内环缓冲，记录每条协议帧（载荷 / 响应），供「请求调试」页查看。
+// 仅调试用途，不落盘；密码在载荷预览中脱敏。
+// ---------------------------------------------------------------------------
+
+/// 载荷 / 响应预览截断长度。
+const DEBUG_PREVIEW_LEN: usize = 2048;
+/// 环缓冲容量。
+const DEBUG_LOG_CAP: usize = 200;
+
+static REQUEST_LOG: LazyLock<Mutex<VecDeque<RequestRecord>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(DEBUG_LOG_CAP)));
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 记录一条协议请求（由 send_frame 调用）。
+fn record_request(
+    action: &str,
+    endpoint: &str,
+    status: u16,
+    duration_ms: u64,
+    code: &str,
+    response: &str,
+    password: &str,
+) {
+    // 载荷脱敏：密码字面量替换为 ***（密码为空时跳过，避免 replace("") 异常）
+    let payload = if password.is_empty() {
+        code.to_string()
+    } else {
+        code.replace(password, "***")
+    };
+    let mut record = RequestRecord {
+        id: REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed),
+        endpoint: endpoint.to_string(),
+        action: action.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        status,
+        duration_ms,
+        payload: truncate(&payload),
+        response: truncate(response),
+    };
+    // 响应里可能残留明文密码（如 AUTH_FAIL 回显外的场景），一并脱敏
+    record.response = if password.is_empty() {
+        record.response
+    } else {
+        record.response.replace(password, "***")
+    };
+    let mut log = REQUEST_LOG.lock().expect("请求日志锁异常");
+    if log.len() >= DEBUG_LOG_CAP {
+        log.pop_front();
+    }
+    log.push_back(record);
+}
+
+fn truncate(value: &str) -> String {
+    let mut chars = value.chars();
+    let head: String = chars.by_ref().take(DEBUG_PREVIEW_LEN).collect();
+    if chars.next().is_some() {
+        format!("{head}\n…（已截断）")
+    } else {
+        head
+    }
+}
+
+/// 列出请求记录（可选按端点过滤），新记录在前。
+pub fn list_requests(endpoint: Option<&str>) -> Vec<RequestRecord> {
+    let log = REQUEST_LOG.lock().expect("请求日志锁异常");
+    log.iter()
+        .rev()
+        .filter(|record| endpoint.map_or(true, |target| record.endpoint == target))
+        .cloned()
+        .collect()
+}
+
+/// 清空请求记录。
+pub fn clear_requests() {
+    REQUEST_LOG.lock().expect("请求日志锁异常").clear();
+}
+
 impl PhpProtocol {
     /// 将 `params` 逐项替换进模板的 `{key}` 占位符。
     fn build_code(template: &str, params: &[(&str, &str)]) -> String {
@@ -107,14 +188,16 @@ impl PhpProtocol {
         password: &str,
         code_template: &str,
         settings: &AppSettings,
+        action: &str,
     ) -> Result<Value, ProtocolError> {
         // 8 字节随机 nonce（hex 字符串）
         let nonce = random_nonce();
+        let start = Instant::now();
         let code = code_template.replace("{NONCE}", &nonce);
 
         let body = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("k", password)
-            .append_pair("x", &B64.encode(code))
+            .append_pair("x", &B64.encode(&code))
             .finish();
 
         let response = client
@@ -124,10 +207,13 @@ impl PhpProtocol {
             .send()
             .map_err(|error| ProtocolError::Network(error.to_string()))?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        if !status.is_success() {
             return Err(ProtocolError::HttpStatus(
-                response.status().as_u16(),
-                response.status().canonical_reason().unwrap_or("").to_string(),
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("").to_string(),
             ));
         }
 
@@ -142,6 +228,17 @@ impl PhpProtocol {
             )));
         }
         let text = String::from_utf8_lossy(&bytes);
+
+        // 调试记录（先于错误分支，失败请求同样留痕）
+        record_request(
+            action,
+            endpoint,
+            status.as_u16(),
+            duration_ms,
+            &code,
+            &text,
+            password,
+        );
 
         // 鉴权失败时服务器直接输出明文 AUTH_FAIL（无帧）
         if text.contains("AUTH_FAIL") {
@@ -228,7 +325,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME
         );
         let client = build_client(settings);
-        let value = self.send_frame(&client, &profile.endpoint, &profile.password, &code, settings)?;
+        let value = self.send_frame(&client, &profile.endpoint, &profile.password, &code, settings, "probe")?;
 
         let server = value
             .pointer("/data/server")
@@ -299,7 +396,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME
         );
         let start = Instant::now();
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "exec")?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let stdout = value
@@ -333,7 +430,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "list_dir")?;
 
         let entries: Vec<FileEntry> = value
             .pointer("/data/entries")
@@ -376,7 +473,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "read_file")?;
 
         value
             .get("data")
@@ -404,7 +501,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "write_file")?;
         Ok(())
     }
 
@@ -425,7 +522,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "delete")?;
         Ok(())
     }
 
@@ -448,7 +545,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "rename")?;
         Ok(())
     }
 
@@ -469,7 +566,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "mkdir")?;
         Ok(())
     }
 
@@ -494,7 +591,7 @@ impl Protocol for PhpProtocol {
             off = offset,
             len = length,
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "read_chunk")?;
         value
             .get("data")
             .and_then(|v| v.as_str())
@@ -524,7 +621,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME,
             off = offset,
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "write_chunk")?;
         Ok(())
     }
 
@@ -557,7 +654,7 @@ impl Protocol for PhpProtocol {
                 ("DRIVER", &driver),
             ],
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "db_probe")?;
         let databases = value
             .pointer("/data/databases")
             .and_then(|v| v.as_array())
@@ -598,7 +695,7 @@ impl Protocol for PhpProtocol {
             ],
         );
         let start = Instant::now();
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "db_query")?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let columns = value
@@ -969,6 +1066,61 @@ mod tests {
         // SQL 以 base64 嵌入
         let sql_b64 = code.split("$sql=base64_decode('").nth(1).unwrap().split('\'').next().unwrap();
         assert_eq!(String::from_utf8(B64.decode(sql_b64).unwrap()).unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn request_log_records_frames_with_redaction() {
+        let (url, rx) = spawn_fake_server(|_code, _k| {
+            Some(json!({"ok": true, "data": {"stdout": base64::engine::general_purpose::STANDARD.encode("out")}}))
+        });
+        let proto = PhpProtocol;
+        let settings = settings();
+        let session = PhpSession {
+            endpoint: url.clone(),
+            password: "secret".into(),
+            client: build_client(&settings),
+        };
+        proto
+            .execute_command(&session, "id", &settings)
+            .expect("执行应成功");
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到请求");
+
+        // 端点过滤：仅本测试服务器的记录
+        let records = list_requests(Some(&url));
+        assert!(!records.is_empty(), "应存在请求记录");
+        let record = records
+            .iter()
+            .find(|item| item.action == "exec")
+            .expect("应有 exec 记录");
+        assert_eq!(record.status, 200);
+        assert!(record.payload.contains("shell_exec"), "载荷应包含业务代码");
+        assert!(!record.payload.contains("secret"), "载荷中的密码应被脱敏");
+        assert!(record.payload.contains("***"), "脱敏占位符应存在");
+        // 响应体应为 nonce 帧包裹的 base64 JSON：从载荷提取 nonce 验证帧头
+        let nonce = record
+            .payload
+            .split("echo '")
+            .nth(1)
+            .and_then(|part| part.split('\'').next())
+            .unwrap_or_default();
+        assert!(!nonce.is_empty(), "载荷应包含 nonce");
+        assert!(record.response.starts_with(nonce), "响应应以 nonce 帧开头");
+
+        // 端点过滤互不影响
+        assert!(list_requests(Some("http://127.0.0.1:1/x")).is_empty());
+    }
+
+    #[test]
+    fn request_log_truncates_long_payload() {
+        let long = "A".repeat(3000);
+        let payload = format!("echo '{}';", long);
+        let response = "B".repeat(3000);
+        record_request("test", "http://t", 200, 1, &payload, &response, "");
+        let records = list_requests(Some("http://t"));
+        assert!(!records.is_empty());
+        assert!(records[0].payload.len() < 3000, "载荷应截断");
+        assert!(records[0].response.len() < 3000, "响应应截断");
+        assert!(records[0].payload.contains("已截断"));
     }
 
     #[test]
