@@ -1,124 +1,24 @@
-// 与 src-tauri/src/domain.rs 对应的类型定义与 invoke 封装。
+// 与 src-tauri/src/domain.rs 对应的 invoke 封装。
+// 类型由 Rust 侧 ts-rs 生成（src/generated/domain.ts），重新生成：pnpm gen:types
 import { invoke } from "@tauri-apps/api/core";
 
-// --- 类型 ---
+import type {
+  Workspace,
+  ShellProfile,
+  AuditFilter,
+  AuditPage,
+  Dashboard,
+  ProbeResult,
+  AppSettings,
+  ProtocolMeta,
+  CommandOutput,
+  DirListing,
+  FileContent,
+  ConnectResult,
+  SessionInfo,
+} from "./generated/domain";
 
-export type Workspace = {
-  id: string;
-  name: string;
-  authorizationScope: string;
-  expiresAt?: string;
-  createdAt: string;
-};
-
-export type ShellProfile = {
-  id: string;
-  workspaceId: string;
-  name: string;
-  endpoint: string;
-  runtime: string;
-  protocolId: string;
-  password: string;
-  protocolParams: string;
-  authorizationAck: boolean;
-  status: "unknown" | "online" | "offline" | "error";
-  lastConnectedAt?: string;
-  createdAt: string;
-  tags: string[];
-};
-
-export type AuditEvent = {
-  id: number;
-  workspaceId: string;
-  shellId?: string;
-  action: string;
-  outcome: string;
-  detail: string;
-  createdAt: string;
-};
-
-export type AuditFilter = {
-  workspaceId?: string;
-  action?: string;
-  outcome?: string;
-  limit?: number;
-  offset?: number;
-};
-
-export type AuditPage = {
-  total: number;
-  events: AuditEvent[];
-};
-
-export type Dashboard = {
-  workspaces: Workspace[];
-  shells: ShellProfile[];
-  auditEvents: AuditEvent[];
-};
-
-export type ProbeResult = {
-  status: string;
-  server: string;
-  webServer: string;
-  runtime: string;
-  currentDir: string;
-  separator: string;
-  message: string;
-};
-
-export type AppSettings = {
-  httpEnabled: boolean;
-  defaultTimeoutSecs: number;
-  proxy: string | null;
-  maxFileSizeMb: number;
-};
-
-export type ProtocolMeta = {
-  id: string;
-  displayName: string;
-  requiresNetwork: boolean;
-};
-
-export type CommandOutput = {
-  stdout: string;
-  durationMs: number;
-  cwd?: string;
-};
-
-export type FileEntry = {
-  name: string;
-  path: string;
-  isDir: boolean;
-  size: number;
-  modified: string;
-};
-
-export type DirListing = {
-  entries: FileEntry[];
-};
-
-export type FileContent = {
-  name: string;
-  size: number;
-  contentB64: string;
-};
-
-export type ConnectResult = {
-  sessionId: string;
-  server: string;
-  webServer: string;
-  runtime: string;
-  currentDir: string;
-  separator: string;
-  message: string;
-};
-
-export type SessionInfo = {
-  sessionId: string;
-  profileId: string;
-  server: string;
-  lastUsedAt: number;
-};
+export type * from "./generated/domain";
 
 // --- invoke 封装 ---
 
@@ -215,7 +115,7 @@ export const b64 = {
 
 // --- 展示辅助 ---
 
-export function shortTime(value?: string): string {
+export function shortTime(value?: string | null): string {
   if (!value) return "尚未连接";
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",

@@ -867,3 +867,168 @@ pub async fn create_dir(
     })
     .await
 }
+
+// ---------------------------------------------------------------------------
+// 命令层测试：直接构造 AppState（内存库 + 会话管理器 + 内置协议），
+// 验证统一流程：会话上下文解析、授权门、锁外执行。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{CreateShell, CreateWorkspace};
+    use crate::protocol::{MOCK_PROTOCOL_ID, ProtocolRegistry};
+    use crate::session::SessionManager;
+    use crate::storage::Database;
+    use std::sync::Mutex;
+
+    fn app_state() -> AppState {
+        AppState {
+            database: Mutex::new(Database::open(":memory:").unwrap()),
+            sessions: Mutex::new(SessionManager::new()),
+            protocols: ProtocolRegistry::builtin(),
+        }
+    }
+
+    fn add_workspace(db: &mut Database, scope: &str, expires_at: Option<String>) -> String {
+        db.create_workspace(CreateWorkspace {
+            name: "Lab".into(),
+            authorization_scope: scope.into(),
+            expires_at,
+        })
+        .unwrap()
+        .id
+    }
+
+    fn add_shell(state: &AppState, workspace_id: &str, protocol_id: &str) -> ShellProfile {
+        state
+            .database
+            .lock()
+            .unwrap()
+            .create_shell(
+                CreateShell {
+                    workspace_id: workspace_id.into(),
+                    name: "t".into(),
+                    endpoint: "mock://local".into(),
+                    runtime: "php".into(),
+                    protocol_id: protocol_id.into(),
+                    password: Some("secret".into()),
+                    protocol_params: None,
+                    confirm_network: false,
+                    tags: None,
+                },
+                protocol_id,
+            )
+            .unwrap()
+    }
+
+    fn register_session(state: &AppState, shell: &ShellProfile) -> String {
+        let protocol = state.protocols.get(&shell.protocol_id).unwrap();
+        let settings = state
+            .database
+            .lock()
+            .unwrap()
+            .get_settings()
+            .unwrap();
+        let (session, probe) = protocol.connect(shell, &settings).unwrap();
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(
+                &shell.id,
+                &shell.workspace_id,
+                &shell.protocol_id,
+                Arc::from(session),
+                probe,
+            )
+    }
+
+    #[test]
+    fn with_session_runs_outside_lock() {
+        let state = app_state();
+        let workspace_id = add_workspace(&mut state.database.lock().unwrap(), "localhost", None);
+        let shell = add_shell(&state, &workspace_id, MOCK_PROTOCOL_ID);
+        let session_id = register_session(&state, &shell);
+
+        // f 在会话锁释放后执行（锁内仅取出 Arc 克隆）
+        let result = with_session(&state, &session_id, |_session| Ok(42u8));
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn with_session_missing_is_rejected() {
+        let state = app_state();
+        let result = with_session(&state, "s0", |_| Ok(()));
+        assert!(result.is_err(), "不存在的会话应报错");
+        assert!(result.unwrap_err().contains("会话不存在"));
+    }
+
+    #[test]
+    fn session_ctx_resolves_shell_and_settings() {
+        let state = app_state();
+        let workspace_id = add_workspace(&mut state.database.lock().unwrap(), "localhost", None);
+        let shell = add_shell(&state, &workspace_id, MOCK_PROTOCOL_ID);
+        let session_id = register_session(&state, &shell);
+
+        let ctx = session_ctx(&state, &session_id).expect("上下文解析应成功");
+        assert_eq!(ctx.shell.id, shell.id);
+        assert_eq!(ctx.workspace_id, workspace_id);
+        assert_eq!(ctx.protocol.id(), MOCK_PROTOCOL_ID);
+    }
+
+    #[test]
+    fn session_ctx_rejects_expired_workspace() {
+        let state = app_state();
+        let workspace_id = add_workspace(
+            &mut state.database.lock().unwrap(),
+            "localhost",
+            Some("2000-01-01T00:00:00+08:00".into()),
+        );
+        let shell = add_shell(&state, &workspace_id, MOCK_PROTOCOL_ID);
+        let session_id = register_session(&state, &shell);
+
+        match session_ctx(&state, &session_id) {
+            Err(message) => assert!(message.contains("过期"), "应提示过期：{message}"),
+            Ok(_) => panic!("过期 Workspace 应禁止会话操作"),
+        }
+    }
+
+    #[test]
+    fn require_authorized_for_gates_real_network() {
+        let state = app_state();
+        let workspace_id = add_workspace(&mut state.database.lock().unwrap(), "localhost", None);
+        let shell = add_shell(&state, &workspace_id, "builtin.php.v1");
+        let settings = AppSettings { http_enabled: false, ..AppSettings::default() };
+
+        // 网络协议 + 全局开关关闭 → 拒绝
+        let result = require_authorized_for(&state, &shell, &settings);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("真实网络协议未启用"));
+
+        // Mock 协议 → 直接放行
+        let shell_mock = add_shell(&state, &workspace_id, MOCK_PROTOCOL_ID);
+        let result = require_authorized_for(&state, &shell_mock, &settings);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn require_authorized_for_checks_scope() {
+        let state = app_state();
+        let workspace_id = add_workspace(&mut state.database.lock().unwrap(), "other.example", None);
+        let shell = add_shell(&state, &workspace_id, "builtin.php.v1");
+        // PHP 协议 shell 端点不在授权范围内，即使开关开启也会被拒绝
+        let settings = AppSettings { http_enabled: true, ..AppSettings::default() };
+        let result = require_authorized_for(&state, &shell, &settings);
+        assert!(result.is_err(), "越界端点应被拒绝");
+        assert!(result.unwrap_err().contains("授权范围"));
+    }
+
+    #[test]
+    fn load_shell_and_settings_missing_shell() {
+        let state = app_state();
+        let result = load_shell_and_settings(&state, "nope");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("不存在"));
+    }
+}

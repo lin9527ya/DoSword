@@ -51,8 +51,9 @@ export function AuditView() {
     setError("");
     try {
       const data = await api.listAudit({
-        action: action || undefined,
-        outcome: result || undefined,
+        workspaceId: null,
+        action: action || null,
+        outcome: result || null,
         limit: PAGE_SIZE,
         offset: targetPage * PAGE_SIZE,
       });

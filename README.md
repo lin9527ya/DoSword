@@ -4,12 +4,14 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
 
 ## 当前里程碑（第二阶段）
 
-- Workspace 与授权范围登记、到期检查
-- Shell Profile 本地持久化（SQLite，含密码明文——工具惯例，keyring 加密留待后续）
-- 审计日志贯穿所有操作（连接 / 命令 / 文件 / 设置）
-- **标准 PHP WebShell 协议**（类蚁剑）：探测、连接、命令执行、文件浏览/读写/上传/下载/删除/重命名
+- Workspace 与授权范围登记、到期检查，支持删除/编辑（级联清理会话）
+- Shell Profile 本地持久化（SQLite，含密码明文——工具惯例，keyring 加密留待后续），支持标签、删除/编辑
+- 审计日志贯穿所有操作（连接 / 命令 / 文件 / 设置），分页查询与 CSV 导出
+- **标准 PHP WebShell 协议**（类蚁剑）：探测、连接、命令执行、文件浏览/读写/上传/下载/删除/重命名/建目录
+- 分块上传下载（4MB 块 + fseek），上传带进度条
 - 本地 Mock 协议（默认）：不产生任何网络流量
-- 命令终端（xterm.js）、文件管理器、设置页、审计页
+- 命令终端（xterm.js，多 Tab、cwd 追踪、历史持久化）、文件管理器、设置页、审计页
+- 命令层异步化（阻塞线程池），网络操作不冻结 UI、多会话互不阻塞
 
 安全姿态（三层防线）：
 
@@ -86,10 +88,20 @@ cargo test --manifest-path src-tauri/Cargo.toml   # 含真实 PHP 往返测试�
 ## 数据库
 
 SQLite 位于 `app_data_dir/dosword.sqlite3`（Linux: `~/.local/share/io.dosword.desktop/`）。
-通过 `PRAGMA user_version` 管理迁移，旧版本数据库启动时自动无损升级。
+通过 `PRAGMA user_version` 管理迁移，旧版本数据库启动时自动无损升级（当前 v4）。
+
+## 前端类型生成
+
+`src/api.ts` 的类型由 Rust DTO 经 ts-rs 生成（`src/generated/domain.ts`），修改 `src-tauri/src/domain.rs` 后运行：
+
+```bash
+pnpm gen:types
+```
+
+`cargo test` 也会校验生成文件与当前 Rust 类型一致，漂移时自动重新生成并报错。
 
 ## 路线图
 
-- V1.0：Shell / File / Terminal / Database（数据库模块规划中）
-- V2.0：协议 SDK / 插件系统 / 请求调试 / Workspace 增强
+- ✅ V1.0：Shell / File / Terminal / 审计分页 / CRUD / 标签 / 分块传输
+- V2.0：数据库模块 / 协议 SDK / 插件系统 / 请求调试 / Workspace 增强
 - V3.0：大型 Shell 库 / 团队共享 / 远程同步
