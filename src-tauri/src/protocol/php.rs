@@ -954,10 +954,9 @@ mod tests {
                         if is_plain {
                             String::from_utf8_lossy(&raw).to_string()
                         } else {
-                            let mut restored = Vec::new();
                             // XOR
                             let key = md5_hex("secret").into_bytes();
-                            restored = raw
+                            let mut restored: Vec<u8> = raw
                                 .iter()
                                 .enumerate()
                                 .map(|(index, byte)| byte ^ key[index % key.len()])

@@ -2,10 +2,10 @@
 # DoSword 跨平台构建脚本（在 Linux 上构建 Linux / Windows 安装包）
 #
 # 用法：
-#   ./scripts/build.sh linux        # 构建 Linux 安装包（deb / appimage / rpm）
-#   ./scripts/build.sh windows      # 交叉编译 Windows 安装包（nsis，含免安装 exe）
-#   ./scripts/build.sh all          # 依次构建两个平台
-#   ./scripts/build.sh check        # 仅运行质量检查（cargo test + pnpm check）
+#   ./scripts/build.sh check                              # 质量检查（cargo test --workspace + pnpm check + pnpm build）
+#   ./scripts/build.sh linux [--bundles deb,appimage,rpm] [--skip-check]
+#   ./scripts/build.sh windows [--bundles nsis] [--skip-check]
+#   ./scripts/build.sh all [--skip-check]                 # 依次构建两个平台
 #   ./scripts/build.sh help
 #
 # 前置依赖：
@@ -14,9 +14,9 @@
 #   Windows 构建: mingw-w64（x86_64-w64-mingw32-gcc）——脚本会自动补装 rust target；
 #                NSIS 打包需要 makensis（sudo apt install nsis）或 wine
 #
-# 产物位置：
-#   Linux:   src-tauri/target/release/bundle/
-#   Windows: src-tauri/target/x86_64-pc-windows-gnu/release/bundle/
+# 产物位置（workspace 化后 target 位于仓库根）：
+#   Linux:   target/release/bundle/
+#   Windows: target/x86_64-pc-windows-gnu/release/bundle/
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,11 +49,34 @@ ensure_windows_target() {
   fi
 }
 
+# 列出某个 bundle 目录下的安装包产物
+list_artifacts() {
+  local dir="$1"
+  local patterns=("$@")
+  unset 'patterns[0]'
+  if [ ! -d "$dir" ]; then
+    warn "产物目录不存在：$dir"
+    return 0
+  fi
+  local args=()
+  local pat
+  local first=true
+  for pat in "${patterns[@]}"; do
+    if $first; then
+      args+=(-name "$pat")
+      first=false
+    else
+      args+=(-o -name "$pat")
+    fi
+  done
+  find "$dir" -type f \( "${args[@]}" \) -printf "  %p  (%s 字节)\n" 2>/dev/null || true
+}
+
 run_check() {
-  log "==> 运行后端测试（workspace：含 SDK / 示例插件 / 真实 PHP 往返）"
+  log "==> 运行后端测试（workspace：主 crate / SDK / 示例插件 / 真实 PHP 往返）"
   cargo test --workspace --manifest-path Cargo.toml
 
-  log "==> 运行前端类型检查"
+  log "==> 运行前端类型检查（含 ts-rs 生成漂移校验）"
   pnpm check
 
   log "==> 前端构建"
@@ -64,11 +87,16 @@ build_linux() {
   require_cmd cargo "请先安装 Rust（https://rustup.rs）"
   require_cmd pnpm  "请先安装 pnpm（npm i -g pnpm）"
 
-  log "==> 构建 Linux 安装包（deb / appimage / rpm）"
-  pnpm tauri build
+  local bundles="${1:-deb,appimage,rpm}"
+  log "==> 构建 Linux 安装包（bundle: $bundles）"
+  if [ "$bundles" = "all" ]; then
+    pnpm tauri build
+  else
+    pnpm tauri build --bundles "$bundles"
+  fi
 
   log "==> Linux 产物："
-  find src-tauri/target/release/bundle -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.rpm" \) -printf "  %p  (%s 字节)\n" 2>/dev/null || true
+  list_artifacts "target/release/bundle" "*.deb" "*.AppImage" "*.rpm"
 }
 
 build_windows() {
@@ -87,32 +115,58 @@ build_windows() {
 
   ensure_windows_target
 
+  local bundles="${1:-nsis}"
   # WebView2 安装包体积较大（tauri 下载的 nsis），首次构建需要联网
-  # 只打包 nsis：msi（WiX）在 Linux 上无法交叉生成
-  log "==> 交叉编译 Windows 安装包（target: $WINDOWS_TARGET, bundle: nsis）"
-  pnpm tauri build --target "$WINDOWS_TARGET" --bundles nsis
+  # msi（WiX）在 Linux 上无法交叉生成
+  log "==> 交叉编译 Windows 安装包（target: $WINDOWS_TARGET, bundle: $bundles）"
+  pnpm tauri build --target "$WINDOWS_TARGET" --bundles "$bundles"
 
   log "==> Windows 产物："
-  find "src-tauri/target/$WINDOWS_TARGET/release/bundle" -type f \( -name "*.exe" -o -name "*.msi" \) -printf "  %p  (%s 字节)\n" 2>/dev/null || true
+  list_artifacts "target/$WINDOWS_TARGET/release/bundle" "*.exe" "*.msi"
 }
 
 usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-case "${1:-help}" in
+# --- 参数解析 ---
+COMMAND="${1:-help}"
+SKIP_CHECK=false
+BUNDLES=""
+shift 2>/dev/null || true
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --skip-check) SKIP_CHECK=true ;;
+    --bundles)
+      [ $# -ge 2 ] || { err "--bundles 需要参数（如 deb,appimage 或 nsis）"; exit 1; }
+      BUNDLES="$2"
+      shift
+      ;;
+    *)
+      err "未知参数：$1"
+      usage
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+if [ "$COMMAND" != "check" ] \
+  && [ "$COMMAND" != "help" ] && [ "$COMMAND" != "-h" ] && [ "$COMMAND" != "--help" ] \
+  && [ "$SKIP_CHECK" != "true" ]; then
+  run_check
+fi
+
+case "$COMMAND" in
   linux)
-    run_check
-    build_linux
+    build_linux "${BUNDLES:-deb,appimage,rpm}"
     ;;
   windows)
-    run_check
-    build_windows
+    build_windows "${BUNDLES:-nsis}"
     ;;
   all)
-    run_check
-    build_linux
-    build_windows
+    build_linux "${BUNDLES:-deb,appimage,rpm}"
+    build_windows "${BUNDLES:-nsis}"
     ;;
   check)
     run_check
@@ -121,7 +175,7 @@ case "${1:-help}" in
     usage
     ;;
   *)
-    err "未知命令：$1"
+    err "未知命令：$COMMAND"
     usage
     exit 1
     ;;

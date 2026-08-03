@@ -288,8 +288,6 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    use serde_json::json;
-
     use super::*;
 
     fn settings() -> AppSettings {
