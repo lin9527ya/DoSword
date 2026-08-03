@@ -31,6 +31,16 @@ function parseTags(value: string): string[] {
   )];
 }
 
+/** Workspace 到期状态。 */
+function expiryInfo(workspace: Workspace): { label: string; kind: "ok" | "warn" | "expired" } {
+  if (!workspace.expiresAt) return { label: "长期有效", kind: "ok" };
+  const days = Math.ceil((new Date(workspace.expiresAt).getTime() - Date.now()) / 86_400_000);
+  if (days < 0) return { label: `已过期 ${-days} 天`, kind: "expired" };
+  if (days === 0) return { label: "今日到期", kind: "warn" };
+  if (days <= 7) return { label: `${days} 天后到期`, kind: "warn" };
+  return { label: `${days} 天后到期`, kind: "ok" };
+}
+
 export function DashboardView({
   onNavigate,
 }: {
@@ -44,7 +54,9 @@ export function DashboardView({
   const [editingShell, setEditingShell] = useState<ShellProfile | null>(null);
   const [search, setSearch] = useState("");
   const [tagFilter, setTagFilter] = useState("");
+  const [workspaceFilter, setWorkspaceFilter] = useState("");
   const [probing, setProbing] = useState<string | null>(null);
+  const [batchProbing, setBatchProbing] = useState<string[] | null>(null);
   const [connecting, setConnecting] = useState<string | null>(null);
 
   const loadDashboard = useCallback(async () => {
@@ -72,13 +84,14 @@ export function DashboardView({
   const filteredShells = useMemo(() => {
     const query = search.trim().toLowerCase();
     return data.shells.filter((shell) => {
+      if (workspaceFilter && shell.workspaceId !== workspaceFilter) return false;
       if (tagFilter && !shell.tags.includes(tagFilter)) return false;
       if (!query) return true;
       return [shell.name, shell.endpoint, shell.runtime, ...shell.tags].some((value) =>
         value.toLowerCase().includes(query),
       );
     });
-  }, [data.shells, search, tagFilter]);
+  }, [data.shells, search, tagFilter, workspaceFilter]);
 
   async function probe(shell: ShellProfile) {
     setProbing(shell.id);
@@ -91,6 +104,27 @@ export function DashboardView({
     } finally {
       setProbing(null);
     }
+  }
+
+  /** 批量探测当前筛选结果（逐个执行，完成后刷新）。 */
+  async function probeAll() {
+    const targets = filteredShells;
+    if (targets.length === 0) return;
+    setBatchProbing([]);
+    setError("");
+    const done: string[] = [];
+    for (const shell of targets) {
+      try {
+        await api.probeShell(shell.id);
+      } catch (cause) {
+        setError(`探测 ${shell.name} 失败：${errorText(cause)}`);
+        break;
+      }
+      done.push(shell.id);
+      setBatchProbing([...done]);
+    }
+    setBatchProbing(null);
+    await loadDashboard();
   }
 
   async function connect(shell: ShellProfile) {
@@ -154,6 +188,14 @@ export function DashboardView({
               placeholder="搜索 Shell"
             />
           </label>
+          <select className="select" value={workspaceFilter} onChange={(event) => setWorkspaceFilter(event.target.value)}>
+            <option value="">全部 Workspace</option>
+            {data.workspaces.map((workspace) => (
+              <option key={workspace.id} value={workspace.id}>
+                {workspace.name}
+              </option>
+            ))}
+          </select>
           <select className="select" value={tagFilter} onChange={(event) => setTagFilter(event.target.value)}>
             <option value="">全部标签</option>
             {allTags.map((tag) => (
@@ -162,6 +204,20 @@ export function DashboardView({
               </option>
             ))}
           </select>
+          <button
+            className="button secondary"
+            onClick={() => void probeAll()}
+            disabled={batchProbing !== null || filteredShells.length === 0}
+          >
+            {batchProbing !== null ? (
+              <LoaderCircle className="spin" size={16} />
+            ) : (
+              <PlugZap size={16} />
+            )}
+            {batchProbing !== null
+              ? `探测中 ${batchProbing.length}/${filteredShells.length}`
+              : `探测全部（${filteredShells.length}）`}
+          </button>
           <button className="button secondary" onClick={() => void loadDashboard()}>
             <RefreshCw size={16} />
             刷新
@@ -301,7 +357,9 @@ export function DashboardView({
           </div>
         </div>
         <div className="workspace-cards">
-          {data.workspaces.map((workspace) => (
+          {data.workspaces.map((workspace) => {
+            const expiry = expiryInfo(workspace);
+            return (
             <article key={workspace.id} className="workspace-card">
               <FolderKanban size={21} />
               <div>
@@ -311,6 +369,7 @@ export function DashboardView({
               <small>
                 {data.shells.filter((shell) => shell.workspaceId === workspace.id).length} 个配置
               </small>
+              <span className={`expiry-badge ${expiry.kind}`}>{expiry.label}</span>
               <span className="workspace-ops">
                 <button
                   className="icon-button"
@@ -328,7 +387,8 @@ export function DashboardView({
                 </button>
               </span>
             </article>
-          ))}
+            );
+          })}
           {data.workspaces.length === 0 && (
             <p className="muted">
               创建 Workspace 后，所有 Shell 和审计记录都将按项目隔离。

@@ -145,5 +145,6 @@ impl Protocol for MyProtocol { /* ... */ }
 - ✅ 数据库管理模块：PDO 三驱动、SQL 执行与浏览（mysql/pgsql 需目标 PHP 有对应 PDO 驱动）
 - ✅ 请求调试：协议帧记录与检查（环缓冲 200 条，密码脱敏）
 - ✅ 协议 SDK / 插件系统：dosword-sdk + 示例插件（动态加载为 v2 演进）
-- V2.0：Workspace 增强 / 动态加载插件
+- ✅ Workspace 增强：到期状态徽章、按 Workspace 筛选、批量探测
+- V2.0：动态加载插件
 - V3.0：大型 Shell 库 / 团队共享 / 远程同步

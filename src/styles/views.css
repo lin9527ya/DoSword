@@ -195,6 +195,30 @@
   display: flex;
   gap: 4px;
 }
+.expiry-badge {
+  grid-column: 1;
+  grid-row: 3;
+  justify-self: start;
+  align-self: center;
+  padding: 2px 8px;
+  border-radius: 8px;
+  font: 9px var(--mono);
+}
+.expiry-badge.ok {
+  color: #9fb46f;
+  background: rgba(169, 211, 106, 0.08);
+  border: 1px solid rgba(169, 211, 106, 0.25);
+}
+.expiry-badge.warn {
+  color: #d0c66a;
+  background: rgba(208, 198, 106, 0.1);
+  border: 1px solid rgba(208, 198, 106, 0.3);
+}
+.expiry-badge.expired {
+  color: #e08a7d;
+  background: rgba(212, 117, 104, 0.12);
+  border: 1px solid rgba(212, 117, 104, 0.35);
+}
 .muted {
   color: var(--text-faint);
   font-size: 11px;
