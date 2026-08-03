@@ -9,7 +9,7 @@
 use chrono::{DateTime, Local};
 use url::Url;
 
-use crate::domain::{ShellProfile, Workspace};
+use dosword_sdk::domain::{ShellProfile, Workspace};
 use crate::storage::Database;
 
 /// 检查 Shell 所属 Workspace 的授权状态。
@@ -111,7 +111,7 @@ pub fn require_session_alive(db: &Database, shell: &ShellProfile) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::CreateWorkspace;
+    use dosword_sdk::domain::CreateWorkspace;
     use crate::storage::Database;
 
     fn db_with_workspace(scope: &str, expires_at: Option<String>) -> Database {

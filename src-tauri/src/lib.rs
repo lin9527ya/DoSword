@@ -1,6 +1,5 @@
 mod auth;
 mod commands;
-mod domain;
 mod protocol;
 mod session;
 mod storage;
@@ -44,6 +43,7 @@ pub fn run() {
             commands::delete_shell,
             commands::probe_shell,
             commands::list_protocols,
+            commands::list_plugins,
             commands::list_audit,
             commands::write_local_file,
             commands::get_settings,

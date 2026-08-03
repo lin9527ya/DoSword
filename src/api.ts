@@ -20,6 +20,7 @@ import type {
   DbProbeResult,
   DbQueryResult,
   RequestRecord,
+  PluginManifest,
 } from "./generated/domain";
 
 export type * from "./generated/domain";
@@ -60,6 +61,7 @@ export const api = {
   }) => invoke<ShellProfile>("update_shell", { input }),
   deleteShell: (shellId: string) => invoke<void>("delete_shell", { shellId }),
   listProtocols: () => invoke<ProtocolMeta[]>("list_protocols"),
+  listPlugins: () => invoke<PluginManifest[]>("list_plugins"),
   listAudit: (filter: AuditFilter) => invoke<AuditPage>("list_audit", { filter }),
   writeLocalFile: (path: string, contentB64: string) =>
     invoke<void>("write_local_file", { path, contentB64 }),

@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
-import { Save, ShieldAlert, ShieldCheck } from "lucide-react";
+import { Blocks, Save, ShieldAlert, ShieldCheck } from "lucide-react";
 import { api, errorText } from "../api";
-import type { AppSettings } from "../api";
+import type { AppSettings, PluginManifest } from "../api";
 import { Dialog } from "../components/Dialog";
 import { ErrorBanner, Panel } from "../components/common";
 
 export function SettingsView() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [plugins, setPlugins] = useState<PluginManifest[]>([]);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState(false);
@@ -16,6 +17,10 @@ export function SettingsView() {
       .getSettings()
       .then(setSettings)
       .catch((cause) => setError(errorText(cause)));
+    void api
+      .listPlugins()
+      .then(setPlugins)
+      .catch(() => {});
   }, []);
 
   async function save() {
@@ -126,6 +131,38 @@ export function SettingsView() {
               }
             />
           </label>
+        </div>
+      </Panel>
+
+      <Panel eyebrow="PLUGINS" title="协议插件">
+        <div className="plugin-list">
+          {plugins.length === 0 ? (
+            <p className="muted">无插件。</p>
+          ) : (
+            plugins.map((plugin) => (
+              <article className="plugin-row" key={plugin.id}>
+                <Blocks size={16} />
+                <div className="plugin-identity">
+                  <strong>{plugin.name}</strong>
+                  <code>{plugin.id}</code>
+                </div>
+                <span className="plugin-kind">
+                  {plugin.kind === "protocol" ? "协议" : "功能"}
+                </span>
+                <span className="plugin-version">v{plugin.version}</span>
+                <p className="plugin-desc">{plugin.description}</p>
+                {plugin.capabilities.length > 0 && (
+                  <span className="plugin-caps">
+                    {plugin.capabilities.map((capability) => (
+                      <code key={capability} className="shell-tag">
+                        {capability}
+                      </code>
+                    ))}
+                  </span>
+                )}
+              </article>
+            ))
+          )}
         </div>
       </Panel>
 

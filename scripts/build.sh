@@ -50,8 +50,8 @@ ensure_windows_target() {
 }
 
 run_check() {
-  log "==> 运行后端测试（含真实 PHP 往返测试）"
-  cargo test --manifest-path src-tauri/Cargo.toml
+  log "==> 运行后端测试（workspace：含 SDK / 示例插件 / 真实 PHP 往返）"
+  cargo test --workspace --manifest-path Cargo.toml
 
   log "==> 运行前端类型检查"
   pnpm check

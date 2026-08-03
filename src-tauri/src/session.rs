@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::domain::ProbeResult;
-use crate::protocol::SessionState;
+use dosword_sdk::domain::ProbeResult;
+use dosword_sdk::SessionState;
 
 /// 会话默认存活时长（秒）。
 pub const SESSION_TTL_SECS: u64 = 4 * 60 * 60;

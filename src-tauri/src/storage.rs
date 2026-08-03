@@ -4,7 +4,7 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::domain::{
+use dosword_sdk::domain::{
     AppSettings, AuditEvent, AuditFilter, CreateShell, CreateWorkspace, Dashboard, ShellProfile,
     UpdateShell, UpdateWorkspace, Workspace,
 };

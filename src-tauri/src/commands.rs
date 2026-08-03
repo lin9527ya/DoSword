@@ -3,17 +3,16 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use url::Url;
 
-use crate::auth;
-use crate::{
-    AppState,
-    domain::{
-        AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
-        CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing,
-        FileContent, ProbeResult, ProtocolMeta, RequestRecord, SessionInfo, ShellProfile,
-        UpdateShell, UpdateWorkspace, Workspace,
-    },
-    protocol::{Protocol, ProtocolError, SessionState},
+use dosword_sdk::domain::{
+    AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
+    CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing,
+    FileContent, ProbeResult, ProtocolMeta, RequestRecord, SessionInfo, ShellProfile,
+    UpdateShell, UpdateWorkspace, Workspace,
 };
+use dosword_sdk::{PluginManifest, Protocol, ProtocolError, SessionState};
+
+use crate::auth;
+use crate::AppState;
 
 fn validate_text(value: &str, field: &str) -> Result<(), String> {
     if value.trim().is_empty() {
@@ -415,7 +414,12 @@ pub async fn list_audit(filter: AuditFilter, app: AppHandle) -> Result<AuditPage
 
 #[tauri::command]
 pub fn list_protocols(state: State<'_, AppState>) -> Vec<ProtocolMeta> {
-    state.protocols.list()
+    state.protocols.protocol_metas()
+}
+
+#[tauri::command]
+pub fn list_plugins(state: State<'_, AppState>) -> Vec<PluginManifest> {
+    state.protocols.plugin_manifests()
 }
 
 #[tauri::command]
@@ -957,7 +961,7 @@ pub async fn db_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CreateShell, CreateWorkspace};
+    use dosword_sdk::domain::{CreateShell, CreateWorkspace};
     use crate::protocol::{MOCK_PROTOCOL_ID, ProtocolRegistry};
     use crate::session::SessionManager;
     use crate::storage::Database;

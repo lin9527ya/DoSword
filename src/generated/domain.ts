@@ -57,7 +57,15 @@ cwd: string | null, };
 export type DirListing = { entries: Array<FileEntry>, };
 export type FileEntry = { name: string, path: string, isDir: boolean, size: number, modified: string, };
 export type FileContent = { name: string, size: number, contentB64: string, };
-export type ProtocolMeta = { id: string, displayName: string, requiresNetwork: boolean, };
+export type ProtocolMeta = { id: string, displayName: string, requiresNetwork: boolean, 
+/**
+ * 插件版本（来自插件清单）。
+ */
+version: string, description: string, 
+/**
+ * 能力列表（空 = 全支持）。
+ */
+capabilities: Array<string>, };
 export type ConnectResult = { sessionId: string, server: string, webServer: string, runtime: string, currentDir: string, separator: string, message: string, };
 export type SessionInfo = { sessionId: string, profileId: string, server: string, lastUsedAt: number, };
 export type DbConnection = { driver: string, host: string | null, port: number | null, username: string | null, password: string | null, dbname: string | null, };
@@ -88,3 +96,10 @@ payload: string,
  * 响应体（截断 2KB）。
  */
 response: string, };
+export type PluginManifest = { id: string, name: string, version: string, kind: PluginKind, description: string, 
+/**
+ * 声明的能力列表：["files"] ["terminal"] ["database"] 等。
+ * 空列表视为全支持（兼容旧协议）。
+ */
+capabilities: Array<string>, };
+export type PluginKind = "protocol" | "feature";

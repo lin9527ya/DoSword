@@ -2,8 +2,9 @@
 
 use std::any::Any;
 
-use crate::domain::{AppSettings, CommandOutput, DirListing, ProbeResult, ShellProfile};
-use super::{Protocol, ProtocolError, SessionState};
+use dosword_sdk::domain::{AppSettings, CommandOutput, DirListing, ProbeResult, ShellProfile};
+use dosword_sdk::{PluginKind, PluginManifest, ProtocolPlugin};
+use dosword_sdk::{Protocol, ProtocolError, SessionState};
 
 /// Mock 协议的会话状态（目前为空结构，占位）。
 pub struct MockSession;
@@ -16,6 +17,19 @@ impl SessionState for MockSession {
 
 /// Mock 协议实例。
 pub struct MockProtocol;
+
+impl ProtocolPlugin for MockProtocol {
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest {
+            id: super::MOCK_PROTOCOL_ID.to_string(),
+            name: self.display_name().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            kind: PluginKind::Protocol,
+            description: "本地 Mock 协议：不产生任何网络流量，用于验证工作流。".to_string(),
+            capabilities: vec!["terminal".to_string()],
+        }
+    }
+}
 
 impl Protocol for MockProtocol {
     fn id(&self) -> &'static str {

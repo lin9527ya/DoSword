@@ -94,7 +94,7 @@ SQLite 位于 `app_data_dir/dosword.sqlite3`（Linux: `~/.local/share/io.dosword
 
 ## 前端类型生成
 
-`src/api.ts` 的类型由 Rust DTO 经 ts-rs 生成（`src/generated/domain.ts`），修改 `src-tauri/src/domain.rs` 后运行：
+`src/api.ts` 的类型由 Rust DTO 经 ts-rs 生成（`src/generated/domain.ts`），修改 `crates/dosword-sdk/src/domain.rs` 后运行：
 
 ```bash
 pnpm gen:types
@@ -102,10 +102,48 @@ pnpm gen:types
 
 `cargo test` 也会校验生成文件与当前 Rust 类型一致，漂移时自动重新生成并报错。
 
+## 协议 SDK / 插件
+
+协议体系已插件化：`crates/dosword-sdk` 是纯接口库（零 tauri 依赖），第三方协议以 workspace crate 接入。
+
+### 三步接入新协议
+
+1. 新建 crate 并依赖 SDK：
+
+```toml
+[dependencies]
+dosword-sdk = { path = "../dosword-sdk" }
+```
+
+2. 实现 `Protocol`（13 个操作，不支持的可省略用默认 `NotSupported`）+ `ProtocolPlugin::manifest`（清单含 id/版本/描述/能力列表）：
+
+```rust
+use dosword_sdk::{Protocol, ProtocolPlugin, PluginKind, PluginManifest};
+
+pub struct MyProtocol;
+impl ProtocolPlugin for MyProtocol {
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest {
+            id: "my.v1".into(), name: "我的协议".into(), version: "0.1.0".into(),
+            kind: PluginKind::Protocol, description: "...".into(),
+            capabilities: vec!["terminal".into()],   // files / database / terminal
+        }
+    }
+}
+impl Protocol for MyProtocol { /* ... */ }
+```
+
+3. 宿主注册一行（`src-tauri/src/protocol/mod.rs`）：`Box::new(my_protocol::MyProtocol)` 加入 `builtin()` 数组。
+
+接入后自动获得：授权范围校验、审计日志、会话管理、请求调试记录、前端 Tab 按 `capabilities` 显隐。完整示例见 `crates/dosword-plugin-echo`（ECHO 帧协议，含测试）。
+
+> 动态加载（插件目录 + dlopen）为 v2 演进，注册表接口已预留，插件代码无需改动。
+
 ## 路线图
 
 - ✅ V1.0：Shell / File / Terminal / 审计分页 / CRUD / 标签 / 分块传输
 - ✅ 数据库管理模块：PDO 三驱动、SQL 执行与浏览（mysql/pgsql 需目标 PHP 有对应 PDO 驱动）
 - ✅ 请求调试：协议帧记录与检查（环缓冲 200 条，密码脱敏）
-- V2.0：协议 SDK / 插件系统 / Workspace 增强
+- ✅ 协议 SDK / 插件系统：dosword-sdk + 示例插件（动态加载为 v2 演进）
+- V2.0：Workspace 增强 / 动态加载插件
 - V3.0：大型 Shell 库 / 团队共享 / 远程同步

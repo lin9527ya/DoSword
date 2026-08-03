@@ -201,6 +201,53 @@
   align-self: center;
 }
 
+/* 插件面板 */
+.plugin-list {
+  display: grid;
+}
+.plugin-row {
+  display: grid;
+  grid-template-columns: 20px minmax(200px, 1fr) 42px 52px 2fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 11px;
+}
+.plugin-row:last-child {
+  border-bottom: none;
+}
+.plugin-row > svg {
+  color: var(--accent);
+}
+.plugin-identity {
+  display: grid;
+}
+.plugin-identity strong {
+  font-size: 12px;
+}
+.plugin-identity code {
+  color: #747a70;
+  font: 10px var(--mono);
+}
+.plugin-kind {
+  color: #9fb46f;
+  font: 500 10px var(--mono);
+  text-align: center;
+}
+.plugin-version {
+  color: #666c62;
+  font: 10px var(--mono);
+}
+.plugin-desc {
+  margin: 0;
+  color: #87917a;
+}
+.plugin-caps {
+  display: flex;
+  gap: 5px;
+}
+
 /* 详情页 */
 .detail-topbar {
   align-items: center;

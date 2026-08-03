@@ -23,6 +23,7 @@ export function ShellDetailView({
   onNavigate: (view: View) => void;
 }) {
   const [shell, setShell] = useState<ShellProfile | null>(null);
+  const [capabilities, setCapabilities] = useState<string[] | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(initialSessionId ?? null);
   const [info, setInfo] = useState<ConnectResult | null>(null);
   const [connecting, setConnecting] = useState(false);
@@ -76,7 +77,15 @@ export function ShellDetailView({
       .dashboard()
       .then((data) => {
         const profile = data.shells.find((item) => item.id === shellId);
-        if (profile) setShell(profile);
+        if (!profile) return;
+        setShell(profile);
+        void api
+          .listProtocols()
+          .then((protocols) => {
+            const meta = protocols.find((item) => item.id === profile.protocolId);
+            setCapabilities(meta?.capabilities ?? null);
+          })
+          .catch(() => {});
       })
       .catch((cause) => setError(errorText(cause)));
     void ensureConnected();
@@ -107,11 +116,21 @@ export function ShellDetailView({
     );
   }
 
+  /** 能力检查：capabilities 未加载或为空列表视为全支持（SDK 语义）。 */
+  const supports = (capability: string) =>
+    capabilities === null || capabilities.length === 0 || capabilities.includes(capability);
+
   const tabs: { key: Tab; label: string; icon: React.ReactNode }[] = [
     { key: "info", label: "连接信息", icon: <Info size={15} /> },
-    { key: "files", label: "文件管理", icon: <FileCode2 size={15} /> },
-    { key: "database", label: "数据库", icon: <Database size={15} /> },
-    { key: "terminal", label: "终端", icon: <TerminalSquare size={15} /> },
+    ...(supports("files")
+      ? [{ key: "files" as Tab, label: "文件管理", icon: <FileCode2 size={15} /> }]
+      : []),
+    ...(supports("database")
+      ? [{ key: "database" as Tab, label: "数据库", icon: <Database size={15} /> }]
+      : []),
+    ...(supports("terminal")
+      ? [{ key: "terminal" as Tab, label: "终端", icon: <TerminalSquare size={15} /> }]
+      : []),
   ];
 
   return (

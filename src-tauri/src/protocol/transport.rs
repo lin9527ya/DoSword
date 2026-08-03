@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use reqwest::blocking::Client;
 
-use crate::domain::AppSettings;
+use dosword_sdk::domain::AppSettings;
 
 /// 依据全局设置构建 HTTP 客户端。
 /// 重定向策略固定为 `none()`：防止密码参数随 301/302 泄露到其他主机。

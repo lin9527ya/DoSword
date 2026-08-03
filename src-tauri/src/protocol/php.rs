@@ -20,15 +20,33 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde_json::Value;
 
-use crate::domain::{
+use dosword_sdk::domain::{
     AppSettings, CommandOutput, DbConnection, DbProbeResult, DbQueryResult, DirListing, FileEntry,
     ProbeResult, RequestRecord, ShellProfile,
 };
 
 use super::transport::build_client;
-use super::{Protocol, ProtocolError, SessionState};
+use dosword_sdk::{PluginKind, PluginManifest, ProtocolPlugin};
+use dosword_sdk::{Protocol, ProtocolError, SessionState};
 
 pub const PHP_PROTOCOL_ID: &str = "builtin.php.v1";
+
+impl ProtocolPlugin for PhpProtocol {
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest {
+            id: PHP_PROTOCOL_ID.to_string(),
+            name: self.display_name().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            kind: PluginKind::Protocol,
+            description: "标准 PHP WebShell（类蚁剑）：命令执行、文件管理、数据库操作。".to_string(),
+            capabilities: vec![
+                "files".to_string(),
+                "terminal".to_string(),
+                "database".to_string(),
+            ],
+        }
+    }
+}
 
 /// PHP 协议的会话状态：持有专用 HTTP 客户端（每会话独立，避免跨会话并发干扰）。
 pub struct PhpSession {
@@ -808,7 +826,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::domain::ShellProfile;
+    use dosword_sdk::domain::ShellProfile;
 
     fn settings() -> AppSettings {
         AppSettings {

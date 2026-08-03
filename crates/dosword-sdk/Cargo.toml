@@ -1,0 +1,17 @@
+[package]
+name = "dosword-sdk"
+version.workspace = true
+edition.workspace = true
+description = "DoSword 协议 SDK：协议插件开发者依赖的纯接口库（零 tauri 依赖）"
+
+[lib]
+name = "dosword_sdk"
+crate-type = ["rlib"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+base64.workspace = true
+ts-rs.workspace = true
