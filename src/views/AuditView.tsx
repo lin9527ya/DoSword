@@ -26,6 +26,8 @@ const ACTION_LABELS: Record<string, string> = {
   "file.delete": "删除",
   "file.rename": "重命名",
   "file.mkdir": "新建目录",
+  "db.probe": "数据库探测",
+  "db.query": "数据库查询",
   "settings.update": "设置变更",
 };
 

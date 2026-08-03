@@ -60,3 +60,14 @@ export type FileContent = { name: string, size: number, contentB64: string, };
 export type ProtocolMeta = { id: string, displayName: string, requiresNetwork: boolean, };
 export type ConnectResult = { sessionId: string, server: string, webServer: string, runtime: string, currentDir: string, separator: string, message: string, };
 export type SessionInfo = { sessionId: string, profileId: string, server: string, lastUsedAt: number, };
+export type DbConnection = { driver: string, host: string | null, port: number | null, username: string | null, password: string | null, dbname: string | null, };
+export type DbProbeResult = { driver: string, databases: Array<string>, message: string, };
+export type DbQueryResult = { columns: Array<string>, 
+/**
+ * 行数据：值为字符串或 null。
+ */
+rows: Array<Array<string | null>>, 
+/**
+ * 非查询语句的影响行数。
+ */
+affected: number, durationMs: number, };

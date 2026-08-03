@@ -238,6 +238,42 @@ pub struct SessionInfo {
     pub last_used_at: u64,
 }
 
+// --- 数据库管理（V2.0） ---
+
+/// 数据库连接参数。driver 白名单：mysql / pgsql / sqlite（Rust 侧校验）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DbConnection {
+    pub driver: String,
+    pub host: Option<String>,
+    #[ts(type = "number | null")]
+    pub port: Option<u16>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub dbname: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DbProbeResult {
+    pub driver: String,
+    pub databases: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DbQueryResult {
+    pub columns: Vec<String>,
+    /// 行数据：值为字符串或 null。
+    pub rows: Vec<Vec<Option<String>>>,
+    /// 非查询语句的影响行数。
+    #[ts(type = "number")]
+    pub affected: u64,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+}
+
 // ---------------------------------------------------------------------------
 // TS 类型生成：将全部 DTO 导出为 src/generated/domain.ts，前端 api.ts 复用，
 // 避免前后端类型手工重复维护导致的漂移。
@@ -270,6 +306,9 @@ mod ts_bindings {
             ("ProtocolMeta", ProtocolMeta::decl()),
             ("ConnectResult", ConnectResult::decl()),
             ("SessionInfo", SessionInfo::decl()),
+            ("DbConnection", DbConnection::decl()),
+            ("DbProbeResult", DbProbeResult::decl()),
+            ("DbQueryResult", DbQueryResult::decl()),
         ];
         types
     }

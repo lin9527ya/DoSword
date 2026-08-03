@@ -339,3 +339,118 @@
 .terminal-tab-close:hover {
   color: #d47568;
 }
+
+/* 数据库管理 */
+.db-manager {
+  padding: 14px 18px;
+  display: grid;
+  gap: 14px;
+}
+.db-conn-form {
+  display: grid;
+  grid-template-columns: 110px 1fr 80px 1fr 1fr 1fr auto;
+  gap: 8px;
+  align-items: end;
+}
+.db-conn-form label,
+.db-databases label {
+  display: grid;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.db-conn-form input,
+.db-conn-form select,
+.db-databases select,
+.db-sql-box textarea {
+  background: #161a14;
+  border: 1px solid #30342d;
+  border-radius: 5px;
+  color: var(--text);
+  font: 12px var(--mono);
+  padding: 6px 8px;
+  outline: none;
+}
+.db-conn-form input:focus,
+.db-conn-form select:focus,
+.db-sql-box textarea:focus {
+  border-color: var(--accent);
+}
+.db-databases {
+  display: flex;
+  gap: 10px;
+  align-items: end;
+}
+.db-tables {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.db-table-chip {
+  padding: 4px 10px;
+  border: 1px solid #30342d;
+  border-radius: 5px;
+  background: transparent;
+  color: #9fb46f;
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+.db-table-chip:hover {
+  border-color: var(--accent);
+}
+.db-sql-box {
+  display: grid;
+  gap: 8px;
+}
+.db-sql-box textarea {
+  resize: vertical;
+  min-height: 72px;
+  line-height: 1.5;
+}
+.db-sql-actions {
+  display: flex;
+  gap: 8px;
+}
+.db-result {
+  display: grid;
+  gap: 8px;
+}
+.db-result-head {
+  color: var(--text-dim);
+  font-size: 10px;
+}
+.db-result-table {
+  border: 1px solid var(--border-soft);
+  max-height: 320px;
+  overflow: auto;
+}
+.db-result-row {
+  display: grid;
+  grid-auto-columns: minmax(110px, 1fr);
+  grid-auto-flow: column;
+  border-bottom: 1px solid var(--border-soft);
+}
+.db-result-row:last-child {
+  border-bottom: none;
+}
+.db-result-row.head {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  color: #9aa393;
+  font: 600 10px var(--mono);
+  text-transform: uppercase;
+}
+.db-result-row span {
+  padding: 6px 10px;
+  font: 11px var(--mono);
+  word-break: break-all;
+  border-right: 1px solid var(--border-soft);
+}
+.db-result-row span:last-child {
+  border-right: none;
+}
+.db-result-row .null {
+  color: #5c6357;
+  font-style: italic;
+}

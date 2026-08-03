@@ -8,8 +8,9 @@ use crate::{
     AppState,
     domain::{
         AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
-        CreateWorkspace, Dashboard, DirListing, FileContent, ProbeResult, ProtocolMeta,
-        SessionInfo, ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
+        CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing,
+        FileContent, ProbeResult, ProtocolMeta, SessionInfo, ShellProfile, UpdateShell,
+        UpdateWorkspace, Workspace,
     },
     protocol::{Protocol, ProtocolError, SessionState},
 };
@@ -864,6 +865,66 @@ pub async fn create_dir(
         })?;
         audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.mkdir", "success", &format!("新建目录：{path}"));
         Ok(())
+    })
+    .await
+}
+
+// --- 数据库管理 ---
+
+#[tauri::command]
+pub async fn db_probe(
+    session_id: String,
+    connection: DbConnection,
+    app: AppHandle,
+) -> Result<DbProbeResult, String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        let result = with_session(state, &session_id, |session| {
+            ctx.protocol.db_probe(session, &connection, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "db.probe", "error", &error);
+            error
+        })?;
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "db.probe",
+            "success",
+            &format!("探测数据库：{}@{}（{} 个库）", connection.driver, connection.host.as_deref().unwrap_or("localhost"), result.databases.len()),
+        );
+        Ok(result)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn db_query(
+    session_id: String,
+    connection: DbConnection,
+    sql: String,
+    app: AppHandle,
+) -> Result<DbQueryResult, String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        let result = with_session(state, &session_id, |session| {
+            ctx.protocol.db_query(session, &connection, &sql, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "db.query", "error", &error);
+            error
+        })?;
+        let sql_preview: String = sql.chars().take(120).collect();
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "db.query",
+            "success",
+            &format!("数据库查询（{}）：{}", connection.driver, sql_preview),
+        );
+        Ok(result)
     })
     .await
 }

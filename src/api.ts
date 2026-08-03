@@ -16,6 +16,9 @@ import type {
   FileContent,
   ConnectResult,
   SessionInfo,
+  DbConnection,
+  DbProbeResult,
+  DbQueryResult,
 } from "./generated/domain";
 
 export type * from "./generated/domain";
@@ -85,6 +88,10 @@ export const api = {
     invoke<void>("rename_path", { sessionId, from, to }),
   createDir: (sessionId: string, path: string) =>
     invoke<void>("create_dir", { sessionId, path }),
+  dbProbe: (sessionId: string, connection: DbConnection) =>
+    invoke<DbProbeResult>("db_probe", { sessionId, connection }),
+  dbQuery: (sessionId: string, connection: DbConnection, sql: string) =>
+    invoke<DbQueryResult>("db_query", { sessionId, connection, sql }),
 };
 
 // --- Base64 工具（编辑器/上传下载用） ---

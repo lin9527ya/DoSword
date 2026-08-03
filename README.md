@@ -9,6 +9,7 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
 - 审计日志贯穿所有操作（连接 / 命令 / 文件 / 设置），分页查询与 CSV 导出
 - **标准 PHP WebShell 协议**（类蚁剑）：探测、连接、命令执行、文件浏览/读写/上传/下载/删除/重命名/建目录
 - 分块上传下载（4MB 块 + fseek），上传带进度条
+- **数据库管理**（PDO，MySQL / PostgreSQL / SQLite）：连接探测、数据库/表浏览、SQL 执行、结果网格
 - 本地 Mock 协议（默认）：不产生任何网络流量
 - 命令终端（xterm.js，多 Tab、cwd 追踪、历史持久化）、文件管理器、设置页、审计页
 - 命令层异步化（阻塞线程池），网络操作不冻结 UI、多会话互不阻塞
@@ -103,5 +104,6 @@ pnpm gen:types
 ## 路线图
 
 - ✅ V1.0：Shell / File / Terminal / 审计分页 / CRUD / 标签 / 分块传输
-- V2.0：数据库模块 / 协议 SDK / 插件系统 / 请求调试 / Workspace 增强
+- ✅ 数据库管理模块：PDO 三驱动、SQL 执行与浏览（mysql/pgsql 需目标 PHP 有对应 PDO 驱动）
+- V2.0：协议 SDK / 插件系统 / 请求调试 / Workspace 增强
 - V3.0：大型 Shell 库 / 团队共享 / 远程同步

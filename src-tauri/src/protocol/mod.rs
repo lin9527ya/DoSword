@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::domain::{
-    AppSettings, CommandOutput, DirListing, ProbeResult, ProtocolMeta, ShellProfile,
+    AppSettings, CommandOutput, DbConnection, DbProbeResult, DbQueryResult, DirListing,
+    ProbeResult, ProtocolMeta, ShellProfile,
 };
 
 pub const MOCK_PROTOCOL_ID: &str = "builtin.mock.v1";
@@ -172,6 +173,31 @@ pub trait Protocol: Send + Sync {
         }
         whole[start..start + content.len()].copy_from_slice(content);
         self.write_file(session, path, &whole, settings)
+    }
+
+    /// 探测数据库连接并列出数据库（默认不支持，协议按需覆盖）。
+    fn db_probe(
+        &self,
+        _session: &dyn SessionState,
+        _connection: &DbConnection,
+        _settings: &AppSettings,
+    ) -> Result<DbProbeResult, ProtocolError> {
+        Err(ProtocolError::NotSupported(
+            "当前协议不支持数据库操作".into(),
+        ))
+    }
+
+    /// 执行 SQL（查询返回列与行，非查询返回影响行数）。
+    fn db_query(
+        &self,
+        _session: &dyn SessionState,
+        _connection: &DbConnection,
+        _sql: &str,
+        _settings: &AppSettings,
+    ) -> Result<DbQueryResult, ProtocolError> {
+        Err(ProtocolError::NotSupported(
+            "当前协议不支持数据库操作".into(),
+        ))
     }
 }
 

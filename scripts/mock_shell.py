@@ -19,6 +19,7 @@ import base64
 import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -130,6 +131,29 @@ def handle_code(code: str) -> dict:
             return {"ok": True, "data": {}}
         except OSError:
             return {"ok": False, "error": "创建目录失败（权限不足或已存在）"}
+    if "new PDO" in code:
+        # 数据库操作：sqlite 用 python sqlite3 真实执行（mysql/pgsql 仅回显连接成功）
+        dsn = grab(r"\$dsn=base64_decode\('([^']+)'\)")
+        if "$dbh->query($sql)" in code:
+            sql = grab(r"\$sql=base64_decode\('([^']+)'\)")
+            try:
+                if dsn.startswith("sqlite:"):
+                    conn = sqlite3.connect(dsn[len("sqlite:"):])
+                    cursor = conn.execute(sql)
+                    if sql.lstrip().lower().startswith(("select", "show", "desc", "pragma", "with")):
+                        columns = [desc[0] for desc in cursor.description or []]
+                        rows = [[None if v is None else str(v) for v in row] for row in cursor.fetchall()[:1000]]
+                        return {"ok": True, "data": {"columns": columns, "rows": rows, "affected": 0}}
+                    conn.commit()
+                    return {"ok": True, "data": {"columns": [], "rows": [], "affected": cursor.rowcount}}
+                return {"ok": True, "data": {"columns": ["notice"], "rows": [["[mock] 非 sqlite 驱动不做真实执行"]], "affected": 0}}
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": f"数据库操作失败：{exc}"}
+        # 探测：连接 + 列出数据库
+        if dsn.startswith("sqlite:"):
+            path = dsn[len("sqlite:"):]
+            return {"ok": True, "data": {"driver": "sqlite", "databases": [path]}}
+        return {"ok": True, "data": {"driver": "mysql", "databases": ["information_schema", "mysql"]}}
     # 默认视为环境信息探测
     return {
         "ok": True,

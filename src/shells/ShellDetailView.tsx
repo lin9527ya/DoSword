@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowLeft, FileCode2, Info, LoaderCircle, TerminalSquare, Unplug } from "lucide-react";
+import { ArrowLeft, Database, FileCode2, Info, LoaderCircle, TerminalSquare, Unplug } from "lucide-react";
 import { api, errorText, shortTime } from "../api";
 import type { ConnectResult, ShellProfile } from "../api";
 import { ErrorBanner } from "../components/common";
 import { Terminal } from "../widgets/Terminal";
 import { FileManager } from "../widgets/FileManager";
+import { DatabaseManager } from "../widgets/DatabaseManager";
 import type { View } from "../views/types";
 
-type Tab = "info" | "files" | "terminal";
+type Tab = "info" | "files" | "terminal" | "database";
 
 type TerminalTab = { id: number; dir: string };
 
@@ -109,6 +110,7 @@ export function ShellDetailView({
   const tabs: { key: Tab; label: string; icon: React.ReactNode }[] = [
     { key: "info", label: "连接信息", icon: <Info size={15} /> },
     { key: "files", label: "文件管理", icon: <FileCode2 size={15} /> },
+    { key: "database", label: "数据库", icon: <Database size={15} /> },
     { key: "terminal", label: "终端", icon: <TerminalSquare size={15} /> },
   ];
 
@@ -168,6 +170,16 @@ export function ShellDetailView({
       {tab === "files" && !sessionId && (
         <div className="panel detail-panel">
           <p className="muted pad">连接成功后才能浏览文件。</p>
+        </div>
+      )}
+      {tab === "database" && sessionId && (
+        <div className="panel detail-panel">
+          <DatabaseManager sessionId={sessionId} />
+        </div>
+      )}
+      {tab === "database" && !sessionId && (
+        <div className="panel detail-panel">
+          <p className="muted pad">连接成功后才能浏览数据库。</p>
         </div>
       )}
       {tab === "terminal" && sessionId && (

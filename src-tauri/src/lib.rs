@@ -61,6 +61,8 @@ pub fn run() {
             commands::rename_path,
             commands::create_dir,
             commands::write_chunk,
+            commands::db_probe,
+            commands::db_query,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start DoSword");
