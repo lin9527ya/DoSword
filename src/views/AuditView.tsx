@@ -28,6 +28,7 @@ const ACTION_LABELS: Record<string, string> = {
   "file.mkdir": "新建目录",
   "db.probe": "数据库探测",
   "db.query": "数据库查询",
+  "shell.generate": "生成 Webshell",
   "settings.update": "设置变更",
 };
 

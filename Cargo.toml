@@ -18,3 +18,4 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
 ts-rs = { version = "10", features = ["serde-compat"] }
+md-5 = "0.10"

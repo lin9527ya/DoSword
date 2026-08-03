@@ -16,6 +16,7 @@
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,18 @@ ROOT = ""
 
 def decode_param(value: str) -> str:
     return base64.b64decode(value.encode()).decode("utf-8", errors="replace")
+
+
+def decode_payload(x: str) -> str:
+    """解码客户端载荷：支持裸 base64（含 PHP 特征）或 XOR+base64（key=md5 密码）。"""
+    raw = base64.b64decode(x)
+    if b"@ini_set" in raw:
+        return raw.decode("utf-8", errors="replace")
+    key = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
+    restored = bytes(c ^ key[i % len(key)] for i, c in enumerate(raw))
+    if b"@ini_set" in restored:
+        return restored.decode("utf-8", errors="replace")
+    raise ValueError("无法识别的载荷编码")
 
 
 def grab_int(code: str, pattern: str) -> int:
@@ -178,7 +191,7 @@ class Handler(BaseHTTPRequestHandler):
             body = b"AUTH_FAIL"
         else:
             try:
-                code = base64.b64decode(x).decode("utf-8")
+                code = decode_payload(x)
             except Exception:
                 code = ""
             result = handle_code(code)

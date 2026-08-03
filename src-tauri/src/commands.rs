@@ -6,9 +6,10 @@ use url::Url;
 use dosword_sdk::domain::{
     AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
     CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing,
-    FileContent, ProbeResult, ProtocolMeta, RequestRecord, SessionInfo, ShellProfile,
-    UpdateShell, UpdateWorkspace, Workspace,
+    FileContent, GenerateShellResult, ProbeResult, ProtocolMeta, RequestRecord, SessionInfo,
+    ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
 };
+use dosword_sdk::encoder::{EncoderRegistry, STUB_LANGUAGES};
 use dosword_sdk::{PluginManifest, Protocol, ProtocolError, SessionState};
 
 use crate::auth;
@@ -385,7 +386,49 @@ pub async fn probe_shell(shell_id: String, app: AppHandle) -> Result<ProbeResult
 
 // --- 设置 ---
 
-/// 将本地数据（如导出的 CSV）写入用户选择的路径。
+/// 生成服务端 Webshell stub（本地生成，不产生网络流量）。
+/// `language` 白名单：php / asp / aspx / jsp；`encoder_id`：xor_base64 / base64。
+#[tauri::command]
+pub async fn generate_shell(
+    language: String,
+    encoder_id: String,
+    password: String,
+    app: AppHandle,
+) -> Result<GenerateShellResult, String> {
+    blocking(app, move |state| {
+        if !STUB_LANGUAGES.contains(&language.as_str()) {
+            return Err(format!(
+                "不支持的语言：{language}（支持 {}）",
+                STUB_LANGUAGES.join(" / ")
+            ));
+        }
+        let encoder = EncoderRegistry::global()
+            .get(&encoder_id)
+            .ok_or_else(|| format!("未知编码器：{encoder_id}"))?;
+        let content = encoder
+            .stub(&language, &password)
+            .map_err(|error| error.to_string())?;
+        let filename = format!("shell_{}_{}.{}", language, encoder_id, language);
+        audit(
+            state,
+            "system",
+            None,
+            "shell.generate",
+            "success",
+            &format!("生成 Webshell：{filename}（{} 字节）", content.len()),
+        );
+        Ok(GenerateShellResult { filename, content })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_encoders(app: AppHandle) -> Vec<(String, String)> {
+    blocking(app, |_state| Ok(EncoderRegistry::global().list()))
+        .await
+        .unwrap_or_default()
+}
+
 #[tauri::command]
 pub async fn write_local_file(path: String, content_b64: String, app: AppHandle) -> Result<(), String> {
     blocking(app, move |_state| {

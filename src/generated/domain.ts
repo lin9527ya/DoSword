@@ -96,6 +96,15 @@ payload: string,
  * 响应体（截断 2KB）。
  */
 response: string, };
+export type GenerateShellResult = { 
+/**
+ * 建议文件名（如 shell_php_xor_base64.php）。
+ */
+filename: string, 
+/**
+ * 脚本内容。
+ */
+content: string, };
 export type PluginManifest = { id: string, name: string, version: string, kind: PluginKind, description: string, 
 /**
  * 声明的能力列表：["files"] ["terminal"] ["database"] 等。

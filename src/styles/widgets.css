@@ -79,8 +79,7 @@
 .confirm-row {
   display: flex !important;
   flex-direction: row;
-  align-items: center;
-  gap: 8px !important;
+  align-items: center;  gap: 8px !important;
   cursor: pointer;
 }
 .confirm-row input {
@@ -338,6 +337,66 @@
 }
 .terminal-tab-close:hover {
   color: #d47568;
+}
+
+.field-hint {
+  font-size: 9px;
+  color: #666c62;
+  margin-top: 2px;
+}
+
+/* 生成 Webshell */
+.generate-form {
+  display: grid;
+  gap: 12px;
+  min-width: 460px;
+}
+.generate-form label {
+  display: grid;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.generate-form select,
+.generate-form input {
+  background: #161a14;
+  border: 1px solid #30342d;
+  border-radius: 5px;
+  color: var(--text);
+  font: 12px var(--mono);
+  padding: 6px 8px;
+  outline: none;
+}
+.generate-result {
+  display: grid;
+  gap: 8px;
+}
+.generate-result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.generate-result-head code {
+  color: #9fb46f;
+  font: 11px var(--mono);
+}
+.generate-result-head span {
+  display: flex;
+  gap: 6px;
+}
+.generate-result pre {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  background: #12150f;
+  color: #b9c2ae;
+  font: 11px var(--mono);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 240px;
+  overflow: auto;
 }
 
 /* 数据库管理 */

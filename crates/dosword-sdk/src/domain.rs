@@ -281,6 +281,16 @@ pub struct DbQueryResult {
 
 // --- 请求调试器（V2.0） ---
 
+/// 生成的服务端脚本（stub）。
+#[derive(Debug, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateShellResult {
+    /// 建议文件名（如 shell_php_xor_base64.php）。
+    pub filename: String,
+    /// 脚本内容。
+    pub content: String,
+}
+
 /// 一条协议请求记录（内存环缓冲，仅调试用途，不落盘）。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -338,6 +348,7 @@ mod ts_bindings {
             ("DbProbeResult", DbProbeResult::decl()),
             ("DbQueryResult", DbQueryResult::decl()),
             ("RequestRecord", RequestRecord::decl()),
+            ("GenerateShellResult", GenerateShellResult::decl()),
             ("PluginManifest", crate::plugin::PluginManifest::decl()),
             ("PluginKind", crate::plugin::PluginKind::decl()),
         ];

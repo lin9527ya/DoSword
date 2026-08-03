@@ -15,3 +15,4 @@ chrono.workspace = true
 uuid.workspace = true
 base64.workspace = true
 ts-rs.workspace = true
+md-5.workspace = true

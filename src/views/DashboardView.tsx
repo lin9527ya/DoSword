@@ -3,6 +3,7 @@ import {
   Activity,
   ChevronRight,
   CirclePlus,
+  Wand2,
   FilePenLine,
   FolderKanban,
   LoaderCircle,
@@ -17,6 +18,7 @@ import { api, errorText, shortTime } from "../api";
 import type { Dashboard, ProtocolMeta, ShellProfile, Workspace } from "../api";
 import { Dialog } from "../components/Dialog";
 import { Empty, ErrorBanner, Metric, Panel } from "../components/common";
+import { GenerateShellDialog } from "../widgets/GenerateShellDialog";
 import type { View } from "./types";
 
 const EMPTY_DASHBOARD: Dashboard = { workspaces: [], shells: [], auditEvents: [] };
@@ -49,7 +51,7 @@ export function DashboardView({
   const [data, setData] = useState<Dashboard>(EMPTY_DASHBOARD);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [dialog, setDialog] = useState<"workspace" | "shell" | null>(null);
+  const [dialog, setDialog] = useState<"workspace" | "shell" | "generate" | null>(null);
   const [editingWorkspace, setEditingWorkspace] = useState<Workspace | null>(null);
   const [editingShell, setEditingShell] = useState<ShellProfile | null>(null);
   const [search, setSearch] = useState("");
@@ -221,6 +223,10 @@ export function DashboardView({
           <button className="button secondary" onClick={() => void loadDashboard()}>
             <RefreshCw size={16} />
             刷新
+          </button>
+          <button className="button secondary" onClick={() => setDialog("generate")}>
+            <Wand2 size={16} />
+            生成 Webshell
           </button>
           <button className="button primary" onClick={() => setDialog("workspace")}>
             <CirclePlus size={17} />
@@ -397,6 +403,7 @@ export function DashboardView({
         </div>
       </section>
 
+      {dialog === "generate" && <GenerateShellDialog onClose={() => setDialog(null)} />}
       {dialog === "workspace" && (
         <WorkspaceDialog
           initial={editingWorkspace}
@@ -498,6 +505,7 @@ function ShellDialog({
 }) {
   const [protocols, setProtocols] = useState<ProtocolMeta[]>([]);
   const [protocolId, setProtocolId] = useState(initial?.protocolId ?? "builtin.mock.v1");
+  const [encoderId, setEncoderId] = useState("xor_base64");
   const [settings, setSettings] = useState<{ httpEnabled: boolean }>({ httpEnabled: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -536,6 +544,8 @@ function ShellDialog({
           password: form.get("password") ? String(form.get("password")) : undefined,
           confirmNetwork: form.get("confirm") === "on",
           tags: parseTags(String(form.get("tags") ?? "")),
+          protocolParams:
+            protocolId === "builtin.php.v1" ? JSON.stringify({ encoder: encoderId }) : undefined,
         });
       }
       await onCreated();
@@ -619,6 +629,18 @@ function ShellDialog({
               连接密码
               <input name="password" type="password" required={!editing} placeholder={editing ? "留空保持原密码" : "WebShell 鉴权密码"} />
             </label>
+            {!editing && protocolId === "builtin.php.v1" && (
+              <label>
+                编码方式
+                <select value={encoderId} onChange={(event) => setEncoderId(event.target.value)}>
+                  <option value="xor_base64">XOR_BASE64（需对应 stub）</option>
+                  <option value="base64">BASE64（经典裸编码）</option>
+                </select>
+                <span className="field-hint">
+                  与目标 stub 的解码方式一致；可在「生成 Webshell」中生成配套 stub。
+                </span>
+              </label>
+            )}
             {!editing && settings.httpEnabled && (
               <label className="confirm-row">
                 <input name="confirm" type="checkbox" />

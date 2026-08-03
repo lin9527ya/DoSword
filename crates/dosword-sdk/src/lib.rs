@@ -4,8 +4,12 @@
 //! 后即可接入宿主，授权检查 / 审计 / 会话管理由宿主自动完成。
 
 pub mod domain;
+pub mod encoder;
 pub mod plugin;
 pub mod protocol;
 
+pub use encoder::{
+    md5_hex, Base64Encoder, EncoderRegistry, PayloadEncoder, STUB_LANGUAGES, XorBase64Encoder,
+};
 pub use plugin::{PluginKind, PluginManifest, PluginRegistry, ProtocolPlugin};
 pub use protocol::{Protocol, ProtocolError, SessionState};

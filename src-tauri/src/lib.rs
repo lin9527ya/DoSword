@@ -44,6 +44,8 @@ pub fn run() {
             commands::probe_shell,
             commands::list_protocols,
             commands::list_plugins,
+            commands::list_encoders,
+            commands::generate_shell,
             commands::list_audit,
             commands::write_local_file,
             commands::get_settings,
