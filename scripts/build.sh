@@ -6,6 +6,7 @@
 #   ./scripts/build.sh linux [--bundles deb,appimage,rpm] [--skip-check]
 #   ./scripts/build.sh windows [--bundles nsis] [--skip-check]
 #   ./scripts/build.sh all [--skip-check]                 # 依次构建两个平台
+#   ./scripts/build.sh binary [linux|windows|all] [--skip-check]   # 仅构建独立可执行程序（不打包）
 #   ./scripts/build.sh help
 #
 # 前置依赖：
@@ -15,14 +16,16 @@
 #                NSIS 打包需要 makensis（sudo apt install nsis）或 wine
 #
 # 产物位置（workspace 化后 target 位于仓库根）：
-#   Linux:   target/release/bundle/
-#   Windows: target/x86_64-pc-windows-gnu/release/bundle/
+#   Linux:    target/release/bundle/          （deb / appimage / rpm）
+#   Windows:  target/x86_64-pc-windows-gnu/release/bundle/   （nsis）
+#   可执行程序: target/dosword-bin/            （独立二进制，免安装直接运行）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
+BIN_DIR="target/dosword-bin"
 
 # cargo 路径（rustup 安装时不在默认 PATH）
 if [ -f "$HOME/.cargo/env" ]; then
@@ -125,17 +128,73 @@ build_windows() {
   list_artifacts "target/$WINDOWS_TARGET/release/bundle" "*.exe" "*.msi"
 }
 
+# 构建单个平台的独立可执行程序（假定前端资源已构建）
+build_binary_one() {
+  local platform="$1"
+  case "$platform" in
+    linux)
+      log "==> 编译 Linux 可执行程序（release）"
+      cargo build --release -p dosword
+      cp target/release/dosword "$BIN_DIR/dosword-linux-x86_64"
+      log "==> Linux 可执行程序："
+      ls -lh "$BIN_DIR/dosword-linux-x86_64" | awk '{print "  " $5 "  " $9}'
+      ;;
+    windows)
+      require_cmd x86_64-w64-mingw32-gcc \
+        "Windows 交叉编译需要 mingw-w64。Ubuntu/Debian: sudo apt install gcc-mingw-w64-x86-64"
+      ensure_windows_target
+      log "==> 交叉编译 Windows 可执行程序（release, target: $WINDOWS_TARGET）"
+      cargo build --release -p dosword --target "$WINDOWS_TARGET"
+      cp "target/$WINDOWS_TARGET/release/dosword.exe" "$BIN_DIR/dosword-windows-x86_64.exe"
+      log "==> Windows 可执行程序："
+      ls -lh "$BIN_DIR/dosword-windows-x86_64.exe" | awk '{print "  " $5 "  " $9}'
+      ;;
+  esac
+}
+
+# 构建独立可执行程序（免安装直接运行）。tauri 二进制内嵌前端资源，
+# 必须先 pnpm build 保证 dist 最新，再 cargo build。
+build_binary() {
+  local platform="$1"
+  require_cmd cargo "请先安装 Rust（https://rustup.rs）"
+  require_cmd pnpm  "请先安装 pnpm（npm i -g pnpm）"
+
+  log "==> 构建前端资源（内嵌进二进制，必须最新）"
+  pnpm build
+  mkdir -p "$BIN_DIR"
+
+  case "$platform" in
+    all)
+      build_binary_one linux
+      build_binary_one windows
+      ;;
+    linux|windows)
+      build_binary_one "$platform"
+      ;;
+  esac
+}
+
 usage() {
-  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- 参数解析 ---
 COMMAND="${1:-help}"
+shift 2>/dev/null || true
+BIN_PLATFORM="all"
 SKIP_CHECK=false
 BUNDLES=""
-shift 2>/dev/null || true
 while [ $# -gt 0 ]; do
   case "$1" in
+    linux|windows|all)
+      if [ "$COMMAND" = "binary" ]; then
+        BIN_PLATFORM="$1"
+      else
+        err "未知参数：$1"
+        usage
+        exit 1
+      fi
+      ;;
     --skip-check) SKIP_CHECK=true ;;
     --bundles)
       [ $# -ge 2 ] || { err "--bundles 需要参数（如 deb,appimage 或 nsis）"; exit 1; }
@@ -167,6 +226,9 @@ case "$COMMAND" in
   all)
     build_linux "${BUNDLES:-deb,appimage,rpm}"
     build_windows "${BUNDLES:-nsis}"
+    ;;
+  binary)
+    build_binary "$BIN_PLATFORM"
     ;;
   check)
     run_check
