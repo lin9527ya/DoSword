@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ChevronRight,
@@ -510,6 +510,10 @@ function ShellDialog({
   const [settings, setSettings] = useState<{ httpEnabled: boolean }>({ httpEnabled: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [testState, setTestState] = useState<
+    { busy: boolean; ok: boolean; message: string } | null
+  >(null);
+  const formRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {
     void api.listProtocols().then(setProtocols);
@@ -517,7 +521,33 @@ function ShellDialog({
     void api.getSettings().then(setSettings).catch(() => {});
   }, []);
 
+  async function runTest() {
+    if (!formRef.current) return;
+    const form = new FormData(formRef.current);
+    setTestState({ busy: true, ok: false, message: "正在探测目标…" });
+    try {
+      const result = await api.testConnection(
+        String(form.get("endpoint")),
+        String(form.get("password") ?? ""),
+        protocolId,
+        protocolId === "builtin.php.v1"
+          ? JSON.stringify({ encoder: encoderId })
+          : undefined,
+        String(form.get("runtime") ?? "php"),
+      );
+      setTestState({
+        busy: false,
+        ok: true,
+        message: `连接成功：${result.server} · ${result.runtime} · ${result.currentDir}`,
+      });
+    } catch (cause) {
+      setTestState({ busy: false, ok: false, message: `连接失败：${errorText(cause)}` });
+    }
+  }
+
   const selected = protocols.find((protocol) => protocol.id === protocolId);
+  const connectionTestable =
+    selected?.requiresNetwork === true && settings.httpEnabled;
   const networkProtocols = protocols.filter((protocol) => protocol.requiresNetwork);
   const networkLocked = networkProtocols.length > 0 && !settings.httpEnabled;
   const editing = initial !== null;
@@ -563,8 +593,13 @@ function ShellDialog({
 
   return (
     <Dialog title={editing ? "编辑 Shell" : "登记 Shell"} onClose={onClose}>
-      <form onSubmit={(event) => void submit(event)}>
+      <form ref={formRef} onSubmit={(event) => void submit(event)}>
         {error && <p className="form-note error">{error}</p>}
+        {testState && (
+          <p className={testState.ok ? "form-note ok" : "form-note error"}>
+            {testState.message}
+          </p>
+        )}
         <label>
           Workspace
           <select name="workspaceId" required defaultValue={initial?.workspaceId} disabled={editing}>
@@ -670,6 +705,16 @@ function ShellDialog({
           </p>
         )}
         <div className="dialog-actions">
+          {connectionTestable && !editing && (
+            <button
+              type="button"
+              className="button"
+              disabled={testState?.busy}
+              onClick={() => void runTest()}
+            >
+              {testState?.busy ? "测试中…" : "测试连接"}
+            </button>
+          )}
           <button type="button" className="button secondary" onClick={onClose}>
             取消
           </button>

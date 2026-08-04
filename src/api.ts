@@ -71,6 +71,20 @@ export const api = {
   writeLocalFile: (path: string, contentB64: string) =>
     invoke<void>("write_local_file", { path, contentB64 }),
   probeShell: (shellId: string) => invoke<ProbeResult>("probe_shell", { shellId }),
+  testConnection: (
+    endpoint: string,
+    password: string,
+    protocolId: string,
+    protocolParams?: string,
+    runtime?: string,
+  ) =>
+    invoke<ProbeResult>("test_connection", {
+      endpoint,
+      password,
+      protocolId,
+      protocolParams,
+      runtime,
+    }),
   getSettings: () => invoke<AppSettings>("get_settings"),
   updateSettings: (input: AppSettings) => invoke<void>("update_settings", { input }),
   connectShell: (shellId: string) => invoke<ConnectResult>("connect_shell", { shellId }),

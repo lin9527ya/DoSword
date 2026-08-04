@@ -347,6 +347,65 @@ pub async fn delete_shell(shell_id: String, app: AppHandle) -> Result<(), String
     .await
 }
 
+/// 登记前连通性测试：用表单中的临时配置（不落库）对目标执行一次探测。
+#[tauri::command]
+pub async fn test_connection(
+    endpoint: String,
+    password: String,
+    protocol_id: String,
+    protocol_params: Option<String>,
+    runtime: Option<String>,
+    app: AppHandle,
+) -> Result<ProbeResult, String> {
+    blocking(app, move |state| {
+        test_connection_impl(state, &endpoint, &password, &protocol_id, protocol_params.as_deref(), runtime.as_deref())
+    })
+    .await
+}
+
+fn test_connection_impl(
+    state: &AppState,
+    endpoint: &str,
+    password: &str,
+    protocol_id: &str,
+    protocol_params: Option<&str>,
+    runtime: Option<&str>,
+) -> Result<ProbeResult, String> {
+    let settings = state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())?
+        .get_settings()
+        .map_err(|error| error.to_string())?;
+    let protocol = state
+        .protocols
+        .get(protocol_id)
+        .ok_or_else(|| format!("未知协议：{protocol_id}"))?;
+    if protocol.requires_network() && !settings.http_enabled {
+        return Err("真实网络协议尚未在「设置」中开启授权声明".to_string());
+    }
+    parse_endpoint(endpoint)?;
+    validate_text(password, "连接密码")?;
+    let profile = ShellProfile {
+        id: String::new(),
+        workspace_id: String::new(),
+        name: "连接测试".into(),
+        endpoint: endpoint.to_string(),
+        runtime: runtime.unwrap_or("php").to_string(),
+        protocol_id: protocol_id.to_string(),
+        password: password.to_string(),
+        protocol_params: protocol_params.unwrap_or("{}").to_string(),
+        authorization_ack: true,
+        status: String::new(),
+        last_connected_at: None,
+        created_at: String::new(),
+        tags: Vec::new(),
+    };
+    protocol
+        .probe(&profile, &settings)
+        .map_err(|error| format!("连接失败：{error}"))
+}
+
 #[tauri::command]
 pub async fn probe_shell(shell_id: String, app: AppHandle) -> Result<ProbeResult, String> {
     blocking(app, move |state| {
@@ -1055,6 +1114,50 @@ mod tests {
                 protocol_id,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn test_connection_mock_protocol_ok() {
+        let state = app_state();
+        let result = test_connection_impl(
+            &state,
+            "mock://local",
+            "secret",
+            MOCK_PROTOCOL_ID,
+            None,
+            None,
+        );
+        assert!(result.is_ok(), "mock 协议探测应成功：{result:?}");
+        assert_eq!(result.unwrap().status, "online");
+    }
+
+    #[test]
+    fn test_connection_unknown_protocol_rejected() {
+        let state = app_state();
+        let result = test_connection_impl(
+            &state,
+            "mock://local",
+            "secret",
+            "unknown.v1",
+            None,
+            None,
+        );
+        assert!(result.is_err(), "未知协议应报错");
+        assert!(result.unwrap_err().contains("未知协议"));
+    }
+
+    #[test]
+    fn test_connection_invalid_endpoint_rejected() {
+        let state = app_state();
+        let result = test_connection_impl(
+            &state,
+            "not-a-url",
+            "secret",
+            MOCK_PROTOCOL_ID,
+            None,
+            None,
+        );
+        assert!(result.is_err(), "非法 URL 应报错");
     }
 
     fn register_session(state: &AppState, shell: &ShellProfile) -> String {
