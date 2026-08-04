@@ -15,7 +15,8 @@ pub fn build_client(settings: &AppSettings) -> Client {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(settings.default_timeout_secs))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("DoSword/1.0");
+        .user_agent("DoSword/1.0")
+        .cookie_store(true);
     if let Some(proxy) = settings.proxy.as_deref().filter(|value| !value.is_empty()) {
         if let Ok(proxy) = reqwest::Proxy::all(proxy) {
             builder = builder.proxy(proxy);

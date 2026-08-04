@@ -32,6 +32,6 @@ base64.workspace = true
 getrandom = "0.3"
 ipnet = "2"
 ts-rs.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "charset"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "charset", "cookies"] }
 dosword-sdk = { path = "../crates/dosword-sdk" }
 dosword-plugin-echo = { path = "../crates/dosword-plugin-echo" }

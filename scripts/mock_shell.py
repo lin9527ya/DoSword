@@ -55,7 +55,8 @@ def decode_payload(x: str) -> str:
     if b"@ini_set" in raw:
         return raw.decode("utf-8", errors="replace")
     xored = bytes(c ^ key[i % len(key)] for i, c in enumerate(raw))
-    if b"@ini_set" in xored:
+    if b"@ini_set" in xored or xored[:1] == b"{" or b"DswSesInit" in xored:
+        # 协议代码 / Godzilla 分阶段参数（JSON）/ 分阶段初始化（处理器代码）
         return xored.decode("utf-8", errors="replace")
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -219,6 +220,58 @@ def handle_code(code: str) -> dict:
     }
 
 
+def xor_bytes(data: bytes) -> bytes:
+    """按密码 md5 派生密钥做 XOR（与客户端一致）。"""
+    key = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
+    return bytes(c ^ key[i % len(key)] for i, c in enumerate(data))
+
+
+def xor_encrypt_text(text: str) -> bytes:
+    """加密文本响应（base64(XOR)），与 xor_body/xor_session stub 的 pack 一致。"""
+    return base64.b64encode(xor_bytes(text.encode()))
+
+
+def session_handle(req: dict) -> str:
+    """模拟 Godzilla 分阶段载荷的 run()：exec / probe / list 基础操作。"""
+    action = req.get("a", "")
+    nonce = str(req.get("n", "abababab"))
+    if action == "probe":
+        out = {
+            "ok": True,
+            "data": {
+                "server": "Mock Linux 6.x (mock_shell.py)",
+                "web_server": "Python http.server",
+                "php_version": "8.2.0 (模拟)",
+                "current_dir": ROOT,
+                "separator": "/",
+            },
+        }
+    elif action == "exec":
+        cmd = str(req.get("c", ""))
+        out = {
+            "ok": True,
+            "data": {
+                "stdout": base64.b64encode(f"[mock] 已执行：{cmd}".encode()).decode(),
+                "cwd": ROOT,
+            },
+        }
+    elif action == "list":
+        entries = []
+        path = str(req.get("p", ROOT))
+        if os.path.isdir(path):
+            for name in sorted(os.listdir(path)):
+                full = os.path.join(path, name)
+                entries.append({
+                    "name": name, "path": full, "is_dir": os.path.isdir(full),
+                    "size": 0 if os.path.isdir(full) else os.path.getsize(full),
+                    "mtime": int(os.path.getmtime(full)),
+                })
+        out = {"ok": True, "data": {"entries": entries}}
+    else:
+        out = {"ok": False, "error": f"mock 暂不支持 session 操作：{action}"}
+    return nonce + base64.b64encode(json.dumps(out).encode()).decode() + nonce
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", 0))
@@ -235,24 +288,43 @@ class Handler(BaseHTTPRequestHandler):
             # 仅当存在密码参数且不匹配时拒绝；body 直传模式（php_stream）无鉴权
             body = b"AUTH_FAIL"
         else:
-            try:
-                code = decode_payload(x)
-            except Exception:
-                code = ""
-            result = handle_code(code)
-            # 提取客户端 nonce 帧标记
-            nonce = "abababab"
-            match = re.search(r"echo '([0-9a-f]{8,})'", code)
-            if match:
-                nonce = match.group(1)
-            payload = base64.b64encode(json.dumps(result).encode()).decode()
-            body = f"{nonce}{payload}{nonce}".encode()
+            body = self.handle_payload(x)
 
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def handle_payload(self, x: str) -> bytes:
+        """区分协议代码（xor_body 等）与分阶段载荷（xor_session）并应答。"""
+        # Godzilla 分阶段载荷：请求体为 XOR 密文，解密后可能是处理器（含 INIT 标记）
+        # 或操作参数（JSON {a, n}）
+        try:
+            plain = decode_payload(x)
+        except Exception:
+            plain = ""
+        if "DswSesInit" in plain:
+            # 初始化：处理器代码存入会话（模拟），返回加密的 ok
+            self.server.session_handler = plain
+            return xor_encrypt_text("ok")
+        if plain.startswith("{") and '"a"' in plain:
+            try:
+                req = json.loads(plain)
+                if isinstance(req, dict) and "a" in req:
+                    return xor_encrypt_text(session_handle(req))
+            except Exception:
+                pass
+        # 普通协议代码（表单参数或 body 直传的 xor_body 等）
+        code = plain
+        result = handle_code(code)
+        # 提取客户端 nonce 帧标记
+        nonce = "abababab"
+        match = re.search(r"echo '([0-9a-f]{8,})'", code)
+        if match:
+            nonce = match.group(1)
+        payload = base64.b64encode(json.dumps(result).encode()).decode()
+        return f"{nonce}{payload}{nonce}".encode()
 
     def log_message(self, fmt, *args):  # noqa: A003
         sys.stderr.write("[mock-shell] %s\n" % (fmt % args))
