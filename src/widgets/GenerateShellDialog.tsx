@@ -25,7 +25,6 @@ export function GenerateShellDialog({
   const [encoders, setEncoders] = useState<[string, string][]>([]);
   const [encoderId, setEncoderId] = useState("native");
   const [password, setPassword] = useState("");
-  const [session, setSession] = useState(false);
   const [result, setResult] = useState<GenerateShellResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -44,7 +43,7 @@ export function GenerateShellDialog({
     setError("");
     setCopied(false);
     try {
-      setResult(await api.generateShell(language, encoderId, password, session));
+      setResult(await api.generateShell(language, encoderId, password, false));
     } catch (cause) {
       setError(errorText(cause));
     } finally {
@@ -106,16 +105,7 @@ export function GenerateShellDialog({
             placeholder="用于派生 XOR 密钥（md5）"
           />
         </label>
-        {["native", "aes128_ecb", "aes128_cbc", "chacha20", "rabbit"].some((e) => encoderId.startsWith(e)) === false && (
-          <label className="confirm-row">
-            <input
-              type="checkbox"
-              checked={session}
-              onChange={(event) => setSession(event.target.checked)}
-            />
-            <span>分阶段会话模式（Godzilla 风格：代码一次注入，之后仅传参数）</span>
-          </label>
-        )}
+        
         <button className="button primary" onClick={() => void generate()} disabled={busy}>
           {busy ? <LoaderCircle className="spin" size={15} /> : null}
           {busy ? "生成中…" : "生成"}

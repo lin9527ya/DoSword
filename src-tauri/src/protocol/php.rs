@@ -624,7 +624,7 @@ impl Protocol for PhpProtocol {
     ) -> Result<ProbeResult, ProtocolError> {
         // 环境信息探测：不产生任何文件系统副作用
         let encoder = encoder_for(&profile.protocol_params);
-        if encoder.id().starts_with("native") || always_session(encoder.id()) {
+        if encoder.id().starts_with("native") {
             // NATIVE 与自加密编码器恒走分阶段会话通道
             let php = PhpSession {
                 endpoint: profile.endpoint.clone(),
@@ -1164,13 +1164,8 @@ fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, Protocol
 // ---------------------------------------------------------------------------
 
 /// 是否启用分发通道（分阶段载荷 session 模式 或 NATIVE 内置分发）。
-/// 自加密编码器本身即分阶段会话形态（密钥内嵌 + DswSesInit 注入），恒走会话通道。
-fn always_session(encoder_id: &str) -> bool {
-    matches!(encoder_id, "aes128_ecb" | "aes128_cbc")
-}
-
 fn is_session(php: &PhpSession) -> bool {
-    php.session_mode || is_native(php) || always_session(php.encoder.id())
+    php.session_mode || is_native(php)
 }
 
 /// JSON 字符串值转义。
@@ -1562,7 +1557,6 @@ mod tests {
         let encoders = [
             "native", "native_aes_ecb", "native_aes_cbc", "native_des",
             "native_chacha20", "native_rabbit",
-            "aes128_ecb", "aes128_cbc",
         ];
         let settings = settings();
         for encoder_id in encoders {
@@ -1597,7 +1591,6 @@ mod tests {
         let encoders = [
             "native", "native_aes_ecb", "native_aes_cbc", "native_des",
             "native_chacha20", "native_rabbit",
-            "aes128_ecb", "aes128_cbc",
         ];
         let settings = settings();
         for encoder_id in encoders {

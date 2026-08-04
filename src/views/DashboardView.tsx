@@ -507,7 +507,6 @@ function ShellDialog({
   const [protocolId, setProtocolId] = useState(initial?.protocolId ?? "builtin.mock.v1");
   const [encoders, setEncoders] = useState<[string, string][]>([]);
   const [encoderId, setEncoderId] = useState("native");
-  const [sessionMode, setSessionMode] = useState(false);
   const [settings, setSettings] = useState<{ httpEnabled: boolean }>({ httpEnabled: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -549,7 +548,7 @@ function ShellDialog({
           tags: parseTags(String(form.get("tags") ?? "")),
           protocolParams:
             protocolId === "builtin.php.v1"
-              ? JSON.stringify({ encoder: encoderId, ...(sessionMode ? { session: true } : {}) })
+              ? JSON.stringify({ encoder: encoderId })
               : undefined,
         });
       }
@@ -649,16 +648,7 @@ function ShellDialog({
                 </span>
               </label>
             )}
-            {!editing && protocolId === "builtin.php.v1" && ["native", "aes128_ecb", "aes128_cbc", "chacha20", "rabbit"].some((e) => encoderId.startsWith(e)) === false && (
-              <label className="confirm-row">
-                <input
-                  type="checkbox"
-                  checked={sessionMode}
-                  onChange={(event) => setSessionMode(event.target.checked)}
-                />
-                <span>分阶段会话模式（生成 stub 时需勾选相同选项）</span>
-              </label>
-            )}
+            
             {!editing && settings.httpEnabled && (
               <label className="confirm-row">
                 <input name="confirm" type="checkbox" />

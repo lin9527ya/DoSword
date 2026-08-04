@@ -16,16 +16,9 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
   - 自定义 HTTP 头鉴权（X-Debug-Key，头名与 token XOR 加密嵌入）
   - 请求参数业务化 formData；载荷/响应全程加密，**加密方式可选**：
     - `native`：XOR 循环加密（md5 派生密钥，默认）
-    - `native_aes_ecb` / `native_aes_cbc`：AES-128（密钥=md5 前 16 字节，
-      CBC 用 md5 后 16 字节作 IV，cipher 名与密钥 XOR 嵌入）
+    - `native_aes_ecb` / `native_aes_cbc`：AES-256（密钥=md5 hex 全部
+      32 字节，CBC 用 md5 后 16 字节作 IV，cipher 名与密钥 XOR 嵌入）
     - `native_des`：DES-ECB（密钥=md5 前 8 字节）
-- **自加密系列（PHP 5+ 兼容，分阶段会话形态）**：
-  - `aes128_ecb`：AES-128-ECB 自加密（密钥由密码 md5 派生并 XOR 加密嵌入
-    stub，载荷为密文；处理器经 DswSesInit 一次注入，后续请求只传参数）
-  - `aes128_cbc`：AES-128-CBC 自加密（密钥 + IV = md5 前/后 16 字节）
-  - stub 与处理器代码仅用 PHP 5 语法（array()/strpos/无 ??/无短数组/
-    无 intdiv 等），openssl 加解密函数 crc32b 查表调用（PHP 5.3+）
-  - 连接/执行/生成 Webshell 均自动走分阶段会话通道（无需勾选 session）
 - **现代流密码自实现变体（NATIVE 骨架 + 纯 PHP 算法，无 eval / 无敏感特征）**：
   - `native_chacha20`：ChaCha20（RFC 8439，TLS 1.3/SSH/WireGuard 标准流密码）
     密钥 = 密码 md5 hex ASCII（256 位），nonce 12 字节随载荷明文携带；

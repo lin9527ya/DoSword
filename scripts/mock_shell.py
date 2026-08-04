@@ -35,22 +35,36 @@ def decode_param(value: str) -> str:
     return base64.b64decode(value.encode()).decode("utf-8", errors="replace")
 
 
+def looks_plain(raw: bytes) -> bool:
+    """明文载荷特征：@ini_set / DswSesInit 特征串，或以 { 开头且为合法 JSON。
+    （避免 AES/流密码密文首字节恰为 0x7b 时误判为 b64 明文）"""
+    if b"@ini_set" in raw or b"DswSesInit" in raw:
+        return True
+    if raw[:1] == b"{":
+        try:
+            json.loads(raw)
+            return True
+        except Exception:
+            return False
+    return False
+
+
 def decode_payload_mode(x: str) -> tuple:
     """解码载荷并返回 (明文, 编码方式)。mode: "b64"|"xor"|"aes-ecb"|"aes-cbc"|"des-ecb"。"""
     raw = base64.b64decode(x)
-    if b"@ini_set" in raw or raw[:1] == b"{" or b"DswSesInit" in raw:
+    if looks_plain(raw):
         return raw.decode("utf-8", errors="replace"), "b64"
     key = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
     xored = bytes(c ^ key[i % len(key)] for i, c in enumerate(raw))
-    if b"@ini_set" in xored or xored[:1] == b"{" or b"DswSesInit" in xored:
+    if looks_plain(xored):
         return xored.decode("utf-8", errors="replace"), "xor"
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
         from cryptography.hazmat.primitives import padding as sym_padding
 
         schemes = [
-            (algorithms.AES(key[:16]), "aes-ecb", None),
-            (algorithms.AES(key[:16]), "aes-cbc", modes.CBC(key[16:])),
+            (algorithms.AES(key), "aes-ecb", None),
+            (algorithms.AES(key), "aes-cbc", modes.CBC(key[16:])),
         ]
         for algo, name, mode_obj in schemes:
             try:
@@ -58,7 +72,7 @@ def decode_payload_mode(x: str) -> tuple:
                 padded = dec.update(raw) + dec.finalize()
                 unpadder = sym_padding.PKCS7(algo.block_size).unpadder()
                 restored = unpadder.update(padded) + unpadder.finalize()
-                if b"@ini_set" in restored or restored[:1] == b"{" or b"DswSesInit" in restored:
+                if looks_plain(restored):
                     return restored.decode("utf-8", errors="replace"), name
             except Exception:
                 continue
@@ -72,7 +86,7 @@ def decode_payload_mode(x: str) -> tuple:
         pad_len = restored[-1]
         if pad_len <= 8:
             restored = restored[:-pad_len]
-        if b"@ini_set" in restored or restored[:1] == b"{" or b"DswSesInit" in restored:
+        if looks_plain(restored):
             return restored.decode("utf-8", errors="replace"), "des-ecb"
     except (ImportError, ValueError):
         pass
@@ -85,7 +99,7 @@ def decode_payload_mode(x: str) -> tuple:
             ck = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
             dec = ChaCha20.new(key=ck, nonce=nonce)
             restored = dec.decrypt(raw[12:])
-            if b"@ini_set" in restored or restored[:1] == b"{" or b"DswSesInit" in restored:
+            if looks_plain(restored):
                 return restored.decode("utf-8", errors="replace"), "chacha20"
     except (ImportError, ValueError, TypeError):
         pass
@@ -94,7 +108,7 @@ def decode_payload_mode(x: str) -> tuple:
         iv = raw[:8]
         rk = hashlib.md5(PASSWORD.encode()).digest()
         restored = rabbit_stream(rk, iv, 0, raw[8:])
-        if b"@ini_set" in restored or restored[:1] == b"{" or b"DswSesInit" in restored:
+        if looks_plain(restored):
             return restored.decode("utf-8", errors="replace"), "rabbit"
     raise ValueError("无法识别的载荷编码")
 
@@ -410,6 +424,21 @@ def encrypt_native_mode(text: str, mode: str) -> str:
     """按请求的编码方式加密 NATIVE 响应（data 字段内容）。"""
     if mode == "xor":
         return xor_encrypt_text(text).decode()
+    if mode in ("aes-ecb", "aes-cbc"):
+        try:
+            from Crypto.Cipher import AES
+
+            key = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
+            pad = 16 - (len(text.encode()) % 16)
+            padded = text.encode() + bytes([pad]) * pad
+            if mode == "aes-cbc":
+                iv = hashlib.md5(PASSWORD.encode()).hexdigest().encode()[16:]
+                enc = AES.new(key, AES.MODE_CBC, iv)
+            else:
+                enc = AES.new(key, AES.MODE_ECB)
+            return base64.b64encode(enc.encrypt(padded)).decode()
+        except (ImportError, ValueError, TypeError):
+            return base64.b64encode(text.encode()).decode()
     if mode == "chacha20":
         try:
             from Crypto.Cipher import ChaCha20
