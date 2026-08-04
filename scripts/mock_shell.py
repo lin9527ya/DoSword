@@ -34,6 +34,18 @@ def decode_param(value: str) -> str:
     return base64.b64decode(value.encode()).decode("utf-8", errors="replace")
 
 
+def decode_payload_mode(x: str) -> tuple:
+    """解码载荷并返回 (明文, 编码方式)。mode: "b64" 或 "xor"。"""
+    raw = base64.b64decode(x)
+    if b"@ini_set" in raw or raw[:1] == b"{" or b"DswSesInit" in raw:
+        return raw.decode("utf-8", errors="replace"), "b64"
+    key = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
+    xored = bytes(c ^ key[i % len(key)] for i, c in enumerate(raw))
+    if b"@ini_set" in xored or xored[:1] == b"{" or b"DswSesInit" in xored:
+        return xored.decode("utf-8", errors="replace"), "xor"
+    raise ValueError("无法识别的载荷编码")
+
+
 def decode_payload(x: str) -> str:
     """解码客户端载荷。注意：CHAR/OBFUSCATE 载荷不经 base64（stub 直接 eval），
     其余编码器（base64/xor/aes/des）经 base64。特征串 @ini_set 判断。"""
@@ -297,22 +309,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def handle_payload(self, x: str) -> bytes:
-        """区分协议代码（xor_body 等）与分阶段载荷（xor_session）并应答。"""
-        # Godzilla 分阶段载荷：请求体为 XOR 密文，解密后可能是处理器（含 INIT 标记）
-        # 或操作参数（JSON {a, n}）
+        """区分协议代码（xor_body 等）与分阶段载荷（session 模式）并应答。"""
+        # 识别请求编码方式：XOR 密文或明文 base64（决定 session 响应加密方式）
+        mode = "b64"
         try:
-            plain = decode_payload(x)
+            plain, mode = decode_payload_mode(x)
         except Exception:
             plain = ""
         if "DswSesInit" in plain:
-            # 初始化：处理器代码存入会话（模拟），返回加密的 ok
+            # 初始化：处理器代码存入会话（模拟），按请求编码返回 ok
             self.server.session_handler = plain
-            return xor_encrypt_text("ok")
+            return self.encrypt("ok", mode)
         if plain.startswith("{") and '"a"' in plain:
             try:
                 req = json.loads(plain)
                 if isinstance(req, dict) and "a" in req:
-                    return xor_encrypt_text(session_handle(req))
+                    return self.encrypt(session_handle(req), mode)
             except Exception:
                 pass
         # 普通协议代码（表单参数或 body 直传的 xor_body 等）
@@ -325,6 +337,13 @@ class Handler(BaseHTTPRequestHandler):
             nonce = match.group(1)
         payload = base64.b64encode(json.dumps(result).encode()).decode()
         return f"{nonce}{payload}{nonce}".encode()
+
+    @staticmethod
+    def encrypt(text: str, mode: str) -> bytes:
+        """按请求编码方式加密 session 响应。"""
+        if mode == "xor":
+            return xor_encrypt_text(text)
+        return base64.b64encode(text.encode())
 
     def log_message(self, fmt, *args):  # noqa: A003
         sys.stderr.write("[mock-shell] %s\n" % (fmt % args))

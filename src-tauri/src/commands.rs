@@ -393,6 +393,7 @@ pub async fn generate_shell(
     language: String,
     encoder_id: String,
     password: String,
+    session: bool,
     app: AppHandle,
 ) -> Result<GenerateShellResult, String> {
     blocking(app, move |state| {
@@ -405,9 +406,15 @@ pub async fn generate_shell(
         let encoder = EncoderRegistry::global()
             .get(&encoder_id)
             .ok_or_else(|| format!("未知编码器：{encoder_id}"))?;
-        let content = encoder
-            .stub(&language, &password)
-            .map_err(|error| error.to_string())?;
+        let content = if session {
+            encoder
+                .stub_session(&language, &password)
+                .map_err(|error| error.to_string())?
+        } else {
+            encoder
+                .stub(&language, &password)
+                .map_err(|error| error.to_string())?
+        };
         let filename = format!("shell_{}_{}.{}", language, encoder_id, language);
         audit(
             state,

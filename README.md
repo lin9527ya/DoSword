@@ -16,6 +16,10 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
   - `xor_body` Godzilla 风格请求体 XOR 直传（`file_get_contents('php://input')`，默认配置可用）
   - `xor_session` Godzilla 分阶段载荷：处理器代码一次注入服务端 session，
     后续请求只传参数（全功能处理器：命令/文件/数据库），默认配置可用
+- **分阶段会话模式（session）应用到全部编码器**：任意编码器可通过
+  protocol_params `"session": true` 启用 Godzilla 分阶段机制（代码一次注入、
+  参数化调用、请求/响应全程编码器加密）；生成 Webshell / 登记 Shell 均有
+  对应选项；session 化后 stub 不含任何明文代码片段
 - **OPSEC 业务伪装**：PHP stub 整体形如正常业务文件（「会话状态查询接口」），
   webshell 功能隐藏在业务函数中（函数名带随机前缀防与站点业务函数冲突）；
   敏感函数名（base64_decode / openssl_decrypt）完全不在代码中出现——运行时

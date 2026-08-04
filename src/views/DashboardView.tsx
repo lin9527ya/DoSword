@@ -507,6 +507,7 @@ function ShellDialog({
   const [protocolId, setProtocolId] = useState(initial?.protocolId ?? "builtin.mock.v1");
   const [encoders, setEncoders] = useState<[string, string][]>([]);
   const [encoderId, setEncoderId] = useState("xor_base64");
+  const [sessionMode, setSessionMode] = useState(false);
   const [settings, setSettings] = useState<{ httpEnabled: boolean }>({ httpEnabled: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -547,7 +548,9 @@ function ShellDialog({
           confirmNetwork: form.get("confirm") === "on",
           tags: parseTags(String(form.get("tags") ?? "")),
           protocolParams:
-            protocolId === "builtin.php.v1" ? JSON.stringify({ encoder: encoderId }) : undefined,
+            protocolId === "builtin.php.v1"
+              ? JSON.stringify({ encoder: encoderId, ...(sessionMode ? { session: true } : {}) })
+              : undefined,
         });
       }
       await onCreated();
@@ -644,6 +647,16 @@ function ShellDialog({
                 <span className="field-hint">
                   与目标 stub 的解码方式一致；可在「生成 Webshell」中生成配套 stub。
                 </span>
+              </label>
+            )}
+            {!editing && protocolId === "builtin.php.v1" && (
+              <label className="confirm-row">
+                <input
+                  type="checkbox"
+                  checked={sessionMode}
+                  onChange={(event) => setSessionMode(event.target.checked)}
+                />
+                <span>分阶段会话模式（生成 stub 时需勾选相同选项）</span>
               </label>
             )}
             {!editing && settings.httpEnabled && (

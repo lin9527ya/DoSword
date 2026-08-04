@@ -65,8 +65,8 @@ export const api = {
   listProtocols: () => invoke<ProtocolMeta[]>("list_protocols"),
   listPlugins: () => invoke<PluginManifest[]>("list_plugins"),
   listEncoders: () => invoke<[string, string][]>("list_encoders"),
-  generateShell: (language: string, encoderId: string, password: string) =>
-    invoke<GenerateShellResult>("generate_shell", { language, encoderId, password }),
+  generateShell: (language: string, encoderId: string, password: string, session: boolean) =>
+    invoke<GenerateShellResult>("generate_shell", { language, encoderId, password, session }),
   listAudit: (filter: AuditFilter) => invoke<AuditPage>("list_audit", { filter }),
   writeLocalFile: (path: string, contentB64: string) =>
     invoke<void>("write_local_file", { path, contentB64 }),
