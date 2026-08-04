@@ -128,13 +128,15 @@ build_windows() {
   list_artifacts "target/$WINDOWS_TARGET/release/bundle" "*.exe" "*.msi"
 }
 
-# 构建单个平台的独立可执行程序（假定前端资源已构建）
+# 构建单个平台的独立可执行程序。
+# 注意：必须经 tauri CLI 构建（tauri build --no-bundle）——裸 cargo build 的增量
+# 构建可能不触发 tauri-codegen 重新内嵌前端资源，产物会缺少 dist 资源。
 build_binary_one() {
   local platform="$1"
   case "$platform" in
     linux)
-      log "==> 编译 Linux 可执行程序（release）"
-      cargo build --release -p dosword
+      log "==> 编译 Linux 可执行程序（release，内嵌前端资源）"
+      pnpm tauri build --no-bundle
       cp target/release/dosword "$BIN_DIR/dosword-linux-x86_64"
       log "==> Linux 可执行程序："
       ls -lh "$BIN_DIR/dosword-linux-x86_64" | awk '{print "  " $5 "  " $9}'
@@ -144,7 +146,7 @@ build_binary_one() {
         "Windows 交叉编译需要 mingw-w64。Ubuntu/Debian: sudo apt install gcc-mingw-w64-x86-64"
       ensure_windows_target
       log "==> 交叉编译 Windows 可执行程序（release, target: $WINDOWS_TARGET）"
-      cargo build --release -p dosword --target "$WINDOWS_TARGET"
+      pnpm tauri build --no-bundle --target "$WINDOWS_TARGET"
       cp "target/$WINDOWS_TARGET/release/dosword.exe" "$BIN_DIR/dosword-windows-x86_64.exe"
       log "==> Windows 可执行程序："
       ls -lh "$BIN_DIR/dosword-windows-x86_64.exe" | awk '{print "  " $5 "  " $9}'
