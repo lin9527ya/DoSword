@@ -1592,8 +1592,8 @@ impl PayloadEncoder for NativeEncoder {
 
     fn display_name(&self) -> &'static str {
         match self.crypto {
-            "aes_ecb" => "NATIVE·AES-128-ECB（内置分发 + AES 载荷加密）",
-            "aes_cbc" => "NATIVE·AES-128-CBC（内置分发 + AES 载荷加密）",
+            "aes_ecb" => "NATIVE·AES-256-ECB（内置分发 + AES 载荷加密）",
+            "aes_cbc" => "NATIVE·AES-256-CBC（内置分发 + AES 载荷加密）",
             "des" => "NATIVE·DES-ECB（内置分发 + DES 载荷加密）",
             "chacha20" => "NATIVE·CHACHA20（内置分发 + 自实现现代流密码）",
             "rabbit" => "NATIVE·RABBIT（内置分发 + 自实现现代流密码）",
