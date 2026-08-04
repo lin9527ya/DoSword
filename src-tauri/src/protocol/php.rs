@@ -624,7 +624,7 @@ impl Protocol for PhpProtocol {
     ) -> Result<ProbeResult, ProtocolError> {
         // 环境信息探测：不产生任何文件系统副作用
         let encoder = encoder_for(&profile.protocol_params);
-        if encoder.id().starts_with("native") || matches!(encoder.id(), "aes128_ecb" | "aes128_cbc") {
+        if encoder.id().starts_with("native") || always_session(encoder.id()) {
             // NATIVE 与自加密编码器恒走分阶段会话通道
             let php = PhpSession {
                 endpoint: profile.endpoint.clone(),
@@ -1164,9 +1164,13 @@ fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, Protocol
 // ---------------------------------------------------------------------------
 
 /// 是否启用分发通道（分阶段载荷 session 模式 或 NATIVE 内置分发）。
+/// 自加密编码器本身即分阶段会话形态（密钥内嵌 + DswSesInit 注入），恒走会话通道。
+fn always_session(encoder_id: &str) -> bool {
+    matches!(encoder_id, "aes128_ecb" | "aes128_cbc" | "chacha20" | "rabbit")
+}
+
 fn is_session(php: &PhpSession) -> bool {
-    // 自加密编码器（aes128_ecb/aes128_cbc）本身即分阶段会话形态（密钥内嵌 + DswSesInit 注入）
-    php.session_mode || is_native(php) || matches!(php.encoder.id(), "aes128_ecb" | "aes128_cbc")
+    php.session_mode || is_native(php) || always_session(php.encoder.id())
 }
 
 /// JSON 字符串值转义。
@@ -1219,6 +1223,9 @@ fn ensure_session_init(php: &PhpSession, settings: &AppSettings) -> Result<(), P
     }
     let code = dosword_sdk::encoder::session_handler_code();
     let payload = php.encoder.encode(code, &php.password);
+    if php.encoder.id().contains("chacha") {
+        eprintln!("[init] payload head: {}", &payload[..payload.len().min(40)]);
+    }
     let plain = session_post(php, payload, settings)?;
     let text = String::from_utf8_lossy(&plain);
     if !text.contains("ok") {
@@ -1554,7 +1561,7 @@ mod tests {
         // 每个编码器的生成 stub 都做真实执行验证（防止模板双重调用等 bug 漏网）
         let encoders = [
             "native", "native_aes_ecb", "native_aes_cbc", "native_des",
-            "aes128_ecb", "aes128_cbc",
+            "aes128_ecb", "aes128_cbc", "chacha20", "rabbit",
         ];
         let settings = settings();
         for encoder_id in encoders {
@@ -1588,7 +1595,7 @@ mod tests {
         // Godzilla 分阶段载荷应用到所有编码器：每个编码器以 session 模式真实往返
         let encoders = [
             "native", "native_aes_ecb", "native_aes_cbc", "native_des",
-            "aes128_ecb", "aes128_cbc",
+            "aes128_ecb", "aes128_cbc", "chacha20", "rabbit",
         ];
         let settings = settings();
         for encoder_id in encoders {
@@ -1667,7 +1674,9 @@ mod tests {
             .arg("-t")
             .arg(&dir)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(
+                std::fs::File::create(std::env::temp_dir().join("srv.log")).ok()?,
+            ))
             .spawn()
             .ok()?;
         // 等待服务器就绪

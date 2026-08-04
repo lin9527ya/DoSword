@@ -22,6 +22,7 @@ import os
 import re
 import sqlite3
 import sys
+import secrets
 import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs
@@ -73,8 +74,28 @@ def decode_payload_mode(x: str) -> tuple:
             restored = restored[:-pad_len]
         if b"@ini_set" in restored or restored[:1] == b"{" or b"DswSesInit" in restored:
             return restored.decode("utf-8", errors="replace"), "des-ecb"
-    except ImportError:
+    except (ImportError, ValueError):
         pass
+    # CHACHA20：载荷 = nonce[12] + 密钥流异或（key = md5 hex ASCII 32B，请求 counter=0）
+    try:
+        from Crypto.Cipher import ChaCha20
+
+        if len(raw) > 12:
+            nonce = raw[:12]
+            ck = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
+            dec = ChaCha20.new(key=ck, nonce=nonce)
+            restored = dec.decrypt(raw[12:])
+            if b"@ini_set" in restored or restored[:1] == b"{" or b"DswSesInit" in restored:
+                return restored.decode("utf-8", errors="replace"), "chacha20"
+    except (ImportError, ValueError, TypeError):
+        pass
+    # RABBIT：载荷 = iv[8] + 密钥流异或（key = md5 16B，请求 skip=0）
+    if len(raw) > 8:
+        iv = raw[:8]
+        rk = hashlib.md5(PASSWORD.encode()).digest()
+        restored = rabbit_stream(rk, iv, 0, raw[8:])
+        if b"@ini_set" in restored or restored[:1] == b"{" or b"DswSesInit" in restored:
+            return restored.decode("utf-8", errors="replace"), "rabbit"
     raise ValueError("无法识别的载荷编码")
 
 
@@ -313,10 +334,96 @@ def encrypt_native_des(text: str) -> str:
         return base64.b64encode(text.encode()).decode()
 
 
+def rabbit_stream(key: bytes, iv: bytes, skip: int, data: bytes) -> bytes:
+    """Rabbit（RFC 4503）密钥流异或，纯 Python 参考实现（与 SDK/PHP 同规格）。"""
+    M32 = 0xFFFFFFFF
+    k = []
+    for i in range(8):
+        k.append((key[14 - 2 * i] << 8) | key[15 - 2 * i])
+    x = [0] * 8
+    c = [0] * 8
+    for j in range(8):
+        if j % 2 == 0:
+            x[j] = ((k[(j + 1) % 8] << 16) | k[j]) & M32
+            c[j] = ((k[(j + 4) % 8] << 16) | k[(j + 5) % 8]) & M32
+        else:
+            x[j] = ((k[(j + 5) % 8] << 16) | k[(j + 4) % 8]) & M32
+            c[j] = ((k[j] << 16) | k[(j + 1) % 8]) & M32
+    aa = [0x4D34D34D, 0xD34D34D3, 0x34D34D34, 0x4D34D34D, 0xD34D34D3, 0x34D34D34, 0x4D34D34D, 0xD34D34D3]
+    b = 0
+
+    def rc():
+        nonlocal b
+        for j in range(8):
+            t = c[j] + aa[j] + b
+            b = (t >> 32) & M32
+            c[j] = t & M32
+
+    def g(u, v):
+        s = (u + v) & M32
+        sq = s * s
+        return (sq & M32) ^ ((sq >> 32) & M32)
+
+    def rx():
+        gs = [g(x[j], c[j]) for j in range(8)]
+        x[0] = (gs[0] + ((gs[7] << 16) | (gs[7] >> 16)) + ((gs[6] << 16) | (gs[6] >> 16))) & M32
+        x[1] = (gs[1] + ((gs[0] << 8) | (gs[0] >> 24)) + gs[7]) & M32
+        x[2] = (gs[2] + ((gs[1] << 16) | (gs[1] >> 16)) + ((gs[0] << 16) | (gs[0] >> 16))) & M32
+        x[3] = (gs[3] + ((gs[2] << 8) | (gs[2] >> 24)) + gs[1]) & M32
+        x[4] = (gs[4] + ((gs[3] << 16) | (gs[3] >> 16)) + ((gs[2] << 16) | (gs[2] >> 16))) & M32
+        x[5] = (gs[5] + ((gs[4] << 8) | (gs[4] >> 24)) + gs[3]) & M32
+        x[6] = (gs[6] + ((gs[5] << 16) | (gs[5] >> 16)) + ((gs[4] << 16) | (gs[4] >> 16))) & M32
+        x[7] = (gs[7] + ((gs[6] << 8) | (gs[6] >> 24)) + gs[5]) & M32
+
+    for _ in range(4):
+        rc(); rx()
+    for j in range(8):
+        c[j] = (c[j] ^ x[(j + 4) % 8]) & M32
+    iv0 = int.from_bytes(iv[4:8], "big")
+    iv1 = int.from_bytes(iv[0:4], "big")
+    mh = ((iv1 & 0xFFFF0000) | ((iv0 >> 16) & 0xFFFF)) & M32
+    ml = (((iv1 & 0xFFFF) << 16) | (iv0 & 0xFFFF)) & M32
+    c[0] ^= iv0; c[1] ^= mh; c[2] ^= iv1; c[3] ^= ml
+    c[4] ^= iv0; c[5] ^= mh; c[6] ^= iv1; c[7] ^= ml
+    for _ in range(4):
+        rc(); rx()
+    ks = b""
+    need = skip + len(data)
+    while len(ks) < need:
+        rc(); rx()
+        w = [
+            (x[0] & 0xFFFF) ^ (x[5] >> 16),
+            (x[0] >> 16) ^ (x[3] & 0xFFFF),
+            (x[2] & 0xFFFF) ^ (x[7] >> 16),
+            (x[2] >> 16) ^ (x[5] & 0xFFFF),
+            (x[4] & 0xFFFF) ^ (x[1] >> 16),
+            (x[4] >> 16) ^ (x[7] & 0xFFFF),
+            (x[6] & 0xFFFF) ^ (x[3] >> 16),
+            (x[6] >> 16) ^ (x[1] & 0xFFFF),
+        ]
+        for i in range(7, -1, -1):
+            ks += bytes([(w[i] >> 8) & 0xFF, w[i] & 0xFF])
+    return bytes(d ^ kk for d, kk in zip(data, ks[skip:skip + len(data)]))
+
+
 def encrypt_native_mode(text: str, mode: str) -> str:
     """按请求的编码方式加密 NATIVE 响应（data 字段内容）。"""
     if mode == "xor":
         return xor_encrypt_text(text).decode()
+    if mode == "chacha20":
+        try:
+            from Crypto.Cipher import ChaCha20
+
+            nonce = secrets.token_bytes(12)
+            ck = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
+            enc = ChaCha20.new(key=ck, nonce=nonce)
+            return base64.b64encode(nonce + enc.encrypt(text.encode())).decode()
+        except (ImportError, ValueError, TypeError):
+            return base64.b64encode(text.encode()).decode()
+    if mode == "rabbit":
+        iv = secrets.token_bytes(8)
+        rk = hashlib.md5(PASSWORD.encode()).digest()
+        return base64.b64encode(iv + rabbit_stream(rk, iv, 64, text.encode())).decode()
     if mode in ("aes-ecb", "aes-cbc", "des-ecb"):
         try:
             from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes

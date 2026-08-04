@@ -26,6 +26,16 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
   - stub 与处理器代码仅用 PHP 5 语法（array()/strpos/无 ??/无短数组/
     无 intdiv 等），openssl 加解密函数 crc32b 查表调用（PHP 5.3+）
   - 连接/执行/生成 Webshell 均自动走分阶段会话通道（无需勾选 session）
+- **现代流密码自实现系列（PHP 5+ 纯实现，无扩展依赖，自加密会话形态）**：
+  - `chacha20`：ChaCha20（RFC 8439，TLS 1.3/SSH/WireGuard 标准流密码）
+    密钥 = 密码 md5 hex ASCII（256 位），nonce 12 字节随载荷明文携带；
+    请求 counter=0 / 响应 counter=1，载荷 `b64(nonce+密文)`
+  - `rabbit`：Rabbit（RFC 4503，eSTREAM 最终推荐流密码）
+    密钥 = 密码 md5（128 位），IV 8 字节随载荷携带；请求密钥流偏移 0 /
+    响应偏移 64 字节（平方运算 16 位拆分，任意 PHP int 位宽精确）
+  - 算法在 Rust SDK 与 PHP stub 内各自纯实现（无 openssl/mcrypt），
+    以 RFC 官方向量互验（ChaCha20 块/加密向量、Rabbit 密钥/IV 向量）
+  - 要求 64 位 PHP（32 位位运算不可靠）；PHP 5.2+（无 json 环境除外）
 - **OPSEC 业务伪装**：PHP stub 整体形如正常业务文件（「会话状态查询接口」），
   webshell 功能隐藏在业务函数中（函数名带随机前缀防与站点业务函数冲突）；
   敏感函数名（base64_decode / openssl_decrypt）完全不在代码中出现——运行时
