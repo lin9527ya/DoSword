@@ -106,7 +106,7 @@ export function GenerateShellDialog({
             placeholder="用于派生 XOR 密钥（md5）"
           />
         </label>
-        {encoderId !== "native" && (
+        {!encoderId.startsWith("native") && (
           <label className="confirm-row">
             <input
               type="checkbox"

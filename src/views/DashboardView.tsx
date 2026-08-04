@@ -649,7 +649,7 @@ function ShellDialog({
                 </span>
               </label>
             )}
-            {!editing && protocolId === "builtin.php.v1" && encoderId !== "native" && (
+            {!editing && protocolId === "builtin.php.v1" && !encoderId.startsWith("native") && (
               <label className="confirm-row">
                 <input
                   type="checkbox"

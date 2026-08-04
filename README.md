@@ -8,13 +8,17 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
 - Shell Profile 本地持久化（SQLite，含密码明文——工具惯例，keyring 加密留待后续），支持标签、删除/编辑
 - 审计日志贯穿所有操作（连接 / 命令 / 文件 / 设置），分页查询与 CSV 导出
 - **标准 PHP WebShell 协议**（类蚁剑）：探测、连接、命令执行、文件浏览/读写/上传/下载/删除/重命名/建目录
-- **编码方式（唯一）：NATIVE 内置功能分发**（D盾零检出形态）
+- **编码方式：NATIVE 内置功能分发系列**（同一骨架，D盾零检出形态，载荷加密可选）
   - 功能函数（命令/文件/数据库）直接内置在 stub（业务化命名），
     客户端按操作名 md5 哈希分发调用（stub 仅含哈希数字比较）
-  - 敏感函数（shell_exec/file_get_contents/scandir 等 16 个）全部
+  - 敏感函数（shell_exec/file_get_contents/scandir/openssl_decrypt 等）全部
     crc32b 符号表查表调用，stub 无任何明文敏感函数 / eval / php://input
   - 自定义 HTTP 头鉴权（X-Debug-Key，头名与 token XOR 加密嵌入）
-  - 请求参数业务化 formData；载荷/响应全程 XOR 加密
+  - 请求参数业务化 formData；载荷/响应全程加密，**加密方式可选**：
+    - `native`：XOR 循环加密（md5 派生密钥，默认）
+    - `native_aes_ecb` / `native_aes_cbc`：AES-128（密钥=md5 前 16 字节，
+      CBC 用 md5 后 16 字节作 IV，cipher 名与密钥 XOR 嵌入）
+    - `native_des`：DES-ECB（密钥=md5 前 8 字节）
   - 其余编码器实现代码保留为内部库（不再注册暴露）
 - **OPSEC 业务伪装**：PHP stub 整体形如正常业务文件（「会话状态查询接口」），
   webshell 功能隐藏在业务函数中（函数名带随机前缀防与站点业务函数冲突）；

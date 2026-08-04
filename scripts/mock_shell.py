@@ -35,7 +35,7 @@ def decode_param(value: str) -> str:
 
 
 def decode_payload_mode(x: str) -> tuple:
-    """解码载荷并返回 (明文, 编码方式)。mode: "b64" 或 "xor"。"""
+    """解码载荷并返回 (明文, 编码方式)。mode: "b64"|"xor"|"aes-ecb"|"aes-cbc"|"des-ecb"。"""
     raw = base64.b64decode(x)
     if b"@ini_set" in raw or raw[:1] == b"{" or b"DswSesInit" in raw:
         return raw.decode("utf-8", errors="replace"), "b64"
@@ -43,6 +43,38 @@ def decode_payload_mode(x: str) -> tuple:
     xored = bytes(c ^ key[i % len(key)] for i, c in enumerate(raw))
     if b"@ini_set" in xored or xored[:1] == b"{" or b"DswSesInit" in xored:
         return xored.decode("utf-8", errors="replace"), "xor"
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives import padding as sym_padding
+
+        schemes = [
+            (algorithms.AES(key[:16]), "aes-ecb", None),
+            (algorithms.AES(key[:16]), "aes-cbc", modes.CBC(key[16:])),
+        ]
+        for algo, name, mode_obj in schemes:
+            try:
+                dec = Cipher(algo, mode_obj or modes.ECB()).decryptor()
+                padded = dec.update(raw) + dec.finalize()
+                unpadder = sym_padding.PKCS7(algo.block_size).unpadder()
+                restored = unpadder.update(padded) + unpadder.finalize()
+                if b"@ini_set" in restored or restored[:1] == b"{" or b"DswSesInit" in restored:
+                    return restored.decode("utf-8", errors="replace"), name
+            except Exception:
+                continue
+    except ImportError:
+        pass
+    try:
+        from Crypto.Cipher import DES as PyDes
+
+        dec = PyDes.new(key[:8], PyDes.MODE_ECB)
+        restored = dec.decrypt(raw)
+        pad_len = restored[-1]
+        if pad_len <= 8:
+            restored = restored[:-pad_len]
+        if b"@ini_set" in restored or restored[:1] == b"{" or b"DswSesInit" in restored:
+            return restored.decode("utf-8", errors="replace"), "des-ecb"
+    except ImportError:
+        pass
     raise ValueError("无法识别的载荷编码")
 
 
@@ -267,6 +299,45 @@ def native_handle(req: dict) -> str:
     return json.dumps({"ok": False, "error": f"mock 暂不支持操作：{action}"})
 
 
+def encrypt_native_des(text: str) -> str:
+    """DES-ECB 加密（pycryptodome）。"""
+    try:
+        from Crypto.Cipher import DES as PyDes
+
+        key = hashlib.md5(PASSWORD.encode()).hexdigest().encode()[:8]
+        pad_len = 8 - (len(text.encode()) % 8)
+        padded = text.encode() + bytes([pad_len]) * pad_len
+        enc = PyDes.new(key, PyDes.MODE_ECB)
+        return base64.b64encode(enc.encrypt(padded)).decode()
+    except ImportError:
+        return base64.b64encode(text.encode()).decode()
+
+
+def encrypt_native_mode(text: str, mode: str) -> str:
+    """按请求的编码方式加密 NATIVE 响应（data 字段内容）。"""
+    if mode == "xor":
+        return xor_encrypt_text(text).decode()
+    if mode in ("aes-ecb", "aes-cbc", "des-ecb"):
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.primitives import padding as sym_padding
+
+            key = hashlib.md5(PASSWORD.encode()).hexdigest().encode()
+            if mode == "aes-ecb":
+                cipher = Cipher(algorithms.AES(key[:16]), modes.ECB())
+            elif mode == "aes-cbc":
+                cipher = Cipher(algorithms.AES(key[:16]), modes.CBC(key[16:]))
+            else:
+                return encrypt_native_des(text)
+            padder = sym_padding.PKCS7(cipher.algorithm.block_size).padder()
+            padded = padder.update(text.encode()) + padder.finalize()
+            enc = cipher.encryptor()
+            return base64.b64encode(enc.update(padded) + enc.finalize()).decode()
+        except ImportError:
+            return base64.b64encode(text.encode()).decode()
+    return base64.b64encode(text.encode()).decode()
+
+
 def session_handle(req: dict) -> str:
     """模拟 Godzilla 分阶段载荷的 run()：exec / probe / list 基础操作。"""
     action = req.get("a", "")
@@ -377,14 +448,14 @@ class Handler(BaseHTTPRequestHandler):
         if token != hashlib.md5(PASSWORD.encode()).hexdigest()[:16]:
             return 404, b""
         try:
-            plain = decode_payload(fd)
+            plain, mode = decode_payload_mode(fd)
             req = json.loads(plain)
         except Exception:
-            req = {}
+            req, mode = {}, "b64"
         if not isinstance(req, dict):
             req = {}
         out = native_handle(req)
-        enc = xor_encrypt_text(out).decode()
+        enc = encrypt_native_mode(out, mode)
         return 200, json.dumps({"data": enc, "code": 200}).encode()
 
     @staticmethod

