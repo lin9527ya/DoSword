@@ -15,17 +15,18 @@
 #   Windows 构建: mingw-w64（x86_64-w64-mingw32-gcc）——脚本会自动补装 rust target；
 #                NSIS 打包需要 makensis（sudo apt install nsis）或 wine
 #
-# 产物位置（workspace 化后 target 位于仓库根）：
-#   Linux:    target/release/bundle/          （deb / appimage / rpm）
-#   Windows:  target/x86_64-pc-windows-gnu/release/bundle/   （nsis）
-#   可执行程序: target/dosword-bin/            （独立二进制，免安装直接运行）
+# 产物位置：全部最终产物统一输出到 target/release-artifacts/（免安装二进制 + 安装包）
+#   dosword-linux-x86_64 / dosword-windows-x86_64.exe      独立二进制
+#   DoSword_0.1.0_amd64.deb / .AppImage / .rpm              Linux 安装包
+#   DoSword_0.1.0_x64-setup.exe                             Windows 安装包
+# cargo/tauri 中间产物（target/release 等）勿直接使用
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
-BIN_DIR="target/dosword-bin"
+ARTIFACT_DIR="target/release-artifacts"
 
 # cargo 路径（rustup 安装时不在默认 PATH）
 if [ -f "$HOME/.cargo/env" ]; then
@@ -98,8 +99,12 @@ build_linux() {
     pnpm tauri build --bundles "$bundles"
   fi
 
+  log "==> 汇总 Linux 安装包到 $ARTIFACT_DIR"
+  mkdir -p "$ARTIFACT_DIR"
+  find "target/release/bundle" -type f \( -name "*.deb" -o -name "*.AppImage" -o -name "*.rpm" \) \
+    -exec cp -f {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
   log "==> Linux 产物："
-  list_artifacts "target/release/bundle" "*.deb" "*.AppImage" "*.rpm"
+  list_artifacts "$ARTIFACT_DIR" "*.deb" "*.AppImage" "*.rpm"
 }
 
 build_windows() {
@@ -124,8 +129,12 @@ build_windows() {
   log "==> 交叉编译 Windows 安装包（target: $WINDOWS_TARGET, bundle: $bundles）"
   pnpm tauri build --target "$WINDOWS_TARGET" --bundles "$bundles"
 
+  log "==> 汇总 Windows 安装包到 $ARTIFACT_DIR"
+  mkdir -p "$ARTIFACT_DIR"
+  find "target/$WINDOWS_TARGET/release/bundle" -type f \( -name "*.exe" -o -name "*.msi" \) \
+    -exec cp -f {} "$ARTIFACT_DIR/" \; 2>/dev/null || true
   log "==> Windows 产物："
-  list_artifacts "target/$WINDOWS_TARGET/release/bundle" "*.exe" "*.msi"
+  list_artifacts "$ARTIFACT_DIR" "*.exe" "*.msi"
 }
 
 # 构建单个平台的独立可执行程序。
@@ -137,9 +146,9 @@ build_binary_one() {
     linux)
       log "==> 编译 Linux 可执行程序（release，内嵌前端资源）"
       pnpm tauri build --no-bundle
-      cp target/release/dosword "$BIN_DIR/dosword-linux-x86_64"
+      cp target/release/dosword "$ARTIFACT_DIR/dosword-linux-x86_64"
       log "==> Linux 可执行程序："
-      ls -lh "$BIN_DIR/dosword-linux-x86_64" | awk '{print "  " $5 "  " $9}'
+      ls -lh "$ARTIFACT_DIR/dosword-linux-x86_64" | awk '{print "  " $5 "  " $9}'
       ;;
     windows)
       require_cmd x86_64-w64-mingw32-gcc \
@@ -147,9 +156,9 @@ build_binary_one() {
       ensure_windows_target
       log "==> 交叉编译 Windows 可执行程序（release, target: $WINDOWS_TARGET）"
       pnpm tauri build --no-bundle --target "$WINDOWS_TARGET"
-      cp "target/$WINDOWS_TARGET/release/dosword.exe" "$BIN_DIR/dosword-windows-x86_64.exe"
+      cp "target/$WINDOWS_TARGET/release/dosword.exe" "$ARTIFACT_DIR/dosword-windows-x86_64.exe"
       log "==> Windows 可执行程序："
-      ls -lh "$BIN_DIR/dosword-windows-x86_64.exe" | awk '{print "  " $5 "  " $9}'
+      ls -lh "$ARTIFACT_DIR/dosword-windows-x86_64.exe" | awk '{print "  " $5 "  " $9}'
       ;;
   esac
 }
@@ -163,7 +172,7 @@ build_binary() {
 
   log "==> 构建前端资源（内嵌进二进制，必须最新）"
   pnpm build
-  mkdir -p "$BIN_DIR"
+  mkdir -p "$ARTIFACT_DIR"
 
   case "$platform" in
     all)

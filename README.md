@@ -107,7 +107,8 @@ cargo test --manifest-path src-tauri/Cargo.toml   # 含真实 PHP 往返测试�
 
 - Windows 交叉编译依赖 `mingw-w64`（Ubuntu/Debian：`sudo apt install gcc-mingw-w64-x86-64`），rust target 由脚本自动安装
 - Linux 打包依赖 `librsvg2-dev libayatana-appindicator3-dev patchelf`（缺失时 appimage 会失败，deb 仍可用）
-- 产物目录：`src-tauri/target/<平台>/release/bundle/`
+- 产物目录：全部最终产物统一输出到 `target/release-artifacts/`
+  （独立二进制 dosword-linux-x86_64 / dosword-windows-x86_64.exe + 各平台安装包）
 
 ## 数据库
 
