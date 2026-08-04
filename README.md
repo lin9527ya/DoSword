@@ -19,7 +19,13 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
     - `native_aes_ecb` / `native_aes_cbc`：AES-128（密钥=md5 前 16 字节，
       CBC 用 md5 后 16 字节作 IV，cipher 名与密钥 XOR 嵌入）
     - `native_des`：DES-ECB（密钥=md5 前 8 字节）
-  - 其余编码器实现代码保留为内部库（不再注册暴露）
+- **自加密系列（PHP 5+ 兼容，分阶段会话形态）**：
+  - `aes128_ecb`：AES-128-ECB 自加密（密钥由密码 md5 派生并 XOR 加密嵌入
+    stub，载荷为密文；处理器经 DswSesInit 一次注入，后续请求只传参数）
+  - `aes128_cbc`：AES-128-CBC 自加密（密钥 + IV = md5 前/后 16 字节）
+  - stub 与处理器代码仅用 PHP 5 语法（array()/strpos/无 ??/无短数组/
+    无 intdiv 等），openssl 加解密函数 crc32b 查表调用（PHP 5.3+）
+  - 连接/执行/生成 Webshell 均自动走分阶段会话通道（无需勾选 session）
 - **OPSEC 业务伪装**：PHP stub 整体形如正常业务文件（「会话状态查询接口」），
   webshell 功能隐藏在业务函数中（函数名带随机前缀防与站点业务函数冲突）；
   敏感函数名（base64_decode / openssl_decrypt）完全不在代码中出现——运行时

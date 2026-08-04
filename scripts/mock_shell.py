@@ -463,6 +463,8 @@ class Handler(BaseHTTPRequestHandler):
         """按请求编码方式加密 session 响应。"""
         if mode == "xor":
             return xor_encrypt_text(text)
+        if mode in ("aes-ecb", "aes-cbc", "des-ecb"):
+            return encrypt_native_mode(text, mode).encode()
         return base64.b64encode(text.encode())
 
     def log_message(self, fmt, *args):  # noqa: A003

