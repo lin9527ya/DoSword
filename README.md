@@ -26,8 +26,11 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
   经 crc32b 哈希查表从 get_defined_functions() 解析（哥斯拉式符号表）；
   cipher 名（AES-128-ECB / DES-ECB）以 XOR 十六进制嵌入、运行时解密；
   eval 用大小写混合 + 随机纯字母注释分隔（`eVaL/*rvnd*/(...)`，`eval(` 连续
-  字符串不存在）；参数为业务语义 token/data；密钥由连接密码运行时派生；
-  兼容 PHP 5.3+（自加密编码器需 openssl 扩展）
+  字符串不存在），且 eval 经业务函数包裹 + 局部变量中转（防语义级查杀如 D盾
+  的「内藏 Eval 后门」）；file_get_contents / php://input / 解码函数全部经
+  crc32b 符号表查表调用与字符串拆分，stub 无明文敏感特征；参数为业务语义
+  token/data；密钥由连接密码运行时派生；兼容 PHP 5.3+（自加密编码器需
+  openssl 扩展）
 - **生成 Webshell**：PHP / ASP / ASPX / JSP 四种语言 × 编码器生成服务端 stub（自加密 stub 含 openssl 解密逻辑；当前连接协议仅 PHP 可用）
 - 分块上传下载（4MB 块 + fseek），上传带进度条
 - **数据库管理**（PDO，MySQL / PostgreSQL / SQLite）：连接探测、数据库/表浏览、SQL 执行、结果网格
