@@ -115,6 +115,20 @@ pub trait Protocol: Send + Sync {
         settings: &AppSettings,
     ) -> Result<(), ProtocolError>;
 
+    /// 执行一段目标语言代码（功能插件通道）。默认协议不支持；
+    /// PHP 协议以「临时文件部署 + HTTP 请求」实现，JSP/ASP 待协议实现后补齐。
+    fn run_code(
+        &self,
+        _session: &dyn SessionState,
+        _language: &str,
+        _code: &str,
+        _settings: &AppSettings,
+    ) -> Result<String, ProtocolError> {
+        Err(ProtocolError::NotSupported(
+            "该协议不支持代码执行通道".to_string(),
+        ))
+    }
+
     /// 新建目录（递归创建中间目录）。默认不支持，协议按需覆盖。
     fn create_dir(
         &self,

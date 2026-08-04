@@ -26,6 +26,25 @@ import type {
 
 export type * from "./generated/domain";
 
+// 功能插件类型（ts-rs 生成的 domain.ts 未包含，本地定义）
+export type ParamSpec = {
+  name: string;
+  label: string;
+  type: string;
+  default: string | number | boolean | null;
+  options: string[] | null;
+};
+
+export type FeatureManifest = {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  category: string;
+  languages: string[];
+  params: ParamSpec[];
+};
+
 // --- invoke 封装 ---
 
 export const api = {
@@ -64,6 +83,13 @@ export const api = {
   deleteShell: (shellId: string) => invoke<void>("delete_shell", { shellId }),
   listProtocols: () => invoke<ProtocolMeta[]>("list_protocols"),
   listPlugins: () => invoke<PluginManifest[]>("list_plugins"),
+  listFeaturePlugins: () => invoke<FeatureManifest[]>("list_feature_plugins"),
+  runFeaturePlugin: (
+    sessionId: string,
+    pluginId: string,
+    params: Record<string, unknown>,
+  ) => invoke<Record<string, unknown>>("run_feature_plugin", { sessionId, pluginId, params }),
+  refreshShellStatus: () => invoke<ShellProfile[]>("refresh_shell_status"),
   listEncoders: () => invoke<[string, string][]>("list_encoders"),
   generateShell: (language: string, encoderId: string, password: string, session: boolean) =>
     invoke<GenerateShellResult>("generate_shell", { language, encoderId, password, session }),

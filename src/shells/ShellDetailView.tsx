@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowLeft, Database, FileCode2, Info, LoaderCircle, TerminalSquare, Unplug } from "lucide-react";
+import { ArrowLeft, Database, FileCode2, Info, LoaderCircle, Puzzle, TerminalSquare, Unplug } from "lucide-react";
 import { api, errorText, shortTime } from "../api";
 import type { ConnectResult, ShellProfile } from "../api";
 import { ErrorBanner } from "../components/common";
 import { Terminal } from "../widgets/Terminal";
 import { FileManager } from "../widgets/FileManager";
 import { DatabaseManager } from "../widgets/DatabaseManager";
+import { PluginPanel } from "../widgets/PluginPanel";
 import type { View } from "../views/types";
 
-type Tab = "info" | "files" | "terminal" | "database";
+type Tab = "info" | "files" | "terminal" | "database" | "plugins";
 
 type TerminalTab = { id: number; dir: string };
 
@@ -131,6 +132,7 @@ export function ShellDetailView({
     ...(supports("terminal")
       ? [{ key: "terminal" as Tab, label: "终端", icon: <TerminalSquare size={15} /> }]
       : []),
+    { key: "plugins", label: "插件", icon: <Puzzle size={15} /> },
   ];
 
   return (
@@ -200,6 +202,12 @@ export function ShellDetailView({
         <div className="panel detail-panel">
           <p className="muted pad">连接成功后才能浏览数据库。</p>
         </div>
+      )}
+      {tab === "plugins" && sessionId && (
+        <PluginPanel sessionId={sessionId} />
+      )}
+      {tab === "plugins" && !sessionId && (
+        <p className="panel-note">请先连接 Shell 后使用插件面板。</p>
       )}
       {tab === "terminal" && sessionId && (
         <div className="panel detail-panel terminal-panel">

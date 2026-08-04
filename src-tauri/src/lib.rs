@@ -15,6 +15,7 @@ pub struct AppState {
     database: Mutex<Database>,
     sessions: Mutex<SessionManager>,
     protocols: ProtocolRegistry,
+    feature_plugins: dosword_sdk::FeaturePluginRegistry,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -30,6 +31,7 @@ pub fn run() {
                 database: Mutex::new(database),
                 sessions: Mutex::new(SessionManager::new()),
                 protocols: ProtocolRegistry::builtin(),
+                feature_plugins: dosword_sdk::FeaturePluginRegistry::builtin(),
             });
             Ok(())
         })
@@ -44,6 +46,9 @@ pub fn run() {
             commands::probe_shell,
             commands::list_protocols,
             commands::list_plugins,
+            commands::list_feature_plugins,
+            commands::run_feature_plugin,
+            commands::refresh_shell_status,
             commands::list_encoders,
             commands::generate_shell,
             commands::list_audit,

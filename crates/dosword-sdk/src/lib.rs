@@ -6,6 +6,7 @@
 pub mod domain;
 pub mod crypto;
 pub mod encoder;
+pub mod feature_plugins;
 pub mod plugin;
 pub mod protocol;
 
@@ -16,5 +17,8 @@ pub use encoder::{
     EncoderRegistry, NativeEncoder, PayloadEncoder, PhpStreamEncoder, STUB_LANGUAGES,
     XorBase64Encoder, XorBodyEncoder, XorSessionEncoder,
 };
-pub use plugin::{PluginKind, PluginManifest, PluginRegistry, ProtocolPlugin};
+pub use plugin::{
+    FeatureManifest, FeaturePlugin, FeaturePluginRegistry, ParamSpec, PluginKind,
+    PluginManifest, PluginRegistry, ProtocolPlugin,
+};
 pub use protocol::{Protocol, ProtocolError, SessionState};

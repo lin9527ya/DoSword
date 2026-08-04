@@ -279,6 +279,16 @@ impl Database {
             .optional()
     }
 
+    /// 更新 Shell 状态（online / error）与最近连接时间。
+    pub fn update_shell_status(&self, id: &str, status: &str) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE shell_profiles SET status = ?1, last_connected_at = datetime('now')
+             WHERE id = ?2",
+            params![status, id],
+        )?;
+        Ok(())
+    }
+
     pub fn record_probe(
         &self,
         shell: &ShellProfile,
@@ -370,7 +380,7 @@ impl Database {
             .collect()
     }
 
-    fn list_shells(&self) -> rusqlite::Result<Vec<ShellProfile>> {
+    pub fn list_shells(&self) -> rusqlite::Result<Vec<ShellProfile>> {
         let mut statement = self.connection.prepare(
             "SELECT id, workspace_id, name, endpoint, runtime, protocol_id, password,
                     protocol_params, authorization_ack, status, last_connected_at, created_at,

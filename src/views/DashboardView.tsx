@@ -77,6 +77,14 @@ export function DashboardView({
     void loadDashboard();
   }, [loadDashboard]);
 
+  // Shell 状态自动刷新（60s 轮询，仅更新在线/错误状态）
+  useEffect(() => {
+    const timer = setInterval(() => {
+      void api.refreshShellStatus().then(() => loadDashboard()).catch(() => {});
+    }, 60_000);
+    return () => clearInterval(timer);
+  }, [loadDashboard]);
+
   const allTags = useMemo(() => {
     const tags = new Set<string>();
     for (const shell of data.shells) for (const tag of shell.tags) tags.add(tag);

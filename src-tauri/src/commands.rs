@@ -526,6 +526,94 @@ pub fn list_protocols(state: State<'_, AppState>) -> Vec<ProtocolMeta> {
     state.protocols.protocol_metas()
 }
 
+/// 功能插件列表（ZIP / 进程 / 端口扫描 / bypass 等）。
+#[tauri::command]
+pub fn list_feature_plugins(state: State<'_, AppState>) -> Vec<dosword_sdk::FeatureManifest> {
+    state.feature_plugins.list()
+}
+
+/// 在已连接会话上执行功能插件。
+#[tauri::command]
+pub async fn run_feature_plugin(
+    session_id: String,
+    plugin_id: String,
+    params: serde_json::Value,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    blocking(app, move |state| {
+        let (session, protocol_id, runtime) = {
+            let mut sessions = state.sessions.lock().map_err(|_| "会话锁异常".to_string())?;
+            let session = sessions
+                .get_mut(&session_id)
+                .map_err(|error| error.to_string())?;
+            let runtime = {
+                let database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
+                database
+                    .shell(&session.profile_id)
+                    .map_err(|error| error.to_string())?
+                    .map(|shell| shell.runtime)
+                    .unwrap_or_else(|| "php".to_string())
+            };
+            (
+                session.state.clone(),
+                session.protocol_id.clone(),
+                runtime,
+            )
+        };
+        let protocol = state
+            .protocols
+            .get(&protocol_id)
+            .ok_or_else(|| format!("未知协议：{protocol_id}"))?;
+        let plugin = state
+            .feature_plugins
+            .get(&plugin_id)
+            .ok_or_else(|| format!("未知功能插件：{plugin_id}"))?;
+        let settings = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .get_settings()
+            .map_err(|error| error.to_string())?;
+        plugin
+            .execute(protocol, session.as_ref(), &runtime, &params, &settings)
+            .map_err(|error| format!("插件执行失败：{error}"))
+    })
+    .await
+}
+
+/// 刷新全部 Shell 状态（逐个探测，更新 status / last_connected_at），返回最新列表。
+#[tauri::command]
+pub async fn refresh_shell_status(app: AppHandle) -> Result<Vec<ShellProfile>, String> {
+    blocking(app, move |state| {
+        let (shells, settings) = {
+            let database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
+            let shells = database.list_shells().map_err(|error| error.to_string())?;
+            let settings = database.get_settings().map_err(|error| error.to_string())?;
+            (shells, settings)
+        };
+        for shell in &shells {
+            let protocol = state
+                .protocols
+                .get(&shell.protocol_id)
+                .ok_or_else(|| format!("未知协议：{}", shell.protocol_id))?;
+            let status = match protocol.probe(shell, &settings) {
+                Ok(_) => "online".to_string(),
+                Err(_) => "error".to_string(),
+            };
+            let _ = state.database.lock().map_err(|_| "数据库锁异常".to_string()).and_then(
+                |database| {
+                    database
+                        .update_shell_status(&shell.id, &status)
+                        .map_err(|error| error.to_string())
+                },
+            );
+        }
+        let database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
+        database.list_shells().map_err(|error| error.to_string())
+    })
+    .await
+}
+
 #[tauri::command]
 pub fn list_plugins(state: State<'_, AppState>) -> Vec<PluginManifest> {
     state.protocols.plugin_manifests()
@@ -1081,6 +1169,7 @@ mod tests {
             database: Mutex::new(Database::open(":memory:").unwrap()),
             sessions: Mutex::new(SessionManager::new()),
             protocols: ProtocolRegistry::builtin(),
+            feature_plugins: dosword_sdk::FeaturePluginRegistry::builtin(),
         }
     }
 

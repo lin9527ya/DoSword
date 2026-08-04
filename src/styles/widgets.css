@@ -537,3 +537,19 @@
   color: var(--text-faint);
   font-style: italic;
 }
+
+/* --- 功能插件面板 --- */
+.plugin-panel { display: flex; gap: 16px; min-height: 420px; }
+.plugin-sidebar { width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); padding-right: 12px; display: flex; flex-direction: column; gap: 4px; }
+.plugin-group { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 8px 0 2px; }
+.plugin-item { text-align: left; padding: 8px 10px; border-radius: 8px; border: none; background: none; cursor: pointer; font-size: 13px; color: var(--text); }
+.plugin-item:hover { background: var(--bg-hover); }
+.plugin-item.active { background: var(--accent); color: var(--accent-contrast); }
+.plugin-main { flex: 1; display: flex; flex-direction: column; gap: 10px; }
+.plugin-main h3 { margin: 0; font-size: 15px; }
+.plugin-param { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.plugin-param input { max-width: 320px; }
+.plugin-result { background: var(--bg-code, #0f1117); color: #9fe8b0; padding: 12px; border-radius: 8px; overflow: auto; max-height: 320px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+.plugin-result.error { color: #ff8f8f; }
+.spin { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
