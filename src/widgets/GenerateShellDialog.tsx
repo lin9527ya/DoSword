@@ -23,7 +23,7 @@ export function GenerateShellDialog({
 }) {
   const [language, setLanguage] = useState("php");
   const [encoders, setEncoders] = useState<[string, string][]>([]);
-  const [encoderId, setEncoderId] = useState("xor_base64");
+  const [encoderId, setEncoderId] = useState("native");
   const [password, setPassword] = useState("");
   const [session, setSession] = useState(false);
   const [result, setResult] = useState<GenerateShellResult | null>(null);
@@ -106,14 +106,16 @@ export function GenerateShellDialog({
             placeholder="用于派生 XOR 密钥（md5）"
           />
         </label>
-        <label className="confirm-row">
-          <input
-            type="checkbox"
-            checked={session}
-            onChange={(event) => setSession(event.target.checked)}
-          />
-          <span>分阶段会话模式（Godzilla 风格：代码一次注入，之后仅传参数）</span>
-        </label>
+        {encoderId !== "native" && (
+          <label className="confirm-row">
+            <input
+              type="checkbox"
+              checked={session}
+              onChange={(event) => setSession(event.target.checked)}
+            />
+            <span>分阶段会话模式（Godzilla 风格：代码一次注入，之后仅传参数）</span>
+          </label>
+        )}
         <button className="button primary" onClick={() => void generate()} disabled={busy}>
           {busy ? <LoaderCircle className="spin" size={15} /> : null}
           {busy ? "生成中…" : "生成"}

@@ -243,6 +243,30 @@ def xor_encrypt_text(text: str) -> bytes:
     return base64.b64encode(xor_bytes(text.encode()))
 
 
+def native_handle(req: dict) -> str:
+    """NATIVE 分发模拟：返回纯 JSON 结果（无帧）。"""
+    action = req.get("a", "")
+    if action == "probe":
+        return json.dumps({"ok": True, "data": {
+            "server": "Mock Linux 6.x (mock_shell.py)", "web_server": "Python http.server",
+            "php_version": "8.2.0 (模拟)", "current_dir": ROOT, "separator": "/"}})
+    if action == "exec":
+        return json.dumps({"ok": True, "data": {
+            "stdout": base64.b64encode(f"[mock] 已执行：{req.get('c', '')}".encode()).decode(),
+            "cwd": ROOT}})
+    if action == "list":
+        entries = []
+        path = str(req.get("p", ROOT))
+        if os.path.isdir(path):
+            for name in sorted(os.listdir(path)):
+                full = os.path.join(path, name)
+                entries.append({"name": name, "path": full, "is_dir": os.path.isdir(full),
+                                "size": 0 if os.path.isdir(full) else os.path.getsize(full),
+                                "mtime": int(os.path.getmtime(full))})
+        return json.dumps({"ok": True, "data": {"entries": entries}})
+    return json.dumps({"ok": False, "error": f"mock 暂不支持操作：{action}"})
+
+
 def session_handle(req: dict) -> str:
     """模拟 Godzilla 分阶段载荷的 run()：exec / probe / list 基础操作。"""
     action = req.get("a", "")
@@ -292,12 +316,21 @@ class Handler(BaseHTTPRequestHandler):
         # 标准参数（k/x）、业务伪装参数（token/data）与 body 直传（php_stream）均支持
         k = params.get("k", [""])[0] or params.get("token", [""])[0]
         x = params.get("x", [""])[0] or params.get("data", [""])[0]
-        if x == "" and k == "":
+        fd = params.get("formData", [""])[0]
+        if fd != "":
+            # NATIVE 分发：formData 参数 + X-Debug-Key 头鉴权（模拟）
+            status, body = self.handle_native(fd)
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        elif x == "" and k == "":
             # body 直传模式（php_stream）：无表单参数，stub 无鉴权
             x = raw_body
-
-        if k != PASSWORD and not (k == "" and x != ""):
-            # 仅当存在密码参数且不匹配时拒绝；body 直传模式（php_stream）无鉴权
+            body = self.handle_payload(x)
+        elif k != PASSWORD:
             body = b"AUTH_FAIL"
         else:
             body = self.handle_payload(x)
@@ -309,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def handle_payload(self, x: str) -> bytes:
-        """区分协议代码（xor_body 等）与分阶段载荷（session 模式）并应答。"""
+        """区分协议代码（xor_body 等）、分阶段载荷（session 模式）与 NATIVE 分发并应答。"""
         # 识别请求编码方式：XOR 密文或明文 base64（决定 session 响应加密方式）
         mode = "b64"
         try:
@@ -337,6 +370,22 @@ class Handler(BaseHTTPRequestHandler):
             nonce = match.group(1)
         payload = base64.b64encode(json.dumps(result).encode()).decode()
         return f"{nonce}{payload}{nonce}".encode()
+
+    def handle_native(self, fd: str):
+        """NATIVE 分发模拟：返回 (status, body)。鉴权失败 404，成功返回 XOR 加密 JSON。"""
+        token = self.headers.get("X-Debug-Key", "")
+        if token != hashlib.md5(PASSWORD.encode()).hexdigest()[:16]:
+            return 404, b""
+        try:
+            plain = decode_payload(fd)
+            req = json.loads(plain)
+        except Exception:
+            req = {}
+        if not isinstance(req, dict):
+            req = {}
+        out = native_handle(req)
+        enc = xor_encrypt_text(out).decode()
+        return 200, json.dumps({"data": enc, "code": 200}).encode()
 
     @staticmethod
     def encrypt(text: str, mode: str) -> bytes:

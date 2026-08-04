@@ -8,21 +8,14 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
 - Shell Profile 本地持久化（SQLite，含密码明文——工具惯例，keyring 加密留待后续），支持标签、删除/编辑
 - 审计日志贯穿所有操作（连接 / 命令 / 文件 / 设置），分页查询与 CSV 导出
 - **标准 PHP WebShell 协议**（类蚁剑）：探测、连接、命令执行、文件浏览/读写/上传/下载/删除/重命名/建目录
-- **编码器体系**（哥斯拉风格，8 种）：
-  - `base64` 经典裸编码 / `xor_base64` 异或混淆 + Base64
-  - `aes128_ecb` / `aes128_cbc` / `des` 自加密（密钥由密码 md5 派生并内嵌 stub，载荷为密文）
-  - `char` 字符数组混淆 / `php_obfuscate` base64+反转混淆（无密钥，混淆在载荷内）
-  - `php_stream` 零敏感函数 stub（`INCLUDE("php://filter/...php://input")` 一行，需 allow_url_include=On）
-  - `xor_body` Godzilla 风格请求体 XOR 直传（`file_get_contents('php://input')`，默认配置可用）
-  - `xor_session` Godzilla 分阶段载荷：处理器代码一次注入服务端 session，
-    后续请求只传参数（全功能处理器：命令/文件/数据库），默认配置可用
-  - `native` 内置功能分发（对齐 D盾零检出形态）：功能函数直接内置在
-    stub（业务化命名），客户端按操作名 md5 哈希分发调用；敏感函数全部
-    crc32b 查表；自定义 HTTP 头鉴权；**无 eval / 无敏感函数特征**
-- **分阶段会话模式（session）应用到全部编码器**：任意编码器可通过
-  protocol_params `"session": true` 启用 Godzilla 分阶段机制（代码一次注入、
-  参数化调用、请求/响应全程编码器加密）；生成 Webshell / 登记 Shell 均有
-  对应选项；session 化后 stub 不含任何明文代码片段
+- **编码方式（唯一）：NATIVE 内置功能分发**（D盾零检出形态）
+  - 功能函数（命令/文件/数据库）直接内置在 stub（业务化命名），
+    客户端按操作名 md5 哈希分发调用（stub 仅含哈希数字比较）
+  - 敏感函数（shell_exec/file_get_contents/scandir 等 16 个）全部
+    crc32b 符号表查表调用，stub 无任何明文敏感函数 / eval / php://input
+  - 自定义 HTTP 头鉴权（X-Debug-Key，头名与 token XOR 加密嵌入）
+  - 请求参数业务化 formData；载荷/响应全程 XOR 加密
+  - 其余编码器实现代码保留为内部库（不再注册暴露）
 - **OPSEC 业务伪装**：PHP stub 整体形如正常业务文件（「会话状态查询接口」），
   webshell 功能隐藏在业务函数中（函数名带随机前缀防与站点业务函数冲突）；
   敏感函数名（base64_decode / openssl_decrypt）完全不在代码中出现——运行时

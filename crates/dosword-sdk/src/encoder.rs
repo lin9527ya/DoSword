@@ -317,20 +317,10 @@ static GLOBAL_ENCODERS: std::sync::LazyLock<EncoderRegistry> =
 
 impl EncoderRegistry {
     pub fn builtin() -> Self {
+        // 唯一编码方式：NATIVE（内置功能分发，无 eval / 无敏感特征，D盾零检出）。
+        // 其余编码器实现代码保留为内部库，不再注册暴露。
         Self {
-            encoders: vec![
-                Box::new(XorBase64Encoder),
-                Box::new(Base64Encoder),
-                Box::new(Aes128EcbEncoder),
-                Box::new(Aes128CbcEncoder),
-                Box::new(DesEcbEncoder),
-                Box::new(CharEncoder),
-                Box::new(PhpObfuscateEncoder),
-                Box::new(PhpStreamEncoder),
-                Box::new(XorBodyEncoder),
-                Box::new(XorSessionEncoder),
-                Box::new(NativeEncoder),
-            ],
+            encoders: vec![Box::new(NativeEncoder)],
         }
     }
 
@@ -2041,22 +2031,7 @@ mod tests {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-        assert_eq!(
-            ids,
-            vec![
-                "aes128_cbc",
-                "aes128_ecb",
-                "base64",
-                "char",
-                "des",
-                "native",
-                "php_obfuscate",
-                "php_stream",
-                "xor_base64",
-                "xor_body",
-                "xor_session",
-            ]
-        );
+        assert_eq!(ids, vec!["native"], "注册表应仅暴露 native 编码器");
     }
 
     // --- PHP_STREAM：零敏感函数 stub ---

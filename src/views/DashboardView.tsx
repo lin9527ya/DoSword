@@ -506,7 +506,7 @@ function ShellDialog({
   const [protocols, setProtocols] = useState<ProtocolMeta[]>([]);
   const [protocolId, setProtocolId] = useState(initial?.protocolId ?? "builtin.mock.v1");
   const [encoders, setEncoders] = useState<[string, string][]>([]);
-  const [encoderId, setEncoderId] = useState("xor_base64");
+  const [encoderId, setEncoderId] = useState("native");
   const [sessionMode, setSessionMode] = useState(false);
   const [settings, setSettings] = useState<{ httpEnabled: boolean }>({ httpEnabled: false });
   const [busy, setBusy] = useState(false);
@@ -649,7 +649,7 @@ function ShellDialog({
                 </span>
               </label>
             )}
-            {!editing && protocolId === "builtin.php.v1" && (
+            {!editing && protocolId === "builtin.php.v1" && encoderId !== "native" && (
               <label className="confirm-row">
                 <input
                   type="checkbox"
