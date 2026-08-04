@@ -1166,7 +1166,7 @@ fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, Protocol
 /// 是否启用分发通道（分阶段载荷 session 模式 或 NATIVE 内置分发）。
 /// 自加密编码器本身即分阶段会话形态（密钥内嵌 + DswSesInit 注入），恒走会话通道。
 fn always_session(encoder_id: &str) -> bool {
-    matches!(encoder_id, "aes128_ecb" | "aes128_cbc" | "chacha20" | "rabbit")
+    matches!(encoder_id, "aes128_ecb" | "aes128_cbc")
 }
 
 fn is_session(php: &PhpSession) -> bool {
@@ -1561,7 +1561,8 @@ mod tests {
         // 每个编码器的生成 stub 都做真实执行验证（防止模板双重调用等 bug 漏网）
         let encoders = [
             "native", "native_aes_ecb", "native_aes_cbc", "native_des",
-            "aes128_ecb", "aes128_cbc", "chacha20", "rabbit",
+            "native_chacha20", "native_rabbit",
+            "aes128_ecb", "aes128_cbc",
         ];
         let settings = settings();
         for encoder_id in encoders {
@@ -1595,7 +1596,8 @@ mod tests {
         // Godzilla 分阶段载荷应用到所有编码器：每个编码器以 session 模式真实往返
         let encoders = [
             "native", "native_aes_ecb", "native_aes_cbc", "native_des",
-            "aes128_ecb", "aes128_cbc", "chacha20", "rabbit",
+            "native_chacha20", "native_rabbit",
+            "aes128_ecb", "aes128_cbc",
         ];
         let settings = settings();
         for encoder_id in encoders {
