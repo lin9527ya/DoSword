@@ -140,6 +140,10 @@ export function Terminal({
     const term = new XTerm({
       fontFamily: '"IBM Plex Mono", monospace',
       fontSize: 13,
+      // 输出中的 
+ 自动转 
+（否则 ls 等列对齐输出光标不回到行首导致错乱）
+      convertEol: true,
       theme: {
         background: "#111310",
         foreground: "#d6d8d2",
