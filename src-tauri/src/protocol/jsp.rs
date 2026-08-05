@@ -531,6 +531,117 @@ impl Protocol for AspNetProtocol {
     }
 }
 
+/// 经典 ASP 协议（builtin.asp.v1，VBScript stub，XOR 载荷）。
+pub struct AspProtocol;
+
+impl Protocol for AspProtocol {
+    fn id(&self) -> &'static str {
+        "builtin.asp.v1"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "ASP（VBScript，XOR 载荷）"
+    }
+
+    fn requires_network(&self) -> bool {
+        true
+    }
+
+    fn probe(
+        &self,
+        profile: &ShellProfile,
+        settings: &AppSettings,
+    ) -> Result<ProbeResult, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.asp.v1", display_name: "" }.probe(profile, settings)
+    }
+
+    fn connect(
+        &self,
+        profile: &ShellProfile,
+        settings: &AppSettings,
+    ) -> Result<(Box<dyn SessionState>, ProbeResult), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.asp.v1", display_name: "" }.connect(profile, settings)
+    }
+
+    fn execute_command(
+        &self,
+        session: &dyn SessionState,
+        command: &str,
+        settings: &AppSettings,
+    ) -> Result<CommandOutput, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.asp.v1", display_name: "" }.execute_command(session, command, settings)
+    }
+
+    fn list_dir(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<DirListing, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.asp.v1", display_name: "" }.list_dir(session, path, settings)
+    }
+
+    fn read_file(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.asp.v1", display_name: "" }.read_file(session, path, settings)
+    }
+
+    fn write_file(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        content: &[u8],
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.asp.v1", display_name: "" }.write_file(session, path, content, settings)
+    }
+
+    fn delete_path(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.asp.v1", display_name: "" }.delete_path(session, path, settings)
+    }
+
+    fn rename_path(
+        &self,
+        session: &dyn SessionState,
+        from: &str,
+        to: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.asp.v1", display_name: "" }.rename_path(session, from, to, settings)
+    }
+
+    fn create_dir(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.asp.v1", display_name: "" }.create_dir(session, path, settings)
+    }
+}
+
+impl dosword_sdk::ProtocolPlugin for AspProtocol {
+    fn manifest(&self) -> dosword_sdk::PluginManifest {
+        dosword_sdk::PluginManifest {
+            id: self.id().to_string(),
+            name: self.display_name().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            kind: dosword_sdk::PluginKind::Protocol,
+            description: "经典 ASP WebShell（VBScript）：命令执行、文件管理（XOR 载荷）。".to_string(),
+            capabilities: vec!["files".into(), "terminal".into()],
+        }
+    }
+}
+
 /// 环境信息缓存（供 connect 后的文件操作取 cwd/separator）。
 pub fn session_info(session: &dyn SessionState) -> Option<ProbeResult> {
     let jsp = session.as_any().downcast_ref::<JspSession>()?;
@@ -695,6 +806,38 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
         let mut bad = profile(&url);
         bad.password = "wrong".into();
         assert!(protocol.probe(&bad, &settings).is_err());
+    }
+
+    #[test]
+    fn asp_protocol_round_trip_against_mock_server() {
+        let script = std::env::temp_dir().join("dosword_jsp_mock.py");
+        let _ = std::fs::write(&script, JSP_MOCK);
+        let port: u16 = 22000 + (std::process::id() % 500) as u16;
+        let _child = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(port.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let url = format!("http://127.0.0.1:{port}/shell.asp");
+        let settings = settings();
+        let mut p = profile(&url);
+        p.protocol_id = "builtin.asp.v1".into();
+        let protocol = AspProtocol;
+        let (session, info) = protocol.connect(&p, &settings).unwrap();
+        assert_eq!(info.current_dir, "/tmp");
+        let out = protocol.execute_command(session.as_ref(), "dir", &settings).unwrap();
+        assert_eq!(out.stdout, "echo:dir");
+        let listing = protocol.list_dir(session.as_ref(), "/", &settings).unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        // stub 生成
+        let stub = NativeEncoder { crypto: "xor" }.stub("asp", "secret").unwrap();
+        assert!(stub.contains("WScript.Shell"), "ASP stub 应含命令执行");
+        assert!(stub.contains("ADODB.Stream"), "ASP stub 应含二进制文件 I/O");
+        assert!(!stub.contains("{xk}"), "占位符应已替换");
     }
 
     #[test]

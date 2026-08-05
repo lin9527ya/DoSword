@@ -27,6 +27,7 @@ impl ProtocolRegistry {
             Box::new(php::PhpProtocol),
             Box::new(jsp::JspProtocol),
             Box::new(jsp::AspNetProtocol),
+            Box::new(jsp::AspProtocol),
             Box::new(dosword_plugin_echo::EchoProtocol),
         ] {
             inner

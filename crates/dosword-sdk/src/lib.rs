@@ -6,6 +6,7 @@
 pub mod domain;
 pub mod crypto;
 pub mod encoder;
+pub mod asp_stub;
 pub mod feature_plugins;
 pub mod jsp_stub;
 pub mod plugin;
