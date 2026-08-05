@@ -140,7 +140,6 @@ export function Terminal({
     const term = new XTerm({
       fontFamily: '"IBM Plex Mono", monospace',
       fontSize: 13,
-      // 输出中的 
       // 输出换行自动转 CRLF（修复 ls 等列对齐输出错乱）
       convertEol: true,
       theme: {
