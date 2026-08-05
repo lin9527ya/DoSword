@@ -18,8 +18,8 @@ pub use encoder::{
     XorBase64Encoder, XorBodyEncoder, XorSessionEncoder,
 };
 pub use plugin::{
-    FeatureManifest, FeaturePlugin, FeaturePluginRegistry, ParamSpec, PluginExecution,
-    PluginKind, PluginManifest, PluginRegistry, ProtocolPlugin, ScriptFeaturePlugin,
-    ScriptPluginDef,
+    FeatureManifest, FeaturePlugin, FeaturePluginRegistry, NativePlugin,
+    NativePluginAbi, ParamSpec, PluginExecution, PluginKind, PluginManifest,
+    PluginRegistry, ProtocolPlugin, ScriptFeaturePlugin, ScriptPluginDef,
 };
 pub use protocol::{Protocol, ProtocolError, SessionState};

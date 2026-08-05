@@ -578,3 +578,116 @@ mod feature_tests {
         assert!(r.register(Box::new(crate::feature_plugins::ProcessesPlugin)).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// 二进制插件（Native .plugin）：Rust cdylib，运行时 dlopen 加载。
+// 导出宏生成 C ABI 符号（magic/version/manifest/execute），宿主用 libloading 加载。
+// v1 约定：execute 为纯逻辑（无协议句柄）；需要命令/代码通道的插件用脚本型 .plugin。
+// ---------------------------------------------------------------------------
+
+/// 二进制插件：纯逻辑执行（runtime + 参数 → JSON）。
+pub trait NativePlugin: Send + Sync {
+    fn manifest(&self) -> FeatureManifest;
+    fn execute_native(
+        &self,
+        runtime: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
+}
+
+/// 二进制插件 C ABI（#[repr(C)]，跨 crate 稳定布局）。
+/// 内部仅为函数指针与整数，跨线程安全。
+#[repr(C)]
+pub struct NativePluginAbi {
+    /// 内部字段见下（unsafe impl Sync 见文件尾）。
+    /// 魔数 "DSWD"。
+    pub magic: u32,
+    /// ABI 版本（当前 1）。
+    pub version: u32,
+    /// 返回清单 JSON（静态字符串，无需释放）。
+    pub manifest_json: extern "C" fn() -> *const std::ffi::c_char,
+    /// 执行：runtime + 参数 JSON → 结果 JSON（宿主调用 free_json 释放）。
+    pub execute_json:
+        extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char) -> *mut std::ffi::c_char,
+    /// 释放 execute_json 返回的字符串。
+    pub free_json: extern "C" fn(*mut std::ffi::c_char),
+}
+
+/// 导出二进制插件：插件类型需为 unit struct（常量构造），实现 `NativePlugin`。
+/// 用法：
+/// ```ignore
+/// use dosword_sdk::{export_dosword_plugin, NativePlugin, FeatureManifest, ParamSpec};
+/// pub struct DemoPlugin;
+/// impl NativePlugin for DemoPlugin { ... }
+/// export_dosword_plugin!(DemoPlugin);
+/// ```
+#[macro_export]
+macro_rules! export_dosword_plugin {
+    ($plugin:ident) => {
+        static DOSWORD_PLUGIN_INSTANCE: $plugin = $plugin;
+
+        extern "C" fn __dosword_manifest_json() -> *const std::ffi::c_char {
+            static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let ptr = *CELL.get_or_init(|| {
+                let json = serde_json::to_string(&DOSWORD_PLUGIN_INSTANCE.manifest())
+                    .unwrap_or_else(|_| "{}".to_string());
+                let leaked: &'static mut str = Box::leak(json.into_boxed_str());
+                leaked.as_ptr() as usize
+            });
+            ptr as *const std::ffi::c_char
+        }
+
+        extern "C" fn __dosword_execute_json(
+            runtime: *const std::ffi::c_char,
+            params_json: *const std::ffi::c_char,
+        ) -> *mut std::ffi::c_char {
+            use std::ffi::CStr;
+            let runtime = unsafe { CStr::from_ptr(runtime) }
+                .to_str()
+                .unwrap_or("")
+                .to_string();
+            let params: serde_json::Value = if params_json.is_null() {
+                serde_json::Value::Null
+            } else {
+                unsafe { CStr::from_ptr(params_json) }
+                    .to_str()
+                    .map(|s| serde_json::from_str(s).unwrap_or(serde_json::Value::Null))
+                    .unwrap_or(serde_json::Value::Null)
+            };
+            let result = DOSWORD_PLUGIN_INSTANCE.execute_native(&runtime, &params);
+            let json = match result {
+                Ok(value) => serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()),
+                Err(error) => serde_json::json!({ "ok": false, "error": error }).to_string(),
+            };
+            let leaked: &'static mut str = Box::leak(json.into_boxed_str());
+            leaked.as_mut_ptr() as *mut std::ffi::c_char
+        }
+
+        extern "C" fn __dosword_free_json(ptr: *mut std::ffi::c_char) {
+            if ptr.is_null() {
+                return;
+            }
+            unsafe {
+                let _ = Box::from_raw(std::ffi::CStr::from_ptr(ptr).to_bytes_with_nul() as *const [u8]
+                    as *mut [u8]);
+            }
+        }
+
+        /// ABI 入口符号。
+        #[unsafe(no_mangle)]
+        pub extern "C" fn dosword_plugin_abi() -> *const dosword_sdk::NativePluginAbi {
+            static ABI: dosword_sdk::NativePluginAbi = dosword_sdk::NativePluginAbi {
+                magic: 0x4453_5744,
+                version: 1,
+                manifest_json: __dosword_manifest_json,
+                execute_json: __dosword_execute_json,
+                free_json: __dosword_free_json,
+            };
+            &ABI
+        }
+    };
+}
+
+// NativePluginAbi 仅含函数指针与整数（可跨线程调用），显式声明 Send + Sync。
+unsafe impl Send for NativePluginAbi {}
+unsafe impl Sync for NativePluginAbi {}

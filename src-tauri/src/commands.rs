@@ -672,6 +672,43 @@ pub fn list_feature_plugins(state: State<'_, AppState>) -> Vec<dosword_sdk::Feat
         .unwrap_or_default()
 }
 
+/// 安装二进制 .plugin（Rust cdylib）：复制到数据目录并动态加载注册。
+#[tauri::command]
+pub async fn install_native_plugin(source_path: String, app: AppHandle) -> Result<(), String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let plugins_dir = data_dir.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).map_err(|error| error.to_string())?;
+    // 先加载校验（含 manifest id），再落盘
+    let plugin = crate::native_plugin::NativeFeaturePlugin::load(std::path::Path::new(&source_path))?;
+    let id = plugin.abi_manifest()?.id.clone();
+    if id.is_empty() || id.contains("..") {
+        return Err("插件 id 非法".to_string());
+    }
+    let ext = std::path::Path::new(&source_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("so")
+        .to_string();
+    let target = plugins_dir.join(format!("{id}.native.{ext}"));
+    std::fs::copy(&source_path, &target)
+        .map_err(|error| format!("插件文件复制失败：{error}"))?;
+    blocking(app, move |state| {
+        let mut registry = state
+            .feature_plugins
+            .lock()
+            .map_err(|_| "插件注册表锁异常".to_string())?;
+        registry
+            .register(Box::new(plugin))
+            .map_err(|error| format!("注册失败：{error}"))?;
+        registry.installed.insert(id);
+        Ok(())
+    })
+    .await
+}
+
 /// 安装外部 .plugin 插件（JSON 清单 + 执行定义），持久化到数据目录。
 #[tauri::command]
 pub async fn install_plugin(content: String, app: AppHandle) -> Result<(), String> {
@@ -707,8 +744,15 @@ pub async fn uninstall_plugin(plugin_id: String, app: AppHandle) -> Result<(), S
         .app_data_dir()
         .map_err(|error| error.to_string())?;
     blocking(app, move |state| {
-        let file = data_dir.join("plugins").join(format!("{plugin_id}.plugin"));
-        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_file(data_dir.join("plugins").join(format!("{plugin_id}.plugin")));
+        if let Ok(entries) = std::fs::read_dir(data_dir.join("plugins")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == format!("{plugin_id}.plugin") || name.starts_with(&format!("{plugin_id}.native.")) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         let mut registry = state
             .feature_plugins
             .lock()

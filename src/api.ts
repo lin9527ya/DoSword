@@ -99,6 +99,8 @@ export const api = {
   ) => invoke<Record<string, unknown>>("run_feature_plugin", { sessionId, pluginId, params }),
   refreshShellStatus: () => invoke<ShellProfile[]>("refresh_shell_status"),
   installPlugin: (content: string) => invoke<void>("install_plugin", { content }),
+  installNativePlugin: (sourcePath: string) =>
+    invoke<void>("install_native_plugin", { sourcePath }),
   uninstallPlugin: (pluginId: string) => invoke<void>("uninstall_plugin", { pluginId }),
   exportShells: () => invoke<string>("export_shells"),
   importShells: (payload: string, workspaceId: string) =>

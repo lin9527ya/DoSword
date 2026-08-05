@@ -4,6 +4,7 @@ members = [
   "src-tauri",
   "crates/dosword-sdk",
   "crates/dosword-plugin-echo",
+  "crates/dosword-plugin-bin",
 ]
 
 [workspace.package]

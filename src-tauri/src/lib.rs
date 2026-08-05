@@ -2,6 +2,7 @@ mod auth;
 mod commands;
 mod protocol;
 mod session;
+mod native_plugin;
 mod storage;
 
 use std::sync::Mutex;
@@ -32,14 +33,24 @@ pub fn run() {
                 if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
                     let mut registry = dosword_sdk::FeaturePluginRegistry::builtin();
                     for entry in entries.flatten() {
-                        if entry.path().extension().and_then(|e| e.to_str()) != Some("plugin") {
-                            continue;
-                        }
-                        if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                            if let Ok(plugin) = dosword_sdk::ScriptFeaturePlugin::from_json(&content) {
-                                let id = plugin.manifest().id.clone();
-                                if registry.register(Box::new(plugin)).is_ok() {
-                                    registry.installed.insert(id);
+                        let file_name = entry.file_name().to_string_lossy().into_owned();
+                        if file_name.ends_with(".plugin") {
+                            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                                if let Ok(plugin) = dosword_sdk::ScriptFeaturePlugin::from_json(&content) {
+                                    let id = plugin.manifest().id.clone();
+                                    if registry.register(Box::new(plugin)).is_ok() {
+                                        registry.installed.insert(id);
+                                    }
+                                }
+                            }
+                        } else if file_name.contains(".native.") {
+                            // 二进制插件：动态加载（失败跳过，不阻塞启动）
+                            if let Ok(plugin) = crate::native_plugin::NativeFeaturePlugin::load(&entry.path()) {
+                                if let Ok(manifest) = plugin.abi_manifest() {
+                                    let id = manifest.id.clone();
+                                    if registry.register(Box::new(plugin)).is_ok() {
+                                        registry.installed.insert(id);
+                                    }
                                 }
                             }
                         }
@@ -82,6 +93,7 @@ pub fn run() {
             commands::export_shells,
             commands::import_shells,
             commands::install_plugin,
+            commands::install_native_plugin,
             commands::uninstall_plugin,
             commands::list_encoders,
             commands::generate_shell,

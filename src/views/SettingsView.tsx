@@ -33,12 +33,21 @@ export function SettingsView() {
   async function installPlugin() {
     const localPath = await open({
       multiple: false,
-      filters: [{ name: "DoSword 插件", extensions: ["plugin", "json"] }],
+      filters: [
+        { name: "DoSword 插件", extensions: ["plugin", "json", "so", "dll", "dylib"] },
+      ],
     });
     if (!localPath || Array.isArray(localPath)) return;
     try {
-      const contentB64 = await api.readLocalFile(String(localPath));
-      await api.installPlugin(b64.decodeText(contentB64));
+      const ext = String(localPath).split(".").pop()?.toLowerCase();
+      if (ext === "so" || ext === "dll" || ext === "dylib") {
+        // 二进制插件（Rust cdylib，dlopen 加载）
+        await api.installNativePlugin(String(localPath));
+      } else {
+        // 脚本型插件（JSON 清单）
+        const contentB64 = await api.readLocalFile(String(localPath));
+        await api.installPlugin(b64.decodeText(contentB64));
+      }
       loadFeaturePlugins();
     } catch (cause) {
       setError(`安装失败：${errorText(cause)}`);

@@ -183,7 +183,15 @@ impl Protocol for MyProtocol { /* ... */ }
 - ✅ 请求调试：协议帧记录与检查（环缓冲 200 条，密码脱敏）
 - ✅ 协议 SDK / 插件系统：dosword-sdk + 示例插件（动态加载为 v2 演进）
 - ✅ Workspace 增强：到期状态徽章、按 Workspace 筛选、批量探测
-- V2.0：动态加载插件
+- V2.0：动态加载插件 ✅（脚本型 .plugin JSON + 二进制 .so/.dll dlopen）
+
+## 二进制插件（Native .plugin）
+- 导出宏 `export_dosword_plugin!(MyPlugin)`：unit struct 实现 `NativePlugin`，
+  编译为 cdylib（crate-type = ["cdylib"]）即可被宿主 dlopen
+- 运行时校验 ABI 魔数/版本；安装复制到数据目录 plugins/*.native.so，
+  启动自动扫描加载；卸载删除文件并释放
+- v1 约定：execute 为纯逻辑（runtime + 参数 JSON → JSON），
+  需要命令/代码通道的插件请用脚本型 .plugin
 
 ## 功能插件清单（内置 12 个 + 外部 .plugin）
 
