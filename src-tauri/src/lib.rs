@@ -76,6 +76,7 @@ pub fn run() {
             commands::run_feature_plugin,
             commands::refresh_shell_status,
             commands::http_send,
+            commands::encode_text,
             commands::batch_update_shells,
             commands::read_local_file,
             commands::export_shells,

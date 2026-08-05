@@ -496,6 +496,25 @@ pub async fn list_encoders(app: AppHandle) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// 按编码把文本编码为字节（GBK 等浏览器 TextEncoder 不支持的编码）。
+#[tauri::command]
+pub async fn encode_text(text: String, encoding: String, app: AppHandle) -> Result<String, String> {
+    blocking(app, move |_state| encode_text_impl(&text, &encoding))
+    .await
+}
+
+fn encode_text_impl(text: &str, encoding: &str) -> Result<String, String> {
+    let (bytes, _, had_errors) = match encoding {
+        "gbk" => encoding_rs::GBK.encode(text),
+        "big5" => encoding_rs::BIG5.encode(text),
+        other => return Err(format!("不支持的编码：{other}（支持 gbk / big5）")),
+    };
+    if had_errors {
+        return Err("文本包含无法用该编码表示的字符".to_string());
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
 /// 读取本地文件（Shell 导入用）。
 #[tauri::command]
 pub async fn read_local_file(path: String, app: AppHandle) -> Result<String, String> {
@@ -1480,6 +1499,19 @@ mod tests {
                 protocol_id,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn encode_text_gbk_round_trip() {
+        // "中文" 的 GBK 编码（浏览器 TextEncoder 不支持，走后端）
+        let encoded = encode_text_impl("中文测试", "gbk").unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&encoded).unwrap();
+        assert_eq!(bytes, b"\xd6\xd0\xce\xc4\xb2\xe2\xca\xd4", "GBK 字节应正确");
+        // 用 encoding_rs 解码验证往返
+        let (decoded, _, _) = encoding_rs::GBK.decode(&bytes);
+        assert_eq!(decoded, "中文测试");
+        // 不支持编码
+        assert!(encode_text_impl("x", "utf-16").is_err());
     }
 
     #[test]

@@ -553,3 +553,9 @@
 .plugin-result.error { color: #ff8f8f; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* --- 文件拖拽上传 --- */
+.file-manager { position: relative; }
+.file-manager.drag-active { outline: 2px dashed var(--accent); outline-offset: -2px; border-radius: 10px; }
+.drop-overlay { position: absolute; inset: 0; z-index: 20; display: flex; flex-direction: column; gap: 8px; align-items: center; justify-content: center; background: color-mix(in srgb, var(--accent) 12%, transparent); border-radius: 10px; color: var(--accent); font-weight: 600; pointer-events: none; }
+.editor-encoding { width: 96px; }

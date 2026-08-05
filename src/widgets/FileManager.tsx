@@ -31,6 +31,7 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
   const [renaming, setRenaming] = useState<FileEntry | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [uploading, setUploading] = useState<{ name: string; sent: number; total: number } | null>(null);
+  const [dragActive, setDragActive] = useState(false);
   const uploadRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(
@@ -176,8 +177,31 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
   const crumbs = path.split(separator).filter(Boolean);
 
   return (
-    <div className="file-manager">
+    <div
+      className={`file-manager ${dragActive ? "drag-active" : ""}`}
+      onDragOver={(event) => {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "copy";
+        setDragActive(true);
+      }}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+          setDragActive(false);
+        }
+      }}
+      onDrop={(event) => {
+        event.preventDefault();
+        setDragActive(false);
+        void uploadFiles(event.dataTransfer.files);
+      }}
+    >
       <ErrorBanner message={error} />
+      {dragActive && (
+        <div className="drop-overlay">
+          <Upload size={28} />
+          释放以上传到当前目录
+        </div>
+      )}
       <div className="file-toolbar">
         <div className="breadcrumb">
           <button className="crumb" onClick={() => setPath(separator)}>

@@ -895,6 +895,7 @@ dependencies = [
  "chrono",
  "dosword-plugin-echo",
  "dosword-sdk",
+ "encoding_rs",
  "getrandom 0.3.4",
  "ipnet",
  "reqwest 0.12.28",

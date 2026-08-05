@@ -104,6 +104,8 @@ export const api = {
   importShells: (payload: string, workspaceId: string) =>
     invoke<{ imported: number; skipped: number }>("import_shells", { payload, workspaceId }),
   readLocalFile: (path: string) => invoke<string>("read_local_file", { path }),
+  encodeText: (text: string, encoding: string) =>
+    invoke<string>("encode_text", { text, encoding }),
   batchUpdateShells: (
     ids: string[],
     tags?: string[],
