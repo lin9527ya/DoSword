@@ -69,8 +69,8 @@ impl FeaturePlugin for ProcessesPlugin {
         FeatureManifest {
             id: "processes".into(),
             name: "进程详情".into(),
-            version: "1.0.0".into(),
-            description: "列出目标进程（通用，按语言选择 ps/tasklist 命令）。".into(),
+            version: "1.1.0".into(),
+            description: "列出目标进程（PHP 载荷解析为表格；其他语言回退命令输出）。".into(),
             category: "general".into(),
             languages: vec![],
             params: vec![],
@@ -86,7 +86,32 @@ impl FeaturePlugin for ProcessesPlugin {
         _params: &serde_json::Value,
         settings: &AppSettings,
     ) -> Result<serde_json::Value, ProtocolError> {
-        run_command(protocol, session, process_command(runtime), settings)
+        match runtime {
+            "php" => {
+                let code = r#"<?php
+error_reporting(0);
+$raw = @shell_exec('ps -eo pid,user,pcpu,pmem,rss,cmd --no-headers 2>/dev/null | head -80');
+$rows = array();
+foreach (explode("
+", trim((string)$raw)) as $line) {
+    $line = trim($line);
+    if ($line === '') continue;
+    $parts = preg_split('/\s+/', $line, 6);
+    if (count($parts) < 6) continue;
+    $rows[] = $parts;
+}
+echo json_encode(array('ok' => true, 'data' => array(
+    'columns' => array('PID', 'USER', '%CPU', '%MEM', 'RSS(KB)', 'COMMAND'),
+    'rows' => $rows,
+)));
+"#;
+                let output = protocol.run_code(session, "php", code, settings)?;
+                serde_json::from_str(&output).map_err(|_| {
+                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
+                })
+            }
+            other => run_command(protocol, session, process_command(other), settings),
+        }
     }
 }
 

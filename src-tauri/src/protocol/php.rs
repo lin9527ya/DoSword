@@ -1695,12 +1695,13 @@ mod tests {
             let (session, _) = PhpProtocol.connect(&profile, &settings)?;
             let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
             let protocol = PhpProtocol;
-            // 通用：进程详情（命令通道）
+            // 通用：进程详情（结构化表格）
             let out = dosword_sdk::feature_plugins::ProcessesPlugin
                 .execute(&protocol, php, "php", &serde_json::json!({}), &settings)?;
-            let stdout = out["stdout"].as_str().unwrap_or("");
-            assert!(!stdout.is_empty(), "进程列表不应为空");
-            eprintln!("[plugin] processes {} 字节", stdout.len());
+            let rows = out["data"]["rows"].as_array().map(|a| a.len()).unwrap_or(0);
+            assert!(rows > 0, "进程行不应为空：{out:?}");
+            assert_eq!(out["data"]["columns"].as_array().map(|a| a.len()).unwrap_or(0), 6);
+            eprintln!("[plugin] processes 结构化 {rows} 行");
             // 通用：端口扫描（代码通道，扫本机开放端口）
             let scan = dosword_sdk::feature_plugins::PortScanPlugin.execute(
                 &protocol,

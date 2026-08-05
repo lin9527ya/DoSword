@@ -581,4 +581,30 @@
 .term-view-mode { width: 130px; }
 
 /* --- 插件结果操作 --- */
-.plugin-result-actions { display: flex; justify-content: flex-end; }
+.plugin-result-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.plugin-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.plugin-kind-badge { font: 600 10px var(--mono); color: var(--text-dim); border: 1px solid var(--border); border-radius: var(--radius-xs); padding: 3px 8px; white-space: nowrap; }
+.plugin-kind-badge.crypto { color: var(--warn); border-color: var(--ok-border); }
+.plugin-kind-badge.loader { color: var(--accent); border-color: var(--ok-border); }
+.plugin-params { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--panel-2); }
+.plugin-param { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.plugin-param textarea { font-family: var(--mono); font-size: 12px; }
+.plugin-run-row { display: flex; align-items: center; gap: 12px; }
+.plugin-run-meta { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-dim); }
+.plugin-result-status { font-weight: 600; }
+.plugin-result-status.ok { color: var(--ok); }
+.plugin-result-status.err { color: var(--err); }
+.plugin-result-box { display: flex; flex-direction: column; gap: 8px; }
+.plugin-table-wrap { max-height: 340px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.plugin-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.plugin-table th { position: sticky; top: 0; background: var(--panel-2); color: var(--text-dim); text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); font: 600 11px var(--mono); white-space: nowrap; }
+.plugin-table td { padding: 6px 10px; border-bottom: 1px solid var(--border-soft); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-table tr:hover td { background: var(--hover); }
+.plugin-json-view pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px; overflow: auto; max-height: 340px; font-size: 12px; }
+.plugin-history { margin-top: 10px; border-top: 1px solid var(--border-soft); padding-top: 8px; }
+.plugin-history summary { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; color: var(--text-dim); }
+.plugin-history ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; max-height: 160px; overflow: auto; }
+.plugin-history li { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.plugin-history-status.ok { color: var(--ok); }
+.plugin-history-status.err { color: var(--err); }
+.plugin-history small { color: var(--text-faint); margin-left: auto; }
