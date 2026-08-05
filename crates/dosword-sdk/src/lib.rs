@@ -7,6 +7,7 @@ pub mod domain;
 pub mod crypto;
 pub mod encoder;
 pub mod feature_plugins;
+pub mod jsp_stub;
 pub mod plugin;
 pub mod protocol;
 

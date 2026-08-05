@@ -3,6 +3,7 @@
 //! 宿主负责安全门：授权检查、审计、会话管理在命令层完成；
 //! 插件只实现 `Protocol` 能力，即自动纳入既有安全模型。
 
+pub mod jsp;
 pub mod mock;
 pub mod php;
 pub mod transport;
@@ -24,6 +25,8 @@ impl ProtocolRegistry {
         for plugin in [
             Box::new(mock::MockProtocol) as Box<dyn ProtocolPlugin>,
             Box::new(php::PhpProtocol),
+            Box::new(jsp::JspProtocol),
+            Box::new(jsp::AspNetProtocol),
             Box::new(dosword_plugin_echo::EchoProtocol),
         ] {
             inner

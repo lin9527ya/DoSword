@@ -103,6 +103,7 @@ export const api = {
     invoke<void>("install_native_plugin", { sourcePath }),
   uninstallPlugin: (pluginId: string) => invoke<void>("uninstall_plugin", { pluginId }),
   exportShells: () => invoke<string>("export_shells"),
+  backupShells: (backupDir: string) => invoke<string>("backup_shells", { backupDir }),
   importShells: (payload: string, workspaceId: string) =>
     invoke<{ imported: number; skipped: number }>("import_shells", { payload, workspaceId }),
   readLocalFile: (path: string) => invoke<string>("read_local_file", { path }),

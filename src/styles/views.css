@@ -606,3 +606,11 @@
 .batch-tags { flex: 1; min-width: 180px; }
 .shell-check { accent-color: var(--accent); }
 .shell-row.selected { outline: 1px solid var(--accent); }
+
+/* --- Shell 分页 --- */
+.pager { display: flex; gap: 10px; align-items: center; justify-content: center; padding: 10px 0; }
+.pager-info { font-size: 12px; color: var(--muted); }
+
+/* --- 自动备份 --- */
+.backup-form { display: flex; flex-direction: column; gap: 10px; }
+.backup-dir { flex: 1; }

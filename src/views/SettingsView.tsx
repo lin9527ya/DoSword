@@ -15,6 +15,9 @@ export function SettingsView() {
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState(false);
+  const [backupDir, setBackupDir] = useState(() => localStorage.getItem("dosword:backup-dir") ?? "");
+  const [backupEnabled, setBackupEnabled] = useState(() => localStorage.getItem("dosword:backup-enabled") === "1");
+  const [backupNote, setBackupNote] = useState("");
 
   function changeTheme(next: "light" | "dark") {
     setTheme(next);
@@ -62,6 +65,32 @@ export function SettingsView() {
       setError(`卸载失败：${errorText(cause)}`);
     }
   }
+
+  async function runBackup() {
+    if (!backupDir.trim()) return;
+    try {
+      const file = await api.backupShells(backupDir.trim());
+      setBackupNote(`备份完成：${file}`);
+    } catch (cause) {
+      setBackupNote(`备份失败：${errorText(cause)}`);
+    }
+  }
+
+  function saveBackupConfig(enabled: boolean, dir: string) {
+    setBackupEnabled(enabled);
+    setBackupDir(dir);
+    localStorage.setItem("dosword:backup-enabled", enabled ? "1" : "0");
+    localStorage.setItem("dosword:backup-dir", dir);
+  }
+
+  useEffect(() => {
+    if (!backupEnabled) return;
+    // 启动备份 + 每小时轮询（V3.0 远程同步本地版）
+    void runBackup();
+    const timer = setInterval(() => void runBackup(), 60 * 60 * 1000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [backupEnabled, backupDir]);
 
   useEffect(() => {
     loadFeaturePlugins();
@@ -256,6 +285,36 @@ export function SettingsView() {
               </article>
             ))
           )}
+        </div>
+      </Panel>
+
+      <Panel eyebrow="AUTO BACKUP" title="自动备份（V3.0 远程同步·本地版）">
+        <div className="backup-form">
+          <label className="confirm-row">
+            <input
+              type="checkbox"
+              checked={backupEnabled}
+              onChange={(event) => saveBackupConfig(event.target.checked, backupDir)}
+            />
+            <span>启用自动备份（启动时 + 每小时导出全部 Shell 配置）</span>
+          </label>
+          <div className="repeater-row">
+            <input
+              className="backup-dir"
+              value={backupDir}
+              onChange={(event) => saveBackupConfig(backupEnabled, event.target.value)}
+              placeholder="备份目录，如 /home/user/dosword-backups"
+              spellCheck={false}
+            />
+            <button className="button compact" onClick={() => void runBackup()} disabled={!backupDir.trim()}>
+              立即备份
+            </button>
+          </div>
+          {backupNote && <p className="form-note ok">{backupNote}</p>}
+          <p className="field-hint">
+            备份文件为 JSON（含全部 Shell 配置与密码），请妥善保管；
+            配合「导入」可在其他机器恢复（团队共享 / 迁移）。
+          </p>
         </div>
       </Panel>
 

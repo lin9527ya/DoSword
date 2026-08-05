@@ -60,6 +60,7 @@ export function DashboardView({
   const [batchBusy, setBatchBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [pluginCount, setPluginCount] = useState(0);
+  const [page, setPage] = useState(0);
   const [tagFilter, setTagFilter] = useState("");
   const [workspaceFilter, setWorkspaceFilter] = useState("");
   const [probing, setProbing] = useState<string | null>(null);
@@ -120,6 +121,10 @@ export function DashboardView({
       );
     });
   }, [data.shells, search, tagFilter, workspaceFilter]);
+
+  const PAGE_SIZE = 50;
+  const pageCount = Math.max(1, Math.ceil(filteredShells.length / PAGE_SIZE));
+  const pageShells = filteredShells.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
 
   async function probe(shell: ShellProfile) {
     setProbing(shell.id);
@@ -473,7 +478,7 @@ export function DashboardView({
             )}
             {notice && <p className="form-note ok">{notice}</p>}
             <div className="shell-list">
-              {filteredShells.map((shell) => (
+              {pageShells.map((shell) => (
                 <article className={`shell-row ${selected.includes(shell.id) ? "selected" : ""}`} key={shell.id}>
                   <input
                     type="checkbox"
@@ -534,7 +539,25 @@ export function DashboardView({
                 </article>
               ))}
             </div>
+            {filteredShells.length > PAGE_SIZE && (
+              <div className="pager">
+                <button className="button compact" disabled={page === 0} onClick={() => setPage(page - 1)}>
+                  上一页
+                </button>
+                <span className="pager-info">
+                  第 {page + 1} / {pageCount} 页（共 {filteredShells.length}）
+                </span>
+                <button
+                  className="button compact"
+                  disabled={page >= pageCount - 1}
+                  onClick={() => setPage(page + 1)}
+                >
+                  下一页
+                </button>
+              </div>
+            )}
             </>
+            
           )}
         </Panel>
 

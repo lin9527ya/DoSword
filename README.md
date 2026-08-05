@@ -200,4 +200,10 @@ WebShell 扫描、超级终端（批量命令）、虚拟终端、Socks 代理�
 
 **PHP 专用**：PHP 环境检测（bypass 前置评估）、代码执行（P_Eval_Code）、
 ByPassOpenBasedir（symlink+glob）、BypassDisableFunctions（LD_PRELOAD+mail）
-- V3.0：大型 Shell 库 / 团队共享 / 远程同步
+- V3.0（部分）：大型 Shell 库（分页）、自动备份（远程同步·本地版）✅；
+  团队共享经「导出/导入 + 备份文件」协作；高速索引=搜索过滤
+- **JSP / ASP.NET 协议**（builtin.jsp.v1 / builtin.aspnet.v1）：
+  - 与 PHP native 相同载荷协议（formData XOR 密文 + X-Debug-Key 头 +
+    md5 哈希分发），stub 为 Java（javax.servlet）与 C#（aspx），
+    命令 / 文件 / 探测（手动 JSON，无第三方依赖）
+  - 生成 Webshell 支持 jsp / aspx（XOR 载荷）；经典 ASP（VBScript）暂只生成
