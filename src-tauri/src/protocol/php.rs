@@ -87,6 +87,24 @@ pub struct PhpSession {
     pub initialized: std::sync::Mutex<bool>,
     /// 分阶段载荷模式（protocol_params 中 session: true 且编码器支持）。
     pub session_mode: bool,
+    /// 会话当前工作目录（cd 支持：每次命令前 stub 端 chdir）。
+    pub cwd: std::sync::Mutex<String>,
+}
+
+impl PhpSession {
+    /// 当前会话工作目录。
+    fn current_dir(&self) -> String {
+        self.cwd.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// 更新会话工作目录（命令响应回传）。
+    fn update_cwd(&self, cwd: &str) {
+        if !cwd.is_empty() {
+            if let Ok(mut slot) = self.cwd.lock() {
+                *slot = cwd.to_string();
+            }
+        }
+    }
 }
 
 impl SessionState for PhpSession {
@@ -254,7 +272,8 @@ impl PhpProtocol {
         settings: &AppSettings,
     ) -> Result<CommandOutput, ProtocolError> {
         let start = Instant::now();
-        let value = dispatch(php, "exec", &[("c", command)], settings)?;
+        let w = php.current_dir();
+        let value = dispatch(php, "exec", &[("c", command), ("w", &w)], settings)?;
         let duration_ms = start.elapsed().as_millis() as u64;
         let stdout = value
             .pointer("/data/stdout")
@@ -266,6 +285,9 @@ impl PhpProtocol {
             .pointer("/data/cwd")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        if let Some(ref c) = cwd {
+            php.update_cwd(c);
+        }
         Ok(CommandOutput {
             stdout,
             duration_ms,
@@ -696,6 +718,7 @@ impl Protocol for PhpProtocol {
                 encoder,
                 initialized: std::sync::Mutex::new(false),
                 session_mode: false,
+                cwd: std::sync::Mutex::new(String::new()),
             };
             return self.session_probe(&php, settings);
         }
@@ -707,6 +730,7 @@ impl Protocol for PhpProtocol {
                 encoder,
                 initialized: std::sync::Mutex::new(false),
                 session_mode: true,
+                cwd: std::sync::Mutex::new(String::new()),
             };
             return self.session_probe(&php, settings);
         }
@@ -778,6 +802,7 @@ impl Protocol for PhpProtocol {
             encoder,
             initialized: std::sync::Mutex::new(false),
             session_mode: session_mode_for(&profile.protocol_params, encoder),
+            cwd: std::sync::Mutex::new(result.current_dir.clone()),
         });
         Ok((session, result))
     }
@@ -2041,6 +2066,42 @@ while True:
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
         result.unwrap_or_else(|error| panic!("哥斯拉扩展插件真实执行应成功：{error}"));
+    }
+
+    #[test]
+    fn real_php_terminal_cd_support() {
+        // 终端 cd：会话级 cwd 跟踪 + stub 端 chdir（每次命令前）
+        let settings = settings();
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            eprintln!("跳过：未检测到 php");
+            return;
+        };
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, info) = PhpProtocol.connect(&profile, &settings)?;
+            assert_eq!(info.current_dir, dir.to_string_lossy(), "初始 cwd 应为 docroot");
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            // 1) pwd：初始目录
+            let out = PhpProtocol.execute_command(session.as_ref(), "pwd", &settings)?;
+            assert_eq!(out.cwd.as_deref(), Some(dir.to_string_lossy().as_ref()));
+            // 2) cd 到 /tmp
+            let out = PhpProtocol.execute_command(session.as_ref(), "cd /tmp", &settings)?;
+            assert_eq!(out.cwd.as_deref(), Some("/tmp"), "cd 后 cwd 应更新");
+            assert_eq!(php.current_dir(), "/tmp", "会话 cwd 应跟踪");
+            // 3) pwd 验证新目录
+            let out = PhpProtocol.execute_command(session.as_ref(), "pwd", &settings)?;
+            assert_eq!(out.cwd.as_deref(), Some("/tmp"), "后续命令应在新目录执行");
+            // 4) ls 新目录内容
+            let out = PhpProtocol.execute_command(session.as_ref(), "ls", &settings)?;
+            assert!(!out.stdout.is_empty(), "ls /tmp 应有输出");
+            eprintln!("[cd] {} -> /tmp 成功，ls {} 字节", info.current_dir, out.stdout.len());
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("终端 cd 真实执行应成功：{error}"));
     }
 
     // --- Level B：真实 PHP 往返（本机装有 php 时执行） ---

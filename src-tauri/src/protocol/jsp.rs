@@ -22,6 +22,8 @@ pub struct JspSession {
     pub encoder: &'static dyn PayloadEncoder,
     /// 上次探测的环境信息（current_dir / separator）。
     pub info: Mutex<Option<ProbeResult>>,
+    /// 会话当前工作目录（cd 支持）。
+    pub cwd: Mutex<String>,
 }
 
 impl SessionState for JspSession {
@@ -50,6 +52,7 @@ fn make_session(endpoint: &str, password: &str, settings: &AppSettings) -> JspSe
         client: build_client(settings),
         encoder: &NativeEncoder { crypto: "xor" },
         info: Mutex::new(None),
+        cwd: Mutex::new(String::new()),
     }
 }
 
@@ -190,6 +193,9 @@ impl Protocol for JvmLikeProtocol {
     ) -> Result<(Box<dyn SessionState>, ProbeResult), ProtocolError> {
         let session = make_session(&profile.endpoint, &profile.password, settings);
         let info = ensure_info(&session, settings)?;
+        if let Ok(mut cwd) = session.cwd.lock() {
+            *cwd = info.current_dir.clone();
+        }
         Ok((Box::new(session), info))
     }
 
@@ -203,7 +209,8 @@ impl Protocol for JvmLikeProtocol {
             .as_any()
             .downcast_ref::<JspSession>()
             .expect("会话类型不匹配");
-        let value = form_call(jsp, "exec", &[("c", command)], settings)?;
+        let w = jsp.cwd.lock().map(|c| c.clone()).unwrap_or_default();
+        let value = form_call(jsp, "exec", &[("c", command), ("w", &w)], settings)?;
         let stdout = value
             .pointer("/data/stdout")
             .and_then(|v| v.as_str())
@@ -216,6 +223,11 @@ impl Protocol for JvmLikeProtocol {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        if !cwd.is_empty() {
+            if let Ok(mut slot) = jsp.cwd.lock() {
+                *slot = cwd.clone();
+            }
+        }
         Ok(CommandOutput {
             stdout: String::from_utf8_lossy(&decoded).into_owned(),
             cwd: Some(cwd),
@@ -722,8 +734,15 @@ class Hd(BaseHTTPRequestHandler):
             out = {"ok": True, "data": {"server": "JVM Sim", "web_server": "Mock",
                    "php_version": "", "current_dir": "/tmp", "separator": "/"}}
         elif h == H["exec"]:
-            out = {"ok": True, "data": {"stdout": base64.b64encode(
-                   ("echo:" + req.get("c", "")).encode()).decode(), "cwd": "/tmp"}}
+            c = req.get("c", "")
+            w = req.get("w", "/tmp")
+            if c.strip().startswith("cd ") and len(c.strip()) > 3:
+                t = c.strip()[3:].strip()
+                nw = t if t.startswith("/") else w.rstrip("/") + "/" + t
+                out = {"ok": True, "data": {"stdout": "", "cwd": nw}}
+            else:
+                out = {"ok": True, "data": {"stdout": base64.b64encode(
+                       ("echo:" + c).encode()).decode(), "cwd": w}}
         elif h == H["list"]:
             out = {"ok": True, "data": {"entries": [
                    {"name": "a.txt", "path": "/tmp/a.txt", "is_dir": False,
@@ -792,6 +811,11 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
         assert_eq!(info.current_dir, "/tmp");
         let out = protocol.execute_command(session.as_ref(), "whoami", &settings).unwrap();
         assert_eq!(out.stdout, "echo:whoami");
+        // cd 支持：cd 后 cwd 更新，后续命令在新目录执行
+        let out = protocol.execute_command(session.as_ref(), "cd /opt", &settings).unwrap();
+        assert_eq!(out.cwd.as_deref(), Some("/opt"));
+        let out = protocol.execute_command(session.as_ref(), "pwd", &settings).unwrap();
+        assert_eq!(out.cwd.as_deref(), Some("/opt"), "cd 后应保持新目录");
         let listing = protocol.list_dir(session.as_ref(), "/tmp", &settings).unwrap();
         assert_eq!(listing.entries.len(), 1);
         assert_eq!(listing.entries[0].name, "a.txt");
