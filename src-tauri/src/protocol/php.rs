@@ -1766,6 +1766,93 @@ mod tests {
         result.unwrap_or_else(|error| panic!("脚本插件真实执行应成功：{error}"));
     }
 
+    #[test]
+    fn real_php_godzilla_plugins() {
+        // 哥斯拉风格插件全链路（webshell 扫描/超级终端/代码执行/虚拟终端/代理/bypass）
+        let settings = settings();
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            eprintln!("跳过：未检测到 php");
+            return;
+        };
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let protocol = PhpProtocol;
+            let p = |name: &str| format!("[{name}] ");
+
+            // WebShell 扫描：扫 docroot，应命中 shell.php 自身
+            let out = dosword_sdk::feature_plugins::WebShellScanPlugin
+                .execute(&protocol, php, "php", &serde_json::json!({"dir": ".", "max_depth": 2}), &settings)?;
+            let hits = out["webshells"].as_array().map(|a| a.len()).unwrap_or(0);
+            assert!(hits >= 1, "应扫描到 WebShell：{out:?}");
+            eprintln!("{}webshell_scan hits={hits}", p("plugin"));
+
+            // 超级终端：多命令
+            let out = dosword_sdk::feature_plugins::SuperTerminalPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"commands": "echo a\necho b", "cwd": ""}), &settings)?;
+            assert_eq!(out["results"].as_array().map(|a| a.len()).unwrap_or(0), 2);
+            eprintln!("{}super_terminal ok", p("plugin"));
+
+            // 代码执行
+            let out = dosword_sdk::feature_plugins::EvalCodePlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"code": "echo 'eval-ok';"}), &settings)?;
+            assert!(out["output"].as_str().unwrap_or("").contains("eval-ok"));
+            eprintln!("{}p_eval_code ok", p("plugin"));
+
+            // 虚拟终端
+            let out = dosword_sdk::feature_plugins::RealCmdPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"command": "echo realcmd", "cwd": ""}), &settings)?;
+            let stdout = out["stdout"].as_str().unwrap_or("");
+            let decoded = base64::engine::general_purpose::STANDARD.decode(stdout).unwrap_or_default();
+            assert!(String::from_utf8_lossy(&decoded).contains("realcmd"));
+            eprintln!("{}real_cmd ok", p("plugin"));
+
+            // ByPassOpenBasedir：本地无 ob → note 分支
+            let out = dosword_sdk::feature_plugins::BypassOpenBasedirPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"path": "/etc/hostname"}), &settings)?;
+            eprintln!("{}bypass_open_basedir ob={:?} read={:?}", p("plugin"),
+                out["open_basedir"].as_str().unwrap_or(""), out["read"].as_bool());
+
+            // BypassDisableFunctions：本机有 gcc → 尝试 LD_PRELOAD 执行 id
+            let out = dosword_sdk::feature_plugins::BypassDisableFunctionsPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"command": "id"}), &settings)?;
+            eprintln!("{}bypass_disable_functions compiler={:?} result={:?}", p("plugin"),
+                out["compiler"].as_str().unwrap_or(""), out["result"].as_str().unwrap_or(""));
+            if out["compiler"].as_str().is_some() {
+                let has_result = out["result"].as_str().is_some() || out["error"].as_str().is_some();
+                assert!(has_result, "有编译器时应有结果或明确错误：{out:?}");
+            }
+
+            // SOCKS5 代理：pcntl 可用 → 后台驻留
+            let out = dosword_sdk::feature_plugins::SocksProxyPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"port": 18080 + (std::process::id() % 500) as u32, "window": 60}), &settings)?;
+            let mode = out["mode"].as_str().unwrap_or("");
+            assert!(mode == "background" || mode == "foreground", "代理应启动：{out:?}");
+            eprintln!("{}socks_proxy mode={mode}", p("plugin"));
+
+            // HTTP 代理
+            let out = dosword_sdk::feature_plugins::HttpProxyPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"port": 18080 + (std::process::id() % 500) as u32 + 1, "window": 60}), &settings)?;
+            let mode = out["mode"].as_str().unwrap_or("");
+            assert!(mode == "background" || mode == "foreground", "HTTP 代理应启动：{out:?}");
+            eprintln!("{}http_proxy mode={mode}", p("plugin"));
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("哥斯拉插件真实执行应成功：{error}"));
+    }
+
     // --- Level B：真实 PHP 往返（本机装有 php 时执行） ---
 
     /// 在本机临时目录写入指定编码器生成的 stub 并起 `php -S`，

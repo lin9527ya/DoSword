@@ -184,4 +184,12 @@ impl Protocol for MyProtocol { /* ... */ }
 - ✅ 协议 SDK / 插件系统：dosword-sdk + 示例插件（动态加载为 v2 演进）
 - ✅ Workspace 增强：到期状态徽章、按 Workspace 筛选、批量探测
 - V2.0：动态加载插件
+
+## 功能插件清单（内置 12 个 + 外部 .plugin）
+
+**通用（多语言模板，当前 PHP 载荷）**：进程详情、端口扫描、ZIP 压缩、
+WebShell 扫描、超级终端（批量命令）、虚拟终端、Socks 代理、HTTP 代理
+
+**PHP 专用**：PHP 环境检测（bypass 前置评估）、代码执行（P_Eval_Code）、
+ByPassOpenBasedir（symlink+glob）、BypassDisableFunctions（LD_PRELOAD+mail）
 - V3.0：大型 Shell 库 / 团队共享 / 远程同步

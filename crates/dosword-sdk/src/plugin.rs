@@ -474,6 +474,14 @@ impl FeaturePluginRegistry {
         let _ = registry.register(Box::new(crate::feature_plugins::PortScanPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::PhpEnvPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::ZipPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::WebShellScanPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::SuperTerminalPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::EvalCodePlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::RealCmdPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::SocksProxyPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::HttpProxyPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::BypassOpenBasedirPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::BypassDisableFunctionsPlugin));
         registry
     }
 }
@@ -559,6 +567,11 @@ mod feature_tests {
         assert!(ids.contains(&"port_scan".to_string()), "{ids:?}");
         assert!(ids.contains(&"php_env".to_string()), "{ids:?}");
         assert!(ids.contains(&"zip".to_string()), "{ids:?}");
+        assert!(ids.contains(&"webshell_scan".to_string()), "{ids:?}");
+        assert!(ids.contains(&"bypass_disable_functions".to_string()), "{ids:?}");
+        assert!(ids.contains(&"socks_proxy".to_string()), "{ids:?}");
+        assert!(ids.contains(&"http_proxy".to_string()), "{ids:?}");
+        assert!(ids.contains(&"p_eval_code".to_string()), "{ids:?}");
         // 重复注册拒绝
         let mut r = FeaturePluginRegistry::new();
         assert!(r.register(Box::new(crate::feature_plugins::ProcessesPlugin)).is_ok());
