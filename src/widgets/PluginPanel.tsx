@@ -54,16 +54,17 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
     }
   }
 
-  const general = plugins.filter((p) => p.category === "general");
-  const specific = plugins.filter((p) => p.category !== "general");
+  const byKind = (kind: string) => plugins.filter((p) => p.kind === kind);
+  const feature = byKind("feature");
+  const crypto = byKind("crypto");
+  const loader = byKind("loader");
+  const others = plugins.filter((p) => !["feature", "crypto", "loader"].includes(p.kind));
 
   return (
     <div className="plugin-panel">
       <div className="plugin-sidebar">
-        {general.length > 0 && (
-          <p className="plugin-group">通用</p>
-        )}
-        {general.map((plugin) => (
+        {feature.length > 0 && <p className="plugin-group">功能</p>}
+        {feature.map((plugin) => (
           <button
             key={plugin.id}
             className={`plugin-item ${selected?.id === plugin.id ? "active" : ""}`}
@@ -72,8 +73,28 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
             {plugin.name}
           </button>
         ))}
-        {specific.length > 0 && <p className="plugin-group">专用</p>}
-        {specific.map((plugin) => (
+        {crypto.length > 0 && <p className="plugin-group">加密器</p>}
+        {crypto.map((plugin) => (
+          <button
+            key={plugin.id}
+            className={`plugin-item ${selected?.id === plugin.id ? "active" : ""}`}
+            onClick={() => pick(plugin)}
+          >
+            {plugin.name}
+          </button>
+        ))}
+        {loader.length > 0 && <p className="plugin-group">加载器</p>}
+        {loader.map((plugin) => (
+          <button
+            key={plugin.id}
+            className={`plugin-item ${selected?.id === plugin.id ? "active" : ""}`}
+            onClick={() => pick(plugin)}
+          >
+            {plugin.name}
+          </button>
+        ))}
+        {others.length > 0 && <p className="plugin-group">其他</p>}
+        {others.map((plugin) => (
           <button
             key={plugin.id}
             className={`plugin-item ${selected?.id === plugin.id ? "active" : ""}`}
@@ -117,7 +138,17 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
               执行
             </button>
             {result && (
-              <pre className={`plugin-result ${result.ok ? "" : "error"}`}>{result.text}</pre>
+              <>
+                <div className="plugin-result-actions">
+                  <button
+                    className="button compact"
+                    onClick={() => void navigator.clipboard?.writeText(result.text)}
+                  >
+                    复制结果
+                  </button>
+                </div>
+                <pre className={`plugin-result ${result.ok ? "" : "error"}`}>{result.text}</pre>
+              </>
             )}
           </>
         ) : (

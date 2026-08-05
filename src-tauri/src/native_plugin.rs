@@ -92,6 +92,7 @@ impl FeaturePlugin for NativeFeaturePlugin {
             category: "general".into(),
             languages: vec![],
             params: vec![],
+            kind: "feature".into(),
         })
     }
 

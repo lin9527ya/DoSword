@@ -195,11 +195,17 @@ impl Protocol for MyProtocol { /* ... */ }
 
 ## 功能插件清单（内置 12 个 + 外部 .plugin）
 
-**通用（多语言模板，当前 PHP 载荷）**：进程详情、端口扫描、ZIP 压缩、
-WebShell 扫描、超级终端（批量命令）、虚拟终端、Socks 代理、HTTP 代理
-
-**PHP 专用**：PHP 环境检测（bypass 前置评估）、代码执行（P_Eval_Code）、
+**功能（feature）**：进程详情、端口扫描、ZIP 压缩、WebShell 扫描、
+超级终端（批量命令）、虚拟终端、Socks 代理、HTTP 代理、文件搜索、
+网络信息、用户枚举、PHP 环境检测、代码执行（P_Eval_Code）、
 ByPassOpenBasedir（symlink+glob）、BypassDisableFunctions（LD_PRELOAD+mail）
+
+**加密器（crypto）**：加解密工具（AES-256-CBC / MD5-XOR 文本）
+
+**加载器（loader）**：代码加载器（任意 PHP 代码执行 + 可选落盘持久化）
+
+> 插件类型（kind）在清单中声明；前端按 功能/加密器/加载器 分组展示；
+> 非 PHP 运行时的通用插件自动降级为命令型（/dev/tcp 扫描、zip 命令等）
 - V3.0（部分）：大型 Shell 库（分页）、自动备份（远程同步·本地版）✅；
   团队共享经「导出/导入 + 备份文件」协作；高速索引=搜索过滤
 - **JSP / ASP.NET 协议**（builtin.jsp.v1 / builtin.aspnet.v1）：

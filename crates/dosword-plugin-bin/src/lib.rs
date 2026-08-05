@@ -37,6 +37,7 @@ impl NativePlugin for TextToolsPlugin {
                     options: None,
                 },
             ],
+            kind: "feature".into(),
         }
     }
 

@@ -1971,6 +1971,77 @@ while True:
     threading.Thread(target=handle, args=(conn,), daemon=True).start()
 "#;
 
+    #[test]
+    fn real_php_godzilla_extended_plugins() {
+        // 哥斯拉扩展插件：文件搜索 / 网络信息 / 用户枚举 / 加解密 / 代码加载器
+        let settings = settings();
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            eprintln!("跳过：未检测到 php");
+            return;
+        };
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let protocol = PhpProtocol;
+            let p = |name: &str| format!("[{name}] ");
+
+            // 文件搜索（文件名匹配：shell.php 应命中）
+            let out = dosword_sdk::feature_plugins::FileSearchPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"dir": ".", "keyword": "shell", "in_content": false, "max_depth": 2}),
+                &settings)?;
+            assert!(out["matches"].as_array().map(|a| a.len()).unwrap_or(0) >= 1, "{out:?}");
+            eprintln!("{}file_search 命中 {}", p("plugin"), out["matches"].as_array().map(|a| a.len()).unwrap_or(0));
+
+            // 网络信息（命令型）
+            let out = dosword_sdk::feature_plugins::NetInfoPlugin
+                .execute(&protocol, php, "php", &serde_json::json!({}), &settings)?;
+            assert!(!out["stdout"].as_str().unwrap_or("").is_empty());
+            eprintln!("{}netinfo {} 字节", p("plugin"), out["stdout"].as_str().unwrap_or("").len());
+
+            // 用户枚举
+            let out = dosword_sdk::feature_plugins::UserListPlugin
+                .execute(&protocol, php, "php", &serde_json::json!({}), &settings)?;
+            assert!(out["stdout"].as_str().unwrap_or("").contains("root"), "{:?}", out);
+            eprintln!("{}userlist ok", p("plugin"));
+
+            // 加解密工具：AES 加密 → 解密往返
+            let enc = dosword_sdk::feature_plugins::CryptoToolPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"op": "encrypt", "algorithm": "aes", "text": "godzilla-crypto", "pass": "secret"}),
+                &settings)?;
+            let cipher = enc["result"].as_str().unwrap_or("");
+            assert!(!cipher.is_empty());
+            let dec = dosword_sdk::feature_plugins::CryptoToolPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"op": "decrypt", "algorithm": "aes", "text": cipher, "pass": "secret"}),
+                &settings)?;
+            assert_eq!(dec["result"].as_str().unwrap_or(""), "godzilla-crypto");
+            eprintln!("{}crypto_tool AES 往返 ok", p("plugin"));
+
+            // 代码加载器：执行 + 持久化到临时文件
+            let tmp = format!("/tmp/dsw_loader_{}.php", std::process::id());
+            let out = dosword_sdk::feature_plugins::CodeLoaderPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"code": "echo 'loader-ok';", "persist_path": tmp}),
+                &settings)?;
+            assert!(out["output"].as_str().unwrap_or("").contains("loader-ok"));
+            assert_eq!(out["persisted"].as_bool(), Some(true));
+            // 读取持久化文件验证
+            let content = PhpProtocol.read_file(session.as_ref(), &tmp, &settings)?;
+            assert!(String::from_utf8_lossy(&content).contains("loader-ok"));
+            PhpProtocol.delete_path(session.as_ref(), &tmp, &settings)?;
+            eprintln!("{}php_code_loader 执行+持久化+清理 ok", p("plugin"));
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("哥斯拉扩展插件真实执行应成功：{error}"));
+    }
+
     // --- Level B：真实 PHP 往返（本机装有 php 时执行） ---
 
     /// 在本机临时目录写入指定编码器生成的 stub 并起 `php -S`，

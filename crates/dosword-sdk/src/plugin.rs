@@ -272,6 +272,13 @@ pub struct FeatureManifest {
     pub languages: Vec<String>,
     /// 参数 schema。
     pub params: Vec<ParamSpec>,
+    /// 插件类型：feature（功能）/ crypto（加密器）/ loader（加载器），默认 feature。
+    #[serde(default = "default_plugin_kind")]
+    pub kind: String,
+}
+
+fn default_plugin_kind() -> String {
+    "feature".to_string()
 }
 
 /// 功能插件：多语言能力扩展。
@@ -314,6 +321,9 @@ pub struct ScriptPluginDef {
     /// 支持的语言。
     pub languages: Vec<String>,
     pub params: Vec<ParamSpec>,
+    /// 插件类型：feature / crypto / loader（可选，默认 feature）。
+    #[serde(default = "default_plugin_kind")]
+    pub kind: String,
     pub execution: PluginExecution,
 }
 
@@ -340,6 +350,7 @@ impl ScriptFeaturePlugin {
                 category: def.category,
                 languages: def.languages,
                 params: def.params,
+                kind: def.kind,
             },
             execution: def.execution,
         })
@@ -482,6 +493,11 @@ impl FeaturePluginRegistry {
         let _ = registry.register(Box::new(crate::feature_plugins::HttpProxyPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::BypassOpenBasedirPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::BypassDisableFunctionsPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::FileSearchPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::NetInfoPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::UserListPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::CryptoToolPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::CodeLoaderPlugin));
         registry
     }
 }

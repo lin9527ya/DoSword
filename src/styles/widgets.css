@@ -565,3 +565,6 @@
 .term-toolbar { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 8px; }
 .term-toolbar-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
 .term-view-mode { width: 130px; }
+
+/* --- 插件结果操作 --- */
+.plugin-result-actions { display: flex; justify-content: flex-end; }

@@ -51,6 +51,7 @@ export type FeatureManifest = {
   category: string;
   languages: string[];
   params: ParamSpec[];
+  kind: string;
 };
 
 // --- invoke 封装 ---
