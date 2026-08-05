@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
-import { Blocks, Moon, Save, ShieldAlert, ShieldCheck, Sun } from "lucide-react";
-import { api, errorText } from "../api";
-import type { AppSettings, PluginManifest } from "../api";
+import { useCallback, useEffect, useState } from "react";
+import { Blocks, Moon, PackageOpen, Save, ShieldAlert, ShieldCheck, Sun, Trash2 } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { api, b64, errorText } from "../api";
+import type { AppSettings, FeatureManifest, PluginManifest } from "../api";
 import { Dialog } from "../components/Dialog";
 import { ErrorBanner, Panel } from "../components/common";
 import { applyTheme, THEME_KEY, currentTheme } from "../theme";
@@ -9,6 +10,7 @@ import { applyTheme, THEME_KEY, currentTheme } from "../theme";
 export function SettingsView() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [plugins, setPlugins] = useState<PluginManifest[]>([]);
+  const [featurePlugins, setFeaturePlugins] = useState<FeatureManifest[]>([]);
   const [theme, setTheme] = useState<"light" | "dark">(currentTheme());
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
@@ -24,7 +26,36 @@ export function SettingsView() {
     applyTheme();
   }
 
+  const loadFeaturePlugins = useCallback(() => {
+    void api.listFeaturePlugins().then(setFeaturePlugins).catch(() => {});
+  }, []);
+
+  async function installPlugin() {
+    const localPath = await open({
+      multiple: false,
+      filters: [{ name: "DoSword 插件", extensions: ["plugin", "json"] }],
+    });
+    if (!localPath || Array.isArray(localPath)) return;
+    try {
+      const contentB64 = await api.readLocalFile(String(localPath));
+      await api.installPlugin(b64.decodeText(contentB64));
+      loadFeaturePlugins();
+    } catch (cause) {
+      setError(`安装失败：${errorText(cause)}`);
+    }
+  }
+
+  async function uninstallPlugin(id: string) {
+    try {
+      await api.uninstallPlugin(id);
+      loadFeaturePlugins();
+    } catch (cause) {
+      setError(`卸载失败：${errorText(cause)}`);
+    }
+  }
+
   useEffect(() => {
+    loadFeaturePlugins();
     void (async () => {
       try {
         setSettings(await api.getSettings());
@@ -168,6 +199,54 @@ export function SettingsView() {
             <Moon size={16} />
             暗色
           </button>
+        </div>
+      </Panel>
+
+      <Panel
+        eyebrow="FEATURE PLUGINS"
+        title="功能插件"
+        actions={
+          <button className="button compact" onClick={() => void installPlugin()}>
+            <PackageOpen size={14} />
+            安装 .plugin
+          </button>
+        }
+      >
+        <div className="plugin-list">
+          {featurePlugins.length === 0 ? (
+            <p className="muted">无功能插件。</p>
+          ) : (
+            featurePlugins.map((plugin) => (
+              <article className="plugin-row" key={plugin.id}>
+                <Blocks size={16} />
+                <div className="plugin-identity">
+                  <strong>{plugin.name}</strong>
+                  <code>{plugin.id}</code>
+                </div>
+                <span className="plugin-kind">
+                  {plugin.category === "general" ? "通用" : plugin.category.toUpperCase()}
+                </span>
+                <span className="plugin-version">v{plugin.version}</span>
+                <p className="plugin-desc">{plugin.description}</p>
+                {plugin.languages.length > 0 && (
+                  <span className="plugin-caps">
+                    {plugin.languages.map((language) => (
+                      <code key={language} className="shell-tag">
+                        {language}
+                      </code>
+                    ))}
+                  </span>
+                )}
+                <button
+                  className="icon-button danger"
+                  title="卸载"
+                  onClick={() => void uninstallPlugin(plugin.id)}
+                >
+                  <Trash2 size={15} />
+                </button>
+              </article>
+            ))
+          )}
         </div>
       </Panel>
 

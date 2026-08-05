@@ -15,7 +15,7 @@ pub struct AppState {
     database: Mutex<Database>,
     sessions: Mutex<SessionManager>,
     protocols: ProtocolRegistry,
-    feature_plugins: dosword_sdk::FeaturePluginRegistry,
+    feature_plugins: std::sync::Mutex<dosword_sdk::FeaturePluginRegistry>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -27,11 +27,37 @@ pub fn run() {
             let app_data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data)?;
             let database = Database::open(app_data.join("dosword.sqlite3"))?;
+            let plugins_dir = app_data.join("plugins");
+            if plugins_dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
+                    let mut registry = dosword_sdk::FeaturePluginRegistry::builtin();
+                    for entry in entries.flatten() {
+                        if entry.path().extension().and_then(|e| e.to_str()) != Some("plugin") {
+                            continue;
+                        }
+                        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                            if let Ok(plugin) = dosword_sdk::ScriptFeaturePlugin::from_json(&content) {
+                                let id = plugin.manifest().id.clone();
+                                if registry.register(Box::new(plugin)).is_ok() {
+                                    registry.installed.insert(id);
+                                }
+                            }
+                        }
+                    }
+                    app.manage(AppState {
+                        database: Mutex::new(database),
+                        sessions: Mutex::new(SessionManager::new()),
+                        protocols: ProtocolRegistry::builtin(),
+                        feature_plugins: std::sync::Mutex::new(registry),
+                    });
+                    return Ok(());
+                }
+            }
             app.manage(AppState {
                 database: Mutex::new(database),
                 sessions: Mutex::new(SessionManager::new()),
                 protocols: ProtocolRegistry::builtin(),
-                feature_plugins: dosword_sdk::FeaturePluginRegistry::builtin(),
+                feature_plugins: std::sync::Mutex::new(dosword_sdk::FeaturePluginRegistry::builtin()),
             });
             Ok(())
         })
@@ -54,6 +80,8 @@ pub fn run() {
             commands::read_local_file,
             commands::export_shells,
             commands::import_shells,
+            commands::install_plugin,
+            commands::uninstall_plugin,
             commands::list_encoders,
             commands::generate_shell,
             commands::list_audit,

@@ -1724,6 +1724,48 @@ mod tests {
         result.unwrap_or_else(|error| panic!("功能插件真实执行应成功：{error}"));
     }
 
+    #[test]
+    fn real_php_script_plugin_execution() {
+        // 外部 .plugin（代码型）经 run_code 通道真实执行
+        let settings = settings();
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            eprintln!("跳过：未检测到 php");
+            return;
+        };
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let plugin_json = r#"{
+            "id": "test.plugin.code.v1",
+            "name": "测试代码插件",
+            "version": "1.0.0",
+            "description": "真实执行验证",
+            "category": "php",
+            "languages": ["php"],
+            "params": [{"name": "mark", "label": "标记", "type": "string", "default": "hello"}],
+            "execution": {
+                "type": "code",
+                "codes": {
+                    "php": "<?php error_reporting(0); echo json_encode(array('mark' => '{{mark}}', 'php' => PHP_VERSION, 'cwd' => getcwd()));"
+                }
+            }
+        }"#;
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let plugin = dosword_sdk::ScriptFeaturePlugin::from_json(plugin_json)
+                .map_err(|e| ProtocolError::ParseError(e))?;
+            let out = plugin.execute(&PhpProtocol, php, "php", &serde_json::json!({"mark": "from-test"}), &settings)?;
+            assert_eq!(out["mark"].as_str(), Some("from-test"), "参数应注入模板");
+            assert!(out["php"].as_str().is_some(), "应返回 PHP 版本");
+            eprintln!("[plugin] script 插件执行 {}", out["php"].as_str().unwrap_or(""));
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("脚本插件真实执行应成功：{error}"));
+    }
+
     // --- Level B：真实 PHP 往返（本机装有 php 时执行） ---
 
     /// 在本机临时目录写入指定编码器生成的 stub 并起 `php -S`，

@@ -646,7 +646,58 @@ pub fn list_protocols(state: State<'_, AppState>) -> Vec<ProtocolMeta> {
 /// 功能插件列表（ZIP / 进程 / 端口扫描 / bypass 等）。
 #[tauri::command]
 pub fn list_feature_plugins(state: State<'_, AppState>) -> Vec<dosword_sdk::FeatureManifest> {
-    state.feature_plugins.list()
+    state
+        .feature_plugins
+        .lock()
+        .map(|registry| registry.list())
+        .unwrap_or_default()
+}
+
+/// 安装外部 .plugin 插件（JSON 清单 + 执行定义），持久化到数据目录。
+#[tauri::command]
+pub async fn install_plugin(content: String, app: AppHandle) -> Result<(), String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    blocking(app, move |state| {
+        let plugin = dosword_sdk::ScriptFeaturePlugin::from_json(&content)?;
+        let id = plugin.manifest().id.clone();
+        let plugins_dir = data_dir.join("plugins");
+        std::fs::create_dir_all(&plugins_dir).map_err(|error| error.to_string())?;
+        std::fs::write(plugins_dir.join(format!("{id}.plugin")), &content)
+            .map_err(|error| format!("插件文件写入失败：{error}"))?;
+        let mut registry = state
+            .feature_plugins
+            .lock()
+            .map_err(|_| "插件注册表锁异常".to_string())?;
+        registry
+            .register(Box::new(plugin))
+            .map_err(|error| format!("注册失败：{error}"))?;
+        registry.installed.insert(id);
+        Ok(())
+    })
+    .await
+}
+
+/// 卸载外部插件（删除注册与数据目录文件）。
+#[tauri::command]
+pub async fn uninstall_plugin(plugin_id: String, app: AppHandle) -> Result<(), String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    blocking(app, move |state| {
+        let file = data_dir.join("plugins").join(format!("{plugin_id}.plugin"));
+        let _ = std::fs::remove_file(&file);
+        let mut registry = state
+            .feature_plugins
+            .lock()
+            .map_err(|_| "插件注册表锁异常".to_string())?;
+        registry.unregister(&plugin_id);
+        Ok(())
+    })
+    .await
 }
 
 /// 在已连接会话上执行功能插件。
@@ -681,8 +732,11 @@ pub async fn run_feature_plugin(
             .protocols
             .get(&protocol_id)
             .ok_or_else(|| format!("未知协议：{protocol_id}"))?;
-        let plugin = state
+        let registry_guard = state
             .feature_plugins
+            .lock()
+            .map_err(|_| "插件注册表锁异常".to_string())?;
+        let plugin = registry_guard
             .get(&plugin_id)
             .ok_or_else(|| format!("未知功能插件：{plugin_id}"))?;
         let settings = state
@@ -1392,7 +1446,7 @@ mod tests {
             database: Mutex::new(Database::open(":memory:").unwrap()),
             sessions: Mutex::new(SessionManager::new()),
             protocols: ProtocolRegistry::builtin(),
-            feature_plugins: dosword_sdk::FeaturePluginRegistry::builtin(),
+            feature_plugins: std::sync::Mutex::new(dosword_sdk::FeaturePluginRegistry::builtin()),
         }
     }
 
