@@ -7,6 +7,9 @@
 .panel {
   border: 1px solid var(--border);
   background: var(--panel);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
 }
 .panel-heading {
   min-height: 70px;
@@ -25,6 +28,11 @@
 }
 .shell-row {
   min-height: 65px;
+  transition: background 0.12s;
+}
+.shell-row:hover {
+  background: var(--hover);
+}
   display: grid;
   grid-template-columns: 12px minmax(190px, 1fr) 70px 105px 33px 33px 33px 76px;
   gap: 12px;
@@ -67,7 +75,7 @@
 .shell-tag {
   padding: 1px 6px;
   border: 1px solid var(--border-soft);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   color: var(--ok);
   background: rgba(169, 211, 106, 0.06);
   font: 9px var(--mono);
@@ -201,7 +209,7 @@
   justify-self: start;
   align-self: center;
   padding: 2px 8px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   font: 9px var(--mono);
 }
 .expiry-badge.ok {
@@ -234,12 +242,16 @@
   grid-template-columns: 20px minmax(200px, 1fr) 42px 52px 2fr auto;
   gap: 12px;
   align-items: center;
+  transition: background 0.12s;
   padding: 12px 18px;
   border-bottom: 1px solid var(--border-soft);
   font-size: 11px;
 }
 .plugin-row:last-child {
   border-bottom: none;
+}
+.plugin-row:hover {
+  background: var(--hover);
 }
 .plugin-row > svg {
   color: var(--accent);
@@ -292,8 +304,8 @@
 }
 .detail-tabs {
   display: flex;
-  gap: 3px;
-  margin-bottom: 17px;
+  gap: 2px;
+  margin-bottom: 16px;
   border-bottom: 1px solid var(--border);
 }
 .detail-tab {
@@ -304,10 +316,12 @@
   border: 0;
   border-bottom: 2px solid transparent;
   background: transparent;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
   color: var(--text-dim);
   cursor: pointer;
   font-size: 12px;
   font-weight: 600;
+  transition: background 0.15s, color 0.15s;
 }
 .detail-tab:hover {
   color: var(--text);
@@ -324,7 +338,7 @@
   color: var(--text-faint);
   border: 1px solid var(--border-soft);
   padding: 3px 9px;
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
 }
 .status-badge.online {
   color: var(--accent);
@@ -389,6 +403,7 @@
   gap: 9px;
   padding: 12px;
   border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
   background: var(--panel-2);
   color: var(--text-dim);
   font-size: 11px;
@@ -414,7 +429,7 @@
 }
 .settings-form input {
   border: 1px solid var(--border-soft);
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   outline: 0;
   padding: 10px 11px;
   color: var(--text);
@@ -454,6 +469,7 @@
   grid-template-columns: 130px 130px 70px 1fr;
   gap: 12px;
   padding: 11px 18px;
+  transition: background 0.12s;
   font-size: 11px;
 }
 .audit-head {
@@ -497,6 +513,10 @@
 }
 .debug-item {
   border-bottom: 1px solid var(--border-soft);
+  transition: background 0.12s;
+}
+.debug-item:hover {
+  background: var(--hover);
 }
 .debug-item:last-child {
   border-bottom: none;
@@ -520,7 +540,7 @@
 .debug-status {
   font: 600 10px var(--mono);
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   text-align: center;
 }
 .debug-status.ok {
@@ -594,22 +614,22 @@
 .repeater-tpl-name { width: 140px; }
 .repeater-status.ok { color: #4ade80; font-weight: 600; }
 .repeater-status.err { color: #f87171; font-weight: 600; }
-.repeater-resp-headers { background: var(--bg-code, #0f1117); color: #8fb8e8; padding: 8px; border-radius: 6px; font-size: 12px; margin: 6px 0; }
-.repeater-resp-body { background: var(--bg-code, #0f1117); color: var(--text); padding: 10px; border-radius: 6px; max-height: 320px; overflow: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+.repeater-resp-headers { background: var(--bg-code, #0f1117); color: #8fb8e8; padding: 8px; border-radius: var(--radius-sm); font-size: 12px; margin: 6px 0; }
+.repeater-resp-body { background: var(--bg-code, #0f1117); color: var(--text); padding: 10px; border-radius: var(--radius-sm); max-height: 320px; overflow: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
 .tpl-chip { display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; font-size: 12px; }
 .tpl-chip-main { padding: 3px 8px; border: none; background: none; cursor: pointer; color: var(--text); }
-.tpl-chip-x { padding: 3px 6px; border: none; background: none; cursor: pointer; color: var(--muted); }
+.tpl-chip-x { padding: 3px 6px; border: none; background: none; cursor: pointer; color: var(--text-faint); }
 
 /* --- 批量操作栏 --- */
-.batch-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border: 1px solid var(--accent); border-radius: 10px; margin-bottom: 10px; flex-wrap: wrap; }
-.batch-bar span { font-size: 12px; color: var(--muted); }
+.batch-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border: 1px solid var(--accent); border-radius: var(--radius-md); margin-bottom: 10px; flex-wrap: wrap; }
+.batch-bar span { font-size: 12px; color: var(--text-faint); }
 .batch-tags { flex: 1; min-width: 180px; }
 .shell-check { accent-color: var(--accent); }
 .shell-row.selected { outline: 1px solid var(--accent); }
 
 /* --- Shell 分页 --- */
 .pager { display: flex; gap: 10px; align-items: center; justify-content: center; padding: 10px 0; }
-.pager-info { font-size: 12px; color: var(--muted); }
+.pager-info { font-size: 12px; color: var(--text-faint); }
 
 /* --- 自动备份 --- */
 .backup-form { display: flex; flex-direction: column; gap: 10px; }
