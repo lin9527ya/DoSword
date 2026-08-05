@@ -112,7 +112,7 @@ const TEMPLATE_FRAME: &str = r#"echo '{NONCE}'.base64_encode(json_encode($__r)).
 const TEMPLATE_FRAME_DIE: &str = r#"echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';die;"#;
 
 /// 数据库驱动白名单（Rust 侧校验，防止任意 DSN 注入）。
-const DB_DRIVERS: [&str; 3] = ["mysql", "pgsql", "sqlite"];
+const DB_DRIVERS: [&str; 6] = ["mysql", "pgsql", "sqlite", "mssql", "oracle", "redis"];
 
 /// 数据库探测载荷：PDO 连接 + 列出数据库。
 /// 占位符：{PWD} {DSN} {USER} {PASS} {LIST_DBS} {DBNAME} {DRIVER}
@@ -1852,6 +1852,124 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         result.unwrap_or_else(|error| panic!("哥斯拉插件真实执行应成功：{error}"));
     }
+
+    #[test]
+    fn real_php_db_drivers_redis_mssql_oracle() {
+        // Redis 驱动：python mock RESP 服务器 + 真实 stub 协议全链路；
+        // MSSQL/Oracle：本机无服务/驱动 → 验证明确错误路径
+        let settings = settings();
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            eprintln!("跳过：未检测到 php");
+            return;
+        };
+        let mock_script = std::env::temp_dir().join("dosword_redis_mock.py");
+        let _ = std::fs::write(&mock_script, REDIS_MOCK);
+        let port: u16 = 19000 + (std::process::id() % 1000) as u16;
+        let _mock = std::process::Command::new("python3")
+            .arg(&mock_script)
+            .arg(port.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            let redis = DbConnection {
+                driver: "redis".into(),
+                host: Some("127.0.0.1".into()),
+                port: Some(port),
+                username: None,
+                password: None,
+                dbname: None,
+            };
+            let probe = PhpProtocol.db_probe(session.as_ref(), &redis, &settings)?;
+            assert_eq!(probe.driver, "redis");
+            assert!(probe.databases.contains(&"0".to_string()), "{:?}", probe.databases);
+            // Redis 命令执行（GET mykey → hello）
+            let query = PhpProtocol.db_query(session.as_ref(), &redis, "GET mykey", &settings)?;
+            assert_eq!(query.rows, vec![vec![Some("hello".to_string())]]);
+            // KEYS *
+            let keys = PhpProtocol.db_query(session.as_ref(), &redis, "KEYS *", &settings)?;
+            assert!(keys.rows.len() >= 2, "{:?}", keys.rows);
+            // MSSQL：本机无服务 → 明确错误
+            let mssql = DbConnection {
+                driver: "mssql".into(),
+                host: Some("127.0.0.1".into()),
+                port: Some(1433),
+                username: Some("sa".into()),
+                password: Some("x".into()),
+                dbname: Some("master".into()),
+            };
+            let err = PhpProtocol.db_probe(session.as_ref(), &mssql, &settings).unwrap_err();
+            assert!(err.to_string().contains("mssql"), "{err}");
+            // Oracle：无 pdo_oci → 明确错误
+            let oracle = DbConnection {
+                driver: "oracle".into(),
+                host: Some("127.0.0.1".into()),
+                port: Some(1521),
+                username: Some("system".into()),
+                password: Some("x".into()),
+                dbname: Some("ORCL".into()),
+            };
+            let err = PhpProtocol.db_probe(session.as_ref(), &oracle, &settings).unwrap_err();
+            assert!(!err.to_string().is_empty(), "oracle 应报错");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("数据库驱动真实执行应成功：{error}"));
+    }
+
+    /// Python mock Redis RESP 服务器（固定数据，输出端口后循环服务）。
+        const REDIS_MOCK: &str = r#"
+import socket, threading
+import sys
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+port = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+srv.bind(("127.0.0.1", port))
+srv.listen(5)
+print(srv.getsockname()[1], flush=True)
+def read_arg(c):
+    line = b""
+    while not line.endswith(b"\r\n"):
+        ch = c.recv(1)
+        if not ch: return None
+        line += ch
+    return line[:-2]
+def handle(c):
+    try:
+        while True:
+            head = read_arg(c)
+            if head is None: break
+            if not head.startswith(b"*"): break
+            n = int(head[1:])
+            args = []
+            for _ in range(n):
+                read_arg(c)
+                arg = read_arg(c)
+                args.append(arg)
+            cmd = args[0].upper() if args else b""
+            if cmd == b"PING": c.sendall(b"+PONG\r\n")
+            elif cmd == b"AUTH": c.sendall(b"+OK\r\n")
+            elif cmd == b"GET": c.sendall(b"$5\r\nhello\r\n")
+            elif cmd == b"KEYS": c.sendall(b"*2\r\n$3\r\nkey\r\n$3\r\nfoo\r\n")
+            elif cmd == b"SET": c.sendall(b"+OK\r\n")
+            elif cmd == b"INFO": c.sendall(b"$11\r\n# Server\r\n")
+            else: c.sendall(b"-ERR unknown command\r\n")
+    except Exception:
+        pass
+    finally:
+        try: c.close()
+        except Exception: pass
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+"#;
 
     // --- Level B：真实 PHP 往返（本机装有 php 时执行） ---
 

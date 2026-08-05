@@ -15,10 +15,14 @@ const DEFAULT_CONN: DbConnection = {
   dbname: "",
 };
 
+const isRedis = (driver: string) => driver === "redis";
+
 const TABLE_SQL: Record<string, (db: string) => string> = {
   mysql: () => "SHOW TABLES",
   pgsql: () => "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
   sqlite: () => "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+  mssql: (db) => `SELECT name FROM ${db}.sys.tables`,
+  oracle: () => "SELECT table_name FROM user_tables",
 };
 
 /**
@@ -67,6 +71,7 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
   }
 
   async function loadTables() {
+    if (isRedis(connection.driver)) return;
     if (!selectedDb) return;
     const conn = { ...connection, dbname: selectedDb };
     setBusy("tables");
@@ -83,7 +88,7 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
   }
 
   async function runQuery(sqlText: string) {
-    if (!selectedDb && connection.driver !== "sqlite") {
+    if (!selectedDb && connection.driver !== "sqlite" && !isRedis(connection.driver)) {
       setError("请先选择数据库（sqlite 模式请填写文件路径）");
       return;
     }
@@ -158,12 +163,24 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
               saveConn({
                 ...connection,
                 driver: event.target.value,
-                port: event.target.value === "pgsql" ? 5432 : 3306,
+                port:
+                  event.target.value === "pgsql"
+                    ? 5432
+                    : event.target.value === "mssql"
+                      ? 1433
+                      : event.target.value === "oracle"
+                        ? 1521
+                        : event.target.value === "redis"
+                          ? 6379
+                          : 3306,
               })
             }
           >
             <option value="mysql">MySQL</option>
             <option value="pgsql">PostgreSQL</option>
+            <option value="mssql">MSSQL</option>
+            <option value="oracle">Oracle</option>
+            <option value="redis">Redis</option>
             <option value="sqlite">SQLite（本地文件）</option>
           </select>
         </label>
@@ -246,6 +263,7 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
           <button
             className="button compact"
             onClick={() => void loadTables()}
+            style={isRedis(connection.driver) ? { display: "none" } : undefined}
             disabled={busy !== null || !selectedDb}
           >
             {busy === "tables" ? <LoaderCircle className="spin" size={14} /> : <Table2 size={14} />}
@@ -281,7 +299,11 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
               void runQuery(sql);
             }
           }}
-          placeholder="SELECT * FROM users LIMIT 100（Ctrl+Enter 执行）"
+          placeholder={
+            isRedis(connection.driver)
+              ? "Redis 命令，如：GET key / KEYS * / SET k v / INFO"
+              : "SELECT * FROM users LIMIT 100（Ctrl+Enter 执行）"
+          }
           rows={4}
           spellCheck={false}
         />

