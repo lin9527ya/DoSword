@@ -11,6 +11,55 @@ import { api } from "../api";
  */
 const HISTORY_KEY = "dosword:term-history";
 
+type ViewMode = "ansi" | "text" | "json" | "hex";
+
+const VIEW_LABELS: Record<ViewMode, string> = {
+  ansi: "ANSI",
+  text: "文本",
+  json: "JSON",
+  hex: "HEX",
+};
+
+/** 剥离 ANSI 转义序列（文本/JSON 模式用）。 */
+function stripAnsi(text: string): string {
+  return text
+    .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+    .replace(/\x1b[()][0-9A-Z]/g, "");
+}
+
+/** 按查看格式渲染输出文本。 */
+function renderOutput(stdout: string, mode: ViewMode): string {
+  switch (mode) {
+    case "text":
+      return stripAnsi(stdout);
+    case "json": {
+      const stripped = stripAnsi(stdout).trim();
+      try {
+        const parsed = JSON.parse(stripped);
+        return JSON.stringify(parsed, null, 2);
+      } catch {
+        return stripped;
+      }
+    }
+    case "hex": {
+      const bytes = new TextEncoder().encode(stripAnsi(stdout));
+      const lines: string[] = [];
+      for (let i = 0; i < bytes.length; i += 16) {
+        const chunk = Array.from(bytes.slice(i, i + 16));
+        const hex = chunk.map((byte) => byte.toString(16).padStart(2, "0")).join(" ");
+        const ascii = chunk
+          .map((byte) => (byte >= 0x20 && byte <= 0x7e ? String.fromCharCode(byte) : "."))
+          .join("");
+        lines.push(`${i.toString(16).padStart(8, "0")}  ${hex.padEnd(47)}  ${ascii}`);
+      }
+      return lines.join("\r\n");
+    }
+    default:
+      return stdout;
+  }
+}
+
 export function Terminal({
   sessionId,
   currentDir,
@@ -30,6 +79,9 @@ export function Terminal({
   const currentDirRef = useRef(currentDir);
   currentDirRef.current = currentDir;
   const [ready, setReady] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>("ansi");
+  const viewModeRef = useRef<ViewMode>("ansi");
+  viewModeRef.current = viewMode;
 
   useEffect(() => {
     try {
@@ -49,7 +101,7 @@ export function Terminal({
     term.write(`\r\n`);
     try {
       const output = await api.executeCommand(sessionId, command);
-      term.write(output.stdout.replace(/\n$/, "") + "\r\n");
+      term.write(renderOutput(output.stdout, viewModeRef.current).replace(/\n$/, "") + "\r\n");
       if (output.cwd) onCwdChange?.(output.cwd);
     } catch (error) {
       term.write(`\x1b[31m${String(error)}\x1b[0m\r\n`);
@@ -61,6 +113,13 @@ export function Terminal({
         historyIndexRef.current = -1;
       }
     }
+  }
+
+  function changeViewMode(next: ViewMode) {
+    setViewMode(next);
+    const term = termRef.current;
+    if (!term) return;
+    term.write(`\r\n\x1b[90m[输出格式: ${VIEW_LABELS[next]}——仅影响后续输出]\x1b[0m\r\n${prompt()}`);
   }
 
   function pushHistory(command: string) {
@@ -172,6 +231,21 @@ export function Terminal({
   }, []);
 
   return (
-    <div className="terminal-box" ref={containerRef} data-ready={ready} />
+    <div className="terminal-wrap">
+      <div className="term-toolbar">
+        <span className="term-toolbar-label">输出格式</span>
+        <select
+          className="select term-view-mode"
+          value={viewMode}
+          onChange={(event) => changeViewMode(event.target.value as ViewMode)}
+        >
+          <option value="ansi">ANSI 颜色</option>
+          <option value="text">普通文本</option>
+          <option value="json">JSON</option>
+          <option value="hex">HEX</option>
+        </select>
+      </div>
+      <div className="terminal-box" ref={containerRef} data-ready={ready} />
+    </div>
   );
 }
