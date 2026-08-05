@@ -206,4 +206,6 @@ ByPassOpenBasedir（symlink+glob）、BypassDisableFunctions（LD_PRELOAD+mail�
   - 与 PHP native 相同载荷协议（formData XOR 密文 + X-Debug-Key 头 +
     md5 哈希分发），stub 为 Java（javax.servlet）与 C#（aspx），
     命令 / 文件 / 探测（手动 JSON，无第三方依赖）
-  - 生成 Webshell 支持 jsp / aspx（XOR 载荷）；经典 ASP（VBScript）暂只生成
+  - 生成 Webshell 支持 jsp / aspx / asp（XOR 载荷）；经典 ASP（VBScript）
+    协议 builtin.asp.v1 已可用（命令/文件；操作分发用字符串比较免 MD5，
+    base64 纯 VBScript 实现，文件 I/O 用 FSO + ADODB.Stream）
