@@ -110,7 +110,7 @@ export function ShellDetailView({
     return (
       <header className="topbar">
         <div>
-          <p className="eyebrow">SHELL DETAIL</p>
+          <p className="eyebrow">Shell 详情</p>
           <h1>{error || "正在加载…"}</h1>
         </div>
       </header>
@@ -143,7 +143,7 @@ export function ShellDetailView({
             <ArrowLeft size={17} />
           </button>
           <div>
-            <p className="eyebrow">SHELL DETAIL</p>
+            <p className="eyebrow">Shell 详情</p>
             <h1>{shell.name}</h1>
           </div>
           <span className={`status-dot ${sessionId ? "online" : shell.status}`} />
@@ -283,7 +283,7 @@ function InfoPanel({
     <div className="panel detail-panel">
       <div className="panel-heading">
         <div>
-          <p className="eyebrow">ENVIRONMENT</p>
+          <p className="eyebrow">环境信息</p>
           <h2>环境信息</h2>
         </div>
         <span className={`status-badge ${sessionId ? "online" : ""}`}>

@@ -106,14 +106,14 @@ export function AuditView() {
     <>
       <header className="topbar">
         <div>
-          <p className="eyebrow">AUDIT TRAIL</p>
+          <p className="eyebrow">审计轨迹</p>
           <h1>审计日志</h1>
         </div>
         <div className="top-actions">
           <select className="select" value={outcome} onChange={(event) => setOutcome(event.target.value)}>
             <option value="">全部结果</option>
-            <option value="success">success</option>
-            <option value="error">error</option>
+            <option value="success">成功</option>
+            <option value="error">失败</option>
           </select>
           <select className="select" value={filter} onChange={(event) => setFilter(event.target.value)}>
             <option value="">全部操作</option>
@@ -133,7 +133,7 @@ export function AuditView() {
         </div>
       </header>
       {error && <ErrorBanner message={error} />}
-      <Panel eyebrow="EVENT LOG" title={`审计事件（${total}）`}>
+      <Panel eyebrow="事件日志" title={`审计事件（${total}）`}>
         {loading ? (
           <Empty icon={<Activity />} title="正在读取审计日志" />
         ) : events.length === 0 ? (

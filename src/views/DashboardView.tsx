@@ -344,7 +344,7 @@ export function DashboardView({
     <>
       <header className="topbar">
         <div>
-          <p className="eyebrow">OPERATIONS CONSOLE</p>
+          <p className="eyebrow">操作控制台</p>
           <h1>授权环境总览</h1>
         </div>
         <div className="top-actions">
@@ -402,23 +402,23 @@ export function DashboardView({
       </header>
       {error && <ErrorBanner message={error} />}
       <section className="metrics">
-        <Metric label="WORKSPACES" value={data.workspaces.length} detail="授权项目空间" />
-        <Metric label="SHELL PROFILES" value={data.shells.length} detail="已登记端点" />
+        <Metric label="工作区" value={data.workspaces.length} detail="授权项目空间" />
+        <Metric label="Shell 配置" value={data.shells.length} detail="已登记端点" />
         <Metric
-          label="ONLINE"
+          label="在线状态"
           value={data.shells.filter((item) => item.status === "online").length}
           detail="最近探测在线"
           accent
         />
-        <Metric label="AUDIT EVENTS" value={data.auditEvents.length} detail="最近操作记录" />
-        <Metric label="PLUGINS" value={pluginCount} detail="功能/协议插件" />
-        <Metric label="LAST CONNECT" value={data.shells.filter((s) => s.lastConnectedAt).length} detail={lastConnected} />
+        <Metric label="审计事件" value={data.auditEvents.length} detail="最近操作记录" />
+        <Metric label="插件" value={pluginCount} detail="功能/协议插件" />
+        <Metric label="最近连接" value={data.shells.filter((s) => s.lastConnectedAt).length} detail={lastConnected} />
       </section>
 
       <section className="main-grid">
         <Panel
           className="shell-panel"
-          eyebrow="SHELL REGISTRY"
+          eyebrow="SHELL 配置"
           title="连接配置"
           actions={
             <>
@@ -561,7 +561,7 @@ export function DashboardView({
           )}
         </Panel>
 
-        <Panel eyebrow="RECENT ACTIVITY" title="审计事件">
+        <Panel eyebrow="最近活动" title="审计事件">
           {data.auditEvents.length === 0 ? (
             <Empty icon={<Activity />} title="暂无审计事件" />
           ) : (
@@ -584,7 +584,7 @@ export function DashboardView({
       <section className="panel workspace-panel">
         <div className="panel-heading">
           <div>
-            <p className="eyebrow">AUTHORIZATION BOUNDARIES</p>
+            <p className="eyebrow">授权边界</p>
             <h2>工作空间</h2>
           </div>
         </div>
@@ -690,7 +690,7 @@ function WorkspaceDialog({
         {error && <p className="form-note error">{error}</p>}
         <label>
           项目名称
-          <input name="name" required defaultValue={initial?.name} placeholder="Internal Security Test" />
+          <input name="name" required defaultValue={initial?.name} placeholder="例如：授权测试项目" />
         </label>
         <label>
           授权范围
@@ -838,7 +838,7 @@ function ShellDialog({
         </label>
         <label>
           名称
-          <input name="name" required defaultValue={initial?.name} placeholder="Local Test Endpoint" />
+          <input name="name" required defaultValue={initial?.name} placeholder="例如：本地测试端点" />
         </label>
         <label>
           Endpoint
@@ -846,7 +846,7 @@ function ShellDialog({
             name="endpoint"
             required
             defaultValue={initial?.endpoint ?? "mock://local"}
-            placeholder="http://target/shell.php"
+            placeholder="http://目标/shell.php"
           />
         </label>
         <label>
@@ -854,7 +854,7 @@ function ShellDialog({
           <input
             name="tags"
             defaultValue={initial?.tags.join(", ")}
-            placeholder="可选：web, test（逗号分隔）"
+            placeholder="可选：生产, 测试（逗号分隔）"
           />
         </label>
         {editing ? (

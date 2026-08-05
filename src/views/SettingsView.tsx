@@ -132,7 +132,7 @@ export function SettingsView() {
       <>
         <header className="topbar">
           <div>
-            <p className="eyebrow">PREFERENCES</p>
+            <p className="eyebrow">偏好设置</p>
             <h1>设置</h1>
           </div>
         </header>
@@ -145,7 +145,7 @@ export function SettingsView() {
     <>
       <header className="topbar">
         <div>
-          <p className="eyebrow">PREFERENCES</p>
+          <p className="eyebrow">偏好设置</p>
           <h1>设置</h1>
         </div>
         <div className="top-actions">
@@ -158,7 +158,7 @@ export function SettingsView() {
       {error && <ErrorBanner message={error} />}
       {saved && <div className="success-banner">设置已保存。</div>}
 
-      <Panel eyebrow="NETWORK SAFETY GATE" title="真实网络协议">
+      <Panel eyebrow="网络安全门" title="真实网络协议">
         <div className="settings-body">
           <label className="toggle-row">
             <div>
@@ -182,7 +182,7 @@ export function SettingsView() {
         </div>
       </Panel>
 
-      <Panel eyebrow="COMMUNICATION" title="通信配置">
+      <Panel eyebrow="通信配置" title="通信配置">
         <div className="settings-form">
           <label>
             请求超时（秒）
@@ -221,7 +221,7 @@ export function SettingsView() {
         </div>
       </Panel>
 
-      <Panel eyebrow="APPEARANCE" title="主题">
+      <Panel eyebrow="外观" title="主题">
         <div className="theme-switch">
           <button
             className={`theme-option ${theme === "light" ? "active" : ""}`}
@@ -241,7 +241,7 @@ export function SettingsView() {
       </Panel>
 
       <Panel
-        eyebrow="FEATURE PLUGINS"
+        eyebrow="功能插件"
         title="功能插件"
         actions={
           <button className="button compact" onClick={() => void installPlugin()}>
@@ -288,7 +288,7 @@ export function SettingsView() {
         </div>
       </Panel>
 
-      <Panel eyebrow="AUTO BACKUP" title="自动备份（V3.0 远程同步·本地版）">
+      <Panel eyebrow="自动备份" title="自动备份（V3.0 远程同步·本地版）">
         <div className="backup-form">
           <label className="confirm-row">
             <input
@@ -318,7 +318,7 @@ export function SettingsView() {
         </div>
       </Panel>
 
-      <Panel eyebrow="PLUGINS" title="协议插件">
+      <Panel eyebrow="协议插件" title="协议插件">
         <div className="plugin-list">
           {plugins.length === 0 ? (
             <p className="muted">无插件。</p>

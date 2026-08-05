@@ -155,7 +155,7 @@ export function RequestDebugView() {
     <>
       <header className="topbar">
         <div>
-          <p className="eyebrow">PROTOCOL INSPECTOR</p>
+          <p className="eyebrow">协议检查器</p>
           <h1>请求调试</h1>
         </div>
         <div className="top-actions">
@@ -187,7 +187,7 @@ export function RequestDebugView() {
       </header>
       {error && <ErrorBanner message={error} />}
 
-      <Panel eyebrow="REPEATER" title="手工请求（修改 / 重放 / 模板）">
+      <Panel eyebrow="重放器" title="手工请求（修改 / 重放 / 模板）">
         <div className="repeater">
           <div className="repeater-request">
             <div className="repeater-row">
@@ -206,7 +206,7 @@ export function RequestDebugView() {
                 className="repeater-url"
                 value={request.url}
                 onChange={(event) => setRequest((prev) => ({ ...prev, url: event.target.value }))}
-                placeholder="https://target/shell.php"
+                placeholder="https://目标/shell.php"
               />
               <button className="button primary" onClick={() => void send()} disabled={sending || !request.url}>
                 {sending ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}
@@ -219,7 +219,7 @@ export function RequestDebugView() {
                   <input
                     className="repeater-hname"
                     value={name}
-                    placeholder="Header"
+                    placeholder="请求头"
                     onChange={(event) =>
                       setRequest((prev) => {
                         const headers = prev.headers.map((item, i) => (i === index ? [event.target.value, item[1]] as [string, string] : item));
@@ -230,7 +230,7 @@ export function RequestDebugView() {
                   <input
                     className="repeater-hvalue"
                     value={value}
-                    placeholder="Value"
+                    placeholder="值"
                     onChange={(event) =>
                       setRequest((prev) => {
                         const headers = prev.headers.map((item, i) => (i === index ? [item[0], event.target.value] as [string, string] : item));
@@ -305,7 +305,7 @@ export function RequestDebugView() {
         </div>
       </Panel>
 
-      <Panel eyebrow="FRAME LOG" title={`协议请求（${filtered.length}）`}>
+      <Panel eyebrow="帧日志" title={`协议请求（${filtered.length}）`}>
         {loading ? (
           <Empty icon={<LoaderCircle className="spin" />} title="正在读取请求记录" />
         ) : filtered.length === 0 ? (

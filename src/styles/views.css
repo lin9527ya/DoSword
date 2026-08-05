@@ -28,17 +28,16 @@
 }
 .shell-row {
   min-height: 65px;
+  display: grid;
+  grid-template-columns: 16px 12px minmax(190px, 1fr) 70px 105px 33px 33px 33px 76px;
+  gap: 10px;
+  align-items: center;
+  padding: 0 17px;
+  border-bottom: 1px solid var(--border-soft);
   transition: background 0.12s;
 }
 .shell-row:hover {
   background: var(--hover);
-}
-  display: grid;
-  grid-template-columns: 12px minmax(190px, 1fr) 70px 105px 33px 33px 33px 76px;
-  gap: 12px;
-  align-items: center;
-  padding: 0 17px;
-  border-bottom: 1px solid var(--border-soft);
 }
 .status-dot {
   width: 7px;

@@ -41,12 +41,12 @@ export function SessionsView({ onNavigate }: { onNavigate: (view: View) => void 
     <>
       <header className="topbar">
         <div>
-          <p className="eyebrow">ACTIVE CONNECTIONS</p>
+          <p className="eyebrow">活跃连接</p>
           <h1>终端会话</h1>
         </div>
       </header>
       {error && <ErrorBanner message={error} />}
-      <Panel eyebrow="SESSION LIST" title="活跃会话">
+      <Panel eyebrow="会话列表" title="活跃会话">
         {loading ? (
           <Empty icon={<LoaderCircle className="spin" />} title="正在读取会话" />
         ) : sessions.length === 0 ? (
@@ -60,7 +60,7 @@ export function SessionsView({ onNavigate }: { onNavigate: (view: View) => void 
                   <strong>会话 {session.sessionId}</strong>
                   <span>{session.server}</span>
                 </div>
-                <code>ACTIVE</code>
+                <code>活跃</code>
                 <div className="last-seen">
                   <span>最后使用</span>
                   <small>{shortTime(new Date(session.lastUsedAt * 1000).toISOString())}</small>
