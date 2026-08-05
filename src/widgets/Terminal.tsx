@@ -141,8 +141,7 @@ export function Terminal({
       fontFamily: '"IBM Plex Mono", monospace',
       fontSize: 13,
       // 输出中的 
- 自动转 
-（否则 ls 等列对齐输出光标不回到行首导致错乱）
+      // 输出换行自动转 CRLF（修复 ls 等列对齐输出错乱）
       convertEol: true,
       theme: {
         background: "#111310",
