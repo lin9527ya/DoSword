@@ -14,8 +14,8 @@ export function Metric({
   return (
     <article className={`metric ${accent ? "accent" : ""}`}>
       <span>{label}</span>
-      <strong>{String(value).padStart(2, "0")}</strong>
-      <small>{detail}</small>
+      <strong>{value > 0 ? String(value).padStart(2, "0") : detail}</strong>
+      <small>{value > 0 ? detail : "最近连接时间"}</small>
     </article>
   );
 }

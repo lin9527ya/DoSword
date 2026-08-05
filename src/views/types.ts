@@ -7,3 +7,10 @@ export type View =
   | { kind: "debug" }
   | { kind: "audit" }
   | { kind: "settings" };
+
+/** 多 Shell 标签页：一次可同时打开多个 Shell 详情。 */
+export type ShellTab = {
+  id: string;
+  shellId: string;
+  sessionId?: string;
+};

@@ -35,6 +35,14 @@ export type ParamSpec = {
   options: string[] | null;
 };
 
+export type HttpSendResult = {
+  status: number;
+  statusText: string;
+  headers: [string, string][];
+  body: string;
+  durationMs: number;
+};
+
 export type FeatureManifest = {
   id: string;
   name: string;
@@ -90,6 +98,21 @@ export const api = {
     params: Record<string, unknown>,
   ) => invoke<Record<string, unknown>>("run_feature_plugin", { sessionId, pluginId, params }),
   refreshShellStatus: () => invoke<ShellProfile[]>("refresh_shell_status"),
+  exportShells: () => invoke<string>("export_shells"),
+  importShells: (payload: string, workspaceId: string) =>
+    invoke<{ imported: number; skipped: number }>("import_shells", { payload, workspaceId }),
+  readLocalFile: (path: string) => invoke<string>("read_local_file", { path }),
+  batchUpdateShells: (
+    ids: string[],
+    tags?: string[],
+    password?: string,
+  ) => invoke<number>("batch_update_shells", { ids, tags, password }),
+  httpSend: (request: {
+    method: string;
+    url: string;
+    headers: [string, string][];
+    body: string;
+  }) => invoke<HttpSendResult>("http_send", request),
   listEncoders: () => invoke<[string, string][]>("list_encoders"),
   generateShell: (language: string, encoderId: string, password: string, session: boolean) =>
     invoke<GenerateShellResult>("generate_shell", { language, encoderId, password, session }),

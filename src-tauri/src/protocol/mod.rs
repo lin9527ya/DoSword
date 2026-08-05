@@ -5,7 +5,7 @@
 
 pub mod mock;
 pub mod php;
-mod transport;
+pub mod transport;
 
 use dosword_sdk::domain::ProtocolMeta;
 use dosword_sdk::{PluginManifest, PluginRegistry, ProtocolPlugin};

@@ -13,8 +13,8 @@ import {
   ShieldCheck,
   Trash2,
 } from "lucide-react";
-import { ask } from "@tauri-apps/plugin-dialog";
-import { api, errorText, shortTime } from "../api";
+import { ask, open, save } from "@tauri-apps/plugin-dialog";
+import { api, b64, errorText, shortTime } from "../api";
 import type { Dashboard, ProtocolMeta, ShellProfile, Workspace } from "../api";
 import { Dialog } from "../components/Dialog";
 import { Empty, ErrorBanner, Metric, Panel } from "../components/common";
@@ -55,6 +55,11 @@ export function DashboardView({
   const [editingWorkspace, setEditingWorkspace] = useState<Workspace | null>(null);
   const [editingShell, setEditingShell] = useState<ShellProfile | null>(null);
   const [search, setSearch] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [batchTags, setBatchTags] = useState("");
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [pluginCount, setPluginCount] = useState(0);
   const [tagFilter, setTagFilter] = useState("");
   const [workspaceFilter, setWorkspaceFilter] = useState("");
   const [probing, setProbing] = useState<string | null>(null);
@@ -76,6 +81,19 @@ export function DashboardView({
   useEffect(() => {
     void loadDashboard();
   }, [loadDashboard]);
+
+  useEffect(() => {
+    void api.listFeaturePlugins().then((plugins) => setPluginCount(plugins.length)).catch(() => {});
+  }, []);
+
+  const lastConnected = useMemo(() => {
+    const times = data.shells
+      .map((shell) => shell.lastConnectedAt)
+      .filter((value): value is string => Boolean(value))
+      .sort()
+      .reverse();
+    return times.length > 0 ? shortTime(times[0]) : "—";
+  }, [data.shells]);
 
   // Shell 状态自动刷新（60s 轮询，仅更新在线/错误状态）
   useEffect(() => {
@@ -135,6 +153,141 @@ export function DashboardView({
     }
     setBatchProbing(null);
     await loadDashboard();
+  }
+
+  function toggleSelect(id: string) {
+    setSelected((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id],
+    );
+  }
+
+  async function batchConnect() {
+    setBatchBusy(true);
+    setError("");
+    let connected = 0;
+    for (const id of selected) {
+      const shell = data.shells.find((item) => item.id === id);
+      if (!shell) continue;
+      try {
+        await api.connectShell(shell.id);
+        connected += 1;
+      } catch (cause) {
+        setError(`连接 ${shell.name} 失败：${errorText(cause)}`);
+        break;
+      }
+    }
+    setBatchBusy(false);
+    setSelected([]);
+    await loadDashboard();
+    if (connected > 0) {
+      setNotice(`已建立 ${connected} 个会话（可在「会话」页查看）`);
+    }
+  }
+
+  async function batchApplyTags() {
+    const tags = batchTags
+      .split(/[,，]/)
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+    setBatchBusy(true);
+    setError("");
+    try {
+      const count = await api.batchUpdateShells(selected, tags);
+      setNotice(`已为 ${count} 个 Shell 设置标签`);
+      setBatchTags("");
+      setSelected([]);
+      await loadDashboard();
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  async function batchDelete() {
+    const confirmed = await ask(`确定删除选中的 ${selected.length} 个 Shell？`, {
+      title: "批量删除确认",
+      kind: "warning",
+      okLabel: "删除",
+      cancelLabel: "取消",
+    });
+    if (!confirmed) return;
+    setBatchBusy(true);
+    setError("");
+    for (const id of selected) {
+      try {
+        await api.deleteShell(id);
+      } catch (cause) {
+        setError(errorText(cause));
+        break;
+      }
+    }
+    setBatchBusy(false);
+    setSelected([]);
+    await loadDashboard();
+  }
+
+  async function exportShells() {
+    setError("");
+    try {
+      const json = await api.exportShells();
+      const localPath = await save({
+        defaultPath: `dosword-shells-${new Date().toISOString().slice(0, 10)}.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!localPath) return;
+      const bytes = new TextEncoder().encode(json);
+      await api.writeLocalFile(localPath, b64.encodeBytes(bytes));
+      setNotice(`已导出 ${data.shells.length} 个 Shell 配置`);
+    } catch (cause) {
+      setError(`导出失败：${errorText(cause)}`);
+    }
+  }
+
+  async function importShells() {
+    if (data.workspaces.length === 0) {
+      setError("请先创建 Workspace 再导入");
+      return;
+    }
+    const workspaceId = data.workspaces[0].id;
+    setError("");
+    try {
+      const localPath = await open({
+        multiple: false,
+        filters: [{ name: "Shell 配置", extensions: ["json", "csv"] }],
+      });
+      if (!localPath || Array.isArray(localPath)) return;
+      const contentB64 = await api.readLocalFile(String(localPath));
+      const text = b64.decodeText(contentB64);
+      const payload = text.trim().startsWith("[") || text.trim().startsWith("{")
+        ? text
+        : csvToJson(text);
+      const result = await api.importShells(payload, workspaceId);
+      setNotice(`导入完成：新增 ${result.imported}，跳过 ${result.skipped}`);
+      await loadDashboard();
+    } catch (cause) {
+      setError(`导入失败：${errorText(cause)}`);
+    }
+  }
+
+  function csvToJson(csv: string): string {
+    const rows = csv
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => line.split(",").map((cell) => cell.trim()));
+    if (rows.length === 0) return "[]";
+    const headers = rows[0];
+    const items = rows.slice(1)
+      .filter((row) => row.length >= 2)
+      .map((row) => {
+        const item: Record<string, string> = {};
+        headers.forEach((header, index) => {
+          item[header] = row[index] ?? "";
+        });
+        return item;
+      });
+    return JSON.stringify(items);
   }
 
   async function connect(shell: ShellProfile) {
@@ -253,6 +406,8 @@ export function DashboardView({
           accent
         />
         <Metric label="AUDIT EVENTS" value={data.auditEvents.length} detail="最近操作记录" />
+        <Metric label="PLUGINS" value={pluginCount} detail="功能/协议插件" />
+        <Metric label="LAST CONNECT" value={data.shells.filter((s) => s.lastConnectedAt).length} detail={lastConnected} />
       </section>
 
       <section className="main-grid">
@@ -261,14 +416,22 @@ export function DashboardView({
           eyebrow="SHELL REGISTRY"
           title="连接配置"
           actions={
-            <button
-              className="button compact"
-              disabled={data.workspaces.length === 0}
-              onClick={() => setDialog("shell")}
-            >
-              <CirclePlus size={16} />
-              登记 Shell
-            </button>
+            <>
+              <button className="button compact" onClick={() => void exportShells()}>
+                导出
+              </button>
+              <button className="button compact" onClick={() => void importShells()}>
+                导入
+              </button>
+              <button
+                className="button compact"
+                disabled={data.workspaces.length === 0}
+                onClick={() => setDialog("shell")}
+              >
+                <CirclePlus size={16} />
+                登记 Shell
+              </button>
+            </>
           }
         >
           {loading ? (
@@ -284,9 +447,40 @@ export function DashboardView({
               }
             />
           ) : (
+            <>
+            {selected.length > 0 && (
+              <div className="batch-bar">
+                <span>已选 {selected.length} 项</span>
+                <button className="button compact" disabled={batchBusy} onClick={() => void batchConnect()}>
+                  批量连接
+                </button>
+                <input
+                  className="batch-tags"
+                  value={batchTags}
+                  onChange={(event) => setBatchTags(event.target.value)}
+                  placeholder="批量设置标签（逗号分隔）"
+                />
+                <button className="button compact" disabled={batchBusy || !batchTags.trim()} onClick={() => void batchApplyTags()}>
+                  应用标签
+                </button>
+                <button className="button compact danger" disabled={batchBusy} onClick={() => void batchDelete()}>
+                  批量删除
+                </button>
+                <button className="button compact" onClick={() => setSelected([])}>
+                  取消选择
+                </button>
+              </div>
+            )}
+            {notice && <p className="form-note ok">{notice}</p>}
             <div className="shell-list">
               {filteredShells.map((shell) => (
-                <article className="shell-row" key={shell.id}>
+                <article className={`shell-row ${selected.includes(shell.id) ? "selected" : ""}`} key={shell.id}>
+                  <input
+                    type="checkbox"
+                    className="shell-check"
+                    checked={selected.includes(shell.id)}
+                    onChange={() => toggleSelect(shell.id)}
+                  />
                   <div className={`status-dot ${shell.status}`} />
                   <div className="shell-identity">
                     <strong>{shell.name}</strong>
@@ -340,6 +534,7 @@ export function DashboardView({
                 </article>
               ))}
             </div>
+            </>
           )}
         </Panel>
 

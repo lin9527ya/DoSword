@@ -263,3 +263,11 @@ nav {
     grid-template-columns: 1fr;
   }
 }
+
+/* --- 多 Shell 标签栏 --- */
+.content { display: flex; flex-direction: column; min-height: 0; }
+.shell-tabs { display: flex; gap: 4px; padding: 6px 12px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.shell-tab { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; font-size: 12px; border: 1px solid var(--border); border-bottom: none; border-radius: 8px 8px 0 0; cursor: pointer; color: var(--muted); max-width: 220px; }
+.shell-tab span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shell-tab.active { color: var(--text); border-color: var(--accent); }
+.shell-tab-close { border: none; background: none; cursor: pointer; color: inherit; padding: 0 2px; font-size: 13px; }

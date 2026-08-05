@@ -6,7 +6,8 @@ use url::Url;
 use dosword_sdk::domain::{
     AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
     CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing,
-    FileContent, GenerateShellResult, ProbeResult, ProtocolMeta, RequestRecord, SessionInfo,
+    FileContent, GenerateShellResult, HttpSendResult, ImportResult, ProbeResult,
+    ProtocolMeta, RequestRecord, SessionInfo,
     ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
 };
 use dosword_sdk::encoder::{EncoderRegistry, STUB_LANGUAGES};
@@ -495,6 +496,122 @@ pub async fn list_encoders(app: AppHandle) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// 读取本地文件（Shell 导入用）。
+#[tauri::command]
+pub async fn read_local_file(path: String, app: AppHandle) -> Result<String, String> {
+    blocking(app, move |_state| {
+        std::fs::read(&path)
+            .map_err(|error| format!("读取本地文件失败：{error}"))
+            .map(|bytes| {
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            })
+    })
+    .await
+}
+
+/// 导出全部 Shell 配置（JSON 数组，含密码——请妥善保管导出文件）。
+#[tauri::command]
+pub fn export_shells(state: State<'_, AppState>) -> Result<String, String> {
+    export_shells_impl(&state)
+}
+
+fn export_shells_impl(state: &AppState) -> Result<String, String> {
+    let database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
+    let shells = database.list_shells().map_err(|error| error.to_string())?;
+    serde_json::to_string_pretty(&shells).map_err(|error| error.to_string())
+}
+
+/// 批量导入 Shell 配置（JSON 数组）。endpoint 已存在或协议不存在时跳过。
+#[tauri::command]
+pub async fn import_shells(
+    payload: String,
+    workspace_id: String,
+    app: AppHandle,
+) -> Result<ImportResult, String> {
+    blocking(app, move |state| {
+        import_shells_impl(&state, &payload, &workspace_id)
+    })
+    .await
+}
+
+fn import_shells_impl(state: &AppState, payload: &str, workspace_id: &str) -> Result<ImportResult, String> {
+    {
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(payload).map_err(|error| format!("导入文件不是合法 JSON：{error}"))?;
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
+        let _workspace = database
+            .workspace(workspace_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "目标 Workspace 不存在".to_string())?;
+        let existing: Vec<String> = database
+            .list_shells()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|shell| shell.endpoint)
+            .collect();
+        for item in items {
+            let endpoint = item.get("endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let protocol_id = item
+                .get("protocol_id")
+                .or_else(|| item.get("protocolId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if endpoint.trim().is_empty()
+                || existing.contains(&endpoint)
+                || state.protocols.get(&protocol_id).is_none()
+            {
+                skipped += 1;
+                continue;
+            }
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let runtime = item
+                .get("runtime")
+                .and_then(|v| v.as_str())
+                .unwrap_or("php")
+                .to_string();
+            let password = item
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let protocol_params = item
+                .get("protocol_params")
+                .or_else(|| item.get("protocolParams"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}")
+                .to_string();
+            let tags: Vec<String> = item
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|tag| tag.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let create = CreateShell {
+                workspace_id: workspace_id.to_string(),
+                name: if name.trim().is_empty() { endpoint.clone() } else { name },
+                endpoint: endpoint.clone(),
+                runtime,
+                protocol_id: protocol_id.clone(),
+                password: Some(password),
+                protocol_params: Some(protocol_params),
+                confirm_network: false,
+                tags: Some(tags),
+            };
+            match database.create_shell(create, &protocol_id) {
+                Ok(_) => imported += 1,
+                Err(_) => skipped += 1,
+            }
+        }
+        Ok(ImportResult { imported, skipped })
+    }
+}
+
 #[tauri::command]
 pub async fn write_local_file(path: String, content_b64: String, app: AppHandle) -> Result<(), String> {
     blocking(app, move |_state| {
@@ -610,6 +727,112 @@ pub async fn refresh_shell_status(app: AppHandle) -> Result<Vec<ShellProfile>, S
         }
         let database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
         database.list_shells().map_err(|error| error.to_string())
+    })
+    .await
+}
+
+/// 批量更新 Shell：批量设置标签 / 密码（其余字段保持）。
+#[tauri::command]
+pub async fn batch_update_shells(
+    ids: Vec<String>,
+    tags: Option<Vec<String>>,
+    password: Option<String>,
+    app: AppHandle,
+) -> Result<usize, String> {
+    blocking(app, move |state| {
+        batch_update_shells_impl(&state, &ids, tags, password)
+    })
+    .await
+}
+
+fn batch_update_shells_impl(
+    state: &AppState,
+    ids: &[String],
+    tags: Option<Vec<String>>,
+    password: Option<String>,
+) -> Result<usize, String> {
+    let mut updated = 0usize;
+    let database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
+    for id in ids {
+        if let Ok(Some(shell)) = database.shell(id) {
+            let input = UpdateShell {
+                id: id.clone(),
+                name: shell.name.clone(),
+                endpoint: shell.endpoint.clone(),
+                password: password.clone().or(Some(shell.password)),
+                tags: tags.clone().or(Some(shell.tags)),
+            };
+            if database.update_shell(&input).is_ok() {
+                updated += 1;
+            }
+        }
+    }
+    Ok(updated)
+}
+
+/// Repeater：手工构造并发送一次 HTTP 请求（不经协议，仅走传输层）。
+#[tauri::command]
+pub async fn http_send(
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: String,
+    app: AppHandle,
+) -> Result<HttpSendResult, String> {
+    blocking(app, move |state| {
+        parse_endpoint(&url)?;
+        let settings = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .get_settings()
+            .map_err(|error| error.to_string())?;
+        if !settings.http_enabled {
+            return Err("真实网络协议尚未在「设置」中开启授权声明".to_string());
+        }
+        let client = crate::protocol::transport::build_client(&settings);
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| format!("不支持的请求方法：{method}"))?;
+        let mut request = client.request(method, &url);
+        for (name, value) in &headers {
+            if !name.trim().is_empty() {
+                request = request.header(name.trim(), value);
+            }
+        }
+        if !body.is_empty()
+            && !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("Content-Type"))
+        {
+            request = request.header("Content-Type", "application/x-www-form-urlencoded");
+        }
+        let start = std::time::Instant::now();
+        let response = request
+            .body(body)
+            .send()
+            .map_err(|error| format!("请求失败：{error}"))?;
+        let status = response.status();
+        let status_text = status.canonical_reason().unwrap_or("").to_string();
+        let resp_headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or("?").to_string(),
+                )
+            })
+            .collect();
+        let resp_body = response
+            .text()
+            .unwrap_or_else(|_| "（响应体读取失败）".to_string());
+        Ok(HttpSendResult {
+            status: status.as_u16(),
+            status_text,
+            headers: resp_headers,
+            body: resp_body,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
     })
     .await
 }
@@ -1247,6 +1470,67 @@ mod tests {
             None,
         );
         assert!(result.is_err(), "非法 URL 应报错");
+    }
+
+    #[test]
+    fn export_shells_returns_json_array() {
+        let state = app_state();
+        let wid = add_workspace(&mut state.database.lock().unwrap(), "scope-a", None);
+        add_shell(&state, &wid, MOCK_PROTOCOL_ID);
+        let json = export_shells_impl(&state).unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0]["endpoint"].as_str().is_some());
+    }
+
+    #[test]
+    fn import_shells_dedupes_endpoint() {
+        let state = app_state();
+        let wid = add_workspace(&mut state.database.lock().unwrap(), "scope-a", None);
+        add_shell(&state, &wid, MOCK_PROTOCOL_ID);
+        let payload = serde_json::json!([
+            {
+                "name": "dup",
+                "endpoint": "mock://local",
+                "runtime": "php",
+                "protocol_id": MOCK_PROTOCOL_ID,
+                "password": "x",
+                "protocol_params": "{}",
+                "tags": []
+            },
+            {
+                "name": "new",
+                "endpoint": "mock://remote",
+                "runtime": "php",
+                "protocol_id": MOCK_PROTOCOL_ID,
+                "password": "y",
+                "protocol_params": "{}",
+                "tags": ["t"]
+            },
+            {
+                "name": "bad",
+                "endpoint": "mock://bad",
+                "runtime": "php",
+                "protocol_id": "unknown.v1",
+                "password": "z",
+                "protocol_params": "{}",
+                "tags": []
+            }
+        ]);
+        let result = import_shells_impl(&state, &payload.to_string(), &wid).unwrap();
+        assert_eq!(result.imported, 1, "仅有效且不重复的应导入");
+        assert_eq!(result.skipped, 2, "重复 endpoint 与未知协议应跳过");
+    }
+
+    #[test]
+    fn batch_update_shells_sets_tags() {
+        let state = app_state();
+        let wid = add_workspace(&mut state.database.lock().unwrap(), "scope-a", None);
+        let shell = add_shell(&state, &wid, MOCK_PROTOCOL_ID);
+        let count = batch_update_shells_impl(&state, &[shell.id.clone()], Some(vec!["prod".to_string()]), None).unwrap();
+        assert_eq!(count, 1);
+        let updated = state.database.lock().unwrap().shell(&shell.id).unwrap().unwrap();
+        assert_eq!(updated.tags, vec!["prod"]);
     }
 
     fn register_session(state: &AppState, shell: &ShellProfile) -> String {

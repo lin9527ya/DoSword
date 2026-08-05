@@ -1,6 +1,7 @@
 import { Activity, Boxes, Braces, FileCode2, LayoutDashboard, Settings, ShieldCheck, TerminalSquare } from "lucide-react";
+import { useEffect } from "react";
 import type { ReactNode } from "react";
-import type { View } from "../views/types";
+import type { ShellTab, View } from "../views/types";
 
 type NavItem = {
   key: string;
@@ -27,12 +28,46 @@ export function Layout({
   view,
   onNavigate,
   children,
+  shellTabs = [],
+  activeTab = null,
+  onSelectTab,
+  onCloseTab,
 }: {
   view: View;
   onNavigate: (view: View) => void;
   children: ReactNode;
+  shellTabs?: ShellTab[];
+  activeTab?: string | null;
+  onSelectTab?: (id: string) => void;
+  onCloseTab?: (id: string) => void;
 }) {
   const activeKey = view.kind === "shell" ? "dashboard" : view.kind;
+
+  // 全局快捷键：Ctrl+T 会话页 / Ctrl+N 总览 / Ctrl+F 搜索总览 / F5 刷新 / Ctrl+W 关闭标签
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const mod = event.ctrlKey || event.metaKey;
+      if (mod && event.key.toLowerCase() === "t") {
+        event.preventDefault();
+        onNavigate({ kind: "sessions" });
+      } else if (mod && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        onNavigate({ kind: "dashboard" });
+      } else if (mod && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        onNavigate({ kind: "dashboard" });
+      } else if (event.key === "F5") {
+        event.preventDefault();
+        onNavigate({ kind: "dashboard" });
+      } else if (mod && event.key.toLowerCase() === "w") {
+        event.preventDefault();
+        if (activeTab && onCloseTab) onCloseTab(activeTab);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onNavigate, activeTab, onCloseTab]);
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -82,7 +117,32 @@ export function Layout({
           </div>
         </div>
       </aside>
-      <main className="content">{children}</main>
+      <div className="content">
+        {shellTabs.length > 0 && (
+          <div className="shell-tabs">
+            {shellTabs.map((tab) => (
+              <span
+                key={tab.id}
+                className={`shell-tab ${activeTab === tab.id ? "active" : ""}`}
+                onClick={() => onSelectTab?.(tab.id)}
+                title={tab.shellId}
+              >
+                {tab.shellId}
+                <button
+                  className="shell-tab-close"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onCloseTab?.(tab.id);
+                  }}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        <main>{children}</main>
+      </div>
     </div>
   );
 }

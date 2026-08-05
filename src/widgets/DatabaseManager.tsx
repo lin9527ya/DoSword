@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Database, LoaderCircle, Play, RefreshCw, Table2 } from "lucide-react";
-import { api, errorText } from "../api";
+import { Database, Download, LoaderCircle, Play, RefreshCw, Table2 } from "lucide-react";
+import { save } from "@tauri-apps/plugin-dialog";
+import { api, b64, errorText } from "../api";
 import type { DbConnection, DbQueryResult } from "../api";
 import { Empty, ErrorBanner } from "../components/common";
 
@@ -109,6 +110,40 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
     `SELECT * FROM \`${table}\` LIMIT 100`;
 
   const cellCount = useMemo(() => result?.columns.length ?? 0, [result]);
+
+  function csvCell(value: unknown): string {
+    if (value === null || value === undefined) return "";
+    const text = String(value);
+    return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  }
+
+  async function exportResult(format: "csv" | "json") {
+    if (!result) return;
+    const stamp = new Date().toISOString().slice(0, 19).replace(/:/g, "-");
+    const localPath = await save({
+      defaultPath: `dosword-query-${stamp}.${format}`,
+      filters: [{ name: format.toUpperCase(), extensions: [format] }],
+    });
+    if (!localPath) return;
+    let content: string;
+    if (format === "csv") {
+      const rows = [
+        result.columns,
+        ...result.rows.map((row) => result.columns.map((_, i) => csvCell(row[i]))),
+      ];
+      content = "\uFEFF" + rows.map((row) => row.join(",")).join("\r\n");
+    } else {
+      const items = result.rows.map((row) =>
+        Object.fromEntries(result.columns.map((column, i) => [column, row[i]])),
+      );
+      content = JSON.stringify(items, null, 2);
+    }
+    try {
+      await api.writeLocalFile(localPath, b64.encodeBytes(new TextEncoder().encode(content)));
+    } catch (cause) {
+      setError(`导出失败：${errorText(cause)}`);
+    }
+  }
 
   return (
     <div className="db-manager">
@@ -274,6 +309,16 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
           <div className="db-result-head">
             <span className="mono">
               {result.columns.length} 列 × {result.rows.length} 行（{result.durationMs} ms）
+            </span>
+            <span className="db-result-actions">
+              <button className="button compact" onClick={() => void exportResult("csv")}>
+                <Download size={13} />
+                CSV
+              </button>
+              <button className="button compact" onClick={() => void exportResult("json")}>
+                <Download size={13} />
+                JSON
+              </button>
             </span>
           </div>
           <div className="db-result-table">

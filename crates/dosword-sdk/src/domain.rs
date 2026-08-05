@@ -128,6 +128,29 @@ pub struct ProbeResult {
     pub message: String,
 }
 
+/// HTTP 手工请求结果（Repeater）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpSendResult {
+    #[ts(type = "number")]
+    pub status: u16,
+    pub status_text: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+}
+
+/// Shell 批量导入结果。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportResult {
+    #[ts(type = "number")]
+    pub imported: usize,
+    #[ts(type = "number")]
+    pub skipped: usize,
+}
+
 /// 全局应用设置（app_settings 表单行 JSON）。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
