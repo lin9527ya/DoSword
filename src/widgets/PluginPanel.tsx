@@ -91,29 +91,50 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
 
   const byKind = (kind: string) => plugins.filter((p) => p.kind === kind);
   const isBypass = (p: FeatureManifest) => p.id.startsWith("bypass_");
+  const dfBypass = plugins.filter((p) => isBypass(p) && p.id !== "bypass_open_basedir");
+  const obBypass = plugins.filter((p) => p.id === "bypass_open_basedir");
   const feature = byKind("feature").filter((p) => !isBypass(p));
   const loader = byKind("loader").filter((p) => !isBypass(p));
-  const bypass = plugins.filter((p) => isBypass(p));
   const crypto = byKind("crypto");
   const others = plugins.filter((p) => !["feature", "crypto", "loader"].includes(p.kind));
 
   return (
     <div className="plugin-panel">
       <div className="plugin-sidebar">
-        {bypass.length > 0 && <p className="plugin-group">Bypass 向量</p>}
-        {bypass.length > 0 && (
+        {dfBypass.length > 0 && <p className="plugin-group">Bypass DisableFunctions</p>}
+        {dfBypass.length > 0 && (
           <select
             className="plugin-bypass-select"
-            value={selected && selected.id.startsWith("bypass_") ? selected.id : ""}
+            value={selected && dfBypass.some((p) => p.id === selected.id) ? selected.id : ""}
             onChange={(event) => {
-              const plugin = bypass.find((p) => p.id === event.target.value);
+              const plugin = dfBypass.find((p) => p.id === event.target.value);
               if (plugin) pick(plugin);
             }}
           >
             <option value="" disabled>
               选择绕过向量…
             </option>
-            {bypass.map((plugin) => (
+            {dfBypass.map((plugin) => (
+              <option key={plugin.id} value={plugin.id}>
+                {plugin.name}
+              </option>
+            ))}
+          </select>
+        )}
+        {obBypass.length > 0 && <p className="plugin-group">Bypass OpenBasedir</p>}
+        {obBypass.length > 0 && (
+          <select
+            className="plugin-bypass-select"
+            value={selected && obBypass.some((p) => p.id === selected.id) ? selected.id : ""}
+            onChange={(event) => {
+              const plugin = obBypass.find((p) => p.id === event.target.value);
+              if (plugin) pick(plugin);
+            }}
+          >
+            <option value="" disabled>
+              选择绕过方法…
+            </option>
+            {obBypass.map((plugin) => (
               <option key={plugin.id} value={plugin.id}>
                 {plugin.name}
               </option>
