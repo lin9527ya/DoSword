@@ -90,10 +90,11 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
   }
 
   const byKind = (kind: string) => plugins.filter((p) => p.kind === kind);
-  const feature = byKind("feature").filter((p) => !p.id.startsWith("bypass_"));
-  const bypass = plugins.filter((p) => p.kind === "feature" && p.id.startsWith("bypass_"));
+  const isBypass = (p: FeatureManifest) => p.id.startsWith("bypass_");
+  const feature = byKind("feature").filter((p) => !isBypass(p));
+  const loader = byKind("loader").filter((p) => !isBypass(p));
+  const bypass = plugins.filter((p) => isBypass(p));
   const crypto = byKind("crypto");
-  const loader = byKind("loader");
   const others = plugins.filter((p) => !["feature", "crypto", "loader"].includes(p.kind));
 
   return (
