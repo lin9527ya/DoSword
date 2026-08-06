@@ -1393,7 +1393,6 @@ impl FeaturePlugin for BypassDisableFunctionsPlugin {
 // ---------------------------------------------------------------------------
 // 文件搜索（通用，PHP 代码型：文件名/内容匹配）
 // ---------------------------------------------------------------------------
-
 fn php_file_search_code(dir: &str, keyword: &str, in_content: bool, max_depth: u32) -> String {
     format!(
         r#"<?php

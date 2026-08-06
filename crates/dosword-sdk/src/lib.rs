@@ -7,6 +7,7 @@ pub mod domain;
 pub mod crypto;
 pub mod encoder;
 pub mod asp_stub;
+pub mod bypass;
 pub mod feature_plugins;
 pub mod jsp_stub;
 pub mod plugin;
@@ -25,3 +26,8 @@ pub use plugin::{
     PluginRegistry, ProtocolPlugin, ScriptFeaturePlugin, ScriptPluginDef,
 };
 pub use protocol::{Protocol, ProtocolError, SessionState};
+
+pub use bypass::{
+    BypassComPlugin, BypassDlPlugin, BypassEvalPlugin, BypassFfiPlugin, BypassLdPreloadPlugin,
+    BypassPcntlPlugin, BypassScanPlugin, BypassSyscallPlugin,
+};

@@ -1847,23 +1847,40 @@ mod tests {
             eprintln!("{}bypass_open_basedir ob={:?} read={:?}", p("plugin"),
                 out["open_basedir"].as_str().unwrap_or(""), out["read"].as_bool());
 
-            // BypassDisableFunctions：多向量自动尝试（FFI / pcntl_exec / LD_PRELOAD）
-            let out = dosword_sdk::feature_plugins::BypassDisableFunctionsPlugin.execute(
+            // Bypass 向量：扫描 → 手动选择测试（syscall/pcntl/ffi 等独立插件）
+            let scan = dosword_sdk::bypass::BypassScanPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({}), &settings)?;
+            assert_eq!(scan["ok"].as_bool(), Some(true));
+            let vectors = scan["vectors"].as_object().map(|o| o.len()).unwrap_or(0);
+            assert!(vectors > 0, "应评估至少一个向量：{scan:?}");
+            eprintln!("{}bypass_scan 评估 {} 个向量", p("plugin"), vectors);
+            // syscall 向量（本机 exec 可用）
+            let out = dosword_sdk::bypass::BypassSyscallPlugin.execute(
                 &protocol, php, "php",
                 &serde_json::json!({"command": "id"}), &settings)?;
-            let vectors = out["vectors"].as_object().map(|o| o.len()).unwrap_or(0);
-            assert!(vectors > 0, "应尝试至少一个绕过向量：{out:?}");
-            // 本机 pcntl_exec 可用 → 应成功
-            if out["detected"]["pcntl_exec"].as_bool() == Some(true) {
-                let result = out["result"].as_str().unwrap_or("");
-                assert!(result.contains("uid="), "pcntl_exec 向量应执行成功：{out:?}");
-                eprintln!("{}bypass_disable_functions pcntl_exec 向量成功", p("plugin"));
+            assert_eq!(out["ok"].as_bool(), Some(true), "syscall 向量应成功：{out:?}");
+            assert!(out["output_text"].as_str().unwrap_or("").contains("uid="));
+            eprintln!("{}bypass_syscall 向量成功", p("plugin"));
+            // pcntl 向量
+            let out = dosword_sdk::bypass::BypassPcntlPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"command": "id"}), &settings)?;
+            if scan["detected"]["pcntl_exec"].as_bool() == Some(true) {
+                assert_eq!(out["ok"].as_bool(), Some(true), "pcntl 向量应成功：{out:?}");
+                assert!(out["output_text"].as_str().unwrap_or("").contains("uid="));
+                eprintln!("{}bypass_pcntl 向量成功", p("plugin"));
             } else {
-                let any_ok = out["vectors"]
-                    .as_object()
-                    .map(|o| o.values().any(|v| v.get("ok").and_then(|x| x.as_bool()) == Some(true)))
-                    .unwrap_or(false);
-                eprintln!("{}bypass_disable_functions 向量：{}（成功={}）", p("plugin"), vectors, any_ok);
+                eprintln!("{}bypass_pcntl 跳过（pcntl_exec 不可用）", p("plugin"));
+            }
+            // FFI 向量（本机未启用时明确报告）
+            let out = dosword_sdk::bypass::BypassFfiPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"command": "id"}), &settings)?;
+            if scan["vectors"]["ffi"].as_bool() == Some(true) {
+                assert_eq!(out["ok"].as_bool(), Some(true), "FFI 向量应成功：{out:?}");
+                eprintln!("{}bypass_ffi 向量成功", p("plugin"));
+            } else {
+                eprintln!("{}bypass_ffi 跳过（FFI 未启用）", p("plugin"));
             }
 
             // SOCKS5 代理：pcntl 可用 → 后台驻留
