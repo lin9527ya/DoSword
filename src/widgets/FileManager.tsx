@@ -352,59 +352,30 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
             spellCheck={false}
           />
         </div>
-        <div className="file-tools">
+        <div className="file-tool-actions">
           <div className="file-search">
             <Search size={14} />
             <input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="搜索当前目录…"
+              placeholder="搜索…"
               spellCheck={false}
             />
           </div>
-        </div>
-        <div className="file-actions">
-          <button className="button compact" onClick={() => setPath(startDir)} title="回到初始目录">
+          <button className="file-tool-btn" onClick={() => setPath(startDir)} title="回到初始目录">
             <ArrowUp size={15} />
           </button>
-          <button className="button compact" onClick={() => void load(path)} title="刷新">
+          <button className="file-tool-btn" onClick={() => void load(path)} title="刷新">
             <RefreshCw size={15} />
           </button>
-          {visible.length > 0 && (
-            <button className="button compact" onClick={toggleSelectAll} title="全选 / 取消全选">
-              <Clipboard size={15} />
-              {selected.size > 0 ? `已选 ${selected.size}` : "全选"}
-            </button>
-          )}
-          {selected.size > 0 && (
-            <>
-              <button className="button compact" onClick={() => void copyToClipboard("copy")} title="复制选中项">
-                <Copy size={15} />
-                复制
-              </button>
-              <button className="button compact" onClick={() => void copyToClipboard("move")} title="剪切选中项">
-                <Scissors size={15} />
-                剪切
-              </button>
-              <button className="button compact danger" onClick={() => void removeMany()} title="批量删除">
-                <Trash2 size={15} />
-                删除
-              </button>
-            </>
-          )}
-          {clipboard && (
-            <button className="button compact" onClick={() => void pasteHere()} title="粘贴到当前目录">
-              <ClipboardPaste size={15} />
-              粘贴 {clipboard.paths.length} 项
-            </button>
-          )}
-          <button className="button compact" onClick={() => { setCreateKind("file"); setCreateName("新文件.txt"); }} title="新建文件">
+          <span className="file-tool-divider" />
+          <button className="file-tool-btn" onClick={() => { setCreateKind("file"); setCreateName("新文件.txt"); }} title="新建文件">
             <FilePenLine size={15} />
           </button>
-          <button className="button compact" onClick={() => { setCreateKind("dir"); setCreateName("新目录"); }} title="新建目录">
+          <button className="file-tool-btn" onClick={() => { setCreateKind("dir"); setCreateName("新目录"); }} title="新建目录">
             <FolderPlus size={15} />
           </button>
-          <button className="button compact" onClick={() => uploadRef.current?.click()} title="上传">
+          <button className="file-tool-btn" onClick={() => uploadRef.current?.click()} title="上传文件">
             <Upload size={15} />
           </button>
           <input
@@ -414,6 +385,41 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
             hidden
             onChange={(event) => void uploadFiles(event.target.files)}
           />
+        </div>
+      </div>
+      <div className="file-batchbar">
+        <span className="file-batch-count">
+          {selected.size > 0 ? `已选 ${selected.size} 项` : clipboard ? `剪贴板：${clipboard.paths.length} 项` : "批量操作"}
+        </span>
+        <div className="file-batch-actions">
+          {visible.length > 0 && (
+            <button className="file-tool-btn" onClick={toggleSelectAll} title="全选 / 取消全选">
+              <Clipboard size={14} />
+              {selected.size === visible.length ? "取消全选" : "全选"}
+            </button>
+          )}
+          {clipboard && (
+            <button className="file-tool-btn" onClick={() => void pasteHere()} title="粘贴到当前目录">
+              <ClipboardPaste size={14} />
+              粘贴
+            </button>
+          )}
+          {selected.size > 0 && (
+            <>
+              <button className="file-tool-btn" onClick={() => void copyToClipboard("copy")} title="复制选中项">
+                <Copy size={14} />
+                复制
+              </button>
+              <button className="file-tool-btn" onClick={() => void copyToClipboard("move")} title="剪切选中项">
+                <Scissors size={14} />
+                剪切
+              </button>
+              <button className="file-tool-btn danger" onClick={() => void removeMany()} title="批量删除选中项">
+                <Trash2 size={14} />
+                删除
+              </button>
+            </>
+          )}
         </div>
       </div>
 

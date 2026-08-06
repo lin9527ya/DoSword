@@ -610,9 +610,16 @@
 .plugin-history-status.err { color: var(--err); }
 .plugin-history small { color: var(--text-faint); margin-left: auto; }
 .plugin-result-text { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.55; margin: 0; }
-.file-tools { display: flex; align-items: center; }
-.file-search { display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 4px 8px; color: var(--text-faint); }
-.file-search input { border: none; background: none; outline: none; color: var(--text); font-size: 13px; width: 180px; }
+.file-tool-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+.file-search { display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 5px 9px; color: var(--text-faint); margin-right: 4px; }
+.file-search:focus-within { border-color: var(--accent); }
+.file-search input { border: none; background: none; outline: none; color: var(--text); font-size: 13px; width: 140px; }
+.file-tool-btn { display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: none; color: var(--text); cursor: pointer; font-size: 12.5px; white-space: nowrap; }
+.file-tool-btn:hover { background: var(--bg-hover); border-color: var(--accent); color: var(--accent); }
+.file-tool-btn.danger:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
+.file-tool-divider { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
+.file-batchbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 10px; margin-bottom: 8px; border: 1px dashed var(--border); border-radius: var(--radius-sm); background: var(--panel-2); font-size: 12.5px; color: var(--text-muted); }
+.file-batch-actions { display: flex; align-items: center; gap: 4px; }
 .file-check-col { width: 28px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
 .file-sortable { cursor: pointer; user-select: none; }
 .file-sortable:hover { color: var(--accent); }
