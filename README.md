@@ -196,9 +196,16 @@ impl Protocol for MyProtocol { /* ... */ }
 ## 功能插件清单（内置 12 个 + 外部 .plugin）
 
 **功能（feature）**：进程详情、端口扫描、ZIP 压缩、WebShell 扫描、
-超级终端（批量命令）、虚拟终端、Socks 代理、HTTP 代理、文件搜索、
-网络信息、用户枚举、PHP 环境检测、代码执行（P_Eval_Code）、
-ByPassOpenBasedir（symlink+glob）、BypassDisableFunctions（LD_PRELOAD+mail）
+Socks 代理、HTTP 代理、文件搜索、网络信息、用户枚举、PHP 环境检测、
+代码执行（P_Eval_Code）、ByPassOpenBasedir（symlink+glob）、
+BypassDisableFunctions（LD_PRELOAD+mail）
+
+**加载器（loader）**：
+- 虚拟终端（反弹 Shell）：fsockopen + proc_open 反弹 /bin/bash 到攻击机
+  （后台驻留可选）；本地 `nc -lvnp PORT` 接收
+- 交互式终端（linpty）：script 分配 PTY 的完全交互式反弹 shell
+  （支持 su 用户切换 / vim / top）；本地用 PTY 方式接收：
+  `socat TCP-LISTEN:PORT,reuseaddr,fork EXEC:'bash',pty,stderr,setsid,sigint,sane`
 
 **加密器（crypto）**：加解密工具（AES-256-CBC / MD5-XOR 文本）
 

