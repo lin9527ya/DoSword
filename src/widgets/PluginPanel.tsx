@@ -90,7 +90,8 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
   }
 
   const byKind = (kind: string) => plugins.filter((p) => p.kind === kind);
-  const feature = byKind("feature");
+  const feature = byKind("feature").filter((p) => !p.id.startsWith("bypass_"));
+  const bypass = plugins.filter((p) => p.kind === "feature" && p.id.startsWith("bypass_"));
   const crypto = byKind("crypto");
   const loader = byKind("loader");
   const others = plugins.filter((p) => !["feature", "crypto", "loader"].includes(p.kind));
@@ -98,6 +99,26 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
   return (
     <div className="plugin-panel">
       <div className="plugin-sidebar">
+        {bypass.length > 0 && <p className="plugin-group">Bypass 向量</p>}
+        {bypass.length > 0 && (
+          <select
+            className="plugin-bypass-select"
+            value={selected && selected.id.startsWith("bypass_") ? selected.id : ""}
+            onChange={(event) => {
+              const plugin = bypass.find((p) => p.id === event.target.value);
+              if (plugin) pick(plugin);
+            }}
+          >
+            <option value="" disabled>
+              选择绕过向量…
+            </option>
+            {bypass.map((plugin) => (
+              <option key={plugin.id} value={plugin.id}>
+                {plugin.name}
+              </option>
+            ))}
+          </select>
+        )}
         {feature.length > 0 && <p className="plugin-group">功能</p>}
         {feature.map((plugin) => (
           <button
@@ -173,7 +194,7 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
                         value={String(values[param.name] ?? "")}
                         onChange={(event) => setValues((prev) => ({ ...prev, [param.name]: Number(event.target.value) }))}
                       />
-                    ) : param.type === "select" ? (
+                    ) : param.type === "select" || (param.options && param.options.length > 0) ? (
                       <select
                         value={String(values[param.name] ?? "")}
                         onChange={(event) => setValues((prev) => ({ ...prev, [param.name]: event.target.value }))}

@@ -1269,7 +1269,7 @@ impl FeaturePlugin for BypassOpenBasedirPlugin {
                 ParamSpec {
                     name: "method".into(),
                     label: "绕过方法".into(),
-                    param_type: "string".into(),
+                    param_type: "select".into(),
                     default: Some(serde_json::json!("auto")),
                     options: Some(vec![
                         "auto".to_string(),

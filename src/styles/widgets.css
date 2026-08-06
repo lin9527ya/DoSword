@@ -556,6 +556,7 @@
 .plugin-panel { display: flex; gap: 16px; min-height: 420px; }
 .plugin-sidebar { width: 200px; flex-shrink: 0; border-right: 1px solid var(--border); padding-right: 12px; display: flex; flex-direction: column; gap: 4px; }
 .plugin-group { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-faint); margin: 8px 0 2px; }
+.plugin-bypass-select { width: 100%; padding: 8px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--panel-2); color: var(--text); font-size: 13px; cursor: pointer; }
 .plugin-item { text-align: left; padding: 8px 10px; border-radius: var(--radius-sm); border: none; background: none; cursor: pointer; font-size: 13px; color: var(--text); }
 .plugin-item:hover { background: var(--bg-hover); }
 .plugin-item.active { background: var(--accent); color: var(--accent-contrast); }
