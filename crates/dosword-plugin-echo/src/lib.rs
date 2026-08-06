@@ -178,6 +178,11 @@ impl Protocol for EchoProtocol {
             current_dir: "/".to_string(),
             separator: "/".to_string(),
             message: "ECHO 协议探测成功（端点可回显 nonce 帧）。".to_string(),
+
+            php_sapi: "".to_string(),
+            arch: "".to_string(),
+            extensions: vec![],
+            disable_functions: "".to_string(),
         })
     }
 

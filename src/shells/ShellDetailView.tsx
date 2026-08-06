@@ -274,10 +274,19 @@ function InfoPanel({
     ["最近连接", shortTime(shell.lastConnectedAt)],
   ];
   if (info) {
+    rows.push(["会话 ID", info.sessionId]);
     rows.push(["服务器", info.server]);
+    rows.push(["系统架构", info.arch || "—"]);
     rows.push(["Web 服务", info.webServer]);
     rows.push(["PHP 版本", info.runtime]);
+    rows.push(["SAPI", info.phpSapi || "—"]);
     rows.push(["当前目录", info.currentDir]);
+    rows.push(["路径分隔符", info.separator]);
+    if (info.extensions && info.extensions.length > 0) {
+      rows.push(["已加载扩展", info.extensions.join(", ")]);
+    }
+    rows.push(["禁用函数", info.disableFunctions || "—"]);
+    rows.push(["连接消息", info.message]);
   }
   return (
     <div className="panel detail-panel">

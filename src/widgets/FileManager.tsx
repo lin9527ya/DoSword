@@ -1,12 +1,23 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
+  Clipboard,
+  ClipboardPaste,
+  Copy,
   File,
+  FileArchive,
+  FileAudio,
+  FileCode2,
   FilePenLine,
+  FileText,
+  FileVideo,
   Folder,
   FolderPlus,
+  Image,
   LoaderCircle,
   RefreshCw,
+  Scissors,
+  Search,
   Trash2,
   Upload,
   Download,
@@ -32,6 +43,11 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
   const [renameValue, setRenameValue] = useState("");
   const [uploading, setUploading] = useState<{ name: string; sent: number; total: number } | null>(null);
   const [dragActive, setDragActive] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [sortBy, setSortBy] = useState<"name" | "size" | "modified">("name");
+  const [sortDir, setSortDir] = useState<1 | -1>(1);
+  const [search, setSearch] = useState("");
+  const [clipboard, setClipboard] = useState<{ kind: "copy" | "move"; paths: string[] } | null>(null);
   const uploadRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(
@@ -56,9 +72,117 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
 
   useEffect(() => {
     void load(path);
+    setSelected(new Set());
   }, [path, load]);
 
   const join = (name: string) => (path.endsWith(separator) ? path + name : path + separator + name);
+
+  const visible = useMemo(() => {
+    let list = entries;
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      list = list.filter((e) => e.name.toLowerCase().includes(q));
+    }
+    const sorted = [...list].sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      let r = 0;
+      if (sortBy === "size") r = a.size - b.size;
+      else if (sortBy === "modified") r = (a.modified ?? "").localeCompare(b.modified ?? "");
+      else r = a.name.localeCompare(b.name);
+      return r * sortDir;
+    });
+    return sorted;
+  }, [entries, search, sortBy, sortDir]);
+
+  function toggleSelect(name: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
+
+  function toggleSelectAll() {
+    if (selected.size === visible.length) setSelected(new Set());
+    else setSelected(new Set(visible.map((e) => e.name)));
+  }
+
+  async function removeMany() {
+    const names = Array.from(selected);
+    if (names.length === 0) return;
+    const confirmed = await ask(
+      `确定删除选中的 ${names.length} 项？${names.length > 1 ? "（目录必须为空）" : ""}`,
+      { title: "批量删除确认", kind: "warning", okLabel: "删除", cancelLabel: "取消" },
+    );
+    if (!confirmed) return;
+    setError("");
+    let failed = 0;
+    for (const name of names) {
+      try {
+        await api.deletePath(sessionId, join(name));
+      } catch {
+        failed++;
+      }
+    }
+    setSelected(new Set());
+    await load(path);
+    if (failed > 0) setError(`批量删除完成，${failed} 项失败`);
+  }
+
+  async function copyToClipboard(kind: "copy" | "move") {
+    const names = Array.from(selected);
+    if (names.length === 0) return;
+    setClipboard({ kind, paths: names.map(join) });
+    setError(kind === "copy" ? `已复制 ${names.length} 项（可在任意目录粘贴）` : `已剪切 ${names.length} 项（可在任意目录粘贴）`);
+  }
+
+  async function pasteHere() {
+    if (!clipboard) return;
+    setError("");
+    let failed = 0;
+    let moved = 0;
+    for (const srcPath of clipboard.paths) {
+      const name = srcPath.split(/[\\/]/).pop() ?? "";
+      const target = join(name);
+      if (srcPath === target) continue;
+      try {
+        if (clipboard.kind === "move") {
+          await api.renamePath(sessionId, srcPath, target);
+          moved++;
+        } else {
+          const content = await api.readFile(sessionId, srcPath);
+          await api.writeFile(sessionId, target, content.contentB64);
+        }
+      } catch {
+        failed++;
+      }
+    }
+    setClipboard(null);
+    await load(path);
+    if (failed > 0) setError(`粘贴完成：成功 ${moved || clipboard.paths.length - failed} 项，失败 ${failed} 项`);
+  }
+
+  function entryIcon(entry: FileEntry) {
+    if (entry.isDir) return <Folder size={16} />;
+    const ext = entry.name.split(".").pop()?.toLowerCase() ?? "";
+    if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico"].includes(ext)) return <Image size={16} />;
+    if (["zip", "tar", "gz", "bz2", "7z", "rar", "xz"].includes(ext)) return <FileArchive size={16} />;
+    if (["php", "js", "ts", "py", "java", "c", "cpp", "go", "rs", "html", "css", "json", "sh", "sql", "rb", "pl", "xml", "yml", "yaml"].includes(ext))
+      return <FileCode2 size={16} />;
+    if (["txt", "md", "log", "ini", "conf", "env"].includes(ext)) return <FileText size={16} />;
+    if (["mp3", "wav", "flac", "ogg", "m4a"].includes(ext)) return <FileAudio size={16} />;
+    if (["mp4", "avi", "mkv", "mov", "webm"].includes(ext)) return <FileVideo size={16} />;
+    return <File size={16} />;
+  }
+
+  function toggleSort(key: "name" | "size" | "modified") {
+    if (sortBy === key) setSortDir((d) => (d === 1 ? -1 : 1));
+    else {
+      setSortBy(key);
+      setSortDir(1);
+    }
+  }
 
   async function openEntry(entry: FileEntry) {
     if (entry.isDir) {
@@ -228,6 +352,17 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
             spellCheck={false}
           />
         </div>
+        <div className="file-tools">
+          <div className="file-search">
+            <Search size={14} />
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="搜索当前目录…"
+              spellCheck={false}
+            />
+          </div>
+        </div>
         <div className="file-actions">
           <button className="button compact" onClick={() => setPath(startDir)} title="回到初始目录">
             <ArrowUp size={15} />
@@ -235,6 +370,34 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
           <button className="button compact" onClick={() => void load(path)} title="刷新">
             <RefreshCw size={15} />
           </button>
+          {visible.length > 0 && (
+            <button className="button compact" onClick={toggleSelectAll} title="全选 / 取消全选">
+              <Clipboard size={15} />
+              {selected.size > 0 ? `已选 ${selected.size}` : "全选"}
+            </button>
+          )}
+          {selected.size > 0 && (
+            <>
+              <button className="button compact" onClick={() => void copyToClipboard("copy")} title="复制选中项">
+                <Copy size={15} />
+                复制
+              </button>
+              <button className="button compact" onClick={() => void copyToClipboard("move")} title="剪切选中项">
+                <Scissors size={15} />
+                剪切
+              </button>
+              <button className="button compact danger" onClick={() => void removeMany()} title="批量删除">
+                <Trash2 size={15} />
+                删除
+              </button>
+            </>
+          )}
+          {clipboard && (
+            <button className="button compact" onClick={() => void pasteHere()} title="粘贴到当前目录">
+              <ClipboardPaste size={15} />
+              粘贴 {clipboard.paths.length} 项
+            </button>
+          )}
           <button className="button compact" onClick={() => { setCreateKind("file"); setCreateName("新文件.txt"); }} title="新建文件">
             <FilePenLine size={15} />
           </button>
@@ -286,18 +449,40 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
         <Empty icon={<LoaderCircle className="spin" />} title="正在读取目录" />
       ) : entries.length === 0 ? (
         <Empty icon={<Folder />} title="空目录" />
+      ) : visible.length === 0 ? (
+        <Empty icon={<Search />} title="无匹配项" />
       ) : (
         <div className="file-table">
           <div className="file-head">
-            <span>名称</span>
-            <span>大小</span>
-            <span>修改时间</span>
+            <span className="file-check-col">
+              <input type="checkbox" checked={selected.size === visible.length} onChange={toggleSelectAll} />
+            </span>
+            <span className="file-sortable" onClick={() => toggleSort("name")} title="按名称排序">
+              名称{sortBy === "name" ? (sortDir === 1 ? " ↑" : " ↓") : ""}
+            </span>
+            <span className="file-sortable" onClick={() => toggleSort("size")} title="按大小排序">
+              大小{sortBy === "size" ? (sortDir === 1 ? " ↑" : " ↓") : ""}
+            </span>
+            <span className="file-sortable" onClick={() => toggleSort("modified")} title="按修改时间排序">
+              修改时间{sortBy === "modified" ? (sortDir === 1 ? " ↑" : " ↓") : ""}
+            </span>
             <span>操作</span>
           </div>
-          {entries.map((entry) => (
-            <div className="file-row" key={entry.path}>
-              <button className="file-name" onDoubleClick={() => void openEntry(entry)}>
-                {entry.isDir ? <Folder size={16} /> : <File size={16} />}
+          {visible.map((entry) => (
+            <div className={`file-row ${selected.has(entry.name) ? "selected" : ""}`} key={entry.path}>
+              <span className="file-check-col">
+                <input
+                  type="checkbox"
+                  checked={selected.has(entry.name)}
+                  onChange={() => toggleSelect(entry.name)}
+                />
+              </span>
+              <button
+                className="file-name"
+                onDoubleClick={() => void openEntry(entry)}
+                onClick={() => toggleSelect(entry.name)}
+              >
+                {entryIcon(entry)}
                 <span>{entry.name}</span>
               </button>
               <span className="mono">{entry.isDir ? "—" : formatSize(entry.size)}</span>

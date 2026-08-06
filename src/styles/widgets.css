@@ -609,3 +609,12 @@
 .plugin-history-status.ok { color: var(--ok); }
 .plugin-history-status.err { color: var(--err); }
 .plugin-history small { color: var(--text-faint); margin-left: auto; }
+.plugin-result-text { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.55; margin: 0; }
+.file-tools { display: flex; align-items: center; }
+.file-search { display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 4px 8px; color: var(--text-faint); }
+.file-search input { border: none; background: none; outline: none; color: var(--text); font-size: 13px; width: 180px; }
+.file-check-col { width: 28px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+.file-sortable { cursor: pointer; user-select: none; }
+.file-sortable:hover { color: var(--accent); }
+.file-row.selected { background: var(--bg-hover); }
+.file-row.selected .file-name { color: var(--accent); }

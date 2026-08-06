@@ -31,7 +31,23 @@ currentDir: string,
 /**
  * 服务器路径分隔符（"/" 或 "\"）。
  */
-separator: string, message: string, };
+separator: string, message: string, 
+/**
+ * PHP SAPI（fpm-fcgi / cli-server / apache2handler 等）。
+ */
+phpSapi: string, 
+/**
+ * 系统架构（php_uname('m')）。
+ */
+arch: string, 
+/**
+ * 已加载 PHP 扩展（前 16 个）。
+ */
+extensions: Array<string>, 
+/**
+ * disable_functions 配置原文。
+ */
+disableFunctions: string, };
 export type AppSettings = { 
 /**
  * 是否允许发起真实网络请求（安全门总开关，默认关闭）。
@@ -66,7 +82,7 @@ version: string, description: string,
  * 能力列表（空 = 全支持）。
  */
 capabilities: Array<string>, };
-export type ConnectResult = { sessionId: string, server: string, webServer: string, runtime: string, currentDir: string, separator: string, message: string, };
+export type ConnectResult = { sessionId: string, server: string, webServer: string, runtime: string, currentDir: string, separator: string, message: string, phpSapi: string, arch: string, extensions: Array<string>, disableFunctions: string, };
 export type SessionInfo = { sessionId: string, profileId: string, server: string, lastUsedAt: number, };
 export type DbConnection = { driver: string, host: string | null, port: number | null, username: string | null, password: string | null, dbname: string | null, };
 export type DbProbeResult = { driver: string, databases: Array<string>, message: string, };

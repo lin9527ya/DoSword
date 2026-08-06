@@ -126,6 +126,14 @@ pub struct ProbeResult {
     /// 服务器路径分隔符（"/" 或 "\"）。
     pub separator: String,
     pub message: String,
+    /// PHP SAPI（fpm-fcgi / cli-server / apache2handler 等）。
+    pub php_sapi: String,
+    /// 系统架构（php_uname('m')）。
+    pub arch: String,
+    /// 已加载 PHP 扩展（前 16 个）。
+    pub extensions: Vec<String>,
+    /// disable_functions 配置原文。
+    pub disable_functions: String,
 }
 
 /// HTTP 手工请求结果（Repeater）。
@@ -239,6 +247,10 @@ pub struct ConnectResult {
     pub current_dir: String,
     pub separator: String,
     pub message: String,
+    pub php_sapi: String,
+    pub arch: String,
+    pub extensions: Vec<String>,
+    pub disable_functions: String,
 }
 
 impl ConnectResult {
@@ -251,6 +263,10 @@ impl ConnectResult {
             current_dir: probe.current_dir,
             separator: probe.separator,
             message: probe.message,
+            php_sapi: probe.php_sapi,
+            arch: probe.arch,
+            extensions: probe.extensions,
+            disable_functions: probe.disable_functions,
         }
     }
 }

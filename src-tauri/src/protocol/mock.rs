@@ -57,6 +57,11 @@ impl Protocol for MockProtocol {
             current_dir: "/".to_string(),
             separator: "/".to_string(),
             message: "本次探测未向远端发送请求，仅用于验证本地工作流。".to_string(),
+
+            php_sapi: "".to_string(),
+            arch: "".to_string(),
+            extensions: vec![],
+            disable_functions: "".to_string(),
         })
     }
 

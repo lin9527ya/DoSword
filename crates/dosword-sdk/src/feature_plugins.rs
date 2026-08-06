@@ -825,24 +825,45 @@ if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground',
 // SOCKS5 代理（通用，PHP 载荷：pcntl 后台 / 前台窗口）
 // ---------------------------------------------------------------------------
 
-fn php_socks_proxy_code(port: u32, window_secs: u32) -> String {
+fn php_socks_proxy_code(port: u32, window_secs: u32, action: &str) -> String {
+    if action == "stop" {
+        return format!(
+            r#"<?php
+error_reporting(0);
+$port = {port};
+$pidFile = sys_get_temp_dir() . '/.dsw_proxy_' . $port . '.pid';
+$stopped = false;
+$pid = 0;
+if (is_file($pidFile)) {{
+    $pid = (int)@file_get_contents($pidFile);
+    if ($pid > 1 && function_exists('posix_kill')) {{ @posix_kill($pid, 9); $stopped = true; }}
+    @unlink($pidFile);
+}}
+echo json_encode(array('ok' => true, 'stopped' => $stopped, 'pid' => $pid));
+return;
+"#,
+            port = port,
+        );
+    }
     format!(
         r#"<?php
 set_time_limit(0);
 error_reporting(0);
 $port = {port};
 $window = {window};
+$pidFile = sys_get_temp_dir() . '/.dsw_proxy_' . $port . '.pid';
 $pid = 0;
 if (function_exists('pcntl_fork')) {{
     $pid = pcntl_fork();
     if ($pid > 0) {{
         echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid, 'port' => $port));
-        exit;
+        return;
     }}
     if (function_exists('posix_setsid')) @posix_setsid();
+    @file_put_contents($pidFile, getmypid());
 }}
 $srv = @stream_socket_server('tcp://0.0.0.0:' . $port, $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
-if (!$srv) {{ echo json_encode(array('ok' => false, 'error' => $errstr)); exit; }}
+if (!$srv) {{ echo json_encode(array('ok' => false, 'error' => $errstr)); return; }}
 $deadline = time() + $window;
 while (time() < $deadline) {{
     $conn = @stream_socket_accept($srv, 3);
@@ -918,6 +939,13 @@ impl FeaturePlugin for SocksProxyPlugin {
                     default: Some(serde_json::json!(600)),
                     options: None,
                 },
+                ParamSpec {
+                    name: "action".into(),
+                    label: "操作".into(),
+                    param_type: "select".into(),
+                    default: Some(serde_json::json!("start")),
+                    options: Some(vec!["start".to_string(), "stop".to_string()]),
+                },
             ],
             kind: "feature".into(),
         }
@@ -935,7 +963,8 @@ impl FeaturePlugin for SocksProxyPlugin {
             "php" => {
                 let port = param_int(params, "port", 1080).clamp(1024, 65535);
                 let window = param_int(params, "window", 600).clamp(30, 3600);
-                let code = php_socks_proxy_code(port, window);
+                let action = param_str(params, "action", "start");
+                let code = php_socks_proxy_code(port, window, &action);
                 let output = protocol.run_code(session, "php", &code, settings)?;
                 serde_json::from_str(&output).map_err(|_| {
                     ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
@@ -952,24 +981,45 @@ impl FeaturePlugin for SocksProxyPlugin {
 // HTTP 代理（通用，PHP 载荷：绝对 URL 转发 + CONNECT 隧道）
 // ---------------------------------------------------------------------------
 
-fn php_http_proxy_code(port: u32, window_secs: u32) -> String {
+fn php_http_proxy_code(port: u32, window_secs: u32, action: &str) -> String {
+    if action == "stop" {
+        return format!(
+            r#"<?php
+error_reporting(0);
+$port = {port};
+$pidFile = sys_get_temp_dir() . '/.dsw_proxy_' . $port . '.pid';
+$stopped = false;
+$pid = 0;
+if (is_file($pidFile)) {{
+    $pid = (int)@file_get_contents($pidFile);
+    if ($pid > 1 && function_exists('posix_kill')) {{ @posix_kill($pid, 9); $stopped = true; }}
+    @unlink($pidFile);
+}}
+echo json_encode(array('ok' => true, 'stopped' => $stopped, 'pid' => $pid));
+return;
+"#,
+            port = port,
+        );
+    }
     format!(
         r#"<?php
 set_time_limit(0);
 error_reporting(0);
 $port = {port};
 $window = {window};
+$pidFile = sys_get_temp_dir() . '/.dsw_proxy_' . $port . '.pid';
 $pid = 0;
 if (function_exists('pcntl_fork')) {{
     $pid = pcntl_fork();
     if ($pid > 0) {{
         echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid, 'port' => $port));
-        exit;
+        return;
     }}
     if (function_exists('posix_setsid')) @posix_setsid();
+    @file_put_contents($pidFile, getmypid());
 }}
 $srv = @stream_socket_server('tcp://0.0.0.0:' . $port, $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
-if (!$srv) {{ echo json_encode(array('ok' => false, 'error' => $errstr)); exit; }}
+if (!$srv) {{ echo json_encode(array('ok' => false, 'error' => $errstr)); return; }}
 $deadline = time() + $window;
 while (time() < $deadline) {{
     $conn = @stream_socket_accept($srv, 3);
@@ -1067,6 +1117,13 @@ impl FeaturePlugin for HttpProxyPlugin {
                     default: Some(serde_json::json!(600)),
                     options: None,
                 },
+                ParamSpec {
+                    name: "action".into(),
+                    label: "操作".into(),
+                    param_type: "select".into(),
+                    default: Some(serde_json::json!("start")),
+                    options: Some(vec!["start".to_string(), "stop".to_string()]),
+                },
             ],
             kind: "feature".into(),
         }
@@ -1084,7 +1141,8 @@ impl FeaturePlugin for HttpProxyPlugin {
             "php" => {
                 let port = param_int(params, "port", 8080).clamp(1024, 65535);
                 let window = param_int(params, "window", 600).clamp(30, 3600);
-                let code = php_http_proxy_code(port, window);
+                let action = param_str(params, "action", "start");
+                let code = php_http_proxy_code(port, window, &action);
                 let output = protocol.run_code(session, "php", &code, settings)?;
                 serde_json::from_str(&output).map_err(|_| {
                     ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))

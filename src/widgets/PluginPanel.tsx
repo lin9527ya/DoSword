@@ -317,6 +317,17 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
 
 /** 结构化结果渲染：表格（rows/columns、entries、matches）→ JSON → 文本。 */
 function PluginResultView({ data }: { data: unknown }) {
+  const textOutput = useMemo(() => {
+    if (data && typeof data === "object") {
+      const obj = data as Record<string, unknown>;
+      for (const key of ["stdout", "output_text", "content"]) {
+        const value = obj[key];
+        if (typeof value === "string" && value.length > 0) return value;
+      }
+    }
+    return null;
+  }, [data]);
+
   const rendered = useMemo(() => {
     if (data && typeof data === "object") {
       const obj = data as Record<string, unknown>;
@@ -366,6 +377,9 @@ function PluginResultView({ data }: { data: unknown }) {
     return null;
   }, [data]);
 
+  if (textOutput !== null) {
+    return <pre className="plugin-result-text">{textOutput}</pre>;
+  }
   if (rendered?.kind === "table") {
     return (
       <div className="plugin-table-wrap">

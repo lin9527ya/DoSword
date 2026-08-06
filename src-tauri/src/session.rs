@@ -150,6 +150,11 @@ mod tests {
             current_dir: "/".into(),
             separator: "/".into(),
             message: "dummy".into(),
+
+            php_sapi: "".to_string(),
+            arch: "".to_string(),
+            extensions: vec![],
+            disable_functions: "".to_string(),
         }
     }
 

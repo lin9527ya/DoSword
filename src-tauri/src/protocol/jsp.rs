@@ -151,6 +151,11 @@ fn ensure_info(session: &JspSession, settings: &AppSettings) -> Result<ProbeResu
             .unwrap_or("/")
             .to_string(),
         message: "JSP/ASP 协议探测成功".to_string(),
+
+            php_sapi: "".to_string(),
+            arch: "".to_string(),
+            extensions: vec![],
+            disable_functions: "".to_string(),
     };
     if let Ok(mut slot) = session.info.lock() {
         *slot = Some(info.clone());
