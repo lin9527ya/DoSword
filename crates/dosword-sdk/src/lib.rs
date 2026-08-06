@@ -29,5 +29,5 @@ pub use protocol::{Protocol, ProtocolError, SessionState};
 
 pub use bypass::{
     BypassComPlugin, BypassDlPlugin, BypassEvalPlugin, BypassFfiPlugin, BypassLdPreloadPlugin,
-    BypassPcntlPlugin, BypassScanPlugin, BypassSyscallPlugin,
+    BypassPcntlPlugin, BypassReversePcntlPlugin, BypassScanPlugin, BypassSyscallPlugin,
 };

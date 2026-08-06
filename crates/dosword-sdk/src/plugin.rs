@@ -502,6 +502,7 @@ impl FeaturePluginRegistry {
         let _ = registry.register(Box::new(crate::bypass::BypassDlPlugin));
         let _ = registry.register(Box::new(crate::bypass::BypassFastcgiPlugin));
         let _ = registry.register(Box::new(crate::bypass::BypassIconvPlugin));
+        let _ = registry.register(Box::new(crate::bypass::BypassReversePcntlPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::FileSearchPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::NetInfoPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::UserListPlugin));

