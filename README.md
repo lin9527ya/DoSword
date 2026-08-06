@@ -198,7 +198,7 @@ impl Protocol for MyProtocol { /* ... */ }
 **功能（feature）**：进程详情、端口扫描、ZIP 压缩、WebShell 扫描、
 Socks 代理、HTTP 代理、文件搜索、网络信息、用户枚举、PHP 环境检测、
 代码执行（P_Eval_Code）、ByPassOpenBasedir（symlink+glob）、
-BypassDisableFunctions（LD_PRELOAD+mail）
+BypassDisableFunctions（多向量自动尝试）
 
 **加载器（loader）**：
 - 虚拟终端（反弹 Shell）：fsockopen + proc_open 反弹 /bin/bash 到攻击机

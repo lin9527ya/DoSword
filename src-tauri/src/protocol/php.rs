@@ -1847,15 +1847,23 @@ mod tests {
             eprintln!("{}bypass_open_basedir ob={:?} read={:?}", p("plugin"),
                 out["open_basedir"].as_str().unwrap_or(""), out["read"].as_bool());
 
-            // BypassDisableFunctions：本机有 gcc → 尝试 LD_PRELOAD 执行 id
+            // BypassDisableFunctions：多向量自动尝试（FFI / pcntl_exec / LD_PRELOAD）
             let out = dosword_sdk::feature_plugins::BypassDisableFunctionsPlugin.execute(
                 &protocol, php, "php",
                 &serde_json::json!({"command": "id"}), &settings)?;
-            eprintln!("{}bypass_disable_functions compiler={:?} result={:?}", p("plugin"),
-                out["compiler"].as_str().unwrap_or(""), out["result"].as_str().unwrap_or(""));
-            if out["compiler"].as_str().is_some() {
-                let has_result = out["result"].as_str().is_some() || out["error"].as_str().is_some();
-                assert!(has_result, "有编译器时应有结果或明确错误：{out:?}");
+            let vectors = out["vectors"].as_object().map(|o| o.len()).unwrap_or(0);
+            assert!(vectors > 0, "应尝试至少一个绕过向量：{out:?}");
+            // 本机 pcntl_exec 可用 → 应成功
+            if out["detected"]["pcntl_exec"].as_bool() == Some(true) {
+                let result = out["result"].as_str().unwrap_or("");
+                assert!(result.contains("uid="), "pcntl_exec 向量应执行成功：{out:?}");
+                eprintln!("{}bypass_disable_functions pcntl_exec 向量成功", p("plugin"));
+            } else {
+                let any_ok = out["vectors"]
+                    .as_object()
+                    .map(|o| o.values().any(|v| v.get("ok").and_then(|x| x.as_bool()) == Some(true)))
+                    .unwrap_or(false);
+                eprintln!("{}bypass_disable_functions 向量：{}（成功={}）", p("plugin"), vectors, any_ok);
             }
 
             // SOCKS5 代理：pcntl 可用 → 后台驻留
