@@ -398,6 +398,17 @@ impl PhpProtocol {
         Ok(())
     }
 
+    fn session_touch(
+        &self,
+        php: &PhpSession,
+        path: &str,
+        timestamp: u64,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        dispatch(php, "touch", &[("p", path), ("t", &timestamp.to_string())], settings)?;
+        Ok(())
+    }
+
     fn session_db_probe(
         &self,
         php: &PhpSession,
@@ -1065,6 +1076,32 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME
         );
         self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "mkdir", php.encoder)?;
+        Ok(())
+    }
+
+    fn touch_path(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        timestamp: u64,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        let php = session
+            .as_any()
+            .downcast_ref::<PhpSession>()
+            .expect("会话类型不匹配");
+        if is_session(php) {
+            return self.session_touch(php, path, timestamp, settings);
+        }
+        let path_b64 = B64.encode(path.as_bytes());
+        let ts = timestamp.to_string();
+        let code = format!(
+            "{}\n$p=base64_decode('{path_b64}');$r=@touch($p,{ts});if($r===false){{$__r=array('ok'=>false,'error'=>'touch 失败（路径不存在或权限不足）');{} }}$__r=array('ok'=>true,'data'=>array());{}",
+            Self::build_prefix(php.encoder, &php.password),
+            TEMPLATE_FRAME_DIE,
+            TEMPLATE_FRAME
+        );
+        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "touch", php.encoder)?;
         Ok(())
     }
 
@@ -2381,6 +2418,48 @@ except Exception as e:
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
         result.unwrap_or_else(|error| panic!("代理开关真实执行应成功：{error}"));
+    }
+
+    #[test]
+    fn real_php_touch_path() {
+        // touch：写文件 → 修改时间戳（过去 epoch）→ listDir 验证 mtime 变化
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            return;
+        };
+        let settings = settings();
+        let mut profile1 = profile(&url);
+        profile1.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile1, &settings)?;
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let protocol = PhpProtocol;
+            let file = format!("{}/touch_me.txt", dir.display());
+            protocol.write_file(session.as_ref(), &file, b"hello", &settings)?;
+            let before = protocol.list_dir(session.as_ref(), dir.to_str().unwrap_or("/"), &settings)?;
+            let before_mtime = before
+                .entries
+                .iter()
+                .find(|e| e.name == "touch_me.txt")
+                .map(|e| e.modified.clone())
+                .unwrap_or_default();
+            // touch 到 2020-01-01（epoch=1577836800）
+            protocol.touch_path(session.as_ref(), &file, 1_577_836_800, &settings)?;
+            let after = protocol.list_dir(session.as_ref(), dir.to_str().unwrap_or("/"), &settings)?;
+            let after_mtime = after
+                .entries
+                .iter()
+                .find(|e| e.name == "touch_me.txt")
+                .map(|e| e.modified.clone())
+                .unwrap_or_default();
+            assert_ne!(before_mtime, after_mtime, "touch 后 mtime 应改变：{before_mtime} -> {after_mtime}");
+            assert!(after_mtime.contains("2020-01-01") || after_mtime.starts_with("2020"), "应接近 2020-01-01：{after_mtime}");
+            eprintln!("[touch] {before_mtime} -> {after_mtime}");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("touch 真实执行应成功：{error}"));
     }
 
     #[test]

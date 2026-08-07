@@ -1407,6 +1407,28 @@ pub async fn rename_path(
 }
 
 #[tauri::command]
+pub async fn touch_path(
+    session_id: String,
+    path: String,
+    timestamp: u64,
+    app: AppHandle,
+) -> Result<(), String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        with_session(state, &session_id, |session| {
+            ctx.protocol.touch_path(session, &path, timestamp, &ctx.settings)
+        })
+        .map_err(|error| {
+            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.touch", "error", &error);
+            error
+        })?;
+        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.touch", "success", &format!("touch：{path}"));
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn create_dir(
     session_id: String,
     path: String,

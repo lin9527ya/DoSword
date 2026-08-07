@@ -167,6 +167,8 @@ export const api = {
     invoke<void>("rename_path", { sessionId, from, to }),
   createDir: (sessionId: string, path: string) =>
     invoke<void>("create_dir", { sessionId, path }),
+  touchPath: (sessionId: string, path: string, timestamp: number) =>
+    invoke<void>("touch_path", { sessionId, path, timestamp }),
   dbProbe: (sessionId: string, connection: DbConnection) =>
     invoke<DbProbeResult>("db_probe", { sessionId, connection }),
   dbQuery: (sessionId: string, connection: DbConnection, sql: string) =>

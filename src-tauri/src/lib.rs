@@ -114,6 +114,7 @@ pub fn run() {
             commands::delete_path,
             commands::rename_path,
             commands::create_dir,
+            commands::touch_path,
             commands::write_chunk,
             commands::db_probe,
             commands::db_query,

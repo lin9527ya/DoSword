@@ -130,6 +130,17 @@ pub trait Protocol: Send + Sync {
     }
 
     /// 新建目录（递归创建中间目录）。默认不支持，协议按需覆盖。
+    /// 修改文件/目录的修改时间戳（秒级 epoch）。
+    fn touch_path(
+        &self,
+        _session: &dyn SessionState,
+        _path: &str,
+        _timestamp: u64,
+        _settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::NotSupported("touch_path".into()))
+    }
+
     fn create_dir(
         &self,
         _session: &dyn SessionState,

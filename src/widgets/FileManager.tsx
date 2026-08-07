@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
   Clipboard,
+  Clock3,
   ClipboardPaste,
   Copy,
   File,
@@ -48,7 +49,21 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
   const [sortDir, setSortDir] = useState<1 | -1>(1);
   const [search, setSearch] = useState("");
   const [clipboard, setClipboard] = useState<{ kind: "copy" | "move"; paths: string[] } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry | null } | null>(null);
+  const [touchTarget, setTouchTarget] = useState<FileEntry | null>(null);
+  const [touchValue, setTouchValue] = useState("");
   const uploadRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("blur", close);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("blur", close);
+    };
+  }, [contextMenu]);
 
   const load = useCallback(
     async (dir: string) => {
@@ -174,6 +189,47 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
     if (["mp3", "wav", "flac", "ogg", "m4a"].includes(ext)) return <FileAudio size={16} />;
     if (["mp4", "avi", "mkv", "mov", "webm"].includes(ext)) return <FileVideo size={16} />;
     return <File size={16} />;
+  }
+
+  function openContextMenu(event: React.MouseEvent, entry: FileEntry | null) {
+    event.preventDefault();
+    setContextMenu({ x: event.clientX, y: event.clientY, entry });
+  }
+
+  async function zipEntry(entry: FileEntry) {
+    setError("");
+    try {
+      const target = entry.isDir ? `${entry.path}.zip` : `${entry.path}.zip`;
+      const out = await api.runFeaturePlugin(sessionId, "zip", { source: entry.path, target });
+      const text = JSON.stringify(out);
+      setError(text.includes('"ok":true') ? "" : `打包失败：${text}`);
+      await load(path);
+    } catch (cause) {
+      setError(`打包失败：${errorText(cause)}`);
+    }
+  }
+
+  function openTouchDialog(entry: FileEntry) {
+    setTouchTarget(entry);
+    setTouchValue("");
+  }
+
+  async function submitTouch() {
+    const entry = touchTarget;
+    if (!entry) return;
+    setTouchTarget(null);
+    setError("");
+    const epoch = new Date(touchValue).getTime() / 1000;
+    if (!Number.isFinite(epoch) || epoch <= 0) {
+      setError("时间格式无效");
+      return;
+    }
+    try {
+      await api.touchPath(sessionId, entry.path, Math.floor(epoch));
+      await load(path);
+    } catch (cause) {
+      setError(`修改时间戳失败：${errorText(cause)}`);
+    }
   }
 
   function toggleSort(key: "name" | "size" | "modified") {
@@ -303,6 +359,10 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
   return (
     <div
       className={`file-manager ${dragActive ? "drag-active" : ""}`}
+      onContextMenu={(event) => {
+        const target = event.target as HTMLElement;
+        if (!target.closest(".file-row")) openContextMenu(event, null);
+      }}
       onDragOver={(event) => {
         event.preventDefault();
         event.dataTransfer.dropEffect = "copy";
@@ -472,10 +532,13 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
             <span className="file-sortable" onClick={() => toggleSort("modified")} title="按修改时间排序">
               修改时间{sortBy === "modified" ? (sortDir === 1 ? " ↑" : " ↓") : ""}
             </span>
-            <span>操作</span>
           </div>
           {visible.map((entry) => (
-            <div className={`file-row ${selected.has(entry.name) ? "selected" : ""}`} key={entry.path}>
+            <div
+              className={`file-row ${selected.has(entry.name) ? "selected" : ""}`}
+              key={entry.path}
+              onContextMenu={(event) => openContextMenu(event, entry)}
+            >
               <span className="file-check-col">
                 <input
                   type="checkbox"
@@ -493,20 +556,89 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
               </button>
               <span className="mono">{entry.isDir ? "—" : formatSize(entry.size)}</span>
               <span className="mono muted">{entry.modified}</span>
-              <span className="file-ops">
-                <button className="icon-button" title="下载" onClick={() => void downloadEntry(entry)}>
-                  <Download size={14} />
-                </button>
-                <button className="icon-button" title="重命名" onClick={() => startRename(entry)}>
-                  <FilePenLine size={14} />
-                </button>
-                <button className="icon-button danger" title="删除" onClick={() => void removeEntry(entry)}>
-                  <Trash2 size={14} />
-                </button>
-              </span>
             </div>
           ))}
         </div>
+      )}
+
+      {contextMenu && (
+        <div
+          className="file-context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          {contextMenu.entry ? (
+            <>
+              <button className="file-context-item" onClick={() => { setContextMenu(null); void openEntry(contextMenu.entry!); }}>
+                <Folder size={14} /> 打开
+              </button>
+              {!contextMenu.entry.isDir && (
+                <button className="file-context-item" onClick={() => { setContextMenu(null); void downloadEntry(contextMenu.entry!); }}>
+                  <Download size={14} /> 下载
+                </button>
+              )}
+              <button className="file-context-item" onClick={() => { setContextMenu(null); startRename(contextMenu.entry!); }}>
+                <FilePenLine size={14} /> 重命名
+              </button>
+              <button className="file-context-item" onClick={() => { setContextMenu(null); void zipEntry(contextMenu.entry!); }}>
+                <FileArchive size={14} /> 打包压缩（ZIP）
+              </button>
+              <button className="file-context-item" onClick={() => { setContextMenu(null); openTouchDialog(contextMenu.entry!); }}>
+                <Clock3 size={14} /> 修改时间戳
+              </button>
+              <button className="file-context-item danger" onClick={() => { setContextMenu(null); void removeEntry(contextMenu.entry!); }}>
+                <Trash2 size={14} /> 删除
+              </button>
+            </>
+          ) : (
+            <>
+              <button className="file-context-item" onClick={() => { setContextMenu(null); void load(path); }}>
+                <RefreshCw size={14} /> 刷新
+              </button>
+              <div className="file-context-sub">
+                <button className="file-context-item" onClick={() => { setContextMenu(null); setCreateKind("file"); setCreateName("新文件.txt"); }}>
+                  <FilePenLine size={14} /> 新建文件
+                </button>
+                <button className="file-context-item" onClick={() => { setContextMenu(null); setCreateKind("dir"); setCreateName("新目录"); }}>
+                  <FolderPlus size={14} /> 新建文件夹
+                </button>
+              </div>
+              <button className="file-context-item" onClick={() => { setContextMenu(null); uploadRef.current?.click(); }}>
+                <Upload size={14} /> 上传
+              </button>
+              {clipboard && (
+                <button className="file-context-item" onClick={() => { setContextMenu(null); void pasteHere(); }}>
+                  <ClipboardPaste size={14} /> 粘贴 {clipboard.paths.length} 项
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {touchTarget && (
+        <Dialog title={`修改「${touchTarget.name}」时间戳`} onClose={() => setTouchTarget(null)}>
+          <div className="dialog-form">
+            <input
+              autoFocus
+              type="datetime-local"
+              value={touchValue}
+              onChange={(event) => setTouchValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void submitTouch();
+                if (event.key === "Escape") setTouchTarget(null);
+              }}
+            />
+          </div>
+          <div className="dialog-actions">
+            <button className="button secondary" onClick={() => setTouchTarget(null)}>
+              取消
+            </button>
+            <button className="button primary" onClick={() => void submitTouch()}>
+              应用
+            </button>
+          </div>
+        </Dialog>
       )}
 
       {renaming && (

