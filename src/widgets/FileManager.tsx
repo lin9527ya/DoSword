@@ -14,6 +14,8 @@ import {
   FileVideo,
   Folder,
   FolderPlus,
+  Globe,
+  TerminalSquare,
   Image,
   LoaderCircle,
   RefreshCw,
@@ -52,6 +54,14 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry | null } | null>(null);
   const [touchTarget, setTouchTarget] = useState<FileEntry | null>(null);
   const [touchValue, setTouchValue] = useState("");
+  const [moveTarget, setMoveTarget] = useState<FileEntry | null>(null);
+  const [moveValue, setMoveValue] = useState("");
+  const [execTarget, setExecTarget] = useState<FileEntry | null>(null);
+  const [execValue, setExecValue] = useState("");
+  const [execOutput, setExecOutput] = useState("");
+  const [downloadTarget, setDownloadTarget] = useState<FileEntry | null>(null);
+  const [downloadUrl, setDownloadUrl] = useState("");
+  const [downloadPath, setDownloadPath] = useState("");
   const uploadRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -253,6 +263,97 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
     if (!trimmed) return;
     const idx = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
     setPath(idx <= 0 ? (separator || "/") : trimmed.slice(0, idx));
+  }
+
+  async function copySelectedNames(entry: FileEntry) {
+    const names = selected.has(entry.name) ? Array.from(selected) : [entry.name];
+    await navigator.clipboard?.writeText(names.join("\n"));
+    setContextMenu(null);
+    setError(`已复制 ${names.length} 个名称`);
+  }
+
+  async function copySelectedPaths(entry: FileEntry) {
+    const paths = selected.has(entry.name)
+      ? visible.filter((e) => selected.has(e.name)).map((e) => e.path)
+      : [entry.path];
+    await navigator.clipboard?.writeText(paths.join("\n"));
+    setContextMenu(null);
+    setError(`已复制 ${paths.length} 个路径`);
+  }
+
+  function openMoveDialog(entry: FileEntry) {
+    setMoveTarget(entry);
+    setMoveValue(entry.isDir ? `${entry.path}` : "");
+    setContextMenu(null);
+  }
+
+  async function submitMove() {
+    const entry = moveTarget;
+    if (!entry) return;
+    const target = moveValue.trim();
+    if (!target) {
+      setMoveTarget(null);
+      return;
+    }
+    setMoveTarget(null);
+    setError("");
+    try {
+      const dest = target.endsWith("/") || target.endsWith("\\") ? `${target}${entry.name}` : target;
+      await api.renamePath(sessionId, entry.path, dest);
+      await load(path);
+    } catch (cause) {
+      setError(`移动失败：${errorText(cause)}`);
+    }
+  }
+
+  function openExecDialog(entry: FileEntry) {
+    setExecTarget(entry);
+    setExecValue("");
+    setExecOutput("");
+    setContextMenu(null);
+  }
+
+  async function submitExec() {
+    const entry = execTarget;
+    const command = execValue.trim();
+    if (!entry || !command) return;
+    setExecOutput("执行中…");
+    try {
+      const dir = entry.isDir ? entry.path : entry.path.slice(0, entry.path.length - entry.name.length);
+      const out = await api.executeCommand(sessionId, `cd "${dir}" && ${command} 2>&1`);
+      setExecOutput(out.stdout || "（无输出）");
+    } catch (cause) {
+      setExecOutput(`执行失败：${errorText(cause)}`);
+    }
+  }
+
+  function openDownloadDialog(entry: FileEntry) {
+    setDownloadTarget(entry);
+    const dir = entry.isDir ? entry.path : entry.path.slice(0, entry.path.length - entry.name.length);
+    setDownloadUrl("");
+    setDownloadPath(`${dir}/downloaded`);
+    setContextMenu(null);
+  }
+
+  async function submitDownload() {
+    const url = downloadUrl.trim();
+    const target = downloadPath.trim();
+    if (!url || !target) return;
+    setError("");
+    try {
+      const out = await api.runFeaturePlugin(sessionId, "remote_download", { url, target });
+      const text = JSON.stringify(out);
+      if (text.includes('"ok":true')) {
+        const size = out.size ?? 0;
+        setError(`远程下载完成：${target}（${formatSize(Number(size))}）`);
+      } else {
+        setError(`远程下载失败：${text}`);
+      }
+      setDownloadTarget(null);
+      await load(path);
+    } catch (cause) {
+      setError(`远程下载失败：${errorText(cause)}`);
+    }
   }
 
   function toggleSort(key: "name" | "size" | "modified") {
@@ -561,6 +662,7 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
             <div
               className={`file-row ${selected.has(entry.name) ? "selected" : ""}`}
               key={entry.path}
+              onClick={() => toggleSelect(entry.name)}
               onContextMenu={(event) => openContextMenu(event, entry)}
             >
               <span className="file-check-col">
@@ -573,7 +675,6 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
               <button
                 className="file-name"
                 onDoubleClick={() => void openEntry(entry)}
-                onClick={() => toggleSelect(entry.name)}
               >
                 {entryIcon(entry)}
                 <span>{entry.name}</span>
@@ -612,11 +713,32 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
                 </button>
               </div>
               <span className="file-context-sep" />
+              <span className="file-context-sep" />
+              <button className="file-context-item" onClick={() => void copySelectedNames(contextMenu.entry!)}>
+                <Copy size={14} /> 复制选中名
+              </button>
+              <button className="file-context-item" onClick={() => void copySelectedPaths(contextMenu.entry!)}>
+                <Clipboard size={14} /> 复制选中路径
+              </button>
+              <button className="file-context-item" onClick={() => openMoveDialog(contextMenu.entry!)}>
+                <Scissors size={14} /> 移动…
+              </button>
+              <button className="file-context-item" onClick={() => openExecDialog(contextMenu.entry!)}>
+                <TerminalSquare size={14} /> 执行…
+              </button>
+              <span className="file-context-sep" />
               {!contextMenu.entry.isDir && (
                 <button className="file-context-item" onClick={() => { setContextMenu(null); void downloadEntry(contextMenu.entry!); }}>
-                  <Download size={14} /> 下载
+                  <Download size={14} /> 大文件下载
                 </button>
               )}
+              <button className="file-context-item" onClick={() => { setContextMenu(null); uploadRef.current?.click(); }}>
+                <Upload size={14} /> 大文件上传
+              </button>
+              <button className="file-context-item" onClick={() => openDownloadDialog(contextMenu.entry!)}>
+                <Globe size={14} /> 远程下载…
+              </button>
+              <span className="file-context-sep" />
               <button className="file-context-item" onClick={() => { setContextMenu(null); startRename(contextMenu.entry!); }}>
                 <FilePenLine size={14} /> 重命名
               </button>
@@ -654,6 +776,92 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
             </>
           )}
         </div>
+      )}
+
+      {moveTarget && (
+        <Dialog title={`移动「${moveTarget.name}」`} onClose={() => setMoveTarget(null)}>
+          <div className="dialog-form">
+            <p className="field-hint">目标路径（绝对路径；以分隔符结尾时保留原名）</p>
+            <input
+              autoFocus
+              value={moveValue}
+              onChange={(event) => setMoveValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void submitMove();
+                if (event.key === "Escape") setMoveTarget(null);
+              }}
+              spellCheck={false}
+            />
+          </div>
+          <div className="dialog-actions">
+            <button className="button secondary" onClick={() => setMoveTarget(null)}>
+              取消
+            </button>
+            <button className="button primary" onClick={() => void submitMove()}>
+              移动
+            </button>
+          </div>
+        </Dialog>
+      )}
+
+      {execTarget && (
+        <Dialog title={`在「${execTarget.isDir ? execTarget.name : execTarget.path.slice(0, execTarget.path.length - execTarget.name.length)}」目录执行`} onClose={() => setExecTarget(null)}>
+          <div className="dialog-form">
+            <p className="field-hint">输入可执行文件名称或命令（如 ./exploit 或 ls -la）</p>
+            <input
+              autoFocus
+              value={execValue}
+              onChange={(event) => setExecValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void submitExec();
+                if (event.key === "Escape") setExecTarget(null);
+              }}
+              spellCheck={false}
+            />
+            {execOutput && <pre className="exec-output">{execOutput}</pre>}
+          </div>
+          <div className="dialog-actions">
+            <button className="button secondary" onClick={() => setExecTarget(null)}>
+              关闭
+            </button>
+            <button className="button primary" onClick={() => void submitExec()}>
+              执行
+            </button>
+          </div>
+        </Dialog>
+      )}
+
+      {downloadTarget && (
+        <Dialog title={`远程下载到目标服务器`} onClose={() => setDownloadTarget(null)}>
+          <div className="dialog-form">
+            <label className="plugin-param">
+              下载地址（URL）
+              <input
+                autoFocus
+                value={downloadUrl}
+                onChange={(event) => setDownloadUrl(event.target.value)}
+                placeholder="https://example.com/tool"
+                spellCheck={false}
+              />
+            </label>
+            <label className="plugin-param">
+              保存路径（目标服务器）
+              <input
+                value={downloadPath}
+                onChange={(event) => setDownloadPath(event.target.value)}
+                spellCheck={false}
+              />
+            </label>
+          </div>
+          <div className="dialog-actions">
+            <button className="button secondary" onClick={() => setDownloadTarget(null)}>
+              取消
+            </button>
+            <button className="button primary" onClick={() => void submitDownload()}>
+              下载
+            </button>
+          </div>
+        </Dialog>
       )}
 
       {touchTarget && (

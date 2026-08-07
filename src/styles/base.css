@@ -8,6 +8,7 @@
 
   /* 明亮主题（默认） */
   --accent: #6f9c33;
+  --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
   --bg: #f4f6f2;
   --panel: #ffffff;
   --panel-2: #ebeee8;
