@@ -47,7 +47,11 @@ extensions: Array<string>,
 /**
  * disable_functions 配置原文。
  */
-disableFunctions: string, };
+disableFunctions: string, 
+/**
+ * 哥斯拉风格环境详情（OsInfo/CurrentUser/服务器/会话/配置等）。
+ */
+info: { [key in string]?: string }, };
 export type AppSettings = { 
 /**
  * 是否允许发起真实网络请求（安全门总开关，默认关闭）。
@@ -71,7 +75,11 @@ export type CommandOutput = { stdout: string, durationMs: number,
  */
 cwd: string | null, };
 export type DirListing = { entries: Array<FileEntry>, };
-export type FileEntry = { name: string, path: string, isDir: boolean, size: number, modified: string, };
+export type FileEntry = { name: string, path: string, isDir: boolean, size: number, modified: string, 
+/**
+ * 权限（八进制字符串，如 "755"）。
+ */
+perms: string, };
 export type FileContent = { name: string, size: number, contentB64: string, };
 export type ProtocolMeta = { id: string, displayName: string, requiresNetwork: boolean, 
 /**
@@ -82,7 +90,7 @@ version: string, description: string,
  * 能力列表（空 = 全支持）。
  */
 capabilities: Array<string>, };
-export type ConnectResult = { sessionId: string, server: string, webServer: string, runtime: string, currentDir: string, separator: string, message: string, phpSapi: string, arch: string, extensions: Array<string>, disableFunctions: string, };
+export type ConnectResult = { sessionId: string, server: string, webServer: string, runtime: string, currentDir: string, separator: string, message: string, phpSapi: string, arch: string, extensions: Array<string>, disableFunctions: string, info: { [key in string]?: string }, };
 export type SessionInfo = { sessionId: string, profileId: string, server: string, lastUsedAt: number, };
 export type DbConnection = { driver: string, host: string | null, port: number | null, username: string | null, password: string | null, dbname: string | null, };
 export type DbProbeResult = { driver: string, databases: Array<string>, message: string, };

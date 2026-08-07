@@ -62,6 +62,7 @@ impl Protocol for MockProtocol {
             arch: "".to_string(),
             extensions: vec![],
             disable_functions: "".to_string(),
+            info: std::collections::HashMap::new(),
         })
     }
 

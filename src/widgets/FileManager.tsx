@@ -211,7 +211,9 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
 
   function openTouchDialog(entry: FileEntry) {
     setTouchTarget(entry);
-    setTouchValue("");
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    setTouchValue(`${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`);
   }
 
   async function submitTouch() {
@@ -219,7 +221,13 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
     if (!entry) return;
     setTouchTarget(null);
     setError("");
-    const epoch = new Date(touchValue).getTime() / 1000;
+    const parsed = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(touchValue.trim());
+    if (!parsed) {
+      setError("时间格式无效（应为 YYYY-MM-DD HH:mm）");
+      return;
+    }
+    const [, y, mo, d, h, mi, s] = parsed;
+    const epoch = new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s ?? "0")).getTime() / 1000;
     if (!Number.isFinite(epoch) || epoch <= 0) {
       setError("时间格式无效");
       return;
@@ -230,6 +238,21 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
     } catch (cause) {
       setError(`修改时间戳失败：${errorText(cause)}`);
     }
+  }
+
+  function permsToRwx(perms: string): string {
+    if (!perms) return "—";
+    let out = "";
+    const map: Record<string, string> = { "0": "---", "1": "--x", "2": "-w-", "3": "-wx", "4": "r--", "5": "r-x", "6": "rw-", "7": "rwx" };
+    for (const ch of perms) out += map[ch] ?? "---";
+    return out;
+  }
+
+  function goParent() {
+    const trimmed = path.replace(/[\\/]+$/, "");
+    if (!trimmed) return;
+    const idx = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+    setPath(idx <= 0 ? (separator || "/") : trimmed.slice(0, idx));
   }
 
   function toggleSort(key: "name" | "size" | "modified") {
@@ -422,7 +445,7 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
               spellCheck={false}
             />
           </div>
-          <button className="file-tool-btn" onClick={() => setPath(startDir)} title="回到初始目录">
+          <button className="file-tool-btn" onClick={goParent} title="返回上一级目录">
             <ArrowUp size={15} />
           </button>
           <button className="file-tool-btn" onClick={() => void load(path)} title="刷新">
@@ -532,6 +555,7 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
             <span className="file-sortable" onClick={() => toggleSort("modified")} title="按修改时间排序">
               修改时间{sortBy === "modified" ? (sortDir === 1 ? " ↑" : " ↓") : ""}
             </span>
+            <span>权限</span>
           </div>
           {visible.map((entry) => (
             <div
@@ -556,6 +580,9 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
               </button>
               <span className="mono">{entry.isDir ? "—" : formatSize(entry.size)}</span>
               <span className="mono muted">{entry.modified}</span>
+              <span className="mono muted file-perms" title={entry.perms ? `八进制 ${entry.perms}` : undefined}>
+                {permsToRwx(entry.perms)}
+              </span>
             </div>
           ))}
         </div>
@@ -564,7 +591,11 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
       {contextMenu && (
         <div
           className="file-context-menu"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
+          style={{
+            left: contextMenu.x,
+            top: contextMenu.y,
+            transform: `translate(${contextMenu.x > window.innerWidth - 190 ? "-100%" : "0"}, ${contextMenu.y > window.innerHeight - 220 ? "-100%" : "0"})`,
+          }}
           onContextMenu={(event) => event.preventDefault()}
         >
           {contextMenu.entry ? (
@@ -572,6 +603,15 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
               <button className="file-context-item" onClick={() => { setContextMenu(null); void openEntry(contextMenu.entry!); }}>
                 <Folder size={14} /> 打开
               </button>
+              <div className="file-context-sub">
+                <button className="file-context-item" onClick={() => { setContextMenu(null); setCreateKind("file"); setCreateName("新文件.txt"); }}>
+                  <FilePenLine size={14} /> 新建文件
+                </button>
+                <button className="file-context-item" onClick={() => { setContextMenu(null); setCreateKind("dir"); setCreateName("新目录"); }}>
+                  <FolderPlus size={14} /> 新建文件夹
+                </button>
+              </div>
+              <span className="file-context-sep" />
               {!contextMenu.entry.isDir && (
                 <button className="file-context-item" onClick={() => { setContextMenu(null); void downloadEntry(contextMenu.entry!); }}>
                   <Download size={14} /> 下载
@@ -619,15 +659,16 @@ export function FileManager({ sessionId, startDir, separator }: { sessionId: str
       {touchTarget && (
         <Dialog title={`修改「${touchTarget.name}」时间戳`} onClose={() => setTouchTarget(null)}>
           <div className="dialog-form">
+            <p className="field-hint">格式：YYYY-MM-DD HH:mm（直接显示当前时间，可修改）</p>
             <input
               autoFocus
-              type="datetime-local"
               value={touchValue}
               onChange={(event) => setTouchValue(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter") void submitTouch();
                 if (event.key === "Escape") setTouchTarget(null);
               }}
+              spellCheck={false}
             />
           </div>
           <div className="dialog-actions">

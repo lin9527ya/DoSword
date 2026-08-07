@@ -286,8 +286,8 @@ function InfoPanel({
       rows.push(["已加载扩展", info.extensions.join(", ")]);
     }
     rows.push(["禁用函数", info.disableFunctions || "—"]);
-    rows.push(["连接消息", info.message]);
   }
+  const infoEntries = info ? Object.entries(info.info ?? {}) : [];
   return (
     <div className="panel detail-panel">
       <div className="panel-heading">
@@ -307,6 +307,25 @@ function InfoPanel({
           </div>
         ))}
       </div>
+      {infoEntries.length > 0 && (
+        <div className="osinfo-block">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">环境详情</p>
+              <h2>环境详情（OsInfo）</h2>
+            </div>
+          </div>
+          <div className="osinfo-grid">
+            {infoEntries.map(([key, value]) => (
+              <div className="osinfo-row" key={key}>
+                <span>{key}</span>
+                <code>{value || "—"}</code>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      <p className="muted">{info?.message}</p>
     </div>
   );
 }

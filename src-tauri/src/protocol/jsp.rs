@@ -156,6 +156,7 @@ fn ensure_info(session: &JspSession, settings: &AppSettings) -> Result<ProbeResu
             arch: "".to_string(),
             extensions: vec![],
             disable_functions: "".to_string(),
+            info: std::collections::HashMap::new(),
     };
     if let Ok(mut slot) = session.info.lock() {
         *slot = Some(info.clone());
@@ -265,6 +266,7 @@ impl Protocol for JvmLikeProtocol {
                         .and_then(|v| v.as_i64())
                         .map(|ts| ts.to_string())
                         .unwrap_or_default(),
+                    perms: "".to_string(),
                 });
             }
         }

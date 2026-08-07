@@ -134,6 +134,8 @@ pub struct ProbeResult {
     pub extensions: Vec<String>,
     /// disable_functions 配置原文。
     pub disable_functions: String,
+    /// 哥斯拉风格环境详情（OsInfo/CurrentUser/服务器/会话/配置等）。
+    pub info: std::collections::HashMap<String, String>,
 }
 
 /// HTTP 手工请求结果（Repeater）。
@@ -211,6 +213,8 @@ pub struct FileEntry {
     #[ts(type = "number")]
     pub size: u64,
     pub modified: String,
+    /// 权限（八进制字符串，如 "755"）。
+    pub perms: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, TS)]
@@ -251,6 +255,7 @@ pub struct ConnectResult {
     pub arch: String,
     pub extensions: Vec<String>,
     pub disable_functions: String,
+    pub info: std::collections::HashMap<String, String>,
 }
 
 impl ConnectResult {
@@ -267,6 +272,7 @@ impl ConnectResult {
             arch: probe.arch,
             extensions: probe.extensions,
             disable_functions: probe.disable_functions,
+            info: probe.info,
         }
     }
 }

@@ -274,6 +274,7 @@ impl PhpProtocol {
                 })
                 .unwrap_or_default(),
             disable_functions: get("disable_functions"),
+            info: info_map(&value),
         })
     }
 
@@ -330,6 +331,11 @@ impl PhpProtocol {
                             .and_then(|v| v.as_i64())
                             .map(format_timestamp)
                             .unwrap_or_default(),
+                        perms: item
+                            .get("perms")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                     })
                     .collect()
             })
@@ -844,6 +850,7 @@ impl Protocol for PhpProtocol {
             arch,
             extensions,
             disable_functions,
+            info: info_map(&value),
         })
     }
 
@@ -942,6 +949,11 @@ impl Protocol for PhpProtocol {
                             .and_then(|v| v.as_i64())
                             .map(format_timestamp)
                             .unwrap_or_default(),
+                        perms: item
+                            .get("perms")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                     })
                     .collect()
             })
@@ -1343,6 +1355,21 @@ fn is_session(php: &PhpSession) -> bool {
 }
 
 /// JSON 字符串值转义。
+/// 从 probe 响应提取哥斯拉风格环境详情键值。
+fn info_map(value: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    value
+        .pointer("/data/info")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    v.as_str().map(|s| (k.clone(), s.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn json_str(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
