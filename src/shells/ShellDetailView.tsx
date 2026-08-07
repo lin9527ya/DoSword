@@ -36,7 +36,16 @@ export function ShellDetailView({
 
   // 进入详情页时自动连接（若尚未持有会话）
   const ensureConnected = useCallback(async () => {
-    if (sessionId) return;
+    if (sessionId) {
+      // 从总览页"测试连接"进入：会话已存在，补拉缓存的环境信息
+      if (!info) {
+        api
+          .getSessionProbe(sessionId)
+          .then((probe) => setInfo({ ...probe, sessionId }))
+          .catch(() => {});
+      }
+      return;
+    }
     setConnecting(true);
     setError("");
     try {
@@ -48,7 +57,7 @@ export function ShellDetailView({
     } finally {
       setConnecting(false);
     }
-  }, [shellId, sessionId]);
+  }, [shellId, sessionId, info]);
 
   function openTerminal(dir?: string) {
     const id = ++terminalSeq.current;

@@ -1064,6 +1064,19 @@ pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectRe
     .await
 }
 
+/// 读取活跃会话缓存的环境信息（供详情页从列表进入时补全连接信息）。
+#[tauri::command]
+pub async fn get_session_probe(session_id: String, app: AppHandle) -> Result<ProbeResult, String> {
+    blocking(app, move |state| {
+        let sessions = state.sessions.lock().map_err(|_| "会话锁异常".to_string())?;
+        let session = sessions
+            .get(&session_id)
+            .ok_or_else(|| "会话不存在或已过期".to_string())?;
+        Ok(session.info.clone())
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn disconnect_shell(session_id: String, app: AppHandle) -> Result<(), String> {
     blocking(app, move |state| {

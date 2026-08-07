@@ -146,6 +146,7 @@ export const api = {
   updateSettings: (input: AppSettings) => invoke<void>("update_settings", { input }),
   connectShell: (shellId: string) => invoke<ConnectResult>("connect_shell", { shellId }),
   disconnectShell: (sessionId: string) => invoke<void>("disconnect_shell", { sessionId }),
+  getSessionProbe: (sessionId: string) => invoke<ProbeResult>("get_session_probe", { sessionId }),
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   executeCommand: (sessionId: string, command: string) =>
     invoke<CommandOutput>("execute_command", { sessionId, command }),

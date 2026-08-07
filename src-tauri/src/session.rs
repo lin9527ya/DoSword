@@ -51,6 +51,11 @@ impl SessionManager {
     }
 
     /// 惰性清理过期会话，然后返回指定会话的可变引用。
+    /// 只读查询会话（不刷新 last_used_at）。
+    pub fn get(&self, session_id: &str) -> Option<&ShellSession> {
+        self.sessions.get(session_id)
+    }
+
     pub fn get_mut(&mut self, session_id: &str) -> Result<&mut ShellSession, String> {
         self.purge_expired();
         let session = self

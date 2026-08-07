@@ -104,6 +104,7 @@ pub fn run() {
             commands::update_settings,
             commands::connect_shell,
             commands::disconnect_shell,
+            commands::get_session_probe,
             commands::list_sessions,
             commands::execute_command,
             commands::list_dir,
