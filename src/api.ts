@@ -147,6 +147,10 @@ export const api = {
   connectShell: (shellId: string) => invoke<ConnectResult>("connect_shell", { shellId }),
   disconnectShell: (sessionId: string) => invoke<void>("disconnect_shell", { sessionId }),
   getSessionProbe: (sessionId: string) => invoke<ProbeResult>("get_session_probe", { sessionId }),
+  startPty: (sessionId: string) => invoke<{ ptyId: string; port: number }>("start_pty_session", { sessionId }),
+  ptyWrite: (ptyId: string, dataB64: string) => invoke<void>("pty_write", { ptyId, dataB64 }),
+  ptyRead: (ptyId: string) => invoke<{ data: string; closed: boolean; error?: string }>("pty_read", { ptyId }),
+  ptyClose: (ptyId: string) => invoke<void>("pty_close", { ptyId }),
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   executeCommand: (sessionId: string, command: string) =>
     invoke<CommandOutput>("execute_command", { sessionId, command }),

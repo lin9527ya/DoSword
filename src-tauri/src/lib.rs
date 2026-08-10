@@ -1,6 +1,7 @@
 mod auth;
 mod commands;
 mod protocol;
+mod pty;
 mod session;
 mod native_plugin;
 mod storage;
@@ -17,6 +18,7 @@ pub struct AppState {
     sessions: Mutex<SessionManager>,
     protocols: ProtocolRegistry,
     feature_plugins: std::sync::Mutex<dosword_sdk::FeaturePluginRegistry>,
+    ptys: pty::PtyRegistry,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -60,6 +62,7 @@ pub fn run() {
                         sessions: Mutex::new(SessionManager::new()),
                         protocols: ProtocolRegistry::builtin(),
                         feature_plugins: std::sync::Mutex::new(registry),
+                        ptys: pty::PtyRegistry::new(),
                     });
                     return Ok(());
                 }
@@ -69,6 +72,7 @@ pub fn run() {
                 sessions: Mutex::new(SessionManager::new()),
                 protocols: ProtocolRegistry::builtin(),
                 feature_plugins: std::sync::Mutex::new(dosword_sdk::FeaturePluginRegistry::builtin()),
+                ptys: pty::PtyRegistry::new(),
             });
             Ok(())
         })
@@ -105,6 +109,10 @@ pub fn run() {
             commands::connect_shell,
             commands::disconnect_shell,
             commands::get_session_probe,
+            commands::start_pty_session,
+            commands::pty_write,
+            commands::pty_read,
+            commands::pty_close,
             commands::list_sessions,
             commands::execute_command,
             commands::list_dir,

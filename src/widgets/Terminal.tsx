@@ -82,6 +82,13 @@ export function Terminal({
   const [viewMode, setViewMode] = useState<ViewMode>("ansi");
   const viewModeRef = useRef<ViewMode>("ansi");
   viewModeRef.current = viewMode;
+  const [ptyId, setPtyId] = useState<string | null>(null);
+  const ptyIdRef = useRef<string | null>(null);
+  ptyIdRef.current = ptyId;
+  const [ptyFailed, setPtyFailed] = useState(false);
+  const ptyFailedRef = useRef(false);
+  ptyFailedRef.current = ptyFailed;
+  const pollTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     try {
@@ -92,6 +99,38 @@ export function Terminal({
   }, []);
 
   const prompt = () => `dosword@target:${currentDirRef.current ?? "~"}$ `;
+
+  async function pollPty(id: string) {
+    try {
+      const result = await api.ptyRead(id);
+      if (result.data) {
+        const bytes = b64decodeToUint8(result.data);
+        termRef.current?.write(bytes);
+      }
+      if (result.closed) {
+        if (pollTimerRef.current !== null) {
+          window.clearInterval(pollTimerRef.current);
+          pollTimerRef.current = null;
+        }
+        setPtyId(null);
+        termRef.current?.write(`\r\n\x1b[31m[交互式会话已断开]\x1b[0m\r\n`);
+        if (termRef.current) termRef.current.write(prompt());
+      }
+    } catch {
+      // 轮询失败忽略（下次重试）
+    }
+  }
+
+  function b64encode(text: string): string {
+    return btoa(unescape(encodeURIComponent(text)));
+  }
+
+  function b64decodeToUint8(data: string): Uint8Array {
+    const binary = atob(data);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
 
   async function run(command: string) {
     if (!command.trim() || busyRef.current) return;
@@ -163,16 +202,39 @@ export function Terminal({
     fit.fit();
     termRef.current = term;
     fitRef.current = fit;
-    term.write(prompt());
     setReady(true);
 
     const resizeObserver = new ResizeObserver(() => fit.fit());
     resizeObserver.observe(container);
 
+    // 尝试建立交互式 PTY 会话（失败降级为命令模式）
+    void api
+      .startPty(sessionId)
+      .then((pty) => {
+        if (!termRef.current) return;
+        setPtyId(pty.ptyId);
+        term.write(`\r\n\x1b[90m[交互式会话已建立（PTY），可直接输入命令，如同本地 shell]\x1b[0m\r\n`);
+        // 轮询输出
+        pollTimerRef.current = window.setInterval(() => {
+          void pollPty(pty.ptyId);
+        }, 80);
+      })
+      .catch(() => {
+        if (!termRef.current) return;
+        ptyFailedRef.current = true;
+        setPtyFailed(true);
+        term.write(`\r\n\x1b[33m[交互式会话不可用（目标不支持），已降级为命令模式]\x1b[0m\r\n${prompt()}`);
+      });
+
     term.onData((data) => {
       const term = termRef.current;
       if (!term) return;
-      // 粘贴多行 / 已提交
+      // PTY 交互模式：直接转发到目标 shell（由远端回显，本地不回显）
+      if (ptyIdRef.current) {
+        void api.ptyWrite(ptyIdRef.current, b64encode(data)).catch(() => {});
+        return;
+      }
+      // 命令模式：粘贴多行 / 已提交
       if (data === "\r") {
         const command = bufferRef.current;
         if (command.trim()) {
@@ -227,6 +289,13 @@ export function Terminal({
 
     return () => {
       resizeObserver.disconnect();
+      if (pollTimerRef.current !== null) {
+        window.clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+      if (ptyIdRef.current) {
+        void api.ptyClose(ptyIdRef.current).catch(() => {});
+      }
       term.dispose();
       termRef.current = null;
     };
@@ -235,7 +304,13 @@ export function Terminal({
   return (
     <div className="terminal-wrap">
       <div className="term-toolbar">
-        <span className="term-toolbar-label">输出格式</span>
+        {ptyId ? (
+          <span className="term-toolbar-label term-pty-badge">交互式会话（PTY）</span>
+        ) : ptyFailed ? (
+          <span className="term-toolbar-label term-pty-fail">命令模式（PTY 不可用）</span>
+        ) : (
+          <>
+            <span className="term-toolbar-label">输出格式</span>
         <select
           className="select term-view-mode"
           value={viewMode}
@@ -246,6 +321,8 @@ export function Terminal({
           <option value="json">JSON</option>
           <option value="hex">HEX</option>
         </select>
+          </>
+        )}
       </div>
       <div className="terminal-box" ref={containerRef} data-ready={ready} />
     </div>
