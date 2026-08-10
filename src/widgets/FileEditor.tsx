@@ -99,19 +99,33 @@ export function FileEditor({
             </button>
           </div>
         </div>
-        <textarea
-          className="editor-body"
-          value={content}
-          onChange={(event) => setContent(event.target.value)}
-          spellCheck={false}
-          placeholder={encoding === "hex" ? "十六进制字节（自动忽略空格与冒号）" : undefined}
-          onKeyDown={(event) => {
-            if ((event.ctrlKey || event.metaKey) && event.key === "s") {
-              event.preventDefault();
-              void saveFile();
-            }
-          }}
-        />
+        <div className="editor-body-wrap">
+          {encoding !== "hex" && (
+            <div className="editor-gutter" aria-hidden>
+              {Array.from({ length: Math.max(1, content.split("\n").length) }, (_, index) => (
+                <span key={index}>{index + 1}</span>
+              ))}
+            </div>
+          )}
+          <textarea
+            className="editor-body"
+            value={content}
+            onChange={(event) => setContent(event.target.value)}
+            onScroll={(event) => {
+              const target = event.currentTarget;
+              const gutter = target.parentElement?.querySelector(".editor-gutter");
+              if (gutter) gutter.scrollTop = target.scrollTop;
+            }}
+            spellCheck={false}
+            placeholder={encoding === "hex" ? "十六进制字节（自动忽略空格与冒号）" : undefined}
+            onKeyDown={(event) => {
+              if ((event.ctrlKey || event.metaKey) && event.key === "s") {
+                event.preventDefault();
+                void saveFile();
+              }
+            }}
+          />
+        </div>
       </section>
     </div>
   );
