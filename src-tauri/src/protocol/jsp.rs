@@ -775,6 +775,8 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             default_timeout_secs: 5,
             proxy: None,
             max_file_size_mb: 32,
+        chunk_size_mb: 4,
+        allow_arbitrary_code: true,
         }
     }
 

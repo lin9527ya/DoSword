@@ -68,7 +68,15 @@ proxy: string | null,
 /**
  * 单次响应大小上限（MB）。
  */
-maxFileSizeMb: number, };
+maxFileSizeMb: number, 
+/**
+ * 分块传输块大小（MB，上传/下载共用，默认 4）。
+ */
+chunkSizeMb: number, 
+/**
+ * 是否允许 run_code 任意代码执行（插件托管载荷之外的安全闸，默认开）。
+ */
+allowArbitraryCode: boolean, };
 export type CommandOutput = { stdout: string, durationMs: number, 
 /**
  * 命令执行后的服务器工作目录（终端据此更新提示符）。

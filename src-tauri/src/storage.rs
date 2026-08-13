@@ -599,6 +599,8 @@ mod tests {
             default_timeout_secs: 20,
             proxy: Some("http://127.0.0.1:8080".into()),
             max_file_size_mb: 64,
+        chunk_size_mb: 4,
+        allow_arbitrary_code: true,
         };
         db.update_settings(&updated).unwrap();
         let loaded = db.get_settings().unwrap();

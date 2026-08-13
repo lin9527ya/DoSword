@@ -175,6 +175,21 @@ pub struct AppSettings {
     /// 单次响应大小上限（MB）。
     #[ts(type = "number")]
     pub max_file_size_mb: u64,
+    /// 分块传输块大小（MB，上传/下载共用，默认 4）。
+    #[ts(type = "number")]
+    #[serde(default = "default_chunk_mb")]
+    pub chunk_size_mb: u64,
+    /// 是否允许 run_code 任意代码执行（插件托管载荷之外的安全闸，默认开）。
+    #[serde(default = "default_allow_code")]
+    pub allow_arbitrary_code: bool,
+}
+
+fn default_chunk_mb() -> u64 {
+    4
+}
+
+fn default_allow_code() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -183,6 +198,8 @@ impl Default for AppSettings {
             http_enabled: false,
             default_timeout_secs: 10,
             proxy: None,
+            chunk_size_mb: 4,
+            allow_arbitrary_code: true,
             max_file_size_mb: 32,
         }
     }
@@ -198,7 +215,7 @@ pub struct CommandOutput {
     pub cwd: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct DirListing {
     pub entries: Vec<FileEntry>,

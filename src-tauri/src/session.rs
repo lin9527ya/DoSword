@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dosword_sdk::domain::ProbeResult;
+use dosword_sdk::domain::{AppSettings, ProbeResult, ShellProfile};
 use dosword_sdk::SessionState;
 
 /// 会话默认存活时长（秒）。
@@ -34,6 +34,9 @@ pub struct ShellSession {
     /// 连接时的环境信息（服务器 / 目录 / 分隔符等）。
     pub info: ProbeResult,
     pub last_used_at: u64,
+    /// 上下文缓存：连接时写入，update_shell / update_settings 时失效（避免每命令重复查库）。
+    pub profile: Option<ShellProfile>,
+    pub settings: Option<AppSettings>,
 }
 
 /// 会话注册表（进程内单例，受 Mutex 保护）。
@@ -51,8 +54,9 @@ impl SessionManager {
     }
 
     /// 惰性清理过期会话，然后返回指定会话的可变引用。
-    /// 只读查询会话（不刷新 last_used_at）。
-    pub fn get(&self, session_id: &str) -> Option<&ShellSession> {
+    /// 查询会话（P8：顺带清理过期，避免只读路径残留过期会话）。
+    pub fn get(&mut self, session_id: &str) -> Option<&ShellSession> {
+        self.purge_expired();
         self.sessions.get(session_id)
     }
 
@@ -91,9 +95,29 @@ impl SessionManager {
                 state,
                 info,
                 last_used_at: now,
+                profile: None,
+                settings: None,
             },
         );
         id
+    }
+
+    /// 按 Shell 失效会话上下文缓存（update_shell 后调用）。
+    pub fn invalidate_context(&mut self, profile_id: &str) {
+        for session in self.sessions.values_mut() {
+            if session.profile_id == profile_id {
+                session.profile = None;
+                session.settings = None;
+            }
+        }
+    }
+
+    /// 失效全部会话上下文缓存（update_settings 后调用）。
+    pub fn invalidate_context_all(&mut self) {
+        for session in self.sessions.values_mut() {
+            session.profile = None;
+            session.settings = None;
+        }
     }
 
     /// 断开指定会话并返回被移除的会话。幂等：不存在时返回 None。

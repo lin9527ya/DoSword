@@ -19,6 +19,7 @@ pub struct AppState {
     protocols: ProtocolRegistry,
     feature_plugins: std::sync::Mutex<dosword_sdk::FeaturePluginRegistry>,
     ptys: pty::PtyRegistry,
+    dir_cache: Mutex<std::collections::HashMap<(String, String), (std::time::Instant, dosword_sdk::domain::DirListing)>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -63,6 +64,7 @@ pub fn run() {
                         protocols: ProtocolRegistry::builtin(),
                         feature_plugins: std::sync::Mutex::new(registry),
                         ptys: pty::PtyRegistry::new(),
+                        dir_cache: Mutex::new(std::collections::HashMap::new()),
                     });
                     return Ok(());
                 }
@@ -73,6 +75,7 @@ pub fn run() {
                 protocols: ProtocolRegistry::builtin(),
                 feature_plugins: std::sync::Mutex::new(dosword_sdk::FeaturePluginRegistry::builtin()),
                 ptys: pty::PtyRegistry::new(),
+                dir_cache: Mutex::new(std::collections::HashMap::new()),
             });
             Ok(())
         })

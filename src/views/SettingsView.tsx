@@ -218,6 +218,28 @@ export function SettingsView() {
               }
             />
           </label>
+          <label>
+            分块传输大小（MB）
+            <input
+              type="number"
+              min={1}
+              max={64}
+              value={settings.chunkSizeMb}
+              onChange={(event) =>
+                setSettings({ ...settings, chunkSizeMb: Number(event.target.value) })
+              }
+            />
+          </label>
+          <label className="settings-check">
+            <input
+              type="checkbox"
+              checked={settings.allowArbitraryCode}
+              onChange={(event) =>
+                setSettings({ ...settings, allowArbitraryCode: event.target.checked })
+              }
+            />
+            允许 run_code 任意代码执行（关闭后插件载荷将无法运行）
+          </label>
         </div>
       </Panel>
 

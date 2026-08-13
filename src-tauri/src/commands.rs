@@ -315,6 +315,10 @@ pub async fn update_shell(input: UpdateShell, app: AppHandle) -> Result<ShellPro
             "success",
             &format!("更新 Shell：{} → {}", previous.endpoint, profile.endpoint),
         );
+        // P6：更新后失效会话上下文缓存（下次使用重查）
+        if let Ok(mut sessions) = state.sessions.lock() {
+            sessions.invalidate_context(&profile.id);
+        }
         Ok(profile)
     })
     .await
@@ -1014,6 +1018,10 @@ pub async fn update_settings(input: AppSettings, app: AppHandle) -> Result<(), S
             };
             audit(state, "system", None, "settings.update", "success", &detail);
         }
+        // P6：设置变更后失效全部会话上下文缓存
+        if let Ok(mut sessions) = state.sessions.lock() {
+            sessions.invalidate_context_all();
+        }
         Ok(())
     })
     .await
@@ -1036,17 +1044,25 @@ pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectRe
             .connect(&shell, &settings)
             .map_err(|error| audit_fail(state, &shell, "shell.connect", error))?;
 
-        let session_id = state
-            .sessions
-            .lock()
-            .map_err(|_| "会话锁异常".to_string())?
-            .insert(
+        let session_id = {
+            let mut sessions = state
+                .sessions
+                .lock()
+                .map_err(|_| "会话锁异常".to_string())?;
+            let session_id = sessions.insert(
                 &shell.id,
                 &shell.workspace_id,
                 &shell.protocol_id,
                 Arc::from(session_state),
                 probe.clone(),
             );
+            // P6：连接时缓存上下文（避免每命令重复查库）
+            if let Ok(session) = sessions.get_mut(&session_id) {
+                session.profile = Some(shell.clone());
+                session.settings = Some(settings.clone());
+            }
+            session_id
+        };
 
         // 连接成功刷新在线状态
         let _ = state
@@ -1071,7 +1087,7 @@ pub async fn start_pty_session(session_id: String, app: AppHandle) -> Result<ser
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
         let (session, _) = {
-            let sessions = state.sessions.lock().map_err(|_| "会话锁异常".to_string())?;
+            let mut sessions = state.sessions.lock().map_err(|_| "会话锁异常".to_string())?;
             let shell = sessions
                 .get(&session_id)
                 .ok_or_else(|| "会话不存在或已过期，请重新连接".to_string())?;
@@ -1171,7 +1187,7 @@ pub async fn pty_close(pty_id: String, app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn get_session_probe(session_id: String, app: AppHandle) -> Result<ProbeResult, String> {
     blocking(app, move |state| {
-        let sessions = state.sessions.lock().map_err(|_| "会话锁异常".to_string())?;
+        let mut sessions = state.sessions.lock().map_err(|_| "会话锁异常".to_string())?;
         let session = sessions
             .get(&session_id)
             .ok_or_else(|| "会话不存在或已过期".to_string())?;
@@ -1240,25 +1256,36 @@ struct SessionCtx<'a> {
 /// 从会话 ID 解析出会话命令上下文。
 /// 锁内完成：会话取出 → Shell 查询 → 授权轻量复查（仅过期检查）→ 协议解析。
 fn session_ctx<'a>(state: &'a AppState, session_id: &str) -> Result<SessionCtx<'a>, String> {
-    let (profile_id, protocol_id) = {
+    let (profile_id, protocol_id, cached_profile, cached_settings) = {
         let mut sessions = state
             .sessions
             .lock()
             .map_err(|_| "会话锁异常".to_string())?;
         let session = sessions.get_mut(session_id)?;
-        (session.profile_id.clone(), session.protocol_id.clone())
+        (
+            session.profile_id.clone(),
+            session.protocol_id.clone(),
+            session.profile.clone(),
+            session.settings.clone(),
+        )
     };
 
     let database = state
         .database
         .lock()
         .map_err(|_| "数据库锁异常".to_string())?;
-    let shell = database
-        .shell(&profile_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "Shell 配置不存在".to_string())?;
+    let shell = match cached_profile {
+        Some(profile) => profile,
+        None => database
+            .shell(&profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Shell 配置不存在".to_string())?,
+    };
     auth::require_session_alive(&database, &shell)?;
-    let settings = database.get_settings().map_err(|error| error.to_string())?;
+    let settings = match cached_settings {
+        Some(settings) => settings,
+        None => database.get_settings().map_err(|error| error.to_string())?,
+    };
     drop(database);
 
     let protocol = state
@@ -1321,6 +1348,19 @@ pub async fn list_dir(
 ) -> Result<DirListing, String> {
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
+        // 目录缓存（TTL 5s）：命中直接返回，避免大目录重复网络往返
+        let cache_key = (session_id.clone(), path.clone());
+        if let Some((hit_at, listing)) = state
+            .dir_cache
+            .lock()
+            .map_err(|_| "目录缓存锁异常".to_string())?
+            .get(&cache_key)
+            .cloned()
+        {
+            if hit_at.elapsed() < std::time::Duration::from_secs(5) {
+                return Ok(listing);
+            }
+        }
         let listing = with_session(state, &session_id, |session| {
             ctx.protocol.list_dir(session, &path, &ctx.settings)
         })
@@ -1328,10 +1368,23 @@ pub async fn list_dir(
             audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.list", "error", &error);
             error
         })?;
+        if let Ok(mut cache) = state.dir_cache.lock() {
+            if cache.len() >= 256 {
+                cache.clear();
+            }
+            cache.insert(cache_key, (std::time::Instant::now(), listing.clone()));
+        }
         audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.list", "success", &format!("浏览目录：{path}"));
         Ok(listing)
     })
     .await
+}
+
+/// 写操作后失效该会话的全部目录缓存（保证一致性）。
+fn invalidate_dir_cache(state: &AppState, session_id: &str) {
+    if let Ok(mut cache) = state.dir_cache.lock() {
+        cache.retain(|key, _| key.0 != session_id);
+    }
 }
 
 #[tauri::command]
@@ -1384,6 +1437,7 @@ pub async fn write_file(
             audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "error", &error);
             error
         })?;
+        invalidate_dir_cache(state, &session_id);
         audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "success", &format!("写入文件：{path}（{} 字节）", bytes.len()));
         Ok(())
     })
@@ -1403,13 +1457,27 @@ pub async fn upload_file(
             .decode(&content_b64)
             .map_err(|_| "文件内容不是合法 Base64".to_string())?;
         let ctx = session_ctx(state, &session_id)?;
-        with_session(state, &session_id, |session| {
-            ctx.protocol.write_file(session, &remote_path, &bytes, &ctx.settings)
-        })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.upload", "error", &error);
-            error
-        })?;
+        // P4：整文件上传改为分块（chunk_size_mb 可配），降低内存峰值
+        let chunk = ctx.settings.chunk_size_mb.max(1) * 1024 * 1024;
+        let mut offset = 0u64;
+        while offset < bytes.len() as u64 {
+            let end = (offset + chunk).min(bytes.len() as u64);
+            with_session(state, &session_id, |session| {
+                ctx.protocol.write_chunk(
+                    session,
+                    &remote_path,
+                    &bytes[offset as usize..end as usize],
+                    offset,
+                    &ctx.settings,
+                )
+            })
+            .map_err(|error| {
+                audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.upload", "error", &error);
+                error
+            })?;
+            offset = end;
+        }
+        invalidate_dir_cache(state, &session_id);
         audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.upload", "success", &format!("上传文件：{remote_path}（{} 字节）", bytes.len()));
         Ok(())
     })
@@ -1436,6 +1504,7 @@ pub async fn write_chunk(
             audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "error", &error);
             error
         })?;
+        invalidate_dir_cache(state, &session_id);
         audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "success", &format!("写入文件：{path}（偏移 {offset}，{} 字节）", bytes.len()));
         Ok(())
     })
@@ -1451,13 +1520,13 @@ pub async fn download_file(
 ) -> Result<u64, String> {
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
-        // 分块拉取（每块 4MB），避免大文件一次性占用内存与超时
-        const CHUNK: u64 = 4 * 1024 * 1024;
+        // 分块拉取（块大小由设置配置，默认 4MB），避免大文件一次性占用内存与超时
+        let chunk_size = ctx.settings.chunk_size_mb.max(1) * 1024 * 1024;
         let mut bytes: Vec<u8> = Vec::new();
         loop {
             let chunk = with_session(state, &session_id, |session| {
                 ctx.protocol
-                    .read_chunk(session, &remote_path, bytes.len() as u64, CHUNK, &ctx.settings)
+                    .read_chunk(session, &remote_path, bytes.len() as u64, chunk_size, &ctx.settings)
             })
             .map_err(|error| {
                 audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.download", "error", &error);
@@ -1467,7 +1536,7 @@ pub async fn download_file(
                 break;
             }
             bytes.extend_from_slice(&chunk);
-            if (chunk.len() as u64) < CHUNK {
+            if (chunk.len() as u64) < chunk_size {
                 break;
             }
         }
@@ -1495,6 +1564,7 @@ pub async fn delete_path(
             error
         })?;
         audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.delete", "success", &format!("删除：{path}"));
+        invalidate_dir_cache(state, &session_id);
         Ok(())
     })
     .await
@@ -1517,6 +1587,7 @@ pub async fn rename_path(
             error
         })?;
         audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.rename", "success", &format!("重命名：{from} → {to}"));
+        invalidate_dir_cache(state, &session_id);
         Ok(())
     })
     .await
@@ -1539,6 +1610,7 @@ pub async fn touch_path(
             error
         })?;
         audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.touch", "success", &format!("touch：{path}"));
+        invalidate_dir_cache(state, &session_id);
         Ok(())
     })
     .await
@@ -1560,6 +1632,7 @@ pub async fn create_dir(
             error
         })?;
         audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.mkdir", "success", &format!("新建目录：{path}"));
+        invalidate_dir_cache(state, &session_id);
         Ok(())
     })
     .await
@@ -1666,6 +1739,7 @@ mod tests {
             protocols: ProtocolRegistry::builtin(),
             feature_plugins: std::sync::Mutex::new(dosword_sdk::FeaturePluginRegistry::builtin()),
             ptys: crate::pty::PtyRegistry::new(),
+            dir_cache: Mutex::new(std::collections::HashMap::new()),
         }
     }
 

