@@ -1082,6 +1082,18 @@ pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectRe
 }
 
 /// 建立交互式 PTY 会话：目标反弹回连后返回 ptyId（失败则报错，前端降级为命令模式）。
+/// E3：注册自定义编码器 stub（自定义 stub + XOR 载荷，生成 Shell 时可选 "custom"）。
+#[tauri::command]
+pub async fn register_custom_encoder(stub: String, app: AppHandle) -> Result<(), String> {
+    blocking(app, move |state| {
+        dosword_sdk::encoder::set_custom_stub(&stub)
+            .map_err(|error| error.to_string())?;
+        audit(state, "system", None, "encoder.register", "success", "注册自定义编码器 stub");
+        Ok(())
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn start_pty_session(session_id: String, app: AppHandle) -> Result<serde_json::Value, String> {
     blocking(app, move |state| {
@@ -1306,7 +1318,7 @@ fn session_ctx<'a>(state: &'a AppState, session_id: &str) -> Result<SessionCtx<'
 fn with_session<T>(
     state: &AppState,
     session_id: &str,
-    f: impl FnOnce(&dyn SessionState) -> Result<T, ProtocolError>,
+    mut f: impl FnMut(&dyn SessionState) -> Result<T, ProtocolError>,
 ) -> Result<T, String> {
     let session = {
         let mut sessions = state
@@ -1316,7 +1328,88 @@ fn with_session<T>(
         let session = sessions.get_mut(session_id)?;
         session.state.clone()
     };
-    f(session.as_ref()).map_err(|error| error.to_string())
+    match f(session.as_ref()) {
+        Ok(value) => Ok(value),
+        // E4：网络类错误自动重连一次（目标短暂不可达/重启后 stub 仍在）
+        Err(error) if is_reconnectable(&error) => match reconnect_session(state, session_id) {
+            Ok(()) => {
+                let session = {
+                    let mut sessions = state
+                        .sessions
+                        .lock()
+                        .map_err(|_| "会话锁异常".to_string())?;
+                    let session = sessions.get_mut(session_id)?;
+                    session.state.clone()
+                };
+                f(session.as_ref()).map_err(|error| error.to_string())
+            }
+            Err(_) => Err(error.to_string()),
+        },
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// 判断错误是否值得自动重连（网络层失败；业务错误如密码错误/404 不重连）。
+fn is_reconnectable(error: &ProtocolError) -> bool {
+    let text = error.to_string();
+    let markers = [
+        "Network",
+        "network",
+        "error sending request",
+        "连接失败",
+        "timed out",
+        "Connection refused",
+        "connection reset",
+        "broken pipe",
+        "超时",
+        "timeout",
+    ];
+    markers.iter().any(|marker| text.contains(marker))
+}
+
+/// E4：重建协议会话（连接成功则替换 SessionManager 中的状态与信息）。
+fn reconnect_session(state: &AppState, session_id: &str) -> Result<(), String> {
+    let (profile_id, protocol_id, cached_profile) = {
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?;
+        let session = sessions.get_mut(session_id)?;
+        (
+            session.profile_id.clone(),
+            session.protocol_id.clone(),
+            session.profile.clone(),
+        )
+    };
+    let database = state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())?;
+    let profile = match cached_profile {
+        Some(profile) => profile,
+        None => database
+            .shell(&profile_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Shell 配置不存在".to_string())?,
+    };
+    let settings = database.get_settings().map_err(|error| error.to_string())?;
+    drop(database);
+    let protocol = state
+        .protocols
+        .get(&protocol_id)
+        .ok_or_else(|| format!("未知协议：{protocol_id}"))?;
+    let (new_state, probe) = protocol
+        .connect(&profile, &settings)
+        .map_err(|error| format!("自动重连失败：{error}"))?;
+    let mut sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| "会话锁异常".to_string())?;
+    if let Ok(session) = sessions.get_mut(session_id) {
+        session.state = Arc::from(new_state);
+        session.info = probe;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1385,6 +1478,31 @@ fn invalidate_dir_cache(state: &AppState, session_id: &str) {
     if let Ok(mut cache) = state.dir_cache.lock() {
         cache.retain(|key, _| key.0 != session_id);
     }
+}
+
+/// E2：批量目录浏览（一次往返返回多个目录，减少 RPC 次数）。
+#[tauri::command]
+pub async fn batch_list_dir(
+    session_id: String,
+    paths: Vec<String>,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        let mut results = serde_json::Map::new();
+        for path in paths {
+            let listing = with_session(state, &session_id, |session| {
+                ctx.protocol.list_dir(session, &path, &ctx.settings)
+            })
+            .map_err(|error| format!("浏览 {path} 失败：{error}"))?;
+            results.insert(
+                path.clone(),
+                serde_json::to_value(listing).map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(serde_json::Value::Object(results))
+    })
+    .await
 }
 
 #[tauri::command]

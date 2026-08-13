@@ -18,6 +18,22 @@ export function SettingsView() {
   const [backupDir, setBackupDir] = useState(() => localStorage.getItem("dosword:backup-dir") ?? "");
   const [backupEnabled, setBackupEnabled] = useState(() => localStorage.getItem("dosword:backup-enabled") === "1");
   const [backupNote, setBackupNote] = useState("");
+  const [customStub, setCustomStub] = useState("");
+  const [stubBusy, setStubBusy] = useState(false);
+  const [stubNote, setStubNote] = useState("");
+
+  async function registerStub() {
+    setStubBusy(true);
+    setStubNote("");
+    try {
+      await api.registerCustomEncoder(customStub);
+      setStubNote("注册成功：生成 Shell 时编码器选择「自定义」即可使用");
+    } catch (cause) {
+      setStubNote(`注册失败：${errorText(cause)}`);
+    } finally {
+      setStubBusy(false);
+    }
+  }
 
   function changeTheme(next: "light" | "dark") {
     setTheme(next);
@@ -240,6 +256,30 @@ export function SettingsView() {
             />
             允许 run_code 任意代码执行（关闭后插件载荷将无法运行）
           </label>
+        </div>
+      </Panel>
+
+      <Panel eyebrow="自定义编码器" title="自定义编码器（Custom）">
+        <div className="settings-form">
+          <p className="field-hint">
+            粘贴自定义 PHP stub（需包含 &lt;?php）。载荷协议为 XOR + Base64（密钥由密码 md5 派生），
+            stub 需实现：读取 POST formData 参数 → base64 解码 → XOR 还原 → 执行。
+          </p>
+          <textarea
+            className="custom-stub-input"
+            rows={8}
+            value={customStub}
+            onChange={(event) => setCustomStub(event.target.value)}
+            placeholder="<?php&#10;// 自定义 stub：解析 formData（base64 + XOR md5 密钥）并执行载荷&#10;..."
+            spellCheck={false}
+          />
+          <div className="settings-row">
+            <button className="button primary" onClick={() => void registerStub()} disabled={stubBusy}>
+              <Blocks size={15} />
+              {stubBusy ? "注册中…" : "注册 stub"}
+            </button>
+            {stubNote && <span className={stubNote.startsWith("注册失败") ? "form-note error" : "form-note"}>{stubNote}</span>}
+          </div>
         </div>
       </Panel>
 

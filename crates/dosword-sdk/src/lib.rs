@@ -7,6 +7,8 @@ pub mod domain;
 pub mod crypto;
 pub mod encoder;
 pub mod asp_stub;
+pub mod node_stub;
+pub mod python_stub;
 pub mod bypass;
 pub mod feature_plugins;
 pub mod jsp_stub;

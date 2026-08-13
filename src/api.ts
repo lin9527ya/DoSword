@@ -122,6 +122,7 @@ export const api = {
     body: string;
   }) => invoke<HttpSendResult>("http_send", request),
   listEncoders: () => invoke<[string, string][]>("list_encoders"),
+  registerCustomEncoder: (stub: string) => invoke<void>("register_custom_encoder", { stub }),
   generateShell: (language: string, encoderId: string, password: string, session: boolean) =>
     invoke<GenerateShellResult>("generate_shell", { language, encoderId, password, session }),
   listAudit: (filter: AuditFilter) => invoke<AuditPage>("list_audit", { filter }),
@@ -154,6 +155,8 @@ export const api = {
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   executeCommand: (sessionId: string, command: string) =>
     invoke<CommandOutput>("execute_command", { sessionId, command }),
+  batchListDir: (sessionId: string, paths: string[]) =>
+    invoke<Record<string, DirListing>>("batch_list_dir", { sessionId, paths }),
   listDir: (sessionId: string, path: string) =>
     invoke<DirListing>("list_dir", { sessionId, path }),
   readFile: (sessionId: string, path: string) =>
