@@ -284,6 +284,18 @@ impl Database {
     }
 
     /// 更新 Shell 状态（online / error）与最近连接时间。
+    /// P3：批量更新 Shell 在线状态（单事务，避免 N 次独立写 + N 次 fsync）。
+    pub fn batch_update_shell_status(&mut self, results: &[(String, String)]) -> rusqlite::Result<()> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut stmt = transaction.prepare("UPDATE shells SET status = ?1 WHERE id = ?2")?;
+            for (id, status) in results {
+                stmt.execute(params![status, id])?;
+            }
+        }
+        transaction.commit()
+    }
+
     pub fn update_shell_status(&self, id: &str, status: &str) -> rusqlite::Result<()> {
         self.connection.execute(
             "UPDATE shell_profiles SET status = ?1, last_connected_at = datetime('now')
@@ -294,22 +306,24 @@ impl Database {
     }
 
     pub fn record_probe(
-        &self,
+        &mut self,
         shell: &ShellProfile,
         outcome: &str,
         detail: &str,
     ) -> rusqlite::Result<()> {
+        // P10：单事务合并两次写（少一次 fsync）
         let now = Utc::now().to_rfc3339();
-        self.connection.execute(
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
             "UPDATE shell_profiles SET status = ?1, last_connected_at = ?2 WHERE id = ?3",
             params![outcome, now, shell.id],
         )?;
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO audit_events (workspace_id, shell_id, action, outcome, detail, created_at)
              VALUES (?1, ?2, 'shell.probe', ?3, ?4, ?5)",
             params![shell.workspace_id, shell.id, outcome, detail, now],
         )?;
-        Ok(())
+        transaction.commit()
     }
 
     /// 记录一条通用审计事件（会话操作 / 文件操作 / 设置变更等）。

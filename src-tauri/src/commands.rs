@@ -246,6 +246,9 @@ pub async fn update_workspace(input: UpdateWorkspace, app: AppHandle) -> Result<
             for session_id in removed {
                 state.ptys.close_for_session(&session_id);
             }
+        } else if let Ok(mut sessions) = state.sessions.lock() {
+            // 仅过期时间变化：失效快照（下次复查回退查库）
+            sessions.invalidate_workspace_expiry(&workspace.id);
         }
         audit(
             state,
@@ -488,7 +491,7 @@ pub async fn probe_shell(shell_id: String, app: AppHandle) -> Result<ProbeResult
                 .database
                 .lock()
                 .map_err(|_| "数据库锁异常".to_string())
-                .and_then(|database| {
+                .and_then(|mut database| {
                     database
                         .record_probe(&shell, "error", &error.to_string())
                         .map_err(|db_error| db_error.to_string())
@@ -647,7 +650,7 @@ pub fn export_shells(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 fn export_shells_impl(state: &AppState) -> Result<String, String> {
-    let database = state
+    let mut database = state
         .database
         .lock()
         .map_err(|_| "数据库锁异常".to_string())?;
@@ -801,7 +804,7 @@ pub async fn write_local_file(
 #[tauri::command]
 pub async fn list_audit(filter: AuditFilter, app: AppHandle) -> Result<AuditPage, String> {
     blocking(app, move |state| {
-        let database = state
+        let mut database = state
             .database
             .lock()
             .map_err(|_| "数据库锁异常".to_string())?;
@@ -955,13 +958,16 @@ pub async fn run_feature_plugin(
             .protocols
             .get(&protocol_id)
             .ok_or_else(|| format!("未知协议：{protocol_id}"))?;
-        let registry_guard = state
-            .feature_plugins
-            .lock()
-            .map_err(|_| "插件注册表锁异常".to_string())?;
-        let plugin = registry_guard
-            .get(&plugin_id)
-            .ok_or_else(|| format!("未知功能插件：{plugin_id}"))?;
+        let plugin = {
+            let registry_guard = state
+                .feature_plugins
+                .lock()
+                .map_err(|_| "插件注册表锁异常".to_string())?;
+            registry_guard
+                .get(&plugin_id)
+                .ok_or_else(|| format!("未知功能插件：{plugin_id}"))?
+                .clone()
+        };
         let settings = state
             .database
             .lock()
@@ -1052,7 +1058,8 @@ pub async fn refresh_shell_status(app: AppHandle) -> Result<Vec<ShellProfile>, S
                 })
                 .collect()
         };
-        // P6：并行探测（上限 8 并发，逐壳错误互不影响），避免 100 个 Shell 串行累加超时
+        // P6：并行探测（上限 8 并发，逐壳错误互不影响），避免 100 个 Shell 串行累加超时；
+        // P3：全量探测复用同一 client（共享连接池），写回合并为单事务
         let shells = allowed;
         let workers = shells.len().clamp(1, 8);
         let results: Vec<(String, String)> = std::thread::scope(|scope| {
@@ -1083,16 +1090,14 @@ pub async fn refresh_shell_status(app: AppHandle) -> Result<Vec<ShellProfile>, S
                 .flat_map(|handle| handle.join().unwrap_or_default())
                 .collect()
         });
-        for (shell_id, status) in results {
-            let _ = state
+        {
+            let mut database = state
                 .database
                 .lock()
-                .map_err(|_| "数据库锁异常".to_string())
-                .and_then(|database| {
-                    database
-                        .update_shell_status(&shell_id, &status)
-                        .map_err(|error| error.to_string())
-                });
+                .map_err(|_| "数据库锁异常".to_string())?;
+            database
+                .batch_update_shell_status(&results)
+                .map_err(|error| error.to_string())?;
         }
         let database = state
             .database
@@ -1248,17 +1253,15 @@ pub fn list_plugins(state: State<'_, AppState>) -> Vec<PluginManifest> {
     state.protocols.plugin_manifests()
 }
 
+/// P16：高频微操作改同步 command（免 spawn_blocking 调度开销）。
 #[tauri::command]
-pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
-    blocking(app, move |state| {
-        state
-            .database
-            .lock()
-            .map_err(|_| "数据库锁异常".to_string())?
-            .get_settings()
-            .map_err(|error| error.to_string())
-    })
-    .await
+pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())?
+        .get_settings()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1327,10 +1330,23 @@ pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectRe
                 Arc::from(session_state),
                 probe.clone(),
             );
-            // P6：连接时缓存上下文（避免每命令重复查库）
+            // P6：连接时缓存上下文（避免每命令重复查库）；P5：快照授权过期时间
+            let expires_snapshot = {
+                let database = state
+                    .database
+                    .lock()
+                    .map_err(|_| "数据库锁异常".to_string())?;
+                database
+                    .workspace(&shell.workspace_id)
+                    .ok()
+                    .flatten()
+                    .map(|workspace| workspace.expires_at)
+                    .flatten()
+            };
             if let Ok(session) = sessions.get_mut(&session_id) {
                 session.profile = Some(shell.clone());
                 session.settings = Some(settings.clone());
+                session.workspace_expires_at = expires_snapshot;
             }
             session_id
         };
@@ -1340,7 +1356,7 @@ pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectRe
             .database
             .lock()
             .map_err(|_| "数据库锁异常".to_string())
-            .and_then(|database| {
+            .and_then(|mut database| {
                 database
                     .record_probe(&shell, "online", "连接成功")
                     .map_err(|error| error.to_string())
@@ -1591,7 +1607,7 @@ struct SessionCtx<'a> {
 /// 从会话 ID 解析出会话命令上下文。
 /// 锁内完成：会话取出 → Shell 查询 → 授权轻量复查（仅过期检查）→ 协议解析。
 fn session_ctx<'a>(state: &'a AppState, session_id: &str) -> Result<SessionCtx<'a>, String> {
-    let (profile_id, protocol_id, cached_profile, cached_settings) = {
+    let (profile_id, protocol_id, cached_profile, cached_settings, cached_workspace_expires) = {
         let mut sessions = state
             .sessions
             .lock()
@@ -1602,10 +1618,11 @@ fn session_ctx<'a>(state: &'a AppState, session_id: &str) -> Result<SessionCtx<'
             session.protocol_id.clone(),
             session.profile.clone(),
             session.settings.clone(),
+            session.workspace_expires_at.clone(),
         )
     };
 
-    let database = state
+    let mut database = state
         .database
         .lock()
         .map_err(|_| "数据库锁异常".to_string())?;
@@ -1616,7 +1633,12 @@ fn session_ctx<'a>(state: &'a AppState, session_id: &str) -> Result<SessionCtx<'
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "Shell 配置不存在".to_string())?,
     };
-    auth::require_session_alive(&database, &shell)?;
+    // P5：授权复查优先用会话内快照（免查库）；快照失效/缺失时回退查库
+    if cached_workspace_expires.is_some() {
+        auth::workspace_alive_from_snapshot(cached_workspace_expires.as_deref())?;
+    } else {
+        auth::require_session_alive(&database, &shell)?;
+    }
     let settings = match cached_settings {
         Some(settings) => settings,
         None => database.get_settings().map_err(|error| error.to_string())?,
@@ -1767,15 +1789,10 @@ pub async fn list_dir(
         let ctx = session_ctx(state, &session_id)?;
         // 目录缓存（TTL 5s）：命中直接返回，避免大目录重复网络往返
         let cache_key = (session_id.clone(), path.clone());
-        if let Some((hit_at, listing)) = state
-            .dir_cache
-            .lock()
-            .map_err(|_| "目录缓存锁异常".to_string())?
-            .get(&cache_key)
-            .cloned()
-            && hit_at.elapsed() < std::time::Duration::from_secs(5)
-        {
-            return Ok(listing);
+        if let Ok(mut cache) = state.dir_cache.lock() {
+            if let Some(listing) = cache.get(&cache_key, std::time::Duration::from_secs(5)) {
+                return Ok((*listing).clone());
+            }
         }
         let listing = with_session(state, &session_id, |session| {
             ctx.protocol.list_dir(session, &path, &ctx.settings)
@@ -1790,8 +1807,12 @@ pub async fn list_dir(
             error,
             )
         })?;
+        let listing_arc = std::sync::Arc::new(listing);
         if let Ok(mut cache) = state.dir_cache.lock() {
-            cache.insert(cache_key, (std::time::Instant::now(), listing.clone()));
+            cache.insert(
+                cache_key,
+                (std::time::Instant::now(), std::sync::Arc::clone(&listing_arc)),
+            );
         }
         audit(
             state,
@@ -1801,7 +1822,7 @@ pub async fn list_dir(
             "success",
             &format!("浏览目录：{path}"),
         );
-        Ok(listing)
+        Ok((*listing_arc).clone())
     })
     .await
 }
@@ -1822,36 +1843,77 @@ pub async fn batch_list_dir(
 ) -> Result<serde_json::Value, String> {
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
-        let mut results = serde_json::Map::new();
-        for path in paths {
-            // P7：批量浏览同样命中目录缓存（避免重复网络往返）
-            let cache_key = (session_id.clone(), path.clone());
-            let listing = {
-                let cache_hit = state
-                    .dir_cache
-                    .lock()
-                    .ok()
-                    .and_then(|mut cache| cache.get(&cache_key).cloned())
-                    .filter(|(hit_at, _)| hit_at.elapsed() < std::time::Duration::from_secs(5))
-                    .map(|(_, listing)| listing);
-                match cache_hit {
-                    Some(listing) => listing,
-                    None => {
-                        let listing = with_session(state, &session_id, |session| {
-                            ctx.protocol.list_dir(session, &path, &ctx.settings)
-                        })
-                        .map_err(|error| format!("浏览 {path} 失败：{error}"))?;
-                        if let Ok(mut cache) = state.dir_cache.lock() {
-                            cache.insert(cache_key, (std::time::Instant::now(), listing.clone()));
+        // P4：并行拉取（上限 4 线程），避免 N 个目录串行网络往返
+        let workers = paths.len().clamp(1, 4);
+        let path_list = &paths;
+        let session_id_ref = &session_id;
+        let settings_ref = &ctx.settings;
+        let collected: Vec<(String, Result<serde_json::Value, String>)> =
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(workers);
+                for worker in 0..workers {
+                    let path_list = path_list;
+                    let session_id = session_id_ref;
+                    let settings = settings_ref;
+                    handles.push(scope.spawn(move || {
+                        let mut out = Vec::new();
+                        let mut index = worker;
+                        while index < path_list.len() {
+                            let path = &path_list[index];
+                            // 批量浏览同样命中目录缓存（避免重复网络往返）
+                            let cache_key = (session_id.clone(), path.clone());
+                            let listing = {
+                                let cache_hit = state.dir_cache.lock().ok().and_then(|mut cache| {
+                                    cache.get(&cache_key, std::time::Duration::from_secs(5))
+                                });
+                                match cache_hit {
+                                    Some(listing) => (*listing).clone(),
+                                    None => {
+                                        let listing = with_session(state, session_id, |session| {
+                                            ctx.protocol.list_dir(session, path, settings)
+                                        })
+                                        .map_err(|error| format!("浏览 {path} 失败：{error}"));
+                                        match listing {
+                                            Ok(listing) => {
+                                                let listing_arc = std::sync::Arc::new(listing);
+                                                if let Ok(mut cache) = state.dir_cache.lock() {
+                                                    cache.insert(
+                                                        cache_key,
+                                                        (
+                                                            std::time::Instant::now(),
+                                                            std::sync::Arc::clone(&listing_arc),
+                                                        ),
+                                                    );
+                                                }
+                                                (*listing_arc).clone()
+                                            }
+                                            Err(error) => {
+                                                out.push((path.clone(), Err(error)));
+                                                index += workers;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+                            out.push((
+                                path.clone(),
+                                serde_json::to_value(listing)
+                                    .map_err(|error| error.to_string()),
+                            ));
+                            index += workers;
                         }
-                        listing
-                    }
+                        out
+                    }));
                 }
-            };
-            results.insert(
-                path.clone(),
-                serde_json::to_value(listing).map_err(|error| error.to_string())?,
-            );
+                handles
+                    .into_iter()
+                    .flat_map(|handle| handle.join().unwrap_or_default())
+                    .collect()
+            });
+        let mut results = serde_json::Map::new();
+        for (path, value) in collected {
+            results.insert(path, value.map_err(|error| error)?);
         }
         Ok(serde_json::Value::Object(results))
     })
@@ -1947,21 +2009,29 @@ pub async fn upload_file(
 ) -> Result<(), String> {
     blocking(app, move |state| {
         // 上传复用写入通道，审计动作修正为 file.upload
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&content_b64)
-            .map_err(|_| "文件内容不是合法 Base64".to_string())?;
         let ctx = session_ctx(state, &session_id)?;
-        // P4：整文件上传改为分块（chunk_size_mb 可配），降低内存峰值
-        let chunk = ctx.settings.chunk_size_mb.max(1) * 1024 * 1024;
-        let mut offset = 0u64;
-        while offset < bytes.len() as u64 {
-            let end = (offset + chunk).min(bytes.len() as u64);
+        // P7：流式 base64 解码分块（每块解码 chunk_size_mb 对应长度后立即发送，
+        // 内存峰值从「整文件×2」降到单块；base64 按 4 字符对齐切片）
+        let chunk_bytes = ctx.settings.chunk_size_mb.max(1) * 1024 * 1024;
+        let b64_per_chunk = (chunk_bytes / 3 * 4) as usize;
+        let total = content_b64.len();
+        let mut b64_offset = 0usize;
+        let mut byte_offset = 0u64;
+        while b64_offset < total {
+            let mut end = (b64_offset + b64_per_chunk).min(total);
+            end -= (end - b64_offset) % 4;
+            if end <= b64_offset {
+                break;
+            }
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&content_b64[b64_offset..end])
+                .map_err(|_| "文件内容不是合法 Base64".to_string())?;
             with_session(state, &session_id, |session| {
                 ctx.protocol.write_chunk(
                     session,
                     &remote_path,
-                    &bytes[offset as usize..end as usize],
-                    offset,
+                    &decoded,
+                    byte_offset,
                     &ctx.settings,
                 )
             })
@@ -1975,7 +2045,33 @@ pub async fn upload_file(
                 error,
                 )
             })?;
-            offset = end;
+            byte_offset += decoded.len() as u64;
+            b64_offset = end;
+        }
+        // 尾部不足 4 字符的残余
+        if b64_offset < total {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&content_b64[b64_offset..])
+                .map_err(|_| "文件内容不是合法 Base64".to_string())?;
+            with_session(state, &session_id, |session| {
+                ctx.protocol.write_chunk(
+                    session,
+                    &remote_path,
+                    &decoded,
+                    byte_offset,
+                    &ctx.settings,
+                )
+            })
+            .inspect_err(|error| {
+                audit(
+                    state,
+                    &ctx.workspace_id,
+                    Some(&ctx.shell.id),
+                    "file.upload",
+                    "error",
+                error,
+                )
+            })?;
         }
         invalidate_dir_cache(state, &session_id);
         audit(
@@ -1984,7 +2080,7 @@ pub async fn upload_file(
             Some(&ctx.shell.id),
             "file.upload",
             "success",
-            &format!("上传文件：{remote_path}（{} 字节）", bytes.len()),
+            &format!("上传文件：{remote_path}（{} 字节）", byte_offset),
         );
         Ok(())
     })

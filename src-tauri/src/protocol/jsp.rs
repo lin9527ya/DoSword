@@ -366,6 +366,70 @@ impl Protocol for JvmLikeProtocol {
         Ok(())
     }
 
+    /// P1：分块读取（stub 支持 seek 时按 offset 定位；否则返回整文件由本端切片）。
+    fn read_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        offset: u64,
+        length: u64,
+        _settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let jsp = session
+            .as_any()
+            .downcast_ref::<JspSession>()
+            .expect("会话类型不匹配");
+        let value = form_call(
+            jsp,
+            "read",
+            &[
+                ("p", path),
+                ("o", &offset.to_string()),
+                ("l", &length.to_string()),
+            ],
+            &AppSettings::default(),
+        )?;
+        let data = value
+            .pointer("/data")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|_| ProtocolError::ParseError("文件内容 Base64 解码失败".to_string()))?;
+        // 兼容不支持 seek 的 stub：返回整文件时按 offset/length 切片
+        let total = bytes.len() as u64;
+        if offset >= total {
+            Ok(Vec::new())
+        } else if total > offset + length {
+            Ok(bytes[offset as usize..(offset + length) as usize].to_vec())
+        } else {
+            Ok(bytes[offset as usize..].to_vec())
+        }
+    }
+
+    /// P1：分块写入（stub 支持 seek 时按 offset 定位覆盖写；否则整文件读改写）。
+    fn write_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        content: &[u8],
+        offset: u64,
+        _settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        let jsp = session
+            .as_any()
+            .downcast_ref::<JspSession>()
+            .expect("会话类型不匹配");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(content);
+        form_call(
+            jsp,
+            "write",
+            &[("p", path), ("d", &b64), ("o", &offset.to_string())],
+            &AppSettings::default(),
+        )?;
+        Ok(())
+    }
+
     fn delete_path(
         &self,
         session: &dyn SessionState,

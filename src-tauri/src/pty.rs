@@ -45,9 +45,13 @@ impl PtyRegistry {
 
     /// 写入数据到目标 shell。
     pub fn write(&self, id: &str, data: &[u8]) -> Result<(), String> {
-        let sessions = self.sessions.lock().map_err(|_| "PTY 锁异常".to_string())?;
-        let stream = sessions
+        // P8：锁内仅克隆流句柄，IO 在锁外执行（慢流不阻塞其他 PTY 操作）
+        let stream = self
+            .sessions
+            .lock()
+            .map_err(|_| "PTY 锁异常".to_string())?
             .get(id)
+            .cloned()
             .ok_or_else(|| "PTY 会话不存在或已关闭".to_string())?;
         let mut guard = stream.lock().map_err(|_| "PTY 流锁异常".to_string())?;
         guard
@@ -57,9 +61,13 @@ impl PtyRegistry {
 
     /// 非阻塞读取可用输出（空串表示暂时无输出；错误表示连接关闭）。
     pub fn read(&self, id: &str) -> Result<Vec<u8>, String> {
-        let sessions = self.sessions.lock().map_err(|_| "PTY 锁异常".to_string())?;
-        let stream = sessions
+        // P8：锁内仅克隆流句柄，IO 在锁外执行
+        let stream = self
+            .sessions
+            .lock()
+            .map_err(|_| "PTY 锁异常".to_string())?
             .get(id)
+            .cloned()
             .ok_or_else(|| "PTY 会话不存在或已关闭".to_string())?;
         let mut guard = stream.lock().map_err(|_| "PTY 流锁异常".to_string())?;
         let mut buf = vec![0u8; 8192];

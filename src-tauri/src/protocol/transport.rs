@@ -29,10 +29,16 @@ pub fn build_client(settings: &AppSettings) -> Client {
 /// 相比 url::form_urlencoded 的全量百分号编码，避免对每块（最大 4MB+）载荷
 /// 做一次全串遍历与分配；正斜杠在 PHP 表单解析中原样保留，百分号不出现在 base64 中。
 pub fn form_escape(value: &str) -> String {
-    value
-        .replace('&', "%26")
-        .replace('+', "%2B")
-        .replace('=', "%3D")
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("%26"),
+            '+' => out.push_str("%2B"),
+            '=' => out.push_str("%3D"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// PHP 单引号字符串转义（S3）：密码含 `'`/`\` 时防止载荷语法破坏或鉴权被改写。

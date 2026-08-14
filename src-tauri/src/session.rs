@@ -37,6 +37,8 @@ pub struct ShellSession {
     /// 上下文缓存：连接时写入，update_shell / update_settings 时失效（避免每命令重复查库）。
     pub profile: Option<ShellProfile>,
     pub settings: Option<AppSettings>,
+    /// P5：Workspace 过期时间快照（复查免查库；update_workspace 时置 None）。
+    pub workspace_expires_at: Option<String>,
 }
 
 /// 会话注册表（进程内单例，受 Mutex 保护）。
@@ -97,6 +99,7 @@ impl SessionManager {
                 last_used_at: now,
                 profile: None,
                 settings: None,
+                workspace_expires_at: None,
             },
         );
         id
@@ -117,6 +120,15 @@ impl SessionManager {
         for session in self.sessions.values_mut() {
             session.profile = None;
             session.settings = None;
+        }
+    }
+
+    /// 失效指定 Workspace 会话的授权过期快照（update_workspace 后调用）。
+    pub fn invalidate_workspace_expiry(&mut self, workspace_id: &str) {
+        for session in self.sessions.values_mut() {
+            if session.workspace_id == workspace_id {
+                session.workspace_expires_at = None;
+            }
         }
     }
 

@@ -78,9 +78,27 @@ http.createServer((req, res) => {{
         const p = reqObj.p || '.';
         out.data = {{ entries: fs.readdirSync(p).sort().map((f) => {{ const fp = path.join(p, f); const st = fs.statSync(fp); return {{ name: f, path: fp, is_dir: st.isDirectory(), size: st.isFile() ? st.size : 0, mtime: Math.floor(st.mtimeMs / 1000), perms: (st.mode & 0o777).toString(8) }}; }}) }};
       }} else if (hh === H.read) {{
-        out.data = fs.readFileSync(reqObj.p || '').toString('base64');
+        const o = Number(reqObj.o) || 0;
+        const l = Number(reqObj.l) || 0;
+        if (l > 0) {{
+          const fd = fs.openSync(reqObj.p || '', 'r');
+          const buf = Buffer.alloc(l);
+          const n = fs.readSync(fd, buf, 0, l, o);
+          fs.closeSync(fd);
+          out.data = buf.slice(0, n).toString('base64');
+        }} else {{
+          out.data = fs.readFileSync(reqObj.p || '').toString('base64');
+        }}
       }} else if (hh === H.write) {{
-        fs.writeFileSync(reqObj.p || '', Buffer.from(reqObj.d || '', 'base64'));
+        const o = Number(reqObj.o) || 0;
+        const data = Buffer.from(reqObj.d || '', 'base64');
+        if (o > 0) {{
+          const fd = fs.openSync(reqObj.p || '', 'r+');
+          fs.writeSync(fd, data, 0, data.length, o);
+          fs.closeSync(fd);
+        }} else {{
+          fs.writeFileSync(reqObj.p || '', data);
+        }}
       }} else if (hh === H.delete) {{
         fs.rmSync(reqObj.p || '', {{ recursive: true, force: true }});
       }} else if (hh === H.rename) {{

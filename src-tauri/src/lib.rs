@@ -24,11 +24,10 @@ pub struct AppState {
 
 /// 目录列表缓存（LRU + TTL 5s）：容量 256，满则淘汰最久未使用条目（P7）。
 /// 键 = (session_id, path)；写操作按会话失效。
+/// 目录列表缓存（TTL 5s）：容量 256，满则淘汰最旧条目（P6：存 Arc，惰性过期，
+/// 免整份 DirListing clone 与 LRU 移位 O(n) 开销）。
 pub struct DirCache {
-    map: std::collections::HashMap<
-        (String, String),
-        (std::time::Instant, dosword_sdk::domain::DirListing),
-    >,
+    map: std::collections::HashMap<(String, String), (std::time::Instant, std::sync::Arc<dosword_sdk::domain::DirListing>)>,
     order: std::collections::VecDeque<(String, String)>,
     cap: usize,
 }
@@ -42,35 +41,35 @@ impl DirCache {
         }
     }
 
-    /// 命中时把键移到队尾（LRU 语义）。
+    /// 命中且未过期时返回 Arc（clone 是引用计数，非深拷贝）。
     pub fn get(
         &mut self,
         key: &(String, String),
-    ) -> Option<&(std::time::Instant, dosword_sdk::domain::DirListing)> {
-        if let Some(position) = self.order.iter().position(|item| item == key) {
-            let entry = self.order.remove(position)?;
-            self.order.push_back(entry);
+        ttl: std::time::Duration,
+    ) -> Option<std::sync::Arc<dosword_sdk::domain::DirListing>> {
+        let (hit_at, listing) = self.map.get(key)?;
+        if hit_at.elapsed() > ttl {
+            return None;
         }
-        self.map.get(key)
+        Some(std::sync::Arc::clone(listing))
     }
 
     pub fn insert(
         &mut self,
         key: (String, String),
-        value: (std::time::Instant, dosword_sdk::domain::DirListing),
+        value: (std::time::Instant, std::sync::Arc<dosword_sdk::domain::DirListing>),
     ) {
-        if let Some(position) = self.order.iter().position(|item| *item == key) {
-            self.order.remove(position);
-        }
-        while self.map.len() >= self.cap {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    self.map.remove(&oldest);
+        if !self.map.contains_key(&key) {
+            while self.map.len() >= self.cap {
+                match self.order.pop_front() {
+                    Some(oldest) => {
+                        self.map.remove(&oldest);
+                    }
+                    None => break,
                 }
-                None => break,
             }
+            self.order.push_back(key.clone());
         }
-        self.order.push_back(key.clone());
         self.map.insert(key, value);
     }
 

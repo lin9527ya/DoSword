@@ -97,11 +97,23 @@ try:
             }})
         out['data'] = {{'entries': entries}}
     elif h == _H['read']:
+        _o = int(req.get('o', 0) or 0)
+        _l = int(req.get('l', 0) or 0)
         with open(req.get('p', ''), 'rb') as f:
-            out['data'] = base64.b64encode(f.read()).decode()
+            f.seek(_o)
+            _chunk = f.read(_l) if _l > 0 else f.read()
+            out['data'] = base64.b64encode(_chunk).decode()
     elif h == _H['write']:
-        with open(req.get('p', ''), 'wb') as f:
-            f.write(base64.b64decode(req.get('d', '')))
+        _o = int(req.get('o', 0) or 0)
+        _data = base64.b64decode(req.get('d', ''))
+        if _o > 0:
+            # 分块写：r+b 定位覆盖
+            with open(req.get('p', ''), 'r+b') as f:
+                f.seek(_o)
+                f.write(_data)
+        else:
+            with open(req.get('p', ''), 'wb') as f:
+                f.write(_data)
     elif h == _H['delete']:
         p = req.get('p', '')
         if os.path.isdir(p) and not os.path.islink(p):

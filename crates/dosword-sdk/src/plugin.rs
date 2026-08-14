@@ -438,7 +438,7 @@ pub fn render_template(template: &str, params: &serde_json::Value) -> String {
 /// 功能插件注册表。
 #[derive(Default)]
 pub struct FeaturePluginRegistry {
-    map: std::collections::HashMap<String, Box<dyn FeaturePlugin>>,
+    map: std::collections::HashMap<String, std::sync::Arc<dyn FeaturePlugin>>,
     /// 已安装外部插件 id（供列表展示来源）。
     pub installed: std::collections::HashSet<String>,
 }
@@ -454,12 +454,13 @@ impl FeaturePluginRegistry {
         if self.map.contains_key(&id) {
             return Err(format!("功能插件 id 冲突：{id}"));
         }
-        self.map.insert(id, plugin);
+        self.map.insert(id, std::sync::Arc::from(plugin));
         Ok(())
     }
 
-    pub fn get(&self, id: &str) -> Option<&dyn FeaturePlugin> {
-        self.map.get(id).map(|plugin| plugin.as_ref())
+    /// P2：返回 Arc 引用（调用方可锁外执行插件，避免注册表锁跨网络持有）。
+    pub fn get(&self, id: &str) -> Option<std::sync::Arc<dyn FeaturePlugin>> {
+        self.map.get(id).map(std::sync::Arc::clone)
     }
 
     /// 移除插件（卸载外部插件用）。

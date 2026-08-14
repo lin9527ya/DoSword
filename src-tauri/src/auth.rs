@@ -112,6 +112,21 @@ pub fn require_session_alive(db: &Database, shell: &ShellProfile) -> Result<(), 
     check_workspace_authorized(workspace.as_ref())
 }
 
+/// P5：基于快照的过期检查（免查库）。快照缺失/为空视为未设置过期。
+pub fn workspace_alive_from_snapshot(expires_at: Option<&str>) -> Result<(), String> {
+    match expires_at {
+        None => Ok(()),
+        Some(expires_at) if expires_at.is_empty() => Ok(()),
+        Some(expires_at) => {
+            let expires = parse_expiry(expires_at)?;
+            if Local::now() > expires {
+                return Err(format!("授权已于 {expires_at} 过期，禁止继续操作"));
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
