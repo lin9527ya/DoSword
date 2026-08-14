@@ -337,13 +337,13 @@ impl Protocol for JvmLikeProtocol {
         &self,
         session: &dyn SessionState,
         path: &str,
-        _settings: &AppSettings,
+        settings: &AppSettings,
     ) -> Result<Vec<u8>, ProtocolError> {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
             .expect("会话类型不匹配");
-        let value = form_call(jsp, "read", &[("p", path)], &AppSettings::default())?;
+        let value = form_call(jsp, "read", &[("p", path)], settings)?;
         let data = value
             .pointer("/data")
             .and_then(|v| v.as_str())
@@ -358,7 +358,7 @@ impl Protocol for JvmLikeProtocol {
         session: &dyn SessionState,
         path: &str,
         content: &[u8],
-        _settings: &AppSettings,
+        settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
         let jsp = session
             .as_any()
@@ -369,7 +369,7 @@ impl Protocol for JvmLikeProtocol {
             jsp,
             "write",
             &[("p", path), ("d", &data)],
-            &AppSettings::default(),
+            settings,
         )?;
         Ok(())
     }
@@ -381,7 +381,7 @@ impl Protocol for JvmLikeProtocol {
         path: &str,
         offset: u64,
         length: u64,
-        _settings: &AppSettings,
+        settings: &AppSettings,
     ) -> Result<Vec<u8>, ProtocolError> {
         let jsp = session
             .as_any()
@@ -395,7 +395,7 @@ impl Protocol for JvmLikeProtocol {
                 ("o", &offset.to_string()),
                 ("l", &length.to_string()),
             ],
-            &AppSettings::default(),
+            settings,
         )?;
         let data = value
             .pointer("/data")
@@ -422,7 +422,7 @@ impl Protocol for JvmLikeProtocol {
         path: &str,
         content: &[u8],
         offset: u64,
-        _settings: &AppSettings,
+        settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
         let jsp = session
             .as_any()
@@ -433,7 +433,7 @@ impl Protocol for JvmLikeProtocol {
             jsp,
             "write",
             &[("p", path), ("d", &b64), ("o", &offset.to_string())],
-            &AppSettings::default(),
+            settings,
         )?;
         Ok(())
     }
@@ -539,13 +539,13 @@ impl Protocol for JvmLikeProtocol {
         &self,
         session: &dyn SessionState,
         path: &str,
-        _settings: &AppSettings,
+        settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
             .expect("会话类型不匹配");
-        form_call(jsp, "delete", &[("p", path)], &AppSettings::default())?;
+        form_call(jsp, "delete", &[("p", path)], settings)?;
         Ok(())
     }
 
@@ -554,7 +554,7 @@ impl Protocol for JvmLikeProtocol {
         session: &dyn SessionState,
         from: &str,
         to: &str,
-        _settings: &AppSettings,
+        settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
         let jsp = session
             .as_any()
@@ -564,7 +564,7 @@ impl Protocol for JvmLikeProtocol {
             jsp,
             "rename",
             &[("f", from), ("t", to)],
-            &AppSettings::default(),
+            settings,
         )?;
         Ok(())
     }
@@ -573,13 +573,13 @@ impl Protocol for JvmLikeProtocol {
         &self,
         session: &dyn SessionState,
         path: &str,
-        _settings: &AppSettings,
+        settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
             .expect("会话类型不匹配");
-        form_call(jsp, "mkdir", &[("p", path)], &AppSettings::default())?;
+        form_call(jsp, "mkdir", &[("p", path)], settings)?;
         Ok(())
     }
 }

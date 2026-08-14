@@ -80,6 +80,21 @@ impl DirCache {
     }
 }
 
+/// Q9：统一装配 AppState（两处启动路径复用）。
+fn build_app_state(
+    database: Database,
+    feature_plugins: dosword_sdk::FeaturePluginRegistry,
+) -> AppState {
+    AppState {
+        database: Mutex::new(database),
+        sessions: Mutex::new(SessionManager::new()),
+        protocols: ProtocolRegistry::builtin(),
+        feature_plugins: Mutex::new(feature_plugins),
+        ptys: pty::PtyRegistry::new(),
+        dir_cache: Mutex::new(DirCache::new()),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -126,27 +141,14 @@ pub fn run() {
                             }
                         }
                     }
-                    app.manage(AppState {
-                        database: Mutex::new(database),
-                        sessions: Mutex::new(SessionManager::new()),
-                        protocols: ProtocolRegistry::builtin(),
-                        feature_plugins: std::sync::Mutex::new(registry),
-                        ptys: pty::PtyRegistry::new(),
-                        dir_cache: Mutex::new(DirCache::new()),
-                    });
+                    app.manage(build_app_state(database, registry));
                     return Ok(());
                 }
             }
-            app.manage(AppState {
-                database: Mutex::new(database),
-                sessions: Mutex::new(SessionManager::new()),
-                protocols: ProtocolRegistry::builtin(),
-                feature_plugins: std::sync::Mutex::new(
-                    dosword_sdk::FeaturePluginRegistry::builtin(),
-                ),
-                ptys: pty::PtyRegistry::new(),
-                dir_cache: Mutex::new(DirCache::new()),
-            });
+            app.manage(build_app_state(
+                database,
+                dosword_sdk::FeaturePluginRegistry::builtin(),
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
