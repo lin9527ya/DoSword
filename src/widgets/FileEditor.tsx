@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Save, X } from "lucide-react";
 import { api, b64, errorText } from "../api";
 import type { FileEntry } from "../api";
@@ -35,6 +35,11 @@ export function FileEditor({
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // P10：行号随内容变化惰性重算（避免每次渲染对全文 split）
+  const lineNumbers = useMemo(
+    () => Array.from({ length: Math.max(1, content.split("\n").length) }, (_, index) => index + 1),
+    [content],
+  );
 
   function switchEncoding(next: Encoding) {
     if (!entry.contentB64) return;
@@ -102,8 +107,8 @@ export function FileEditor({
         <div className="editor-body-wrap">
           {encoding !== "hex" && (
             <div className="editor-gutter" aria-hidden>
-              {Array.from({ length: Math.max(1, content.split("\n").length) }, (_, index) => (
-                <span key={index}>{index + 1}</span>
+              {lineNumbers.map((number) => (
+                <span key={number}>{number}</span>
               ))}
             </div>
           )}

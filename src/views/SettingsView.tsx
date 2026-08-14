@@ -256,6 +256,18 @@ export function SettingsView() {
             />
             允许 run_code 任意代码执行（关闭后插件载荷将无法运行）
           </label>
+          <label>
+            审计日志保留天数（0 = 不清理）
+            <input
+              type="number"
+              min={0}
+              max={3650}
+              value={settings.auditRetentionDays}
+              onChange={(event) =>
+                setSettings({ ...settings, auditRetentionDays: Number(event.target.value) })
+              }
+            />
+          </label>
         </div>
       </Panel>
 

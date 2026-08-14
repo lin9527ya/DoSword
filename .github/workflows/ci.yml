@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust 检查与测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Linux 系统依赖（Tauri）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev             libayatana-appindicator3-dev patchelf
+        if: runner.os == 'Linux'
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy（零警告门禁）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 格式化检查
+        run: cargo fmt --check
+
+      - name: 单元测试（含真实 PHP 往返，需 php）
+        run: |
+          sudo apt-get install -y php-cli || true
+          cargo test --workspace
+
+  frontend:
+    name: 前端类型与构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 类型检查
+        run: pnpm check
+
+      - name: 构建
+        run: pnpm build

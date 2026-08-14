@@ -326,6 +326,7 @@ export function RequestDebugView() {
                     {record.status}
                   </span>
                   <span className="debug-action">{actionLabel(record.action)}</span>
+                  <span className="debug-protocol">{record.protocolId.replace("builtin.", "").replace(".v1", "")}</span>
                   <code className="debug-endpoint">{record.endpoint}</code>
                   <span className="debug-meta">
                     {shortTime(record.createdAt)} · {record.durationMs} ms
@@ -334,7 +335,7 @@ export function RequestDebugView() {
                 {expanded === record.id && (
                   <div className="debug-body">
                     <div className="debug-block">
-                      <h3>载荷（PHP，已脱敏）</h3>
+                      <h3>载荷（已脱敏）</h3>
                       <pre>{record.payload}</pre>
                     </div>
                     <div className="debug-block">

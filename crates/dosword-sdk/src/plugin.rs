@@ -70,11 +70,8 @@ impl PluginRegistry {
 
     /// 全部插件元信息（按 id 稳定排序）。
     pub fn list(&self) -> Vec<PluginManifest> {
-        let mut manifests: Vec<PluginManifest> = self
-            .map
-            .values()
-            .map(|plugin| plugin.manifest())
-            .collect();
+        let mut manifests: Vec<PluginManifest> =
+            self.map.values().map(|plugin| plugin.manifest()).collect();
         manifests.sort_by(|a, b| a.id.cmp(&b.id));
         manifests
     }
@@ -128,8 +125,10 @@ mod tests {
             &self,
             _profile: &crate::domain::ShellProfile,
             _settings: &crate::domain::AppSettings,
-        ) -> Result<(Box<dyn SessionState>, crate::domain::ProbeResult), crate::protocol::ProtocolError>
-        {
+        ) -> Result<
+            (Box<dyn SessionState>, crate::domain::ProbeResult),
+            crate::protocol::ProtocolError,
+        > {
             unreachable!()
         }
         fn execute_command(
@@ -236,7 +235,6 @@ mod tests {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // 功能插件（Feature）：跨语言能力扩展（ZIP / 进程 / 端口扫描 / bypass 等）。
 // 通用插件（languages 为空）与语言专用插件（languages 限定 php/jsp/aspnet）。
@@ -303,9 +301,13 @@ pub trait FeaturePlugin: Send + Sync {
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum PluginExecution {
     /// 执行系统命令（通用，无需载荷）：commands[language] = 命令模板。
-    Command { commands: std::collections::HashMap<String, String> },
+    Command {
+        commands: std::collections::HashMap<String, String>,
+    },
     /// 运行目标语言代码载荷：codes[language] = 代码模板（{{param}} 占位符）。
-    Code { codes: std::collections::HashMap<String, String> },
+    Code {
+        codes: std::collections::HashMap<String, String>,
+    },
 }
 
 /// 外部 .plugin 文件：JSON 清单 + 执行定义（脚本型功能插件）。
@@ -336,8 +338,8 @@ pub struct ScriptFeaturePlugin {
 impl ScriptFeaturePlugin {
     /// 从 .plugin JSON 内容构建。
     pub fn from_json(content: &str) -> Result<Self, String> {
-        let def: ScriptPluginDef = serde_json::from_str(content)
-            .map_err(|error| format!("插件清单解析失败：{error}"))?;
+        let def: ScriptPluginDef =
+            serde_json::from_str(content).map_err(|error| format!("插件清单解析失败：{error}"))?;
         if def.id.trim().is_empty() {
             return Err("插件 id 不能为空".to_string());
         }
@@ -397,14 +399,12 @@ impl FeaturePlugin for ScriptFeaturePlugin {
                 }))
             }
             PluginExecution::Code { codes } => {
-                let template = codes
-                    .get(runtime)
-                    .ok_or_else(|| {
-                        crate::protocol::ProtocolError::NotSupported(format!(
-                            "插件 {} 不支持运行时 {runtime}",
-                            self.manifest.id
-                        ))
-                    })?;
+                let template = codes.get(runtime).ok_or_else(|| {
+                    crate::protocol::ProtocolError::NotSupported(format!(
+                        "插件 {} 不支持运行时 {runtime}",
+                        self.manifest.id
+                    ))
+                })?;
                 let code = render_template(template, params);
                 let output = protocol.run_code(session, runtime, &code, settings)?;
                 // 载荷输出优先按 JSON 解析，否则按文本返回
@@ -469,11 +469,8 @@ impl FeaturePluginRegistry {
     }
 
     pub fn list(&self) -> Vec<FeatureManifest> {
-        let mut items: Vec<FeatureManifest> = self
-            .map
-            .values()
-            .map(|plugin| plugin.manifest())
-            .collect();
+        let mut items: Vec<FeatureManifest> =
+            self.map.values().map(|plugin| plugin.manifest()).collect();
         items.sort_by(|a, b| a.id.cmp(&b.id));
         items
     }
@@ -606,8 +603,14 @@ mod feature_tests {
         assert!(ids.contains(&"p_eval_code".to_string()), "{ids:?}");
         // 重复注册拒绝
         let mut r = FeaturePluginRegistry::new();
-        assert!(r.register(Box::new(crate::feature_plugins::ProcessesPlugin)).is_ok());
-        assert!(r.register(Box::new(crate::feature_plugins::ProcessesPlugin)).is_err());
+        assert!(
+            r.register(Box::new(crate::feature_plugins::ProcessesPlugin))
+                .is_ok()
+        );
+        assert!(
+            r.register(Box::new(crate::feature_plugins::ProcessesPlugin))
+                .is_err()
+        );
     }
 }
 
@@ -663,8 +666,9 @@ macro_rules! export_dosword_plugin {
             let ptr = *CELL.get_or_init(|| {
                 let json = serde_json::to_string(&DOSWORD_PLUGIN_INSTANCE.manifest())
                     .unwrap_or_else(|_| "{}".to_string());
-                let leaked: &'static mut str = Box::leak(json.into_boxed_str());
-                leaked.as_ptr() as usize
+                // CString 含 NUL 结尾，宿主侧 CStr::from_ptr 安全；一次性静态泄漏可接受
+                let cstring = std::ffi::CString::new(json).unwrap_or_default();
+                cstring.into_raw() as usize
             });
             ptr as *const std::ffi::c_char
         }
@@ -691,17 +695,17 @@ macro_rules! export_dosword_plugin {
                 Ok(value) => serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()),
                 Err(error) => serde_json::json!({ "ok": false, "error": error }).to_string(),
             };
-            let leaked: &'static mut str = Box::leak(json.into_boxed_str());
-            leaked.as_mut_ptr() as *mut std::ffi::c_char
+            let cstring = std::ffi::CString::new(json).unwrap_or_default();
+            cstring.into_raw()
         }
 
         extern "C" fn __dosword_free_json(ptr: *mut std::ffi::c_char) {
             if ptr.is_null() {
                 return;
             }
+            // S15：分配为 CString（into_raw），按 from_raw 还原（std 契约保证尺寸一致）
             unsafe {
-                let _ = Box::from_raw(std::ffi::CStr::from_ptr(ptr).to_bytes_with_nul() as *const [u8]
-                    as *mut [u8]);
+                drop(std::ffi::CString::from_raw(ptr));
             }
         }
 

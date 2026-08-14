@@ -2,7 +2,7 @@
 //! 编译为 cdylib 后，宿主动态加载（dlopen）并注册为功能插件。
 
 use base64::Engine;
-use dosword_sdk::{export_dosword_plugin, FeatureManifest, NativePlugin, ParamSpec};
+use dosword_sdk::{FeatureManifest, NativePlugin, ParamSpec, export_dosword_plugin};
 
 pub struct TextToolsPlugin;
 
@@ -12,7 +12,8 @@ impl NativePlugin for TextToolsPlugin {
             id: "bin.text_tools".into(),
             name: "文本工具（二进制）".into(),
             version: "1.0.0".into(),
-            description: "二进制插件示例：base64 编解码 / 反转 / 大小写转换（纯逻辑，无协议通道）。".into(),
+            description:
+                "二进制插件示例：base64 编解码 / 反转 / 大小写转换（纯逻辑，无协议通道）。".into(),
             category: "general".into(),
             languages: vec![],
             params: vec![

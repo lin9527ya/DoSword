@@ -147,9 +147,7 @@ pub trait Protocol: Send + Sync {
         _path: &str,
         _settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
-        Err(ProtocolError::NotSupported(
-            "当前协议不支持新建目录".into(),
-        ))
+        Err(ProtocolError::NotSupported("当前协议不支持新建目录".into()))
     }
 
     /// 读取文件指定区间（offset 起 length 字节；length=0 表示读到文件尾）。
@@ -182,9 +180,7 @@ pub trait Protocol: Send + Sync {
         offset: u64,
         settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
-        let mut whole = self
-            .read_file(session, path, settings)
-            .unwrap_or_default();
+        let mut whole = self.read_file(session, path, settings).unwrap_or_default();
         let start = offset as usize;
         if start + content.len() > whole.len() {
             whole.resize(start + content.len(), 0);

@@ -550,6 +550,15 @@
   color: var(--err);
   background: rgba(212, 117, 104, 0.1);
 }
+.debug-protocol {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(182, 215, 125, 0.12);
+  color: #b6d77d;
+  font-size: 11px;
+}
+
 .debug-action {
   font: 500 11px var(--mono);
   color: var(--accent);

@@ -9,8 +9,8 @@
 use chrono::{DateTime, Local, NaiveDate};
 use url::Url;
 
-use dosword_sdk::domain::{ShellProfile, Workspace};
 use crate::storage::Database;
+use dosword_sdk::domain::{ShellProfile, Workspace};
 
 /// 解析授权到期时间：优先 RFC3339；兼容历史数据中的 `YYYY-MM-DD`（按当天 23:59:59 计）。
 fn parse_expiry(expires_at: &str) -> Result<DateTime<Local>, String> {
@@ -27,18 +27,13 @@ fn parse_expiry(expires_at: &str) -> Result<DateTime<Local>, String> {
 
 /// 检查 Shell 所属 Workspace 的授权状态。
 /// 返回 Err 表示授权过期或不存在。
-pub fn check_workspace_authorized(
-    workspace: Option<&Workspace>,
-) -> Result<(), String> {
+pub fn check_workspace_authorized(workspace: Option<&Workspace>) -> Result<(), String> {
     let workspace = workspace.ok_or("Shell 所属的 Workspace 不存在，已禁止操作")?;
     if let Some(expires_at) = &workspace.expires_at {
         let expires = parse_expiry(expires_at)?;
         let now = Local::now();
         if now > expires {
-            return Err(format!(
-                "授权已于 {} 过期，禁止继续操作",
-                expires_at
-            ));
+            return Err(format!("授权已于 {} 过期，禁止继续操作", expires_at));
         }
     }
     Ok(())
@@ -59,7 +54,7 @@ pub fn scope_allows(scope: &str, url: &Url) -> (bool, String) {
     let host_trimmed = host.trim_end_matches('.');
 
     for token in scope
-        .split(|c: char| c == ',' || c == '，' || c == ' ' || c == ';' || c == '\n')
+        .split([',', '，', ' ', ';', '\n'])
         .map(str::trim)
         .filter(|token| !token.is_empty())
     {
@@ -70,10 +65,10 @@ pub fn scope_allows(scope: &str, url: &Url) -> (bool, String) {
         }
         // CIDR（IPv4/IPv6）
         if let Ok(network) = token.parse::<ipnet::IpNet>() {
-            if let Some(addr) = ip_addr {
-                if network.contains(&addr) {
-                    return (true, format!("CIDR 范围 {token}"));
-                }
+            if let Some(addr) = ip_addr
+                && network.contains(&addr)
+            {
+                return (true, format!("CIDR 范围 {token}"));
             }
             continue;
         }
@@ -94,17 +89,14 @@ pub fn scope_allows(scope: &str, url: &Url) -> (bool, String) {
 
 /// 完整授权检查：Workspace 存在 + 未过期 + endpoint 在授权范围内。
 /// 返回 Ok(校验说明) 表示放行。
-pub fn require_authorized(
-    db: &Database,
-    shell: &ShellProfile,
-) -> Result<String, String> {
+pub fn require_authorized(db: &Database, shell: &ShellProfile) -> Result<String, String> {
     let workspace = db
         .workspace(&shell.workspace_id)
         .map_err(|error| format!("读取授权信息失败：{error}"))?;
     check_workspace_authorized(workspace.as_ref())?;
 
-    let endpoint = Url::parse(&shell.endpoint)
-        .map_err(|_| "Shell 端点解析失败，已按禁止处理".to_string())?;
+    let endpoint =
+        Url::parse(&shell.endpoint).map_err(|_| "Shell 端点解析失败，已按禁止处理".to_string())?;
     let (allowed, reason) = scope_allows(&workspace.unwrap().authorization_scope, &endpoint);
     if !allowed {
         return Err(format!("目标不在授权范围内：{reason}"));
@@ -123,8 +115,8 @@ pub fn require_session_alive(db: &Database, shell: &ShellProfile) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dosword_sdk::domain::CreateWorkspace;
     use crate::storage::Database;
+    use dosword_sdk::domain::CreateWorkspace;
 
     fn db_with_workspace(scope: &str, expires_at: Option<String>) -> Database {
         let mut db = Database::open(":memory:").unwrap();
@@ -138,7 +130,13 @@ mod tests {
     }
 
     fn shell_for(db: &Database, endpoint: &str) -> ShellProfile {
-        let workspace = db.dashboard().unwrap().workspaces.into_iter().next().unwrap();
+        let workspace = db
+            .dashboard()
+            .unwrap()
+            .workspaces
+            .into_iter()
+            .next()
+            .unwrap();
         ShellProfile {
             id: "s".into(),
             workspace_id: workspace.id,
@@ -159,11 +157,19 @@ mod tests {
     #[test]
     fn exact_host_matches() {
         assert_eq!(
-            scope_allows("example.com", &Url::parse("http://example.com/shell.php").unwrap()).0,
+            scope_allows(
+                "example.com",
+                &Url::parse("http://example.com/shell.php").unwrap()
+            )
+            .0,
             true
         );
         assert_eq!(
-            scope_allows("example.com", &Url::parse("http://other.com/shell.php").unwrap()).0,
+            scope_allows(
+                "example.com",
+                &Url::parse("http://other.com/shell.php").unwrap()
+            )
+            .0,
             false
         );
     }
@@ -171,16 +177,28 @@ mod tests {
     #[test]
     fn suffix_wildcard_matches() {
         assert_eq!(
-            scope_allows("*.example.com", &Url::parse("http://sub.example.com/a.php").unwrap()).0,
+            scope_allows(
+                "*.example.com",
+                &Url::parse("http://sub.example.com/a.php").unwrap()
+            )
+            .0,
             true
         );
         assert_eq!(
-            scope_allows("*.example.com", &Url::parse("http://example.com/a.php").unwrap()).0,
+            scope_allows(
+                "*.example.com",
+                &Url::parse("http://example.com/a.php").unwrap()
+            )
+            .0,
             true,
             "裸域也应匹配 *. 后缀"
         );
         assert_eq!(
-            scope_allows("*.example.com", &Url::parse("http://evil-example.com/a.php").unwrap()).0,
+            scope_allows(
+                "*.example.com",
+                &Url::parse("http://evil-example.com/a.php").unwrap()
+            )
+            .0,
             false,
             "不应匹配相似后缀"
         );
@@ -193,7 +211,11 @@ mod tests {
             true
         );
         assert_eq!(
-            scope_allows("10.0.0.0/8", &Url::parse("http://192.168.1.1/a.php").unwrap()).0,
+            scope_allows(
+                "10.0.0.0/8",
+                &Url::parse("http://192.168.1.1/a.php").unwrap()
+            )
+            .0,
             false
         );
     }
@@ -209,17 +231,18 @@ mod tests {
     #[test]
     fn multiple_tokens_separated_by_commas() {
         assert_eq!(
-            scope_allows("10.0.0.0/8, *.corp.example; localhost", &Url::parse("http://svc.corp.example/a.php").unwrap()).0,
+            scope_allows(
+                "10.0.0.0/8, *.corp.example; localhost",
+                &Url::parse("http://svc.corp.example/a.php").unwrap()
+            )
+            .0,
             true
         );
     }
 
     #[test]
     fn expired_workspace_is_rejected() {
-        let db = db_with_workspace(
-            "localhost",
-            Some("2000-01-01T00:00:00+08:00".into()),
-        );
+        let db = db_with_workspace("localhost", Some("2000-01-01T00:00:00+08:00".into()));
         let shell = shell_for(&db, "http://localhost/a.php");
         let result = require_authorized(&db, &shell);
         assert!(result.is_err());

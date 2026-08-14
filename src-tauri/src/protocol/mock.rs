@@ -96,9 +96,7 @@ impl Protocol for MockProtocol {
         _path: &str,
         _settings: &AppSettings,
     ) -> Result<DirListing, ProtocolError> {
-        Ok(DirListing {
-            entries: vec![],
-        })
+        Ok(DirListing { entries: vec![] })
     }
 
     fn read_file(
@@ -107,7 +105,9 @@ impl Protocol for MockProtocol {
         _path: &str,
         _settings: &AppSettings,
     ) -> Result<Vec<u8>, ProtocolError> {
-        Err(ProtocolError::NotSupported("Mock 协议不支持文件操作".to_string()))
+        Err(ProtocolError::NotSupported(
+            "Mock 协议不支持文件操作".to_string(),
+        ))
     }
 
     fn write_file(
@@ -117,7 +117,9 @@ impl Protocol for MockProtocol {
         _content: &[u8],
         _settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
-        Err(ProtocolError::NotSupported("Mock 协议不支持文件操作".to_string()))
+        Err(ProtocolError::NotSupported(
+            "Mock 协议不支持文件操作".to_string(),
+        ))
     }
 
     fn delete_path(
@@ -126,7 +128,9 @@ impl Protocol for MockProtocol {
         _path: &str,
         _settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
-        Err(ProtocolError::NotSupported("Mock 协议不支持文件操作".to_string()))
+        Err(ProtocolError::NotSupported(
+            "Mock 协议不支持文件操作".to_string(),
+        ))
     }
 
     fn rename_path(
@@ -136,6 +140,8 @@ impl Protocol for MockProtocol {
         _to: &str,
         _settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
-        Err(ProtocolError::NotSupported("Mock 协议不支持文件操作".to_string()))
+        Err(ProtocolError::NotSupported(
+            "Mock 协议不支持文件操作".to_string(),
+        ))
     }
 }

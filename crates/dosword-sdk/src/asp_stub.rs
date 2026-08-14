@@ -4,12 +4,7 @@
 //! base64 纯 VBScript 实现，文件 I/O 用 FSO + ADODB.Stream。
 
 #[allow(clippy::too_many_arguments)]
-pub fn asp_stub(
-    xk: &str,
-    gk_hex: &str,
-    token_hex: &str,
-    key_hex: &str,
-) -> String {
+pub fn asp_stub(xk: &str, gk_hex: &str, token_hex: &str, key_hex: &str) -> String {
     const TPL: &str = r#"<%@ Language="VBScript" %>
 <% Option Explicit
 ' --- 工具函数 ---

@@ -1,6 +1,7 @@
 //! 现代流密码算法自实现（不依赖外部加密库）：
 //! - ChaCha20：RFC 8439，256 位密钥 / 96 位 nonce / 32 位计数器
 //! - Rabbit：RFC 4503（eSTREAM 最终推荐），128 位密钥 / 64 位 IV
+//!
 //! PHP 5+ 侧有完全对应的纯实现（stub 内嵌），两端用官方测试向量互验。
 
 fn le32(bytes: &[u8]) -> u32 {
@@ -161,10 +162,10 @@ impl RabbitState {
     }
 
     fn counter_update(&mut self) {
-        for j in 0..8 {
-            let t = self.c[j] as u64 + RABBIT_A[j] as u64 + self.carry;
+        for (c, a) in self.c.iter_mut().zip(RABBIT_A.iter()) {
+            let t = *c as u64 + *a as u64 + self.carry;
             self.carry = t >> 32;
-            self.c[j] = (t & 0xFFFF_FFFF) as u32;
+            *c = (t & 0xFFFF_FFFF) as u32;
         }
     }
 
@@ -178,9 +179,7 @@ impl RabbitState {
         let g: Vec<u32> = (0..8).map(|j| Self::g(self.x[j], self.c[j])).collect();
         let rot16 = |v: u32| v.rotate_left(16);
         let rot8 = |v: u32| v.rotate_left(8);
-        let (g0, g1, g2, g3, g4, g5, g6, g7) = (
-            g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
-        );
+        let (g0, g1, g2, g3, g4, g5, g6, g7) = (g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
         let x = [
             g0.wrapping_add(rot16(g7)).wrapping_add(rot16(g6)),
             g1.wrapping_add(rot8(g0)).wrapping_add(g7),
@@ -275,11 +274,12 @@ mod tests {
         // RFC 8439 §2.4.2：counter 起点 1，Ladies and Gentlemen 明文
         let key = (0u8..32).collect::<Vec<u8>>();
         let nonce = hex("000000000000004a00000000");
-        let plaintext =
-            hex("4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66\
+        let plaintext = hex(
+            "4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66\
                  202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e6520\
                  74697020666f7220746865206675747572652c2073756e73637265656e20776f756c6420\
-                 62652069742e");
+                 62652069742e",
+        );
         let cipher = chacha20_xor(&key, &nonce, 1, &plaintext);
         let expect = hex(
             "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0b\
@@ -297,11 +297,9 @@ mod tests {
         let mut state = RabbitState::new(&key);
         let mut ks = vec![0u8; 48];
         state.keystream(&mut ks);
-        let expect = hex(
-            "b15754f036a5d6ecf56b45261c4af702\
+        let expect = hex("b15754f036a5d6ecf56b45261c4af702\
              88e8d815c59c0c397b696c4789c68aa7\
-             f416a1c3700cd451da68d1881673d696",
-        );
+             f416a1c3700cd451da68d1881673d696");
         assert_eq!(ks, expect, "RFC 4503 Rabbit 无 IV 向量不符");
     }
 

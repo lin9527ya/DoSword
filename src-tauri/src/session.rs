@@ -4,12 +4,12 @@
 //! 这是简单且安全的策略。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dosword_sdk::domain::{AppSettings, ProbeResult, ShellProfile};
 use dosword_sdk::SessionState;
+use dosword_sdk::domain::{AppSettings, ProbeResult, ShellProfile};
 
 /// 会话默认存活时长（秒）。
 pub const SESSION_TTL_SECS: u64 = 4 * 60 * 60;
@@ -125,16 +125,38 @@ impl SessionManager {
         self.sessions.remove(session_id)
     }
 
-    /// 移除指定 Workspace 的全部会话（Workspace 被删除时调用）。
-    pub fn remove_by_workspace(&mut self, workspace_id: &str) {
+    /// 移除指定 Workspace 的全部会话（Workspace 被删除时调用），返回被移除的会话 id。
+    pub fn remove_by_workspace(&mut self, workspace_id: &str) -> Vec<String> {
+        let removed: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.workspace_id == workspace_id)
+            .map(|(id, _)| id.clone())
+            .collect();
         self.sessions
             .retain(|_, session| session.workspace_id != workspace_id);
+        removed
     }
 
-    /// 移除指定 Shell 配置的全部会话（Shell 被删除时调用）。
-    pub fn remove_by_profile(&mut self, profile_id: &str) {
+    /// 移除指定 Shell 配置的全部会话（Shell 被删除时调用），返回被移除的会话 id。
+    pub fn remove_by_profile(&mut self, profile_id: &str) -> Vec<String> {
+        let removed: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.profile_id == profile_id)
+            .map(|(id, _)| id.clone())
+            .collect();
         self.sessions
             .retain(|_, session| session.profile_id != profile_id);
+        removed
+    }
+
+    /// 查询某 Shell 的活跃会话 id（connect 替换前清理旧 PTY 用）。
+    pub fn session_id_for_profile(&self, profile_id: &str) -> Option<String> {
+        self.sessions
+            .iter()
+            .find(|(_, session)| session.profile_id == profile_id)
+            .map(|(id, _)| id.clone())
     }
 
     /// 列出全部活跃会话的元信息（不含协议状态）。
@@ -191,15 +213,33 @@ mod tests {
     #[test]
     fn insert_and_retrieve() {
         let mut manager = SessionManager::new();
-        let id = manager.insert("p1", "w1", "builtin.mock.v1", Arc::new(DummyState), dummy_info());
+        let id = manager.insert(
+            "p1",
+            "w1",
+            "builtin.mock.v1",
+            Arc::new(DummyState),
+            dummy_info(),
+        );
         assert_eq!(manager.get_mut(&id).unwrap().profile_id, "p1");
     }
 
     #[test]
     fn same_profile_replaces_old_session() {
         let mut manager = SessionManager::new();
-        let first = manager.insert("p1", "w1", "builtin.mock.v1", Arc::new(DummyState), dummy_info());
-        let second = manager.insert("p1", "w1", "builtin.mock.v1", Arc::new(DummyState), dummy_info());
+        let first = manager.insert(
+            "p1",
+            "w1",
+            "builtin.mock.v1",
+            Arc::new(DummyState),
+            dummy_info(),
+        );
+        let second = manager.insert(
+            "p1",
+            "w1",
+            "builtin.mock.v1",
+            Arc::new(DummyState),
+            dummy_info(),
+        );
         assert_ne!(first, second);
         assert!(manager.get_mut(&first).is_err(), "旧会话应被替换");
         assert!(manager.get_mut(&second).is_ok());
@@ -209,7 +249,13 @@ mod tests {
     fn expired_session_is_purged() {
         let mut manager = SessionManager::new();
         manager.ttl_secs = 1;
-        let id = manager.insert("p1", "w1", "builtin.mock.v1", Arc::new(DummyState), dummy_info());
+        let id = manager.insert(
+            "p1",
+            "w1",
+            "builtin.mock.v1",
+            Arc::new(DummyState),
+            dummy_info(),
+        );
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(manager.get_mut(&id).is_err(), "过期会话应被清理");
     }
@@ -217,7 +263,13 @@ mod tests {
     #[test]
     fn remove_is_idempotent() {
         let mut manager = SessionManager::new();
-        let id = manager.insert("p1", "w1", "builtin.mock.v1", Arc::new(DummyState), dummy_info());
+        let id = manager.insert(
+            "p1",
+            "w1",
+            "builtin.mock.v1",
+            Arc::new(DummyState),
+            dummy_info(),
+        );
         assert!(manager.remove(&id).is_some());
         assert!(manager.remove(&id).is_none(), "重复断开应幂等返回 None");
     }
@@ -225,7 +277,13 @@ mod tests {
     #[test]
     fn list_returns_metadata() {
         let mut manager = SessionManager::new();
-        manager.insert("p1", "w1", "builtin.mock.v1", Arc::new(DummyState), dummy_info());
+        manager.insert(
+            "p1",
+            "w1",
+            "builtin.mock.v1",
+            Arc::new(DummyState),
+            dummy_info(),
+        );
         let sessions = manager.list();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].1, "p1");

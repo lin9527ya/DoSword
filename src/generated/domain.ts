@@ -76,7 +76,11 @@ chunkSizeMb: number,
 /**
  * 是否允许 run_code 任意代码执行（插件托管载荷之外的安全闸，默认开）。
  */
-allowArbitraryCode: boolean, };
+allowArbitraryCode: boolean, 
+/**
+ * 审计日志保留天数（超出自动清理；0 = 不清理，默认 90 天）。
+ */
+auditRetentionDays: number, };
 export type CommandOutput = { stdout: string, durationMs: number, 
 /**
  * 命令执行后的服务器工作目录（终端据此更新提示符）。
@@ -112,6 +116,10 @@ rows: Array<Array<string | null>>,
  */
 affected: number, durationMs: number, };
 export type RequestRecord = { id: number, 
+/**
+ * 产生该帧的协议 id（builtin.php.v1 / builtin.jsp.v1 / ...）。
+ */
+protocolId: string, 
 /**
  * 目标端点。
  */

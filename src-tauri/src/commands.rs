@@ -1,4 +1,5 @@
 use base64::Engine;
+use std::io::Write;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use url::Url;
@@ -6,16 +7,15 @@ use url::Url;
 use dosword_sdk::domain::{
     AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
     CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing,
-    FileContent, GenerateShellResult, HttpSendResult, ImportResult, ProbeResult,
-    ProtocolMeta, RequestRecord, SessionInfo,
-    ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
+    FileContent, GenerateShellResult, HttpSendResult, ImportResult, ProbeResult, ProtocolMeta,
+    RequestRecord, SessionInfo, ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
 };
 use dosword_sdk::encoder::{EncoderRegistry, STUB_LANGUAGES};
 use dosword_sdk::plugin::FeaturePlugin;
 use dosword_sdk::{PluginManifest, Protocol, ProtocolError, SessionState};
 
-use crate::auth;
 use crate::AppState;
+use crate::auth;
 
 fn validate_text(value: &str, field: &str) -> Result<(), String> {
     if value.trim().is_empty() {
@@ -48,7 +48,10 @@ where
 }
 
 /// 读取 Shell 配置与全局设置（锁内完成，不跨网络）。
-fn load_shell_and_settings(state: &AppState, shell_id: &str) -> Result<(ShellProfile, AppSettings), String> {
+fn load_shell_and_settings(
+    state: &AppState,
+    shell_id: &str,
+) -> Result<(ShellProfile, AppSettings), String> {
     let database = state
         .database
         .lock()
@@ -89,13 +92,24 @@ fn audit_fail(
     error: ProtocolError,
 ) -> String {
     let message = error.to_string();
-    audit(state, &shell.workspace_id, Some(&shell.id), action, "error", &message);
+    audit(
+        state,
+        &shell.workspace_id,
+        Some(&shell.id),
+        action,
+        "error",
+        &message,
+    );
     message
 }
 
 /// 对真实网络协议做完整授权检查；Mock 协议直接放行。
 /// 返回校验方式说明（供审计追溯）。
-fn require_authorized_for(state: &AppState, shell: &ShellProfile, settings: &AppSettings) -> Result<String, String> {
+fn require_authorized_for(
+    state: &AppState,
+    shell: &ShellProfile,
+    settings: &AppSettings,
+) -> Result<String, String> {
     let protocol = state
         .protocols
         .get(&shell.protocol_id)
@@ -130,10 +144,7 @@ pub async fn dashboard(app: AppHandle) -> Result<Dashboard, String> {
 }
 
 #[tauri::command]
-pub async fn create_workspace(
-    input: CreateWorkspace,
-    app: AppHandle,
-) -> Result<Workspace, String> {
+pub async fn create_workspace(input: CreateWorkspace, app: AppHandle) -> Result<Workspace, String> {
     blocking(app, move |state| {
         validate_text(&input.name, "名称")?;
         validate_text(&input.authorization_scope, "授权范围")?;
@@ -148,10 +159,7 @@ pub async fn create_workspace(
 }
 
 #[tauri::command]
-pub async fn create_shell(
-    input: CreateShell,
-    app: AppHandle,
-) -> Result<ShellProfile, String> {
+pub async fn create_shell(input: CreateShell, app: AppHandle) -> Result<ShellProfile, String> {
     blocking(app, move |state| {
         validate_text(&input.name, "名称")?;
         validate_text(&input.workspace_id, "Workspace")?;
@@ -198,7 +206,10 @@ pub async fn create_shell(
             Some(&profile.id),
             "shell.create",
             "success",
-            &format!("登记 Shell：{}（协议 {}）", profile.endpoint, profile.protocol_id),
+            &format!(
+                "登记 Shell：{}（协议 {}）",
+                profile.endpoint, profile.protocol_id
+            ),
         );
         Ok(profile)
     })
@@ -206,26 +217,46 @@ pub async fn create_shell(
 }
 
 #[tauri::command]
-pub async fn update_workspace(
-    input: UpdateWorkspace,
-    app: AppHandle,
-) -> Result<Workspace, String> {
+pub async fn update_workspace(input: UpdateWorkspace, app: AppHandle) -> Result<Workspace, String> {
     blocking(app, move |state| {
         validate_text(&input.name, "名称")?;
         validate_text(&input.authorization_scope, "授权范围")?;
-        let workspace = state
-            .database
-            .lock()
-            .map_err(|_| "数据库锁异常".to_string())?
-            .update_workspace(&input)
-            .map_err(|error| error.to_string())?;
+        let (workspace, scope_changed) = {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            let previous = database
+                .workspace(&input.id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Workspace 不存在".to_string())?;
+            let updated = database
+                .update_workspace(&input)
+                .map_err(|error| error.to_string())?;
+            let changed = previous.authorization_scope != updated.authorization_scope;
+            (updated, changed)
+        };
+        // S7：授权范围收窄后，该 Workspace 的活跃会话全部失效（断开 + 级联清理 PTY）
+        if scope_changed {
+            let removed = state
+                .sessions
+                .lock()
+                .map_err(|_| "会话锁异常".to_string())?
+                .remove_by_workspace(&workspace.id);
+            for session_id in removed {
+                state.ptys.close_for_session(&session_id);
+            }
+        }
         audit(
             state,
             &workspace.id,
             None,
             "workspace.update",
             "success",
-            &format!("更新 Workspace：{}（范围 {}）", workspace.name, workspace.authorization_scope),
+            &format!(
+                "更新 Workspace：{}（范围 {}）",
+                workspace.name, workspace.authorization_scope
+            ),
         );
         Ok(workspace)
     })
@@ -249,13 +280,23 @@ pub async fn delete_workspace(workspace_id: String, app: AppHandle) -> Result<()
                 .map_err(|error| error.to_string())?;
             workspace.name
         };
-        // 清理该 Workspace 下的全部活跃会话
-        state
+        // 清理该 Workspace 下的全部活跃会话（级联清理 PTY 流）
+        let removed = state
             .sessions
             .lock()
             .map_err(|_| "会话锁异常".to_string())?
             .remove_by_workspace(&workspace_id);
-        audit(state, &workspace_id, None, "workspace.delete", "success", &format!("删除 Workspace：{name}"));
+        for session_id in removed {
+            state.ptys.close_for_session(&session_id);
+        }
+        audit(
+            state,
+            &workspace_id,
+            None,
+            "workspace.delete",
+            "success",
+            &format!("删除 Workspace：{name}"),
+        );
         Ok(())
     })
     .await
@@ -294,7 +335,8 @@ pub async fn update_shell(input: UpdateShell, app: AppHandle) -> Result<ShellPro
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| "Workspace 不存在".to_string())?;
                 auth::check_workspace_authorized(Some(&workspace))?;
-                let (allowed, _reason) = auth::scope_allows(&workspace.authorization_scope, &endpoint);
+                let (allowed, _reason) =
+                    auth::scope_allows(&workspace.authorization_scope, &endpoint);
                 if !allowed {
                     return Err("目标不在 Workspace 授权范围内，请检查授权范围或端点地址".into());
                 }
@@ -341,13 +383,23 @@ pub async fn delete_shell(shell_id: String, app: AppHandle) -> Result<(), String
                 .map_err(|error| error.to_string())?;
             (shell.workspace_id, shell.endpoint)
         };
-        // 清理该 Shell 的活跃会话
-        state
+        // 清理该 Shell 的活跃会话（级联清理 PTY 流）
+        let removed = state
             .sessions
             .lock()
             .map_err(|_| "会话锁异常".to_string())?
             .remove_by_profile(&shell_id);
-        audit(state, &workspace_id, None, "shell.delete", "success", &format!("删除 Shell：{endpoint}"));
+        for session_id in removed {
+            state.ptys.close_for_session(&session_id);
+        }
+        audit(
+            state,
+            &workspace_id,
+            None,
+            "shell.delete",
+            "success",
+            &format!("删除 Shell：{endpoint}"),
+        );
         Ok(())
     })
     .await
@@ -364,7 +416,14 @@ pub async fn test_connection(
     app: AppHandle,
 ) -> Result<ProbeResult, String> {
     blocking(app, move |state| {
-        test_connection_impl(state, &endpoint, &password, &protocol_id, protocol_params.as_deref(), runtime.as_deref())
+        test_connection_impl(
+            state,
+            &endpoint,
+            &password,
+            &protocol_id,
+            protocol_params.as_deref(),
+            runtime.as_deref(),
+        )
     })
     .await
 }
@@ -443,7 +502,14 @@ pub async fn probe_shell(shell_id: String, app: AppHandle) -> Result<ProbeResult
             .map_err(|_| "数据库锁异常".to_string())?
             .record_probe(&shell, "online", &result.message)
             .map_err(|error| error.to_string())?;
-        audit(state, &shell.workspace_id, Some(&shell.id), "shell.probe", "success", &result.message);
+        audit(
+            state,
+            &shell.workspace_id,
+            Some(&shell.id),
+            "shell.probe",
+            "success",
+            &result.message,
+        );
         Ok(result)
     })
     .await
@@ -504,8 +570,7 @@ pub async fn list_encoders(app: AppHandle) -> Vec<(String, String)> {
 /// 自动备份：导出全部 Shell 配置到指定目录（带时间戳文件名），返回备份文件路径。
 #[tauri::command]
 pub async fn backup_shells(backup_dir: String, app: AppHandle) -> Result<String, String> {
-    blocking(app, move |state| backup_shells_impl(state, &backup_dir))
-    .await
+    blocking(app, move |state| backup_shells_impl(state, &backup_dir)).await
 }
 
 fn backup_shells_impl(state: &AppState, backup_dir: &str) -> Result<String, String> {
@@ -521,8 +586,7 @@ fn backup_shells_impl(state: &AppState, backup_dir: &str) -> Result<String, Stri
 /// 按编码把文本编码为字节（GBK 等浏览器 TextEncoder 不支持的编码）。
 #[tauri::command]
 pub async fn encode_text(text: String, encoding: String, app: AppHandle) -> Result<String, String> {
-    blocking(app, move |_state| encode_text_impl(&text, &encoding))
-    .await
+    blocking(app, move |_state| encode_text_impl(&text, &encoding)).await
 }
 
 fn encode_text_impl(text: &str, encoding: &str) -> Result<String, String> {
@@ -539,13 +603,39 @@ fn encode_text_impl(text: &str, encoding: &str) -> Result<String, String> {
 
 /// 读取本地文件（Shell 导入用）。
 #[tauri::command]
+/// S4：本地路径安全校验——规范化并拒绝敏感系统目录（防止被攻破的前端读写任意本地文件）。
+fn sanitize_local_path(path: &str, for_write: bool) -> Result<std::path::PathBuf, String> {
+    let deny = ["/etc", "/proc", "/sys", "/root", "/boot", "/dev", "/var/lib", "/usr"];
+    if for_write {
+        let p = std::path::Path::new(path);
+        let parent = p.parent().ok_or_else(|| "路径缺少父目录".to_string())?;
+        let canon_parent = std::fs::canonicalize(parent)
+            .map_err(|error| format!("路径无效：{error}"))?;
+        for prefix in deny {
+            if canon_parent.starts_with(prefix) {
+                return Err(format!("拒绝访问敏感目录：{prefix}"));
+            }
+        }
+        Ok(canon_parent.join(p.file_name().unwrap_or_default()))
+    } else {
+        let canonical =
+            std::fs::canonicalize(path).map_err(|error| format!("路径无效：{error}"))?;
+        for prefix in deny {
+            if canonical.starts_with(prefix) {
+                return Err(format!("拒绝访问敏感目录：{prefix}"));
+            }
+        }
+        Ok(canonical)
+    }
+}
+
+#[tauri::command]
 pub async fn read_local_file(path: String, app: AppHandle) -> Result<String, String> {
     blocking(app, move |_state| {
-        std::fs::read(&path)
+        let safe = sanitize_local_path(&path, false)?;
+        std::fs::read(&safe)
             .map_err(|error| format!("读取本地文件失败：{error}"))
-            .map(|bytes| {
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            })
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
     })
     .await
 }
@@ -557,7 +647,10 @@ pub fn export_shells(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 fn export_shells_impl(state: &AppState) -> Result<String, String> {
-    let database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
+    let database = state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())?;
     let shells = database.list_shells().map_err(|error| error.to_string())?;
     serde_json::to_string_pretty(&shells).map_err(|error| error.to_string())
 }
@@ -570,19 +663,26 @@ pub async fn import_shells(
     app: AppHandle,
 ) -> Result<ImportResult, String> {
     blocking(app, move |state| {
-        import_shells_impl(&state, &payload, &workspace_id)
+        import_shells_impl(state, &payload, &workspace_id)
     })
     .await
 }
 
-fn import_shells_impl(state: &AppState, payload: &str, workspace_id: &str) -> Result<ImportResult, String> {
+fn import_shells_impl(
+    state: &AppState,
+    payload: &str,
+    workspace_id: &str,
+) -> Result<ImportResult, String> {
     {
-        let items: Vec<serde_json::Value> =
-            serde_json::from_str(payload).map_err(|error| format!("导入文件不是合法 JSON：{error}"))?;
+        let items: Vec<serde_json::Value> = serde_json::from_str(payload)
+            .map_err(|error| format!("导入文件不是合法 JSON：{error}"))?;
         let mut imported = 0usize;
         let mut skipped = 0usize;
-        let mut database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
-        let _workspace = database
+        let mut database = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?;
+        let workspace = database
             .workspace(workspace_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "目标 Workspace 不存在".to_string())?;
@@ -593,7 +693,11 @@ fn import_shells_impl(state: &AppState, payload: &str, workspace_id: &str) -> Re
             .map(|shell| shell.endpoint)
             .collect();
         for item in items {
-            let endpoint = item.get("endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let endpoint = item
+                .get("endpoint")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let protocol_id = item
                 .get("protocol_id")
                 .or_else(|| item.get("protocolId"))
@@ -607,7 +711,28 @@ fn import_shells_impl(state: &AppState, payload: &str, workspace_id: &str) -> Re
                 skipped += 1;
                 continue;
             }
-            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // S2：真实网络协议的导入项同样受授权范围约束（与 create_shell 门一致）
+            let protocol = state.protocols.get(&protocol_id).expect("已确认协议存在");
+            if protocol.requires_network() {
+                let parsed = match url::Url::parse(&endpoint) {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    }
+                };
+                let (allowed, _reason) =
+                    auth::scope_allows(&workspace.authorization_scope, &parsed);
+                if !allowed {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let runtime = item
                 .get("runtime")
                 .and_then(|v| v.as_str())
@@ -635,7 +760,11 @@ fn import_shells_impl(state: &AppState, payload: &str, workspace_id: &str) -> Re
                 .unwrap_or_default();
             let create = CreateShell {
                 workspace_id: workspace_id.to_string(),
-                name: if name.trim().is_empty() { endpoint.clone() } else { name },
+                name: if name.trim().is_empty() {
+                    endpoint.clone()
+                } else {
+                    name
+                },
                 endpoint: endpoint.clone(),
                 runtime,
                 protocol_id: protocol_id.clone(),
@@ -654,12 +783,17 @@ fn import_shells_impl(state: &AppState, payload: &str, workspace_id: &str) -> Re
 }
 
 #[tauri::command]
-pub async fn write_local_file(path: String, content_b64: String, app: AppHandle) -> Result<(), String> {
+pub async fn write_local_file(
+    path: String,
+    content_b64: String,
+    app: AppHandle,
+) -> Result<(), String> {
     blocking(app, move |_state| {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&content_b64)
             .map_err(|_| "内容不是合法 Base64".to_string())?;
-        std::fs::write(&path, &bytes).map_err(|error| format!("写入本地文件失败：{error}"))
+        let safe = sanitize_local_path(&path, true)?;
+        std::fs::write(&safe, &bytes).map_err(|error| format!("写入本地文件失败：{error}"))
     })
     .await
 }
@@ -704,7 +838,8 @@ pub async fn install_native_plugin(source_path: String, app: AppHandle) -> Resul
     let plugins_dir = data_dir.join("plugins");
     std::fs::create_dir_all(&plugins_dir).map_err(|error| error.to_string())?;
     // 先加载校验（含 manifest id），再落盘
-    let plugin = crate::native_plugin::NativeFeaturePlugin::load(std::path::Path::new(&source_path))?;
+    let plugin =
+        crate::native_plugin::NativeFeaturePlugin::load(std::path::Path::new(&source_path))?;
     let id = plugin.abi_manifest()?.id.clone();
     if id.is_empty() || id.contains("..") {
         return Err("插件 id 非法".to_string());
@@ -715,8 +850,7 @@ pub async fn install_native_plugin(source_path: String, app: AppHandle) -> Resul
         .unwrap_or("so")
         .to_string();
     let target = plugins_dir.join(format!("{id}.native.{ext}"));
-    std::fs::copy(&source_path, &target)
-        .map_err(|error| format!("插件文件复制失败：{error}"))?;
+    std::fs::copy(&source_path, &target).map_err(|error| format!("插件文件复制失败：{error}"))?;
     blocking(app, move |state| {
         let mut registry = state
             .feature_plugins
@@ -770,7 +904,9 @@ pub async fn uninstall_plugin(plugin_id: String, app: AppHandle) -> Result<(), S
         if let Ok(entries) = std::fs::read_dir(data_dir.join("plugins")) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name == format!("{plugin_id}.plugin") || name.starts_with(&format!("{plugin_id}.native.")) {
+                if name == format!("{plugin_id}.plugin")
+                    || name.starts_with(&format!("{plugin_id}.native."))
+                {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -795,23 +931,25 @@ pub async fn run_feature_plugin(
 ) -> Result<serde_json::Value, String> {
     blocking(app, move |state| {
         let (session, protocol_id, runtime) = {
-            let mut sessions = state.sessions.lock().map_err(|_| "会话锁异常".to_string())?;
+            let mut sessions = state
+                .sessions
+                .lock()
+                .map_err(|_| "会话锁异常".to_string())?;
             let session = sessions
                 .get_mut(&session_id)
                 .map_err(|error| error.to_string())?;
             let runtime = {
-                let database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
+                let database = state
+                    .database
+                    .lock()
+                    .map_err(|_| "数据库锁异常".to_string())?;
                 database
                     .shell(&session.profile_id)
                     .map_err(|error| error.to_string())?
                     .map(|shell| shell.runtime)
                     .unwrap_or_else(|| "php".to_string())
             };
-            (
-                session.state.clone(),
-                session.protocol_id.clone(),
-                runtime,
-            )
+            (session.state.clone(), session.protocol_id.clone(), runtime)
         };
         let protocol = state
             .protocols
@@ -830,9 +968,51 @@ pub async fn run_feature_plugin(
             .map_err(|_| "数据库锁异常".to_string())?
             .get_settings()
             .map_err(|error| error.to_string())?;
-        plugin
+        let output = plugin
             .execute(protocol, session.as_ref(), &runtime, &params, &settings)
-            .map_err(|error| format!("插件执行失败：{error}"))
+            .map_err(|error| format!("插件执行失败：{error}"))?;
+        // S9：插件执行审计（含参数摘要，不含代码体）
+        let summary: String = params
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .map(|(key, value)| {
+                        let text = match value {
+                            serde_json::Value::String(s) => {
+                                if s.len() > 64 {
+                                    format!("{}…", &s[..64])
+                                } else {
+                                    s.clone()
+                                }
+                            }
+                            other => other.to_string(),
+                        };
+                        format!("{key}={text}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("&")
+            })
+            .unwrap_or_default();
+        if let Ok(mut sessions) = state.sessions.lock() {
+            if let Ok(session) = sessions.get_mut(&session_id) {
+                let _ = state
+                    .database
+                    .lock()
+                    .map_err(|_| "数据库锁异常".to_string())
+                    .and_then(|database| {
+                        database
+                            .record_audit(
+                                Some(&session.workspace_id),
+                                Some(&session.profile_id),
+                                "plugin.run",
+                                "success",
+                                &format!("插件：{plugin_id}（{summary}）"),
+                            )
+                            .map_err(|error| error.to_string())
+                    });
+            }
+        }
+        Ok(output)
     })
     .await
 }
@@ -842,29 +1022,82 @@ pub async fn run_feature_plugin(
 pub async fn refresh_shell_status(app: AppHandle) -> Result<Vec<ShellProfile>, String> {
     blocking(app, move |state| {
         let (shells, settings) = {
-            let database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
             let shells = database.list_shells().map_err(|error| error.to_string())?;
             let settings = database.get_settings().map_err(|error| error.to_string())?;
             (shells, settings)
         };
-        for shell in &shells {
-            let protocol = state
-                .protocols
-                .get(&shell.protocol_id)
-                .ok_or_else(|| format!("未知协议：{}", shell.protocol_id))?;
-            let status = match protocol.probe(shell, &settings) {
-                Ok(_) => "online".to_string(),
-                Err(_) => "error".to_string(),
-            };
-            let _ = state.database.lock().map_err(|_| "数据库锁异常".to_string()).and_then(
-                |database| {
-                    database
-                        .update_shell_status(&shell.id, &status)
-                        .map_err(|error| error.to_string())
-                },
-            );
+        // S6：授权门——真实网络协议未启用或超出授权范围（scope 过滤）的 Shell 不探测
+        if !settings.http_enabled {
+            return Ok(shells);
         }
-        let database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
+        let allowed: Vec<ShellProfile> = {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            shells
+                .into_iter()
+                .filter(|shell| {
+                    let protocol = state.protocols.get(&shell.protocol_id);
+                    match protocol {
+                        Some(protocol) if protocol.requires_network() => {
+                            auth::require_authorized(&database, shell).is_ok()
+                        }
+                        _ => true,
+                    }
+                })
+                .collect()
+        };
+        // P6：并行探测（上限 8 并发，逐壳错误互不影响），避免 100 个 Shell 串行累加超时
+        let shells = allowed;
+        let workers = shells.len().clamp(1, 8);
+        let results: Vec<(String, String)> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for worker in 0..workers {
+                let shells = &shells;
+                let settings = &settings;
+                handles.push(scope.spawn(move || {
+                    let mut out = Vec::new();
+                    let mut index = worker;
+                    while index < shells.len() {
+                        let shell = &shells[index];
+                        let status = match state.protocols.get(&shell.protocol_id) {
+                            Some(protocol) => match protocol.probe(shell, settings) {
+                                Ok(_) => "online".to_string(),
+                                Err(_) => "error".to_string(),
+                            },
+                            None => "error".to_string(),
+                        };
+                        out.push((shell.id.clone(), status));
+                        index += workers;
+                    }
+                    out
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap_or_default())
+                .collect()
+        });
+        for (shell_id, status) in results {
+            let _ = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())
+                .and_then(|database| {
+                    database
+                        .update_shell_status(&shell_id, &status)
+                        .map_err(|error| error.to_string())
+                });
+        }
+        let database = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?;
         database.list_shells().map_err(|error| error.to_string())
     })
     .await
@@ -879,7 +1112,7 @@ pub async fn batch_update_shells(
     app: AppHandle,
 ) -> Result<usize, String> {
     blocking(app, move |state| {
-        batch_update_shells_impl(&state, &ids, tags, password)
+        batch_update_shells_impl(state, &ids, tags, password)
     })
     .await
 }
@@ -891,7 +1124,10 @@ fn batch_update_shells_impl(
     password: Option<String>,
 ) -> Result<usize, String> {
     let mut updated = 0usize;
-    let database = state.database.lock().map_err(|_| "数据库锁异常".to_string())?;
+    let database = state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())?;
     for id in ids {
         if let Ok(Some(shell)) = database.shell(id) {
             let input = UpdateShell {
@@ -930,8 +1166,9 @@ pub async fn http_send(
             return Err("真实网络协议尚未在「设置」中开启授权声明".to_string());
         }
         let client = crate::protocol::transport::build_client(&settings);
-        let method = reqwest::Method::from_bytes(method.as_bytes())
-            .map_err(|_| format!("不支持的请求方法：{method}"))?;
+        let method_str = method;
+        let method = reqwest::Method::from_bytes(method_str.as_bytes())
+            .map_err(|_| format!("不支持的请求方法：{method_str}"))?;
         let mut request = client.request(method, &url);
         for (name, value) in &headers {
             if !name.trim().is_empty() {
@@ -946,10 +1183,17 @@ pub async fn http_send(
             request = request.header("Content-Type", "application/x-www-form-urlencoded");
         }
         let start = std::time::Instant::now();
-        let response = request
-            .body(body)
-            .send()
-            .map_err(|error| format!("请求失败：{error}"))?;
+        let response = request.body(body).send().map_err(|error| {
+            audit(
+                state,
+                "system",
+                None,
+                "http.send",
+                "error",
+                &format!("{method_str} {url}：{error}"),
+            );
+            format!("请求失败：{error}")
+        })?;
         let status = response.status();
         let status_text = status.canonical_reason().unwrap_or("").to_string();
         let resp_headers: Vec<(String, String)> = response
@@ -962,15 +1206,38 @@ pub async fn http_send(
                 )
             })
             .collect();
-        let resp_body = response
-            .text()
-            .unwrap_or_else(|_| "（响应体读取失败）".to_string());
+        // S1：响应体受 max_file_size_mb 上限约束（避免超大响应撑爆内存）
+        let bytes = response
+            .bytes()
+            .map_err(|error| format!("读取响应失败：{error}"))?;
+        let max_bytes = settings.max_file_size_mb.saturating_mul(1024 * 1024) as usize;
+        if bytes.len() > max_bytes {
+            let detail = format!(
+                "{method_str} {url}：响应超过大小上限（{}MB）",
+                settings.max_file_size_mb
+            );
+            audit(state, "system", None, "http.send", "error", &detail);
+            return Err(detail);
+        }
+        let resp_body = String::from_utf8_lossy(&bytes).into_owned();
+        let duration_ms = start.elapsed().as_millis() as u64;
+        audit(
+            state,
+            "system",
+            None,
+            "http.send",
+            "success",
+            &format!(
+                "{method_str} {url} → HTTP {status}（{} 字节，{duration_ms}ms）",
+                bytes.len()
+            ),
+        );
         Ok(HttpSendResult {
             status: status.as_u16(),
             status_text,
             headers: resp_headers,
             body: resp_body,
-            duration_ms: start.elapsed().as_millis() as u64,
+            duration_ms,
         })
     })
     .await
@@ -1049,6 +1316,10 @@ pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectRe
                 .sessions
                 .lock()
                 .map_err(|_| "会话锁异常".to_string())?;
+            // S8：同 Shell 重连替换旧会话前，级联清理其 PTY 流
+            if let Some(old_session_id) = sessions.session_id_for_profile(&shell.id) {
+                state.ptys.close_for_session(&old_session_id);
+            }
             let session_id = sessions.insert(
                 &shell.id,
                 &shell.workspace_id,
@@ -1074,7 +1345,14 @@ pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectRe
                     .record_probe(&shell, "online", "连接成功")
                     .map_err(|error| error.to_string())
             });
-        audit(state, &shell.workspace_id, Some(&shell.id), "shell.connect", "success", &format!("连接成功：{}", shell.endpoint));
+        audit(
+            state,
+            &shell.workspace_id,
+            Some(&shell.id),
+            "shell.connect",
+            "success",
+            &format!("连接成功：{}", shell.endpoint),
+        );
 
         Ok(ConnectResult::from_probe(session_id, probe))
     })
@@ -1086,20 +1364,32 @@ pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectRe
 #[tauri::command]
 pub async fn register_custom_encoder(stub: String, app: AppHandle) -> Result<(), String> {
     blocking(app, move |state| {
-        dosword_sdk::encoder::set_custom_stub(&stub)
-            .map_err(|error| error.to_string())?;
-        audit(state, "system", None, "encoder.register", "success", "注册自定义编码器 stub");
+        dosword_sdk::encoder::set_custom_stub(&stub).map_err(|error| error.to_string())?;
+        audit(
+            state,
+            "system",
+            None,
+            "encoder.register",
+            "success",
+            "注册自定义编码器 stub",
+        );
         Ok(())
     })
     .await
 }
 
 #[tauri::command]
-pub async fn start_pty_session(session_id: String, app: AppHandle) -> Result<serde_json::Value, String> {
+pub async fn start_pty_session(
+    session_id: String,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
         let (session, _) = {
-            let mut sessions = state.sessions.lock().map_err(|_| "会话锁异常".to_string())?;
+            let mut sessions = state
+                .sessions
+                .lock()
+                .map_err(|_| "会话锁异常".to_string())?;
             let shell = sessions
                 .get(&session_id)
                 .ok_or_else(|| "会话不存在或已过期，请重新连接".to_string())?;
@@ -1120,11 +1410,17 @@ pub async fn start_pty_session(session_id: String, app: AppHandle) -> Result<ser
             .protocols
             .get(&ctx.shell.protocol_id)
             .ok_or_else(|| format!("未知协议：{}", ctx.shell.protocol_id))?;
+        // A2：运行时取自会话上下文（PHP 会话走 PHP 载荷，JSP 等协议按自身 run_code 通道）
+        let runtime = if ctx.shell.runtime.is_empty() {
+            "php"
+        } else {
+            &ctx.shell.runtime
+        };
         let out = <dosword_sdk::feature_plugins::SuperTerminalPlugin as FeaturePlugin>::execute(
             &dosword_sdk::feature_plugins::SuperTerminalPlugin,
             protocol,
             session.as_ref(),
-            "php",
+            runtime,
             &serde_json::json!({"host": "127.0.0.1", "port": port, "background": true}),
             &ctx.settings,
         )
@@ -1132,7 +1428,9 @@ pub async fn start_pty_session(session_id: String, app: AppHandle) -> Result<ser
         if out.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             return Err(format!(
                 "PTY 反弹未启动：{}",
-                out.get("error").and_then(|v| v.as_str()).unwrap_or("未知错误")
+                out.get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未知错误")
             ));
         }
         // 3) 等待目标回连（最长 12 秒）
@@ -1140,12 +1438,30 @@ pub async fn start_pty_session(session_id: String, app: AppHandle) -> Result<ser
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let pty_id = state.ptys.insert(stream);
+                    let pty_id = state.ptys.insert(&session_id, stream);
+                    // S9：PTY 会话建立审计
+                    let _ = state
+                        .database
+                        .lock()
+                        .map_err(|_| "会话锁异常".to_string())
+                        .and_then(|database| {
+                            database
+                                .record_audit(
+                                    None,
+                                    Some(&session_id),
+                                    "pty.start",
+                                    "success",
+                                    "建立交互式 PTY 会话",
+                                )
+                                .map_err(|error| error.to_string())
+                        });
                     return Ok(serde_json::json!({ "ptyId": pty_id, "port": port }));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() > deadline {
-                        return Err("PTY 会话建立超时（目标未回连，可能缺少可执行命令通道）".to_string());
+                        return Err(
+                            "PTY 会话建立超时（目标未回连，可能缺少可执行命令通道）".to_string()
+                        );
                     }
                     std::thread::sleep(std::time::Duration::from_millis(120));
                 }
@@ -1199,7 +1515,10 @@ pub async fn pty_close(pty_id: String, app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn get_session_probe(session_id: String, app: AppHandle) -> Result<ProbeResult, String> {
     blocking(app, move |state| {
-        let mut sessions = state.sessions.lock().map_err(|_| "会话锁异常".to_string())?;
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?;
         let session = sessions
             .get(&session_id)
             .ok_or_else(|| "会话不存在或已过期".to_string())?;
@@ -1217,6 +1536,8 @@ pub async fn disconnect_shell(session_id: String, app: AppHandle) -> Result<(), 
             .map_err(|_| "会话锁异常".to_string())?
             .remove(&session_id)
         {
+            // F2：断开会话时级联清理其全部 PTY 流
+            state.ptys.close_for_session(&session_id);
             audit(
                 state,
                 &session.workspace_id,
@@ -1241,12 +1562,14 @@ pub async fn list_sessions(app: AppHandle) -> Result<Vec<SessionInfo>, String> {
         Ok(sessions
             .list()
             .into_iter()
-            .map(|(session_id, profile_id, server, last_used_at)| SessionInfo {
-                session_id,
-                profile_id,
-                server,
-                last_used_at,
-            })
+            .map(
+                |(session_id, profile_id, server, last_used_at)| SessionInfo {
+                    session_id,
+                    profile_id,
+                    server,
+                    last_used_at,
+                },
+            )
             .collect())
     })
     .await
@@ -1349,22 +1672,9 @@ fn with_session<T>(
     }
 }
 
-/// 判断错误是否值得自动重连（网络层失败；业务错误如密码错误/404 不重连）。
+/// S11：判断错误是否值得自动重连——仅网络层失败（业务错误如密码错误/404/服务端报错不重连）。
 fn is_reconnectable(error: &ProtocolError) -> bool {
-    let text = error.to_string();
-    let markers = [
-        "Network",
-        "network",
-        "error sending request",
-        "连接失败",
-        "timed out",
-        "Connection refused",
-        "connection reset",
-        "broken pipe",
-        "超时",
-        "timeout",
-    ];
-    markers.iter().any(|marker| text.contains(marker))
+    matches!(error, ProtocolError::Network(_))
 }
 
 /// E4：重建协议会话（连接成功则替换 SessionManager 中的状态与信息）。
@@ -1421,13 +1731,27 @@ pub async fn execute_command(
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
         let output = with_session(state, &session_id, |session| {
-            ctx.protocol.execute_command(session, &command, &ctx.settings)
+            ctx.protocol
+                .execute_command(session, &command, &ctx.settings)
         })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "shell.exec", "error", &error);
-            error
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "shell.exec",
+                "error",
+            error,
+            )
         })?;
-        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "shell.exec", "success", &format!("执行命令：{command}"));
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "shell.exec",
+            "success",
+            &format!("执行命令：{command}"),
+        );
         Ok(output)
     })
     .await
@@ -1449,25 +1773,34 @@ pub async fn list_dir(
             .map_err(|_| "目录缓存锁异常".to_string())?
             .get(&cache_key)
             .cloned()
+            && hit_at.elapsed() < std::time::Duration::from_secs(5)
         {
-            if hit_at.elapsed() < std::time::Duration::from_secs(5) {
-                return Ok(listing);
-            }
+            return Ok(listing);
         }
         let listing = with_session(state, &session_id, |session| {
             ctx.protocol.list_dir(session, &path, &ctx.settings)
         })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.list", "error", &error);
-            error
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "file.list",
+                "error",
+            error,
+            )
         })?;
         if let Ok(mut cache) = state.dir_cache.lock() {
-            if cache.len() >= 256 {
-                cache.clear();
-            }
             cache.insert(cache_key, (std::time::Instant::now(), listing.clone()));
         }
-        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.list", "success", &format!("浏览目录：{path}"));
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "file.list",
+            "success",
+            &format!("浏览目录：{path}"),
+        );
         Ok(listing)
     })
     .await
@@ -1476,7 +1809,7 @@ pub async fn list_dir(
 /// 写操作后失效该会话的全部目录缓存（保证一致性）。
 fn invalidate_dir_cache(state: &AppState, session_id: &str) {
     if let Ok(mut cache) = state.dir_cache.lock() {
-        cache.retain(|key, _| key.0 != session_id);
+        cache.invalidate_session(session_id);
     }
 }
 
@@ -1491,10 +1824,30 @@ pub async fn batch_list_dir(
         let ctx = session_ctx(state, &session_id)?;
         let mut results = serde_json::Map::new();
         for path in paths {
-            let listing = with_session(state, &session_id, |session| {
-                ctx.protocol.list_dir(session, &path, &ctx.settings)
-            })
-            .map_err(|error| format!("浏览 {path} 失败：{error}"))?;
+            // P7：批量浏览同样命中目录缓存（避免重复网络往返）
+            let cache_key = (session_id.clone(), path.clone());
+            let listing = {
+                let cache_hit = state
+                    .dir_cache
+                    .lock()
+                    .ok()
+                    .and_then(|mut cache| cache.get(&cache_key).cloned())
+                    .filter(|(hit_at, _)| hit_at.elapsed() < std::time::Duration::from_secs(5))
+                    .map(|(_, listing)| listing);
+                match cache_hit {
+                    Some(listing) => listing,
+                    None => {
+                        let listing = with_session(state, &session_id, |session| {
+                            ctx.protocol.list_dir(session, &path, &ctx.settings)
+                        })
+                        .map_err(|error| format!("浏览 {path} 失败：{error}"))?;
+                        if let Ok(mut cache) = state.dir_cache.lock() {
+                            cache.insert(cache_key, (std::time::Instant::now(), listing.clone()));
+                        }
+                        listing
+                    }
+                }
+            };
             results.insert(
                 path.clone(),
                 serde_json::to_value(listing).map_err(|error| error.to_string())?,
@@ -1516,17 +1869,26 @@ pub async fn read_file(
         let bytes = with_session(state, &session_id, |session| {
             ctx.protocol.read_file(session, &path, &ctx.settings)
         })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.read", "error", &error);
-            error
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "file.read",
+                "error",
+            error,
+            )
         })?;
         let content_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let name = path
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(&path)
-            .to_string();
-        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.read", "success", &format!("读取文件：{path}"));
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(&path).to_string();
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "file.read",
+            "success",
+            &format!("读取文件：{path}"),
+        );
         Ok(FileContent {
             name,
             size: bytes.len() as u64,
@@ -1549,14 +1911,28 @@ pub async fn write_file(
             .map_err(|_| "文件内容不是合法 Base64".to_string())?;
         let ctx = session_ctx(state, &session_id)?;
         with_session(state, &session_id, |session| {
-            ctx.protocol.write_file(session, &path, &bytes, &ctx.settings)
+            ctx.protocol
+                .write_file(session, &path, &bytes, &ctx.settings)
         })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "error", &error);
-            error
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "file.write",
+                "error",
+            error,
+            )
         })?;
         invalidate_dir_cache(state, &session_id);
-        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "success", &format!("写入文件：{path}（{} 字节）", bytes.len()));
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "file.write",
+            "success",
+            &format!("写入文件：{path}（{} 字节）", bytes.len()),
+        );
         Ok(())
     })
     .await
@@ -1589,14 +1965,27 @@ pub async fn upload_file(
                     &ctx.settings,
                 )
             })
-            .map_err(|error| {
-                audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.upload", "error", &error);
-                error
+            .inspect_err(|error| {
+                audit(
+                    state,
+                    &ctx.workspace_id,
+                    Some(&ctx.shell.id),
+                    "file.upload",
+                    "error",
+                error,
+                )
             })?;
             offset = end;
         }
         invalidate_dir_cache(state, &session_id);
-        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.upload", "success", &format!("上传文件：{remote_path}（{} 字节）", bytes.len()));
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "file.upload",
+            "success",
+            &format!("上传文件：{remote_path}（{} 字节）", bytes.len()),
+        );
         Ok(())
     })
     .await
@@ -1616,14 +2005,28 @@ pub async fn write_chunk(
             .map_err(|_| "文件内容不是合法 Base64".to_string())?;
         let ctx = session_ctx(state, &session_id)?;
         with_session(state, &session_id, |session| {
-            ctx.protocol.write_chunk(session, &path, &bytes, offset, &ctx.settings)
+            ctx.protocol
+                .write_chunk(session, &path, &bytes, offset, &ctx.settings)
         })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "error", &error);
-            error
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "file.write",
+                "error",
+            error,
+            )
         })?;
         invalidate_dir_cache(state, &session_id);
-        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.write", "success", &format!("写入文件：{path}（偏移 {offset}，{} 字节）", bytes.len()));
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "file.write",
+            "success",
+            &format!("写入文件：{path}（偏移 {offset}，{} 字节）", bytes.len()),
+        );
         Ok(())
     })
     .await
@@ -1638,50 +2041,83 @@ pub async fn download_file(
 ) -> Result<u64, String> {
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
-        // 分块拉取（块大小由设置配置，默认 4MB），避免大文件一次性占用内存与超时
+        // S4：下载目标必须是用户选定（save 对话框）的普通路径，拒绝敏感目录
+        let safe = sanitize_local_path(&local_path, true)?;
+        // 分块拉取（块大小由设置配置，默认 4MB），避免大文件一次性占用内存与超时；
+        // P3：逐块流式写盘（不再整文件累积在内存后一次性写入）
         let chunk_size = ctx.settings.chunk_size_mb.max(1) * 1024 * 1024;
-        let mut bytes: Vec<u8> = Vec::new();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&safe)
+            .map_err(|error| format!("创建本地文件失败：{error}"))?;
+        let mut written = 0u64;
         loop {
             let chunk = with_session(state, &session_id, |session| {
                 ctx.protocol
-                    .read_chunk(session, &remote_path, bytes.len() as u64, chunk_size, &ctx.settings)
+                    .read_chunk(session, &remote_path, written, chunk_size, &ctx.settings)
             })
-            .map_err(|error| {
-                audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.download", "error", &error);
-                error
+            .inspect_err(|error| {
+                audit(
+                    state,
+                    &ctx.workspace_id,
+                    Some(&ctx.shell.id),
+                    "file.download",
+                    "error",
+                error,
+                )
             })?;
             if chunk.is_empty() {
                 break;
             }
-            bytes.extend_from_slice(&chunk);
+            file.write_all(&chunk)
+                .map_err(|error| format!("写入本地文件失败：{error}"))?;
+            written += chunk.len() as u64;
             if (chunk.len() as u64) < chunk_size {
                 break;
             }
         }
-        std::fs::write(&local_path, &bytes)
-            .map_err(|error| format!("写入本地文件失败：{error}"))?;
-        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.download", "success", &format!("下载文件：{remote_path} → {local_path}（{} 字节）", bytes.len()));
-        Ok(bytes.len() as u64)
+        file.flush()
+            .map_err(|error| format!("刷新本地文件失败：{error}"))?;
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "file.download",
+            "success",
+            &format!("下载文件：{remote_path} → {local_path}（{written} 字节）"),
+        );
+        Ok(written)
     })
     .await
 }
 
 #[tauri::command]
-pub async fn delete_path(
-    session_id: String,
-    path: String,
-    app: AppHandle,
-) -> Result<(), String> {
+pub async fn delete_path(session_id: String, path: String, app: AppHandle) -> Result<(), String> {
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
         with_session(state, &session_id, |session| {
             ctx.protocol.delete_path(session, &path, &ctx.settings)
         })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.delete", "error", &error);
-            error
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "file.delete",
+                "error",
+            error,
+            )
         })?;
-        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.delete", "success", &format!("删除：{path}"));
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "file.delete",
+            "success",
+            &format!("删除：{path}"),
+        );
         invalidate_dir_cache(state, &session_id);
         Ok(())
     })
@@ -1700,11 +2136,24 @@ pub async fn rename_path(
         with_session(state, &session_id, |session| {
             ctx.protocol.rename_path(session, &from, &to, &ctx.settings)
         })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.rename", "error", &error);
-            error
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "file.rename",
+                "error",
+            error,
+            )
         })?;
-        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.rename", "success", &format!("重命名：{from} → {to}"));
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "file.rename",
+            "success",
+            &format!("重命名：{from} → {to}"),
+        );
         invalidate_dir_cache(state, &session_id);
         Ok(())
     })
@@ -1721,13 +2170,27 @@ pub async fn touch_path(
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
         with_session(state, &session_id, |session| {
-            ctx.protocol.touch_path(session, &path, timestamp, &ctx.settings)
+            ctx.protocol
+                .touch_path(session, &path, timestamp, &ctx.settings)
         })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.touch", "error", &error);
-            error
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "file.touch",
+                "error",
+            error,
+            )
         })?;
-        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.touch", "success", &format!("touch：{path}"));
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "file.touch",
+            "success",
+            &format!("touch：{path}"),
+        );
         invalidate_dir_cache(state, &session_id);
         Ok(())
     })
@@ -1735,21 +2198,30 @@ pub async fn touch_path(
 }
 
 #[tauri::command]
-pub async fn create_dir(
-    session_id: String,
-    path: String,
-    app: AppHandle,
-) -> Result<(), String> {
+pub async fn create_dir(session_id: String, path: String, app: AppHandle) -> Result<(), String> {
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
         with_session(state, &session_id, |session| {
             ctx.protocol.create_dir(session, &path, &ctx.settings)
         })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.mkdir", "error", &error);
-            error
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "file.mkdir",
+                "error",
+            error,
+            )
         })?;
-        audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "file.mkdir", "success", &format!("新建目录：{path}"));
+        audit(
+            state,
+            &ctx.workspace_id,
+            Some(&ctx.shell.id),
+            "file.mkdir",
+            "success",
+            &format!("新建目录：{path}"),
+        );
         invalidate_dir_cache(state, &session_id);
         Ok(())
     })
@@ -1764,7 +2236,10 @@ pub async fn list_request_log(
     app: AppHandle,
 ) -> Result<Vec<RequestRecord>, String> {
     blocking(app, move |_state| {
-        Ok(crate::protocol::php::list_requests(endpoint.as_deref()))
+        Ok(crate::protocol::reqlog::list_requests(
+            endpoint.as_deref(),
+            None,
+        ))
     })
     .await
 }
@@ -1772,7 +2247,7 @@ pub async fn list_request_log(
 #[tauri::command]
 pub async fn clear_request_log(app: AppHandle) -> Result<(), String> {
     blocking(app, move |_state| {
-        crate::protocol::php::clear_requests();
+        crate::protocol::reqlog::clear_requests();
         Ok(())
     })
     .await
@@ -1789,9 +2264,15 @@ pub async fn db_probe(
         let result = with_session(state, &session_id, |session| {
             ctx.protocol.db_probe(session, &connection, &ctx.settings)
         })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "db.probe", "error", &error);
-            error
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "db.probe",
+                "error",
+            error,
+            )
         })?;
         audit(
             state,
@@ -1799,7 +2280,12 @@ pub async fn db_probe(
             Some(&ctx.shell.id),
             "db.probe",
             "success",
-            &format!("探测数据库：{}@{}（{} 个库）", connection.driver, connection.host.as_deref().unwrap_or("localhost"), result.databases.len()),
+            &format!(
+                "探测数据库：{}@{}（{} 个库）",
+                connection.driver,
+                connection.host.as_deref().unwrap_or("localhost"),
+                result.databases.len()
+            ),
         );
         Ok(result)
     })
@@ -1816,11 +2302,18 @@ pub async fn db_query(
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
         let result = with_session(state, &session_id, |session| {
-            ctx.protocol.db_query(session, &connection, &sql, &ctx.settings)
+            ctx.protocol
+                .db_query(session, &connection, &sql, &ctx.settings)
         })
-        .map_err(|error| {
-            audit(state, &ctx.workspace_id, Some(&ctx.shell.id), "db.query", "error", &error);
-            error
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "db.query",
+                "error",
+            error,
+            )
         })?;
         let sql_preview: String = sql.chars().take(120).collect();
         audit(
@@ -1844,10 +2337,10 @@ pub async fn db_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dosword_sdk::domain::{CreateShell, CreateWorkspace};
     use crate::protocol::{MOCK_PROTOCOL_ID, ProtocolRegistry};
     use crate::session::SessionManager;
     use crate::storage::Database;
+    use dosword_sdk::domain::{CreateShell, CreateWorkspace};
     use std::sync::Mutex;
 
     fn app_state() -> AppState {
@@ -1857,7 +2350,7 @@ mod tests {
             protocols: ProtocolRegistry::builtin(),
             feature_plugins: std::sync::Mutex::new(dosword_sdk::FeaturePluginRegistry::builtin()),
             ptys: crate::pty::PtyRegistry::new(),
-            dir_cache: Mutex::new(std::collections::HashMap::new()),
+            dir_cache: Mutex::new(crate::DirCache::new()),
         }
     }
 
@@ -1897,7 +2390,9 @@ mod tests {
     fn encode_text_gbk_round_trip() {
         // "中文" 的 GBK 编码（浏览器 TextEncoder 不支持，走后端）
         let encoded = encode_text_impl("中文测试", "gbk").unwrap();
-        let bytes = base64::engine::general_purpose::STANDARD.decode(&encoded).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .unwrap();
         assert_eq!(bytes, b"\xd6\xd0\xce\xc4\xb2\xe2\xca\xd4", "GBK 字节应正确");
         // 用 encoding_rs 解码验证往返
         let (decoded, _, _) = encoding_rs::GBK.decode(&bytes);
@@ -1924,14 +2419,8 @@ mod tests {
     #[test]
     fn test_connection_unknown_protocol_rejected() {
         let state = app_state();
-        let result = test_connection_impl(
-            &state,
-            "mock://local",
-            "secret",
-            "unknown.v1",
-            None,
-            None,
-        );
+        let result =
+            test_connection_impl(&state, "mock://local", "secret", "unknown.v1", None, None);
         assert!(result.is_err(), "未知协议应报错");
         assert!(result.unwrap_err().contains("未知协议"));
     }
@@ -1939,14 +2428,8 @@ mod tests {
     #[test]
     fn test_connection_invalid_endpoint_rejected() {
         let state = app_state();
-        let result = test_connection_impl(
-            &state,
-            "not-a-url",
-            "secret",
-            MOCK_PROTOCOL_ID,
-            None,
-            None,
-        );
+        let result =
+            test_connection_impl(&state, "not-a-url", "secret", MOCK_PROTOCOL_ID, None, None);
         assert!(result.is_err(), "非法 URL 应报错");
     }
 
@@ -2015,36 +2498,70 @@ mod tests {
     }
 
     #[test]
+    fn import_shells_enforces_workspace_scope() {
+        let state = app_state();
+        let wid = add_workspace(&mut state.database.lock().unwrap(), "localhost", None);
+        let payload = serde_json::json!([
+            {
+                "name": "in-scope",
+                "endpoint": "http://localhost/shell.php",
+                "runtime": "php",
+                "protocol_id": "builtin.php.v1",
+                "password": "x",
+                "protocol_params": "{}",
+                "tags": []
+            },
+            {
+                "name": "out-of-scope",
+                "endpoint": "http://evil.example/shell.php",
+                "runtime": "php",
+                "protocol_id": "builtin.php.v1",
+                "password": "y",
+                "protocol_params": "{}",
+                "tags": []
+            }
+        ]);
+        let result = import_shells_impl(&state, &payload.to_string(), &wid).unwrap();
+        assert_eq!(result.imported, 1, "仅授权范围内的应导入");
+        assert_eq!(result.skipped, 1, "越界 endpoint 应被跳过");
+        let shells = state.database.lock().unwrap().list_shells().unwrap();
+        assert!(shells.iter().all(|s| !s.endpoint.contains("evil.example")));
+    }
+
+    #[test]
     fn batch_update_shells_sets_tags() {
         let state = app_state();
         let wid = add_workspace(&mut state.database.lock().unwrap(), "scope-a", None);
         let shell = add_shell(&state, &wid, MOCK_PROTOCOL_ID);
-        let count = batch_update_shells_impl(&state, &[shell.id.clone()], Some(vec!["prod".to_string()]), None).unwrap();
+        let count = batch_update_shells_impl(
+            &state,
+            &[shell.id.clone()],
+            Some(vec!["prod".to_string()]),
+            None,
+        )
+        .unwrap();
         assert_eq!(count, 1);
-        let updated = state.database.lock().unwrap().shell(&shell.id).unwrap().unwrap();
+        let updated = state
+            .database
+            .lock()
+            .unwrap()
+            .shell(&shell.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.tags, vec!["prod"]);
     }
 
     fn register_session(state: &AppState, shell: &ShellProfile) -> String {
         let protocol = state.protocols.get(&shell.protocol_id).unwrap();
-        let settings = state
-            .database
-            .lock()
-            .unwrap()
-            .get_settings()
-            .unwrap();
+        let settings = state.database.lock().unwrap().get_settings().unwrap();
         let (session, probe) = protocol.connect(shell, &settings).unwrap();
-        state
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(
-                &shell.id,
-                &shell.workspace_id,
-                &shell.protocol_id,
-                Arc::from(session),
-                probe,
-            )
+        state.sessions.lock().unwrap().insert(
+            &shell.id,
+            &shell.workspace_id,
+            &shell.protocol_id,
+            Arc::from(session),
+            probe,
+        )
     }
 
     #[test]
@@ -2102,7 +2619,10 @@ mod tests {
         let state = app_state();
         let workspace_id = add_workspace(&mut state.database.lock().unwrap(), "localhost", None);
         let shell = add_shell(&state, &workspace_id, "builtin.php.v1");
-        let settings = AppSettings { http_enabled: false, ..AppSettings::default() };
+        let settings = AppSettings {
+            http_enabled: false,
+            ..AppSettings::default()
+        };
 
         // 网络协议 + 全局开关关闭 → 拒绝
         let result = require_authorized_for(&state, &shell, &settings);
@@ -2118,10 +2638,14 @@ mod tests {
     #[test]
     fn require_authorized_for_checks_scope() {
         let state = app_state();
-        let workspace_id = add_workspace(&mut state.database.lock().unwrap(), "other.example", None);
+        let workspace_id =
+            add_workspace(&mut state.database.lock().unwrap(), "other.example", None);
         let shell = add_shell(&state, &workspace_id, "builtin.php.v1");
         // PHP 协议 shell 端点不在授权范围内，即使开关开启也会被拒绝
-        let settings = AppSettings { http_enabled: true, ..AppSettings::default() };
+        let settings = AppSettings {
+            http_enabled: true,
+            ..AppSettings::default()
+        };
         let result = require_authorized_for(&state, &shell, &settings);
         assert!(result.is_err(), "越界端点应被拒绝");
         assert!(result.unwrap_err().contains("授权范围"));

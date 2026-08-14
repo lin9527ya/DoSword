@@ -4,11 +4,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use dosword_sdk::{
-    FeatureManifest, FeaturePlugin, NativePluginAbi, ProtocolError,
-};
 use dosword_sdk::domain::AppSettings;
 use dosword_sdk::protocol::{Protocol, SessionState};
+use dosword_sdk::{FeatureManifest, FeaturePlugin, NativePluginAbi, ProtocolError};
 
 const ABI_MAGIC: u32 = 0x4453_5744;
 const ABI_VERSION: u32 = 1;
@@ -26,9 +24,10 @@ impl NativeFeaturePlugin {
         let lib = unsafe { libloading::Library::new(path) }
             .map_err(|error| format!("加载插件失败：{error}"))?;
         // SAFETY: 符号由导出宏固定生成
-        let entry: libloading::Symbol<unsafe extern "C" fn() -> *const NativePluginAbi> =
-            unsafe { lib.get(b"dosword_plugin_abi") }
-                .map_err(|_| "插件缺少 dosword_plugin_abi 导出符号（非本工具二进制插件）".to_string())?;
+        let entry: libloading::Symbol<unsafe extern "C" fn() -> *const NativePluginAbi> = unsafe {
+            lib.get(b"dosword_plugin_abi")
+        }
+        .map_err(|_| "插件缺少 dosword_plugin_abi 导出符号（非本工具二进制插件）".to_string())?;
         // SAFETY: 调用插件导出函数获取 ABI 指针
         let abi_ptr = unsafe { entry() };
         if abi_ptr.is_null() {
@@ -40,7 +39,10 @@ impl NativeFeaturePlugin {
             return Err(format!("插件魔数不匹配（0x{:08x}）", abi.magic));
         }
         if abi.version != ABI_VERSION {
-            return Err(format!("插件 ABI 版本不兼容（{}，当前 {ABI_VERSION}）", abi.version));
+            return Err(format!(
+                "插件 ABI 版本不兼容（{}，当前 {ABI_VERSION}）",
+                abi.version
+            ));
         }
         Ok(Self {
             _lib: Arc::new(lib),
@@ -61,13 +63,15 @@ impl NativeFeaturePlugin {
         serde_json::from_str(json).map_err(|error| format!("插件清单解析失败：{error}"))
     }
 
-    fn execute_json(&self, runtime: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    fn execute_json(
+        &self,
+        runtime: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let runtime_c = CString::new(runtime).map_err(|_| "runtime 含 NUL".to_string())?;
         let params_c = CString::new(params.to_string()).map_err(|_| "参数含 NUL".to_string())?;
-        // SAFETY: 插件 ABI 已校验；函数指针在 Library 存活期内有效
-        let out = unsafe {
-            (self.abi.execute_json)(runtime_c.as_ptr(), params_c.as_ptr())
-        };
+        // 插件 ABI 已校验；函数指针在 Library 存活期内有效（指针本身为安全 extern fn）
+        let out = (self.abi.execute_json)(runtime_c.as_ptr(), params_c.as_ptr());
         if out.is_null() {
             return Err("插件执行返回空".to_string());
         }
@@ -76,9 +80,8 @@ impl NativeFeaturePlugin {
             .to_str()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        unsafe { (self.abi.free_json)(out) };
-        serde_json::from_str(&result)
-            .map_err(|error| format!("插件结果非 JSON：{error}"))
+        (self.abi.free_json)(out);
+        serde_json::from_str(&result).map_err(|error| format!("插件结果非 JSON：{error}"))
     }
 }
 
@@ -108,7 +111,6 @@ impl FeaturePlugin for NativeFeaturePlugin {
             .map_err(|error| ProtocolError::ServerError(error))
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -142,7 +144,10 @@ mod tests {
         }
         let plugin = NativeFeaturePlugin::load(&path).unwrap();
         let out = plugin
-            .execute_json("php", &serde_json::json!({"op": "b64_encode", "text": "hello"}))
+            .execute_json(
+                "php",
+                &serde_json::json!({"op": "b64_encode", "text": "hello"}),
+            )
             .unwrap();
         assert_eq!(out["output"], "aGVsbG8=");
         let out = plugin
@@ -150,9 +155,11 @@ mod tests {
             .unwrap();
         assert_eq!(out["output"], "cba");
         // 未知操作 → 错误
-        assert!(plugin
-            .execute_json("php", &serde_json::json!({"op": "nope"}))
-            .is_err());
+        assert!(
+            plugin
+                .execute_json("php", &serde_json::json!({"op": "nope"}))
+                .is_err()
+        );
     }
 
     #[test]

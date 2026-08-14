@@ -14,12 +14,12 @@
 use std::any::Any;
 use std::time::Instant;
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use dosword_sdk::domain::{
-    AppSettings, CommandOutput, DirListing, ProbeResult, ShellProfile,
+use base64::engine::general_purpose::STANDARD as B64;
+use dosword_sdk::domain::{AppSettings, CommandOutput, DirListing, ProbeResult, ShellProfile};
+use dosword_sdk::{
+    PluginKind, PluginManifest, Protocol, ProtocolError, ProtocolPlugin, SessionState,
 };
-use dosword_sdk::{PluginKind, PluginManifest, Protocol, ProtocolError, ProtocolPlugin, SessionState};
 
 pub const ECHO_PROTOCOL_ID: &str = "dev.echo.v1";
 
@@ -44,7 +44,9 @@ const TEMPLATE_FRAME: &str = r#"echo '{NONCE}'.'{PAYLOAD}'.'{NONCE}';"#;
 
 fn build_client(settings: &AppSettings) -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(settings.default_timeout_secs))
+        .timeout(std::time::Duration::from_secs(
+            settings.default_timeout_secs,
+        ))
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("DoSword/1.0 (echo-plugin)")
         .build()
@@ -80,7 +82,11 @@ impl EchoProtocol {
         if !response.status().is_success() {
             return Err(ProtocolError::HttpStatus(
                 response.status().as_u16(),
-                response.status().canonical_reason().unwrap_or("").to_string(),
+                response
+                    .status()
+                    .canonical_reason()
+                    .unwrap_or("")
+                    .to_string(),
             ));
         }
         let bytes = response
@@ -93,13 +99,13 @@ impl EchoProtocol {
             ));
         }
         // 定位 nonce 帧
-        let start = text.find(&nonce).ok_or_else(|| {
-            ProtocolError::ParseError("响应中未找到协议帧".to_string())
-        })?;
+        let start = text
+            .find(&nonce)
+            .ok_or_else(|| ProtocolError::ParseError("响应中未找到协议帧".to_string()))?;
         let tail = &text[start + nonce.len()..];
-        let end = tail.find(&nonce).ok_or(ProtocolError::ParseError(
-            "协议帧不完整".to_string(),
-        ))?;
+        let end = tail
+            .find(&nonce)
+            .ok_or(ProtocolError::ParseError("协议帧不完整".to_string()))?;
         let payload_b64 = &tail[..end];
         let decoded = B64
             .decode(payload_b64)
@@ -302,8 +308,9 @@ mod tests {
             default_timeout_secs: 5,
             proxy: None,
             max_file_size_mb: 32,
-        chunk_size_mb: 4,
-        allow_arbitrary_code: true,
+            chunk_size_mb: 4,
+            allow_arbitrary_code: true,
+            audit_retention_days: 90,
         }
     }
 
@@ -353,10 +360,9 @@ mod tests {
                     .map(|i| i + 4)
                     .unwrap_or(request.len());
                 let body = &request[body_start.min(request.len())..];
-                let params: Vec<(String, String)> =
-                    url::form_urlencoded::parse(body.as_bytes())
-                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                        .collect();
+                let params: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
                 let k = params
                     .iter()
                     .find(|(key, _)| key == "k")
@@ -420,7 +426,9 @@ mod tests {
 
         let probe = proto.probe(&profile, &settings).expect("探测应成功");
         assert_eq!(probe.status, "online");
-        let (k, _) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("应收到请求");
+        let (k, _) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("应收到请求");
         assert_eq!(k, "secret");
 
         let (session, _) = proto.connect(&profile, &settings).unwrap();
@@ -446,11 +454,15 @@ mod tests {
     #[test]
     fn unsupported_ops_return_not_supported() {
         let proto = EchoProtocol;
-        let result = proto.list_dir(&EchoSession {
-            endpoint: "http://t".into(),
-            password: "s".into(),
-            client: build_client(&settings()),
-        }, "/", &settings());
+        let result = proto.list_dir(
+            &EchoSession {
+                endpoint: "http://t".into(),
+                password: "s".into(),
+                client: build_client(&settings()),
+            },
+            "/",
+            &settings(),
+        );
         assert!(matches!(result, Err(ProtocolError::NotSupported(_))));
     }
 }

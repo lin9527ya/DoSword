@@ -1,9 +1,9 @@
 mod auth;
 mod commands;
+mod native_plugin;
 mod protocol;
 mod pty;
 mod session;
-mod native_plugin;
 mod storage;
 
 use std::sync::Mutex;
@@ -19,7 +19,66 @@ pub struct AppState {
     protocols: ProtocolRegistry,
     feature_plugins: std::sync::Mutex<dosword_sdk::FeaturePluginRegistry>,
     ptys: pty::PtyRegistry,
-    dir_cache: Mutex<std::collections::HashMap<(String, String), (std::time::Instant, dosword_sdk::domain::DirListing)>>,
+    dir_cache: Mutex<DirCache>,
+}
+
+/// 目录列表缓存（LRU + TTL 5s）：容量 256，满则淘汰最久未使用条目（P7）。
+/// 键 = (session_id, path)；写操作按会话失效。
+pub struct DirCache {
+    map: std::collections::HashMap<
+        (String, String),
+        (std::time::Instant, dosword_sdk::domain::DirListing),
+    >,
+    order: std::collections::VecDeque<(String, String)>,
+    cap: usize,
+}
+
+impl DirCache {
+    pub fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap: 256,
+        }
+    }
+
+    /// 命中时把键移到队尾（LRU 语义）。
+    pub fn get(
+        &mut self,
+        key: &(String, String),
+    ) -> Option<&(std::time::Instant, dosword_sdk::domain::DirListing)> {
+        if let Some(position) = self.order.iter().position(|item| item == key) {
+            let entry = self.order.remove(position)?;
+            self.order.push_back(entry);
+        }
+        self.map.get(key)
+    }
+
+    pub fn insert(
+        &mut self,
+        key: (String, String),
+        value: (std::time::Instant, dosword_sdk::domain::DirListing),
+    ) {
+        if let Some(position) = self.order.iter().position(|item| *item == key) {
+            self.order.remove(position);
+        }
+        while self.map.len() >= self.cap {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.map.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
+
+    /// 失效某会话的全部目录缓存（写操作后调用，保证一致性）。
+    pub fn invalidate_session(&mut self, session_id: &str) {
+        self.order.retain(|key| key.0 != session_id);
+        self.map.retain(|key, _| key.0 != session_id);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -31,6 +90,12 @@ pub fn run() {
             let app_data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data)?;
             let database = Database::open(app_data.join("dosword.sqlite3"))?;
+            // P5：启动时按保留期清理过期审计（设置 0 表示不清理）
+            if let Ok(settings) = database.get_settings() {
+                if settings.audit_retention_days > 0 {
+                    let _ = database.purge_audit(settings.audit_retention_days);
+                }
+            }
             let plugins_dir = app_data.join("plugins");
             if plugins_dir.exists() {
                 if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
@@ -39,7 +104,9 @@ pub fn run() {
                         let file_name = entry.file_name().to_string_lossy().into_owned();
                         if file_name.ends_with(".plugin") {
                             if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                                if let Ok(plugin) = dosword_sdk::ScriptFeaturePlugin::from_json(&content) {
+                                if let Ok(plugin) =
+                                    dosword_sdk::ScriptFeaturePlugin::from_json(&content)
+                                {
                                     let id = plugin.manifest().id.clone();
                                     if registry.register(Box::new(plugin)).is_ok() {
                                         registry.installed.insert(id);
@@ -48,7 +115,9 @@ pub fn run() {
                             }
                         } else if file_name.contains(".native.") {
                             // 二进制插件：动态加载（失败跳过，不阻塞启动）
-                            if let Ok(plugin) = crate::native_plugin::NativeFeaturePlugin::load(&entry.path()) {
+                            if let Ok(plugin) =
+                                crate::native_plugin::NativeFeaturePlugin::load(&entry.path())
+                            {
                                 if let Ok(manifest) = plugin.abi_manifest() {
                                     let id = manifest.id.clone();
                                     if registry.register(Box::new(plugin)).is_ok() {
@@ -64,7 +133,7 @@ pub fn run() {
                         protocols: ProtocolRegistry::builtin(),
                         feature_plugins: std::sync::Mutex::new(registry),
                         ptys: pty::PtyRegistry::new(),
-                        dir_cache: Mutex::new(std::collections::HashMap::new()),
+                        dir_cache: Mutex::new(DirCache::new()),
                     });
                     return Ok(());
                 }
@@ -73,9 +142,11 @@ pub fn run() {
                 database: Mutex::new(database),
                 sessions: Mutex::new(SessionManager::new()),
                 protocols: ProtocolRegistry::builtin(),
-                feature_plugins: std::sync::Mutex::new(dosword_sdk::FeaturePluginRegistry::builtin()),
+                feature_plugins: std::sync::Mutex::new(
+                    dosword_sdk::FeaturePluginRegistry::builtin(),
+                ),
                 ptys: pty::PtyRegistry::new(),
-                dir_cache: Mutex::new(std::collections::HashMap::new()),
+                dir_cache: Mutex::new(DirCache::new()),
             });
             Ok(())
         })
@@ -88,6 +159,7 @@ pub fn run() {
             commands::update_shell,
             commands::delete_shell,
             commands::probe_shell,
+            commands::test_connection,
             commands::list_protocols,
             commands::list_plugins,
             commands::list_feature_plugins,

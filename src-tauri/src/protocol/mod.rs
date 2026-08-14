@@ -6,6 +6,7 @@
 pub mod jsp;
 pub mod mock;
 pub mod php;
+pub mod reqlog;
 pub mod transport;
 
 use dosword_sdk::domain::ProtocolMeta;
@@ -32,9 +33,7 @@ impl ProtocolRegistry {
             Box::new(jsp::NodeProtocol),
             Box::new(dosword_plugin_echo::EchoProtocol),
         ] {
-            inner
-                .register(plugin)
-                .expect("内置插件注册失败（id 冲突）");
+            inner.register(plugin).expect("内置插件注册失败（id 冲突）");
         }
         Self { inner }
     }

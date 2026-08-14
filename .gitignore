@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# 大体积会话导出/临时归档（勿提交）
+webshell优化.json
+webshell优化.zip
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
