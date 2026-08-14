@@ -222,6 +222,8 @@ pub struct CommandOutput {
     pub duration_ms: u64,
     /// 命令执行后的服务器工作目录（终端据此更新提示符）。
     pub cwd: Option<String>,
+    /// 原始输出字节（base64）——终端 GBK 等非 UTF-8 场景用。
+    pub raw_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

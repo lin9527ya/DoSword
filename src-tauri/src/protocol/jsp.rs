@@ -278,6 +278,7 @@ impl Protocol for JvmLikeProtocol {
             stdout: String::from_utf8_lossy(&decoded).into_owned(),
             cwd: Some(cwd),
             duration_ms: 0,
+            raw_b64: Some(base64::engine::general_purpose::STANDARD.encode(&decoded)),
         })
     }
 

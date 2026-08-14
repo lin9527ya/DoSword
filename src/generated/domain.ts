@@ -85,7 +85,11 @@ export type CommandOutput = { stdout: string, durationMs: number,
 /**
  * 命令执行后的服务器工作目录（终端据此更新提示符）。
  */
-cwd: string | null, };
+cwd: string | null, 
+/**
+ * 原始输出字节（base64）——终端 GBK 等非 UTF-8 场景用。
+ */
+rawB64: string | null, };
 export type DirListing = { entries: Array<FileEntry>, };
 export type FileEntry = { name: string, path: string, isDir: boolean, size: number, modified: string, 
 /**

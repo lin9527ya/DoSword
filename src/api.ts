@@ -190,8 +190,13 @@ export const api = {
 
 export const b64 = {
   encodeBytes(bytes: Uint8Array): string {
+    // 分块拼接（每块 8KB），避免 4MB 级逐字节字符串追加卡顿主线程
+    const CHUNK = 8192;
     let binary = "";
-    for (const byte of bytes) binary += String.fromCharCode(byte);
+    for (let offset = 0; offset < bytes.length; offset += CHUNK) {
+      const end = Math.min(offset + CHUNK, bytes.length);
+      binary += String.fromCharCode(...bytes.subarray(offset, end));
+    }
     return btoa(binary);
   },
   decodeBytes(value: string): Uint8Array {

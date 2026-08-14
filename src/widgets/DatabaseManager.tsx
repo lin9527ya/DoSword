@@ -42,6 +42,8 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
   const [tables, setTables] = useState<string[]>([]);
   const [sql, setSql] = useState("");
   const [result, setResult] = useState<DbQueryResult | null>(null);
+  const [page, setPage] = useState(0);
+  const PAGE_SIZE = 100;
   const [busy, setBusy] = useState<"probe" | "tables" | "query" | null>(null);
   const [error, setError] = useState("");
 
@@ -98,6 +100,7 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
     try {
       const conn = { ...connection, dbname: selectedDb };
       setResult(await api.dbQuery(sessionId, conn, sqlText));
+      setPage(0);
     } catch (cause) {
       setError(errorText(cause));
     } finally {
@@ -352,15 +355,43 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
             {result.rows.length === 0 ? (
               <Empty icon={<Table2 />} title="查询无结果" />
             ) : (
-              result.rows.map((row, rowIndex) => (
-                <div className="db-result-row" key={rowIndex}>
-                  {Array.from({ length: cellCount }, (_, i) => (
-                    <span key={i} className={row[i] === null ? "null" : ""}>
-                      {row[i] === null ? "NULL" : row[i]}
+              <>
+                {(() => {
+                  const start = page * PAGE_SIZE;
+                  const slice = result.rows.slice(start, start + PAGE_SIZE);
+                  return slice.map((row, rowIndex) => (
+                    <div className="db-result-row" key={start + rowIndex}>
+                      {Array.from({ length: cellCount }, (_, i) => (
+                        <span key={i} className={row[i] === null ? "null" : ""}>
+                          {row[i] === null ? "NULL" : row[i]}
+                        </span>
+                      ))}
+                    </div>
+                  ));
+                })()}
+                {result.rows.length > PAGE_SIZE && (
+                  <div className="db-result-pager">
+                    <button
+                      className="button compact"
+                      disabled={page === 0}
+                      onClick={() => setPage((p) => p - 1)}
+                    >
+                      上一页
+                    </button>
+                    <span className="db-result-page-info">
+                      {page + 1} / {Math.ceil(result.rows.length / PAGE_SIZE)}（共{" "}
+                      {result.rows.length} 行）
                     </span>
-                  ))}
-                </div>
-              ))
+                    <button
+                      className="button compact"
+                      disabled={(page + 1) * PAGE_SIZE >= result.rows.length}
+                      onClick={() => setPage((p) => p + 1)}
+                    >
+                      下一页
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>

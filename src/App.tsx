@@ -32,6 +32,7 @@ function App() {
           id: `shell-${tabSeq++}`,
           shellId: view.shellId,
           sessionId: view.sessionId,
+          name: view.shellName,
         };
         setActiveTab(tab.id);
         return [...prev, tab];

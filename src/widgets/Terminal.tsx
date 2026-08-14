@@ -63,10 +63,13 @@ function renderOutput(stdout: string, mode: ViewMode): string {
 export function Terminal({
   sessionId,
   currentDir,
+  active = true,
   onCwdChange,
 }: {
   sessionId: string;
   currentDir?: string;
+  /** 是否活动（非活动时暂停轮询但保持 PTY 连接，切回不丢历史）。 */
+  active?: boolean;
   onCwdChange?: (cwd: string) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -88,7 +91,12 @@ export function Terminal({
   const [ptyFailed, setPtyFailed] = useState(false);
   const ptyFailedRef = useRef(false);
   ptyFailedRef.current = ptyFailed;
+  const [outputEncoding, setOutputEncoding] = useState<"utf-8" | "gbk">("utf-8");
+  const encodingRef = useRef<"utf-8" | "gbk">("utf-8");
+  encodingRef.current = outputEncoding;
   const pollTimerRef = useRef<number | null>(null);
+  const activeRef = useRef(true);
+  activeRef.current = active;
 
   useEffect(() => {
     try {
@@ -101,6 +109,7 @@ export function Terminal({
   const prompt = () => `dosword@target:${currentDirRef.current ?? "~"}$ `;
 
   async function pollPty(id: string) {
+    if (!activeRef.current) return;
     try {
       const result = await api.ptyRead(id);
       if (result.data) {
@@ -140,7 +149,16 @@ export function Terminal({
     term.write(`\r\n`);
     try {
       const output = await api.executeCommand(sessionId, command);
-      term.write(renderOutput(output.stdout, viewModeRef.current).replace(/\n$/, "") + "\r\n");
+      let display = output.stdout;
+      if (output.rawB64 && encodingRef.current === "gbk") {
+        const bytes = b64decodeToUint8(output.rawB64);
+        try {
+          display = new TextDecoder("gbk").decode(bytes);
+        } catch {
+          display = output.stdout;
+        }
+      }
+      term.write(renderOutput(display, viewModeRef.current).replace(/\n$/, "") + "\r\n");
       if (output.cwd) onCwdChange?.(output.cwd);
     } catch (error) {
       term.write(`\x1b[31m${String(error)}\x1b[0m\r\n`);
@@ -304,6 +322,20 @@ export function Terminal({
   return (
     <div className="terminal-wrap">
       <div className="term-toolbar">
+        {!ptyId && !ptyFailed && (
+          <span className="term-toolbar-label">输出编码</span>
+        )}
+        {!ptyId && !ptyFailed && (
+          <select
+            className="select term-encoding"
+            value={outputEncoding}
+            onChange={(event) => setOutputEncoding(event.target.value as "utf-8" | "gbk")}
+            title="Windows 目标（chcp 936）输出请选 GBK"
+          >
+            <option value="utf-8">UTF-8</option>
+            <option value="gbk">GBK</option>
+          </select>
+        )}
         {ptyId ? (
           <span className="term-toolbar-label term-pty-badge">交互式会话（PTY）</span>
         ) : ptyFailed ? (

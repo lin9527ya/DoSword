@@ -125,7 +125,7 @@ export function Layout({
                 key={tab.id}
                 className={`shell-tab ${activeTab === tab.id ? "active" : ""}`}
                 onClick={() => onSelectTab?.(tab.id)}
-                title={tab.shellId}
+                title={tab.name || tab.shellId}
               >
                 {tab.shellId}
                 <button

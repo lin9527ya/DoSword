@@ -87,6 +87,7 @@ impl Protocol for MockProtocol {
             stdout,
             duration_ms: 0,
             cwd: None,
+            raw_b64: None,
         })
     }
 

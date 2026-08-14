@@ -300,7 +300,7 @@ export function DashboardView({
     setError("");
     try {
       const result = await api.connectShell(shell.id);
-      onNavigate({ kind: "shell", shellId: shell.id, sessionId: result.sessionId });
+      onNavigate({ kind: "shell", shellId: shell.id, sessionId: result.sessionId, shellName: shell.name });
     } catch (cause) {
       setError(errorText(cause));
       setConnecting(null);

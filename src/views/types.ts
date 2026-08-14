@@ -2,7 +2,7 @@
 
 export type View =
   | { kind: "dashboard" }
-  | { kind: "shell"; shellId: string; sessionId?: string }
+  | { kind: "shell"; shellId: string; sessionId?: string; shellName?: string }
   | { kind: "sessions" }
   | { kind: "debug" }
   | { kind: "audit" }
@@ -13,4 +13,5 @@ export type ShellTab = {
   id: string;
   shellId: string;
   sessionId?: string;
+  name?: string;
 };

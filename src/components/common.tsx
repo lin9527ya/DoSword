@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Component, type ReactNode } from "react";
 
 export function Metric({
   label,
@@ -67,4 +67,35 @@ export function Panel({
       {children}
     </section>
   );
+}
+
+/** 错误边界：任一子视图渲染异常时显示提示而非白屏。 */
+export class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state = { error: null as Error | null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error("渲染异常：", error);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="panel detail-panel">
+          <p className="eyebrow">渲染异常</p>
+          <pre className="plugin-result error">{String(this.state.error)}</pre>
+          <button className="button secondary" onClick={() => this.setState({ error: null })}>
+            重试
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }

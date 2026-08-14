@@ -188,79 +188,70 @@ export function ShellDetailView({
       </div>
 
       {tab === "info" && <InfoPanel shell={shell} info={info} sessionId={sessionId} />}
-      {tab === "files" && sessionId && (
-        <div className="panel detail-panel">
-          <FileManager
-            sessionId={sessionId}
-            startDir={info?.currentDir ?? "/"}
-            separator={info?.separator ?? "/"}
-          />
-        </div>
-      )}
-      {tab === "files" && !sessionId && (
-        <div className="panel detail-panel">
-          <p className="muted pad">连接成功后才能浏览文件。</p>
-        </div>
-      )}
-      {tab === "database" && sessionId && (
-        <div className="panel detail-panel">
-          <DatabaseManager sessionId={sessionId} />
-        </div>
-      )}
-      {tab === "database" && !sessionId && (
-        <div className="panel detail-panel">
-          <p className="muted pad">连接成功后才能浏览数据库。</p>
-        </div>
-      )}
-      {tab === "plugins" && sessionId && (
-        <PluginPanel sessionId={sessionId} />
-      )}
-      {tab === "plugins" && !sessionId && (
-        <p className="panel-note">请先连接 Shell 后使用插件面板。</p>
-      )}
-      {tab === "terminal" && sessionId && (
-        <div className="panel detail-panel terminal-panel">
-          <div className="terminal-tabs">
-            {terminals.map((terminal) => (
-              <button
-                key={terminal.id}
-                className={`terminal-tab ${activeTerminal === terminal.id ? "active" : ""}`}
-                onClick={() => setActiveTerminal(terminal.id)}
-              >
-                <span className="terminal-tab-dir">{terminal.dir}</span>
-                <span
-                  className="terminal-tab-close"
-                  role="button"
-                  title="关闭终端"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    closeTerminal(terminal.id);
-                  }}
-                >
-                  ×
-                </span>
-              </button>
-            ))}
-            <button className="terminal-tab add" title="新建终端" onClick={() => openTerminal()}>
-              +
-            </button>
-          </div>
-          {terminals.map((terminal) =>
-            terminal.id === activeTerminal ? (
-              <Terminal
-                key={terminal.id}
+      {sessionId ? (
+        <>
+          <div className={`detail-tabpane ${tab === "files" ? "" : "hidden"}`}>
+            <div className="panel detail-panel">
+              <FileManager
                 sessionId={sessionId}
-                currentDir={terminal.dir}
-                onCwdChange={(cwd) => updateTerminalDir(terminal.id, cwd)}
+                startDir={info?.currentDir ?? "/"}
+                separator={info?.separator ?? "/"}
               />
-            ) : null,
-          )}
-        </div>
-      )}
-      {tab === "terminal" && !sessionId && (
-        <div className="panel detail-panel">
-          <p className="muted pad">连接成功后才能执行命令。</p>
-        </div>
+            </div>
+          </div>
+          <div className={`detail-tabpane ${tab === "database" ? "" : "hidden"}`}>
+            <div className="panel detail-panel">
+              <DatabaseManager sessionId={sessionId} />
+            </div>
+          </div>
+          <div className={`detail-tabpane ${tab === "plugins" ? "" : "hidden"}`}>
+            <PluginPanel sessionId={sessionId} />
+          </div>
+          <div className={`detail-tabpane ${tab === "terminal" ? "" : "hidden"}`}>
+            <div className="panel detail-panel terminal-panel">
+              <div className="terminal-tabs">
+                {terminals.map((terminal) => (
+                  <button
+                    key={terminal.id}
+                    className={`terminal-tab ${activeTerminal === terminal.id ? "active" : ""}`}
+                    onClick={() => setActiveTerminal(terminal.id)}
+                  >
+                    <span className="terminal-tab-dir">{terminal.dir}</span>
+                    <span
+                      className="terminal-tab-close"
+                      role="button"
+                      title="关闭终端"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        closeTerminal(terminal.id);
+                      }}
+                    >
+                      ×
+                    </span>
+                  </button>
+                ))}
+                <button className="terminal-tab add" title="新建终端" onClick={() => openTerminal()}>
+                  +
+                </button>
+              </div>
+              {terminals.map((terminal) => (
+                <div
+                  key={terminal.id}
+                  className={`detail-tabpane ${activeTerminal === terminal.id ? "" : "hidden"}`}
+                >
+                  <Terminal
+                    sessionId={sessionId}
+                    currentDir={terminal.dir}
+                    active={activeTerminal === terminal.id}
+                    onCwdChange={(cwd) => updateTerminalDir(terminal.id, cwd)}
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+        </>
+      ) : (
+        <p className="panel-note">连接成功后才能使用文件管理 / 数据库 / 插件 / 终端。</p>
       )}
     </>
   );

@@ -347,11 +347,13 @@ impl PhpProtocol {
         let w = php.current_dir();
         let value = dispatch(php, "exec", &[("c", command), ("w", &w)], settings)?;
         let duration_ms = start.elapsed().as_millis() as u64;
-        let stdout = value
+        let raw = value
             .pointer("/data/stdout")
             .and_then(|v| v.as_str())
-            .and_then(|s| B64.decode(s).ok())
-            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|s| B64.decode(s).ok());
+        let stdout = raw
+            .as_deref()
+            .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok())
             .unwrap_or_default();
         let cwd = value
             .pointer("/data/cwd")
@@ -364,6 +366,7 @@ impl PhpProtocol {
             stdout,
             duration_ms,
             cwd,
+            raw_b64: raw.map(|bytes| B64.encode(bytes)),
         })
     }
 
@@ -908,11 +911,13 @@ impl Protocol for PhpProtocol {
         )?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        let stdout = value
+        let raw = value
             .pointer("/data/stdout")
             .and_then(|v| v.as_str())
-            .and_then(|s| B64.decode(s).ok())
-            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|s| B64.decode(s).ok());
+        let stdout = raw
+            .as_deref()
+            .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok())
             .unwrap_or_default();
         let cwd = value
             .pointer("/data/cwd")
@@ -923,6 +928,7 @@ impl Protocol for PhpProtocol {
             stdout,
             duration_ms,
             cwd,
+            raw_b64: raw.map(|bytes| B64.encode(bytes)),
         })
     }
 

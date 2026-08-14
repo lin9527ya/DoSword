@@ -230,6 +230,7 @@ impl Protocol for EchoProtocol {
             stdout,
             duration_ms,
             cwd: None,
+            raw_b64: None,
         })
     }
 

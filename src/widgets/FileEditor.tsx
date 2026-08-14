@@ -17,6 +17,29 @@ function decodeByEncoding(contentB64: string, encoding: Encoding): string {
   }
 }
 
+/** 行号栏：仅渲染可视区附近的行（窗口化，万行文件不建万级 DOM）。 */
+function EditorGutter({ lineNumbers }: { lineNumbers: number[] }) {
+  const [scrollTop, setScrollTop] = useState(0);
+  const LINE_HEIGHT = 20.4;
+  const WINDOW = 200;
+  const totalLines = lineNumbers.length;
+  const start = Math.max(0, Math.floor(scrollTop / LINE_HEIGHT) - WINDOW);
+  const end = Math.min(totalLines, start + WINDOW * 2);
+  return (
+    <div
+      className="editor-gutter"
+      aria-hidden
+      onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+    >
+      <div style={{ height: start * LINE_HEIGHT }} />
+      {lineNumbers.slice(start, end).map((number) => (
+        <span key={number}>{number}</span>
+      ))}
+      <div style={{ height: Math.max(0, totalLines - end) * LINE_HEIGHT }} />
+    </div>
+  );
+}
+
 /** 文件编辑器：UTF-8 / GBK / HEX 编码读写。 */
 export function FileEditor({
   sessionId,
@@ -105,13 +128,7 @@ export function FileEditor({
           </div>
         </div>
         <div className="editor-body-wrap">
-          {encoding !== "hex" && (
-            <div className="editor-gutter" aria-hidden>
-              {lineNumbers.map((number) => (
-                <span key={number}>{number}</span>
-              ))}
-            </div>
-          )}
+          {encoding !== "hex" && <EditorGutter lineNumbers={lineNumbers} />}
           <textarea
             className="editor-body"
             value={content}
