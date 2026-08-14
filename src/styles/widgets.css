@@ -700,3 +700,9 @@
 .detail-tabpane.hidden { display: none; }
 .db-result-pager { display: flex; align-items: center; gap: 12px; padding: 8px 10px; justify-content: center; }
 .db-result-page-info { font-size: 12px; color: var(--text-dim); }
+.plugin-panel { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+.plugin-panel-body { display: flex; gap: 14px; min-height: 0; flex: 1; }
+.plugin-quickbar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--panel-2); overflow-x: auto; flex-shrink: 0; }
+.plugin-quickbar-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-faint); flex-shrink: 0; }
+.plugin-quick-item { padding: 5px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--input-bg); color: var(--text); cursor: pointer; font-size: 12px; white-space: nowrap; }
+.plugin-quick-item:hover { border-color: var(--accent); color: var(--accent); }

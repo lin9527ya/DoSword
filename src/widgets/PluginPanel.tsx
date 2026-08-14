@@ -36,38 +36,69 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const MEM_KEY = "dosword:plugin-values";
+
   function defaults(plugin: FeatureManifest): Record<string, unknown> {
     return Object.fromEntries(
       plugin.params.map((p) => [p.name, p.default ?? (p.type === "int" ? 0 : p.type === "bool" ? false : "")]),
     );
   }
 
+  /** 哥斯拉风格：参数记忆（localStorage 按插件 id 持久化）。 */
+  function remembered(plugin: FeatureManifest): Record<string, unknown> {
+    try {
+      const stored = JSON.parse(localStorage.getItem(MEM_KEY) ?? "{}") as Record<string, Record<string, unknown>>;
+      const saved = stored[plugin.id];
+      if (!saved) return defaults(plugin);
+      const merged: Record<string, unknown> = { ...defaults(plugin) };
+      for (const param of plugin.params) {
+        if (saved[param.name] !== undefined) merged[param.name] = saved[param.name];
+      }
+      return merged;
+    } catch {
+      return defaults(plugin);
+    }
+  }
+
+  function remember(pluginId: string, value: Record<string, unknown>) {
+    try {
+      const stored = JSON.parse(localStorage.getItem(MEM_KEY) ?? "{}") as Record<string, Record<string, unknown>>;
+      stored[pluginId] = value;
+      localStorage.setItem(MEM_KEY, JSON.stringify(stored));
+    } catch {
+      // 忽略存储失败
+    }
+  }
+
   function pick(plugin: FeatureManifest) {
     setSelected(plugin);
     setResult(null);
     setError("");
-    setValues(defaults(plugin));
+    setValues(remembered(plugin));
   }
 
-  async function run() {
-    if (!selected) return;
+  async function run(pluginId?: string, runValues?: Record<string, unknown>) {
+    const target = plugins.find((p) => p.id === (pluginId ?? selected?.id));
+    if (!target) return;
+    const params = runValues ?? values;
     setBusy(true);
     setError("");
     const started = performance.now();
     try {
-      const out = await api.runFeaturePlugin(sessionId, selected.id, values);
+      const out = await api.runFeaturePlugin(sessionId, target.id, params);
+      remember(target.id, params);
       const ms = Math.round(performance.now() - started);
       const raw = JSON.stringify(out, null, 2);
       setResult({ ok: true, data: out, raw, ms });
       setHistory((prev) =>
-        [{ name: selected.name, ok: true, text: raw, ms, at: new Date().toLocaleTimeString() }, ...prev].slice(0, 20),
+        [{ name: target.name, ok: true, text: raw, ms, at: new Date().toLocaleTimeString() }, ...prev].slice(0, 20),
       );
     } catch (cause) {
       const ms = Math.round(performance.now() - started);
       const text = errorText(cause);
       setResult({ ok: false, data: null, raw: text, ms });
       setHistory((prev) =>
-        [{ name: selected?.name ?? "", ok: false, text, ms, at: new Date().toLocaleTimeString() }, ...prev].slice(0, 20),
+        [{ name: target.name, ok: false, text, ms, at: new Date().toLocaleTimeString() }, ...prev].slice(0, 20),
       );
     } finally {
       setBusy(false);
@@ -89,6 +120,19 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
     }
   }
 
+  const QUICK_IDS = [
+    "sysinfo", "netinfo", "userlist", "processes", "port_scan",
+    "task_scheduler", "cred_scan", "webshell_scan", "file_search", "php_env",
+  ];
+  const quickPlugins = QUICK_IDS.map((id) => plugins.find((p) => p.id === id)).filter(
+    (p): p is FeatureManifest => Boolean(p),
+  );
+
+  async function quickRun(plugin: FeatureManifest) {
+    pick(plugin);
+    await run(plugin.id, remembered(plugin));
+  }
+
   const byKind = (kind: string) => plugins.filter((p) => p.kind === kind);
   const isBypass = (p: FeatureManifest) => p.id.startsWith("bypass_");
   const dfBypass = plugins.filter((p) => isBypass(p) && p.id !== "bypass_open_basedir");
@@ -100,6 +144,23 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
 
   return (
     <div className="plugin-panel">
+      {quickPlugins.length > 0 && (
+        <div className="plugin-quickbar">
+          <span className="plugin-quickbar-label">快捷</span>
+          {quickPlugins.map((plugin) => (
+            <button
+              key={plugin.id}
+              className="plugin-quick-item"
+              onClick={() => void quickRun(plugin)}
+              title={plugin.description}
+              disabled={busy}
+            >
+              {plugin.name}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="plugin-panel-body">
       <div className="plugin-sidebar">
         {dfBypass.length > 0 && <p className="plugin-group">Bypass DisableFunctions</p>}
         {dfBypass.length > 0 && (
@@ -310,6 +371,7 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
         ) : (
           <p className="panel-note">选择左侧插件开始。</p>
         )}
+      </div>
       </div>
     </div>
   );

@@ -2172,6 +2172,30 @@ mod tests {
                 out["read"].as_bool()
             );
 
+            // 哥斯拉风格工具插件：系统信息 / 计划任务 / 服务管理 / 进程结束 / 凭据枚举
+            let out = dosword_sdk::feature_plugins::SysinfoPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true));
+            assert!(out["stdout"].as_str().unwrap_or("").contains("HOST"));
+            eprintln!("{}sysinfo ok", p("plugin"));
+            let out = dosword_sdk::feature_plugins::TaskSchedulerPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"action": "list"}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true));
+            eprintln!("{}task_scheduler list ok", p("plugin"));
+            let out = dosword_sdk::feature_plugins::ServiceCtlPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"action": "list"}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true));
+            eprintln!("{}service_ctl list ok", p("plugin"));
+            let out = dosword_sdk::feature_plugins::ProcessKillPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({"pid": "99999"}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true));
+            eprintln!("{}process_kill ok", p("plugin"));
+            let out = dosword_sdk::feature_plugins::CredScanPlugin.execute(
+                &protocol, php, "php", &serde_json::json!({}), &settings)?;
+            assert_eq!(out["ok"].as_bool(), Some(true));
+            assert!(out["stdout"].as_str().unwrap_or("").contains("USERS"));
+            eprintln!("{}cred_scan ok", p("plugin"));
+
             // Bypass 向量：扫描 → 手动选择测试（syscall/pcntl/ffi 等独立插件）
             let scan = dosword_sdk::bypass::BypassScanPlugin.execute(
                 &protocol,

