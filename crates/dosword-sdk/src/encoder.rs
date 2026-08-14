@@ -2140,6 +2140,8 @@ impl PayloadEncoder for NativeEncoder {
                     &h("delete"),
                     &h("rename"),
                     &h("mkdir"),
+                    &h("dbprobe"),
+                    &h("dbquery"),
                 ))
             }
             "aspx" => {
@@ -2206,6 +2208,8 @@ impl PayloadEncoder for NativeEncoder {
                     &h("rename"),
                     &h("mkdir"),
                     &h("touch"),
+                    &h("dbprobe"),
+                    &h("dbquery"),
                 ))
             }
             "node" => {
@@ -2234,6 +2238,8 @@ impl PayloadEncoder for NativeEncoder {
                     &h("rename"),
                     &h("mkdir"),
                     &h("touch"),
+                    &h("dbprobe"),
+                    &h("dbquery"),
                 ))
             }
             other => Err(ProtocolError::NotSupported(format!(

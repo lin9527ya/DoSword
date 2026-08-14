@@ -18,6 +18,8 @@ pub fn python_stub(
     h_rename: &str,
     h_mkdir: &str,
     h_touch: &str,
+    h_dbprobe: &str,
+    h_dbquery: &str,
 ) -> String {
     format!(
         r#"#!/usr/bin/env python3
@@ -36,6 +38,7 @@ _H = {{
     'probe': '{h_probe}', 'exec': '{h_exec}', 'list': '{h_list}',
     'read': '{h_read}', 'write': '{h_write}', 'delete': '{h_delete}',
     'rename': '{h_rename}', 'mkdir': '{h_mkdir}', 'touch': '{h_touch}',
+    'dbprobe': '{h_dbprobe}', 'dbquery': '{h_dbquery}',
 }}
 try:
     _body = sys.stdin.read(int(os.environ.get('CONTENT_LENGTH', '0') or 0))
@@ -127,6 +130,46 @@ try:
     elif h == _H['touch']:
         t = int(req.get('t', 0)) or int(time.time())
         os.utime(req.get('p', ''), (t, t))
+    elif h == _H['dbprobe']:
+        _c = json.loads(req.get('c', '{{}}'))
+        _drv = _c.get('driver', '')
+        if _drv == 'sqlite':
+            import sqlite3 as _s
+            _conn = _s.connect(_c.get('dbname') or ':memory:', isolation_level=None)
+            _cur = _conn.cursor()
+            _cur.execute("SELECT name FROM sqlite_master WHERE type='table' UNION SELECT 'main'")
+            out['data'] = {{'databases': [r[0] for r in _cur.fetchall()]}}
+            _conn.close()
+        elif _drv == 'mysql':
+            try:
+                import mysql.connector as _m
+                _conn = _m.connect(host=_c.get('host', '127.0.0.1'), port=int(_c.get('port') or 3306), user=_c.get('username', ''), password=_c.get('password', ''))
+                _cur = _conn.cursor(); _cur.execute("SHOW DATABASES")
+                out['data'] = {{'databases': [r[0] for r in _cur.fetchall()]}}
+                _conn.close()
+            except Exception as _me:
+                out = {{'ok': False, 'error': 'mysql: ' + str(_me)}}
+        else:
+            out = {{'ok': False, 'error': 'unsupported driver ' + _drv}}
+    elif h == _H['dbquery']:
+        _c = json.loads(req.get('c', '{{}}'))
+        if _c.get('driver') != 'sqlite':
+            out = {{'ok': False, 'error': 'dbquery 仅支持 sqlite（Python 端）'}}
+        else:
+            import sqlite3 as _s
+            _conn = _s.connect(_c.get('dbname') or ':memory:', isolation_level=None)
+            _cur = _conn.cursor()
+            try:
+                _cur.execute(req.get('q', ''))
+                if _cur.description:
+                    _cols = [d[0] for d in _cur.description]
+                    _rows = [[None if v is None else str(v) for v in r] for r in _cur.fetchall()]
+                    out['data'] = {{'columns': _cols, 'rows': _rows, 'affected': 0}}
+                else:
+                    out['data'] = {{'columns': [], 'rows': [], 'affected': _conn.total_changes}}
+            except Exception as _qe:
+                out = {{'ok': False, 'error': str(_qe)}}
+            _conn.close()
 except Exception as e:
     out = {{'ok': False, 'error': str(e)}}
 print('Content-Type: application/json')
@@ -146,6 +189,8 @@ print(json.dumps({{
         h_rename = h_rename,
         h_mkdir = h_mkdir,
         h_touch = h_touch,
+        h_dbprobe = h_dbprobe,
+        h_dbquery = h_dbquery,
     )
     .replace("{xk}", xk)
     .replace("{gk_hex}", gk_hex)

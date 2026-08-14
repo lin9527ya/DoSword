@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex};
 use base64::Engine;
 use url::Url;
 
-use dosword_sdk::domain::{AppSettings, CommandOutput, DirListing, ProbeResult, ShellProfile};
+use dosword_sdk::domain::{
+    AppSettings, CommandOutput, ConnectResult, DbConnection, DbProbeResult, DbQueryResult,
+    DirListing, FileContent, ProbeResult, ShellProfile,
+};
 use dosword_sdk::encoder::{NativeEncoder, PayloadEncoder, md5_hex};
 
 use super::transport::{form_escape, json_str};
@@ -64,6 +67,10 @@ fn make_session(
         info: Mutex::new(None),
         cwd: Mutex::new(String::new()),
     }
+}
+
+fn conn_json(connection: &DbConnection) -> String {
+    serde_json::to_string(connection).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// 发送一次载荷请求：formData（XOR 密文）+ X-Debug-Key 头 → {data, code} 响应。
@@ -429,6 +436,103 @@ impl Protocol for JvmLikeProtocol {
             &AppSettings::default(),
         )?;
         Ok(())
+    }
+
+    fn db_probe(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        settings: &AppSettings,
+    ) -> Result<DbProbeResult, ProtocolError> {
+        let jsp = session
+            .as_any()
+            .downcast_ref::<JspSession>()
+            .expect("会话类型不匹配");
+        let value = form_call(
+            jsp,
+            "dbprobe",
+            &[("c", &conn_json(connection))],
+            settings,
+        )?;
+        let databases = value
+            .pointer("/data/databases")
+            .and_then(|v| v.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(DbProbeResult {
+            driver: connection.driver.clone(),
+            databases,
+            message: "数据库连接成功".to_string(),
+        })
+    }
+
+    fn db_query(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        sql: &str,
+        settings: &AppSettings,
+    ) -> Result<DbQueryResult, ProtocolError> {
+        let jsp = session
+            .as_any()
+            .downcast_ref::<JspSession>()
+            .expect("会话类型不匹配");
+        let value = form_call(
+            jsp,
+            "dbquery",
+            &[("c", &conn_json(connection)), ("q", sql)],
+            settings,
+        )?;
+        let columns = value
+            .pointer("/data/columns")
+            .and_then(|v| v.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rows = value
+            .pointer("/data/rows")
+            .and_then(|v| v.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|row| {
+                        row.as_array().map(|cells| {
+                            cells
+                                .iter()
+                                .map(|cell| {
+                                    cell.as_str().map(str::to_string).or_else(|| {
+                                        if cell.is_null() {
+                                            Some("NULL".to_string())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                                .collect::<Vec<Option<String>>>()
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let affected = value
+            .pointer("/data/affected")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        Ok(DbQueryResult {
+            columns,
+            rows,
+            affected,
+            duration_ms: 0,
+        })
     }
 
     fn delete_path(
@@ -1188,6 +1292,27 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             let content = protocol.read_file(session.as_ref(), &test_file, &settings)?;
             assert_eq!(content, b"hello py");
             eprintln!("[python] read/write ok");
+            // DB：sqlite（目标进程内建库 + 建表 + 查询）
+            let db_file = format!("{}/py_test.db", dir.display());
+            let conn = DbConnection {
+                driver: "sqlite".into(),
+                host: None,
+                port: None,
+                username: None,
+                password: None,
+                dbname: Some(db_file.clone()),
+            };
+            let probe = protocol.db_probe(session.as_ref(), &conn, &settings)?;
+            assert!(probe.databases.contains(&"main".to_string()), "{:?}", probe.databases);
+            protocol
+                .db_query(session.as_ref(), &conn, "CREATE TABLE IF NOT EXISTS t (id INTEGER, name TEXT)", &settings)?;
+            protocol
+                .db_query(session.as_ref(), &conn, "INSERT INTO t VALUES (1, 'dosword')", &settings)?;
+            let q = protocol.db_query(session.as_ref(), &conn, "SELECT id, name FROM t", &settings)?;
+            assert_eq!(q.columns, vec!["id".to_string(), "name".to_string()]);
+            assert_eq!(q.rows.len(), 1);
+            assert_eq!(q.rows[0][1].as_deref(), Some("dosword"));
+            eprintln!("[python] db(sqlite) ok");
             Ok(())
         })();
         let _ = child.kill();
@@ -1257,6 +1382,27 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             let content = protocol.read_file(session.as_ref(), &test_file, &settings)?;
             assert_eq!(content, b"hello node");
             eprintln!("[node] read/write ok");
+            // DB：sqlite（node:sqlite）
+            let db_file = format!("{}/node_test.db", dir.display());
+            let conn = DbConnection {
+                driver: "sqlite".into(),
+                host: None,
+                port: None,
+                username: None,
+                password: None,
+                dbname: Some(db_file.clone()),
+            };
+            let probe = protocol.db_probe(session.as_ref(), &conn, &settings)?;
+            assert!(!probe.databases.is_empty(), "{:?}", probe.databases);
+            protocol
+                .db_query(session.as_ref(), &conn, "CREATE TABLE IF NOT EXISTS t (id INTEGER, name TEXT)", &settings)?;
+            protocol
+                .db_query(session.as_ref(), &conn, "INSERT INTO t VALUES (1, 'node')", &settings)?;
+            let q = protocol.db_query(session.as_ref(), &conn, "SELECT id, name FROM t", &settings)?;
+            assert_eq!(q.columns, vec!["id".to_string(), "name".to_string()]);
+            assert_eq!(q.rows.len(), 1);
+            assert_eq!(q.rows[0][1].as_deref(), Some("node"));
+            eprintln!("[node] db(sqlite) ok");
             Ok(())
         })();
         let _ = child.kill();
@@ -1429,6 +1575,27 @@ impl Protocol for PythonProtocol {
         }
         .touch_path(session, path, timestamp, settings)
     }
+
+    fn db_probe(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        settings: &AppSettings,
+    ) -> Result<DbProbeResult, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
+            .db_probe(session, connection, settings)
+    }
+
+    fn db_query(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        sql: &str,
+        settings: &AppSettings,
+    ) -> Result<DbQueryResult, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
+            .db_query(session, connection, sql, settings)
+    }
 }
 
 impl dosword_sdk::ProtocolPlugin for PythonProtocol {
@@ -1588,6 +1755,27 @@ impl Protocol for NodeProtocol {
             display_name: "",
         }
         .touch_path(session, path, timestamp, settings)
+    }
+
+    fn db_probe(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        settings: &AppSettings,
+    ) -> Result<DbProbeResult, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
+            .db_probe(session, connection, settings)
+    }
+
+    fn db_query(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        sql: &str,
+        settings: &AppSettings,
+    ) -> Result<DbQueryResult, ProtocolError> {
+        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
+            .db_query(session, connection, sql, settings)
     }
 }
 

