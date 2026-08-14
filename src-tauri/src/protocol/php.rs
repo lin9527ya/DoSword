@@ -1574,6 +1574,7 @@ fn session_call(
     }
     request.push('}');
 
+    // session 变体（分阶段载荷）暂不启用 gzip（响应为明文 JSON，结构不兼容压缩）
     let payload = php.encoder.encode(&request, &php.password);
     let plain = session_post(php, payload, settings)?;
     let text = String::from_utf8_lossy(&plain);
@@ -1617,6 +1618,7 @@ fn native_call(
     request.push('}');
 
     let payload = php.encoder.encode(&request, &php.password);
+    let payload = crate::protocol::transport::gzip_payload(&payload, settings.gzip_enabled);
     // base64 载荷可能含 +/=，必须转义（否则 PHP 表单解析时 + 转空格损坏密文）；
     // P2：手动快速转义（仅 +、=、&），避免对整块载荷全量百分号编码
     let body = format!("formData={}", form_escape(&payload));
@@ -1655,7 +1657,9 @@ fn native_call(
         .get("data")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProtocolError::ParseError("响应缺少 data 字段".to_string()))?;
-    let plain = php.encoder.decode(data, &php.password)?;
+    // gzip：响应若为 gzip 字节则解压后重新 base64（stub 端 gzencode 兜底）
+    let data = crate::protocol::transport::gunzip_if_needed(data);
+    let plain = php.encoder.decode(&data, &php.password)?;
     let value: Value = serde_json::from_slice(&plain)
         .map_err(|_| ProtocolError::ParseError("响应内容不是合法 JSON".to_string()))?;
     if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -1728,6 +1732,7 @@ mod tests {
             chunk_size_mb: 4,
             allow_arbitrary_code: true,
             audit_retention_days: 90,
+        gzip_enabled: true,
         }
     }
 

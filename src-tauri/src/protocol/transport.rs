@@ -65,6 +65,46 @@ pub fn json_str(value: &str) -> String {
     out
 }
 
+/// gzip：压缩载荷文本（base64 载荷 gzip 后再 base64），目标无 zlib 时保持原样由 stub 兜底。
+pub fn gzip_payload(payload: &str, enabled: bool) -> String {
+    if !enabled {
+        return payload.to_string();
+    }
+    use base64::Engine;
+    use std::io::Write;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(payload) {
+        Ok(bytes) => bytes,
+        Err(_) => return payload.to_string(),
+    };
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    if encoder.write_all(&bytes).is_err() {
+        return payload.to_string();
+    }
+    match encoder.finish() {
+        Ok(compressed) => base64::engine::general_purpose::STANDARD.encode(compressed),
+        Err(_) => payload.to_string(),
+    }
+}
+
+/// gzip：响应文本若为 gzip 字节则解压（按魔数 1f 8b 判断），否则原样返回。
+pub fn gunzip_if_needed(text: &str) -> String {
+    use base64::Engine;
+    use std::io::Read;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(text) {
+        Ok(bytes) => bytes,
+        Err(_) => return text.to_string(),
+    };
+    if bytes.len() < 2 || bytes[0] != 0x1f || bytes[1] != 0x8b {
+        return text.to_string();
+    }
+    let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut out = Vec::new();
+    if decoder.read_to_end(&mut out).is_err() {
+        return text.to_string();
+    }
+    base64::engine::general_purpose::STANDARD.encode(out)
+}
+
 /// S10：流式读取响应（上限 max_bytes+1），避免恶意目标撑爆内存。
 pub fn read_limited<R: std::io::Read>(reader: R, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read;

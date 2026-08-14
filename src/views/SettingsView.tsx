@@ -256,6 +256,16 @@ export function SettingsView() {
             />
             允许 run_code 任意代码执行（关闭后插件载荷将无法运行）
           </label>
+          <label className="settings-check">
+            <input
+              type="checkbox"
+              checked={settings.gzipEnabled}
+              onChange={(event) =>
+                setSettings({ ...settings, gzipEnabled: event.target.checked })
+              }
+            />
+            传输压缩（gzip，目标支持 zlib 时启用，大文件/慢网络加速）
+          </label>
           <label>
             审计日志保留天数（0 = 不清理）
             <input

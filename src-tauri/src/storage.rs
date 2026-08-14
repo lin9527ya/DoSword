@@ -632,6 +632,7 @@ mod tests {
             chunk_size_mb: 4,
             allow_arbitrary_code: true,
             audit_retention_days: 30,
+        gzip_enabled: true,
         };
         db.update_settings(&updated).unwrap();
         let loaded = db.get_settings().unwrap();

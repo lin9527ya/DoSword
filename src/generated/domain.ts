@@ -80,7 +80,11 @@ allowArbitraryCode: boolean,
 /**
  * 审计日志保留天数（超出自动清理；0 = 不清理，默认 90 天）。
  */
-auditRetentionDays: number, };
+auditRetentionDays: number, 
+/**
+ * 传输压缩（gzip，目标支持 zlib 时启用，大文件/慢网络加速）。
+ */
+gzipEnabled: boolean, };
 export type CommandOutput = { stdout: string, durationMs: number, 
 /**
  * 命令执行后的服务器工作目录（终端据此更新提示符）。

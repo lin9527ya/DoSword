@@ -31,3 +31,4 @@ aes = "0.8"
 des = "0.8"
 cbc = { version = "0.1", features = ["block-padding", "alloc"] }
 crc32fast = "1.4"
+flate2 = "1"

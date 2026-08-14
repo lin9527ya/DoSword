@@ -186,6 +186,13 @@ pub struct AppSettings {
     #[ts(type = "number")]
     #[serde(default = "default_audit_retention_days")]
     pub audit_retention_days: u64,
+    /// 传输压缩（gzip，目标支持 zlib 时启用，大文件/慢网络加速）。
+    #[serde(default = "default_gzip")]
+    pub gzip_enabled: bool,
+}
+
+fn default_gzip() -> bool {
+    true
 }
 
 fn default_chunk_mb() -> u64 {
@@ -210,6 +217,7 @@ impl Default for AppSettings {
             allow_arbitrary_code: true,
             max_file_size_mb: 32,
             audit_retention_days: 90,
+            gzip_enabled: true,
         }
     }
 }

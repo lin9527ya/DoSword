@@ -312,6 +312,7 @@ mod tests {
             chunk_size_mb: 4,
             allow_arbitrary_code: true,
             audit_retention_days: 90,
+        gzip_enabled: true,
         }
     }
 

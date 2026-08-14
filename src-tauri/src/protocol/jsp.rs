@@ -1007,6 +1007,7 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             chunk_size_mb: 4,
             allow_arbitrary_code: true,
             audit_retention_days: 90,
+        gzip_enabled: true,
         }
     }
 
