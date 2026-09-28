@@ -1,17 +1,21 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
-  ChevronRight,
   CirclePlus,
   Wand2,
   FilePenLine,
   FolderKanban,
+  LayoutGrid,
+  List,
   LoaderCircle,
   PlugZap,
   RefreshCw,
   Search,
   ShieldCheck,
   Trash2,
+  TerminalSquare,
+  Upload,
+  Download,
 } from "lucide-react";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import { api, b64, errorText, shortTime } from "../api";
@@ -19,18 +23,21 @@ import type { Dashboard, ProtocolMeta, ShellProfile, Workspace } from "../api";
 import { Dialog } from "../components/Dialog";
 import { Empty, ErrorBanner, Metric, Panel } from "../components/common";
 import { GenerateShellDialog } from "../widgets/GenerateShellDialog";
+import { useToast } from "../components/Toast";
 import type { View } from "./types";
 
 const EMPTY_DASHBOARD: Dashboard = { workspaces: [], shells: [], auditEvents: [] };
 
 /** 解析标签输入（逗号/空格/顿号分隔，去重去空）。 */
 function parseTags(value: string): string[] {
-  return [...new Set(
-    value
-      .split(/[,，;\s]+/)
-      .map((tag) => tag.trim())
-      .filter(Boolean),
-  )];
+  return [
+    ...new Set(
+      value
+        .split(/[,，;\s]+/)
+        .map((tag) => tag.trim())
+        .filter(Boolean),
+    ),
+  ];
 }
 
 /** Workspace 到期状态。 */
@@ -48,6 +55,7 @@ export function DashboardView({
 }: {
   onNavigate: (view: View) => void;
 }) {
+  const toast = useToast();
   const [data, setData] = useState<Dashboard>(EMPTY_DASHBOARD);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -58,11 +66,12 @@ export function DashboardView({
   const [selected, setSelected] = useState<string[]>([]);
   const [batchTags, setBatchTags] = useState("");
   const [batchBusy, setBatchBusy] = useState(false);
-  const [notice, setNotice] = useState("");
   const [pluginCount, setPluginCount] = useState(0);
   const [page, setPage] = useState(0);
   const [tagFilter, setTagFilter] = useState("");
   const [workspaceFilter, setWorkspaceFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState<string>("");
+  const [viewMode, setViewMode] = useState<"list" | "grid">("list");
   const [probing, setProbing] = useState<string | null>(null);
   const [batchProbing, setBatchProbing] = useState<string[] | null>(null);
   const [connecting, setConnecting] = useState<string | null>(null);
@@ -73,11 +82,13 @@ export function DashboardView({
     try {
       setData(await api.dashboard());
     } catch (cause) {
-      setError(errorText(cause));
+      const msg = errorText(cause);
+      setError(msg);
+      toast.error(msg, "加载失败");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [toast]);
 
   useEffect(() => {
     void loadDashboard();
@@ -115,12 +126,13 @@ export function DashboardView({
     return data.shells.filter((shell) => {
       if (workspaceFilter && shell.workspaceId !== workspaceFilter) return false;
       if (tagFilter && !shell.tags.includes(tagFilter)) return false;
+      if (statusFilter && shell.status !== statusFilter) return false;
       if (!query) return true;
       return [shell.name, shell.endpoint, shell.runtime, ...shell.tags].some((value) =>
         value.toLowerCase().includes(query),
       );
     });
-  }, [data.shells, search, tagFilter, workspaceFilter]);
+  }, [data.shells, search, tagFilter, workspaceFilter, statusFilter]);
 
   const PAGE_SIZE = 50;
   const pageCount = Math.max(1, Math.ceil(filteredShells.length / PAGE_SIZE));
@@ -128,12 +140,12 @@ export function DashboardView({
 
   async function probe(shell: ShellProfile) {
     setProbing(shell.id);
-    setError("");
     try {
-      await api.probeShell(shell.id);
+      const res = await api.probeShell(shell.id);
+      toast.success(`${shell.name} 在线 · ${res.runtime} · ${res.server}`, "探测成功");
       await loadDashboard();
     } catch (cause) {
-      setError(errorText(cause));
+      toast.error(errorText(cause), `探测 ${shell.name} 失败`);
     } finally {
       setProbing(null);
     }
@@ -144,19 +156,18 @@ export function DashboardView({
     const targets = filteredShells;
     if (targets.length === 0) return;
     setBatchProbing([]);
-    setError("");
     const done: string[] = [];
     for (const shell of targets) {
       try {
         await api.probeShell(shell.id);
       } catch (cause) {
-        setError(`探测 ${shell.name} 失败：${errorText(cause)}`);
-        break;
+        toast.warning(`探测 ${shell.name} 失败：${errorText(cause)}`);
       }
       done.push(shell.id);
       setBatchProbing([...done]);
     }
     setBatchProbing(null);
+    toast.success(`完成 ${targets.length} 个端点的连通性探测`, "批量探测完成");
     await loadDashboard();
   }
 
@@ -166,9 +177,16 @@ export function DashboardView({
     );
   }
 
+  function toggleSelectAll() {
+    if (selected.length === pageShells.length) {
+      setSelected([]);
+    } else {
+      setSelected(pageShells.map((s) => s.id));
+    }
+  }
+
   async function batchConnect() {
     setBatchBusy(true);
-    setError("");
     let connected = 0;
     for (const id of selected) {
       const shell = data.shells.find((item) => item.id === id);
@@ -177,7 +195,7 @@ export function DashboardView({
         await api.connectShell(shell.id);
         connected += 1;
       } catch (cause) {
-        setError(`连接 ${shell.name} 失败：${errorText(cause)}`);
+        toast.error(`连接 ${shell.name} 失败：${errorText(cause)}`);
         break;
       }
     }
@@ -185,7 +203,7 @@ export function DashboardView({
     setSelected([]);
     await loadDashboard();
     if (connected > 0) {
-      setNotice(`已建立 ${connected} 个会话（可在「会话」页查看）`);
+      toast.success(`已建立 ${connected} 个活跃会话，可在「终端会话」中切换使用`, "批量连接成功");
     }
   }
 
@@ -195,15 +213,14 @@ export function DashboardView({
       .map((tag) => tag.trim())
       .filter(Boolean);
     setBatchBusy(true);
-    setError("");
     try {
       const count = await api.batchUpdateShells(selected, tags);
-      setNotice(`已为 ${count} 个 Shell 设置标签`);
+      toast.success(`已为 ${count} 个 Shell 应用新标签`, "标签更新成功");
       setBatchTags("");
       setSelected([]);
       await loadDashboard();
     } catch (cause) {
-      setError(errorText(cause));
+      toast.error(errorText(cause), "批量标签失败");
     } finally {
       setBatchBusy(false);
     }
@@ -218,22 +235,23 @@ export function DashboardView({
     });
     if (!confirmed) return;
     setBatchBusy(true);
-    setError("");
+    let deleted = 0;
     for (const id of selected) {
       try {
         await api.deleteShell(id);
+        deleted += 1;
       } catch (cause) {
-        setError(errorText(cause));
+        toast.error(errorText(cause), "删除出错");
         break;
       }
     }
     setBatchBusy(false);
     setSelected([]);
+    toast.success(`已删除 ${deleted} 个 Shell 配置`, "批量删除完成");
     await loadDashboard();
   }
 
   async function exportShells() {
-    setError("");
     try {
       const json = await api.exportShells();
       const localPath = await save({
@@ -243,23 +261,22 @@ export function DashboardView({
       if (!localPath) return;
       const bytes = new TextEncoder().encode(json);
       await api.writeLocalFile(localPath, b64.encodeBytes(bytes));
-      setNotice(`已导出 ${data.shells.length} 个 Shell 配置`);
+      toast.success(`已成功导出 ${data.shells.length} 个 Shell 配置`, "导出完成");
     } catch (cause) {
-      setError(`导出失败：${errorText(cause)}`);
+      toast.error(errorText(cause), "导出失败");
     }
   }
 
   async function importShells() {
     if (data.workspaces.length === 0) {
-      setError("请先创建 Workspace 再导入");
+      toast.warning("请先创建 Workspace 后再执行导入", "缺少工作区");
       return;
     }
     const workspaceId = data.workspaces[0].id;
-    setError("");
     try {
       const localPath = await open({
         multiple: false,
-        filters: [{ name: "Shell 配置", extensions: ["json", "csv"] }],
+        filters: [{ name: "Shell 配置文件", extensions: ["json", "csv"] }],
       });
       if (!localPath || Array.isArray(localPath)) return;
       const contentB64 = await api.readLocalFile(String(localPath));
@@ -268,10 +285,10 @@ export function DashboardView({
         ? text
         : csvToJson(text);
       const result = await api.importShells(payload, workspaceId);
-      setNotice(`导入完成：新增 ${result.imported}，跳过 ${result.skipped}`);
+      toast.success(`导入完成：新增 ${result.imported} 个，跳过 ${result.skipped} 个`, "导入成功");
       await loadDashboard();
     } catch (cause) {
-      setError(`导入失败：${errorText(cause)}`);
+      toast.error(errorText(cause), "导入失败");
     }
   }
 
@@ -297,12 +314,12 @@ export function DashboardView({
 
   async function connect(shell: ShellProfile) {
     setConnecting(shell.id);
-    setError("");
     try {
       const result = await api.connectShell(shell.id);
+      toast.success(`已连接 ${shell.name} · ${result.server}`, "连接成功");
       onNavigate({ kind: "shell", shellId: shell.id, sessionId: result.sessionId, shellName: shell.name });
     } catch (cause) {
-      setError(errorText(cause));
+      toast.error(errorText(cause), `连接 ${shell.name} 失败`);
       setConnecting(null);
     }
   }
@@ -315,12 +332,12 @@ export function DashboardView({
       cancelLabel: "取消",
     });
     if (!confirmed) return;
-    setError("");
     try {
       await api.deleteShell(shell.id);
+      toast.success(`已删除 ${shell.name}`, "删除成功");
       await loadDashboard();
     } catch (cause) {
-      setError(errorText(cause));
+      toast.error(errorText(cause), "删除失败");
     }
   }
 
@@ -331,12 +348,21 @@ export function DashboardView({
       { title: "删除确认", kind: "warning", okLabel: "删除", cancelLabel: "取消" },
     );
     if (!confirmed) return;
-    setError("");
     try {
       await api.deleteWorkspace(workspace.id);
+      toast.success(`已删除工作区 ${workspace.name}`, "删除成功");
       await loadDashboard();
     } catch (cause) {
-      setError(errorText(cause));
+      toast.error(errorText(cause), "删除失败");
+    }
+  }
+
+  async function copyEndpoint(endpoint: string) {
+    try {
+      await navigator.clipboard.writeText(endpoint);
+      toast.info("端点 URL 已复制到剪贴板");
+    } catch {
+      // 忽略
     }
   }
 
@@ -344,27 +370,35 @@ export function DashboardView({
     <>
       <header className="topbar">
         <div>
-          <p className="eyebrow">操作控制台</p>
+          <p className="eyebrow">CONTROL CENTER</p>
           <h1>授权环境总览</h1>
         </div>
         <div className="top-actions">
           <label className="search">
-            <Search size={17} />
+            <Search size={15} />
             <input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="搜索 Shell"
+              placeholder="搜索 Shell 名称 / 端点 / 标签…"
             />
           </label>
-          <select className="select" value={workspaceFilter} onChange={(event) => setWorkspaceFilter(event.target.value)}>
-            <option value="">全部 Workspace</option>
+          <select
+            className="select"
+            value={workspaceFilter}
+            onChange={(event) => setWorkspaceFilter(event.target.value)}
+          >
+            <option value="">全部工作区</option>
             {data.workspaces.map((workspace) => (
               <option key={workspace.id} value={workspace.id}>
                 {workspace.name}
               </option>
             ))}
           </select>
-          <select className="select" value={tagFilter} onChange={(event) => setTagFilter(event.target.value)}>
+          <select
+            className="select"
+            value={tagFilter}
+            onChange={(event) => setTagFilter(event.target.value)}
+          >
             <option value="">全部标签</option>
             {allTags.map((tag) => (
               <option key={tag} value={tag}>
@@ -372,198 +406,394 @@ export function DashboardView({
               </option>
             ))}
           </select>
+          <select
+            className="select"
+            value={statusFilter}
+            onChange={(event) => setStatusFilter(event.target.value)}
+          >
+            <option value="">全部状态</option>
+            <option value="online">在线 (Online)</option>
+            <option value="error">离线/异常 (Error)</option>
+            <option value="untested">未测试 (Untested)</option>
+          </select>
+
           <button
             className="button secondary"
             onClick={() => void probeAll()}
             disabled={batchProbing !== null || filteredShells.length === 0}
+            title="一键测试所有筛选出的 Shell 连通性"
           >
             {batchProbing !== null ? (
-              <LoaderCircle className="spin" size={16} />
+              <LoaderCircle className="spin" size={15} />
             ) : (
-              <PlugZap size={16} />
+              <PlugZap size={15} />
             )}
             {batchProbing !== null
               ? `探测中 ${batchProbing.length}/${filteredShells.length}`
-              : `探测全部（${filteredShells.length}）`}
+              : `探测全部 (${filteredShells.length})`}
           </button>
-          <button className="button secondary" onClick={() => void loadDashboard()}>
-            <RefreshCw size={16} />
+          <button className="button secondary" onClick={() => void loadDashboard()} title="刷新数据">
+            <RefreshCw size={15} />
             刷新
           </button>
           <button className="button secondary" onClick={() => setDialog("generate")}>
-            <Wand2 size={16} />
+            <Wand2 size={15} />
             生成 Webshell
           </button>
           <button className="button primary" onClick={() => setDialog("workspace")}>
-            <CirclePlus size={17} />
+            <CirclePlus size={16} />
             新建 Workspace
           </button>
         </div>
       </header>
+
       {error && <ErrorBanner message={error} />}
+
       <section className="metrics">
-        <Metric label="工作区" value={data.workspaces.length} detail="授权项目空间" />
-        <Metric label="Shell 配置" value={data.shells.length} detail="已登记端点" />
         <Metric
-          label="在线状态"
-          value={data.shells.filter((item) => item.status === "online").length}
-          detail="最近探测在线"
-          accent
+          label="工作空间"
+          value={data.workspaces.length}
+          detail="授权隔离项目"
+          onClick={() => { setWorkspaceFilter(""); setTagFilter(""); setStatusFilter(""); }}
         />
-        <Metric label="审计事件" value={data.auditEvents.length} detail="最近操作记录" />
-        <Metric label="插件" value={pluginCount} detail="功能/协议插件" />
-        <Metric label="最近连接" value={data.shells.filter((s) => s.lastConnectedAt).length} detail={lastConnected} />
+        <Metric
+          label="Shell 配置"
+          value={data.shells.length}
+          detail="已登记端点"
+          onClick={() => { setStatusFilter(""); setSearch(""); }}
+        />
+        <Metric
+          label="在线端点"
+          value={data.shells.filter((item) => item.status === "online").length}
+          detail="最新探测可用"
+          accent
+          onClick={() => setStatusFilter(statusFilter === "online" ? "" : "online")}
+        />
+        <Metric
+          label="功能/协议插件"
+          value={pluginCount}
+          detail="已装载模块"
+        />
+        <Metric
+          label="审计记录"
+          value={data.auditEvents.length}
+          detail="最近安全轨迹"
+        />
+        <Metric
+          label="最近连接"
+          value={lastConnected}
+          detail="最后会话时间"
+        />
       </section>
 
       <section className="main-grid">
         <Panel
           className="shell-panel"
-          eyebrow="SHELL 配置"
-          title="连接配置"
+          eyebrow="SHELL REGISTRY"
+          title={`Shell 列表 (${filteredShells.length})`}
           actions={
             <>
-              <button className="button compact" onClick={() => void exportShells()}>
+              <div className="view-mode-toggle">
+                <button
+                  className={`view-mode-btn ${viewMode === "list" ? "active" : ""}`}
+                  onClick={() => setViewMode("list")}
+                  title="列表视图"
+                >
+                  <List size={14} />
+                </button>
+                <button
+                  className={`view-mode-btn ${viewMode === "grid" ? "active" : ""}`}
+                  onClick={() => setViewMode("grid")}
+                  title="卡片网格视图"
+                >
+                  <LayoutGrid size={14} />
+                </button>
+              </div>
+              <button className="button compact secondary" onClick={() => void exportShells()} title="导出 Shell 配置 JSON">
+                <Download size={13} />
                 导出
               </button>
-              <button className="button compact" onClick={() => void importShells()}>
+              <button className="button compact secondary" onClick={() => void importShells()} title="导入 Shell 配置 JSON/CSV">
+                <Upload size={13} />
                 导入
               </button>
               <button
-                className="button compact"
+                className="button compact primary"
                 disabled={data.workspaces.length === 0}
                 onClick={() => setDialog("shell")}
               >
-                <CirclePlus size={16} />
+                <CirclePlus size={14} />
                 登记 Shell
               </button>
             </>
           }
         >
           {loading ? (
-            <Empty icon={<LoaderCircle className="spin" />} title="正在读取本地数据" />
+            <Empty icon={<LoaderCircle className="spin" size={24} />} title="正在读取本地数据…" />
           ) : filteredShells.length === 0 ? (
             <Empty
-              icon={<PlugZap />}
-              title="尚无 Shell 配置"
+              icon={<PlugZap size={28} />}
+              title="暂无匹配的 Shell 配置"
               detail={
                 data.workspaces.length
-                  ? "登记一个 Shell 验证连接流程。"
-                  : "请先创建带授权范围的 Workspace。"
+                  ? "点击「登记 Shell」添加端点，或调整筛选条件。"
+                  : "请先在下方创建带有授权范围的 Workspace。"
+              }
+              action={
+                data.workspaces.length ? (
+                  <button className="button primary compact" onClick={() => setDialog("shell")}>
+                    <CirclePlus size={14} />
+                    立即登记
+                  </button>
+                ) : (
+                  <button className="button primary compact" onClick={() => setDialog("workspace")}>
+                    <CirclePlus size={14} />
+                    创建 Workspace
+                  </button>
+                )
               }
             />
           ) : (
             <>
-            {selected.length > 0 && (
-              <div className="batch-bar">
-                <span>已选 {selected.length} 项</span>
-                <button className="button compact" disabled={batchBusy} onClick={() => void batchConnect()}>
-                  批量连接
-                </button>
-                <input
-                  className="batch-tags"
-                  value={batchTags}
-                  onChange={(event) => setBatchTags(event.target.value)}
-                  placeholder="批量设置标签（逗号分隔）"
-                />
-                <button className="button compact" disabled={batchBusy || !batchTags.trim()} onClick={() => void batchApplyTags()}>
-                  应用标签
-                </button>
-                <button className="button compact danger" disabled={batchBusy} onClick={() => void batchDelete()}>
-                  批量删除
-                </button>
-                <button className="button compact" onClick={() => setSelected([])}>
-                  取消选择
-                </button>
-              </div>
-            )}
-            {notice && <p className="form-note ok">{notice}</p>}
-            <div className="shell-list">
-              {pageShells.map((shell) => (
-                <article className={`shell-row ${selected.includes(shell.id) ? "selected" : ""}`} key={shell.id}>
+              {selected.length > 0 && (
+                <div className="batch-bar">
+                  <span>已选中 {selected.length} 个端点</span>
+                  <button className="button compact" onClick={toggleSelectAll}>
+                    {selected.length === pageShells.length ? "取消全选" : "全选本页"}
+                  </button>
+                  <button className="button compact primary" disabled={batchBusy} onClick={() => void batchConnect()}>
+                    <TerminalSquare size={13} />
+                    批量连接
+                  </button>
                   <input
-                    type="checkbox"
-                    className="shell-check"
-                    checked={selected.includes(shell.id)}
-                    onChange={() => toggleSelect(shell.id)}
+                    className="batch-tags"
+                    value={batchTags}
+                    onChange={(event) => setBatchTags(event.target.value)}
+                    placeholder="为选中项批量设置标签（逗号分隔）"
                   />
-                  <div className={`status-dot ${shell.status}`} />
-                  <div className="shell-identity">
-                    <strong>{shell.name}</strong>
-                    <span>{shell.endpoint}</span>
-                    {shell.tags.length > 0 && (
-                      <span className="shell-tags">
-                        {shell.tags.map((tag) => (
-                          <code key={tag} className="shell-tag">#{tag}</code>
-                        ))}
-                      </span>
-                    )}
-                  </div>
-                  <code>{shell.runtime.toUpperCase()}</code>
-                  <div className="last-seen">
-                    <span>{shell.status}</span>
-                    <small>{shortTime(shell.lastConnectedAt)}</small>
-                  </div>
                   <button
-                    className="icon-button"
-                    title="编辑"
-                    onClick={() => { setEditingShell(shell); setDialog("shell"); }}
+                    className="button compact"
+                    disabled={batchBusy || !batchTags.trim()}
+                    onClick={() => void batchApplyTags()}
                   >
-                    <FilePenLine size={16} />
+                    应用标签
                   </button>
+                  <button className="button compact danger" disabled={batchBusy} onClick={() => void batchDelete()}>
+                    <Trash2 size={13} />
+                    批量删除
+                  </button>
+                  <button className="button compact" onClick={() => setSelected([])}>
+                    取消选择
+                  </button>
+                </div>
+              )}
+
+              {viewMode === "list" ? (
+                <div className="shell-list">
+                  {pageShells.map((shell) => (
+                    <article
+                      className={`shell-row ${selected.includes(shell.id) ? "selected" : ""}`}
+                      key={shell.id}
+                      onDoubleClick={() => void connect(shell)}
+                      title="双击直接连接并打开控制台"
+                    >
+                      <input
+                        type="checkbox"
+                        className="shell-check"
+                        checked={selected.includes(shell.id)}
+                        onChange={() => toggleSelect(shell.id)}
+                      />
+                      <div className={`status-dot ${shell.status}`} title={`状态: ${shell.status}`} />
+                      <div className="shell-identity">
+                        <strong>{shell.name}</strong>
+                        <span
+                          title={shell.endpoint}
+                          onClick={() => void copyEndpoint(shell.endpoint)}
+                          style={{ cursor: "pointer" }}
+                        >
+                          {shell.endpoint}
+                        </span>
+                        {shell.tags.length > 0 && (
+                          <span className="shell-tags">
+                            {shell.tags.map((tag) => (
+                              <code
+                                key={tag}
+                                className="shell-tag"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setTagFilter(tag);
+                                }}
+                                style={{ cursor: "pointer" }}
+                              >
+                                #{tag}
+                              </code>
+                            ))}
+                          </span>
+                        )}
+                      </div>
+                      <span className={`runtime-badge ${shell.runtime}`}>{shell.runtime}</span>
+                      <div className="last-seen">
+                        <span>{shell.status}</span>
+                        <small>{shortTime(shell.lastConnectedAt)}</small>
+                      </div>
+                      <button
+                        className="icon-button"
+                        title="编辑配置"
+                        onClick={() => {
+                          setEditingShell(shell);
+                          setDialog("shell");
+                        }}
+                      >
+                        <FilePenLine size={15} />
+                      </button>
+                      <button
+                        className="icon-button danger"
+                        title="删除配置"
+                        onClick={() => void removeShell(shell)}
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                      <button
+                        className="icon-button"
+                        title="测试探测"
+                        onClick={() => void probe(shell)}
+                        disabled={probing === shell.id}
+                      >
+                        {probing === shell.id ? (
+                          <LoaderCircle className="spin" size={16} />
+                        ) : (
+                          <PlugZap size={16} />
+                        )}
+                      </button>
+                      <button
+                        className="button compact connect"
+                        onClick={() => void connect(shell)}
+                        disabled={connecting === shell.id}
+                      >
+                        {connecting === shell.id ? (
+                          <LoaderCircle className="spin" size={13} />
+                        ) : (
+                          <TerminalSquare size={13} />
+                        )}
+                        {connecting === shell.id ? "连接中…" : "连接"}
+                      </button>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <div className="shell-grid">
+                  {pageShells.map((shell) => (
+                    <article
+                      className={`shell-card ${selected.includes(shell.id) ? "selected" : ""}`}
+                      key={shell.id}
+                      onDoubleClick={() => void connect(shell)}
+                      title="双击直接连接并打开控制台"
+                    >
+                      <div className="shell-card-header">
+                        <div className="shell-card-title">
+                          <input
+                            type="checkbox"
+                            className="shell-check"
+                            checked={selected.includes(shell.id)}
+                            onChange={() => toggleSelect(shell.id)}
+                          />
+                          <div className={`status-dot ${shell.status}`} />
+                          <strong>{shell.name}</strong>
+                        </div>
+                        <span className={`runtime-badge ${shell.runtime}`}>{shell.runtime}</span>
+                      </div>
+                      <p
+                        className="shell-card-endpoint"
+                        onClick={() => void copyEndpoint(shell.endpoint)}
+                        title="点击复制端点"
+                        style={{ cursor: "pointer" }}
+                      >
+                        {shell.endpoint}
+                      </p>
+                      {shell.tags.length > 0 && (
+                        <div className="shell-tags" style={{ marginBottom: 12 }}>
+                          {shell.tags.map((tag) => (
+                            <code
+                              key={tag}
+                              className="shell-tag"
+                              onClick={() => setTagFilter(tag)}
+                              style={{ cursor: "pointer" }}
+                            >
+                              #{tag}
+                            </code>
+                          ))}
+                        </div>
+                      )}
+                      <div className="shell-card-footer">
+                        <small style={{ color: "var(--text-faint)", fontSize: 11 }}>
+                          {shortTime(shell.lastConnectedAt)}
+                        </small>
+                        <div className="shell-card-actions">
+                          <button
+                            className="icon-button"
+                            title="探测连通性"
+                            onClick={() => void probe(shell)}
+                            disabled={probing === shell.id}
+                          >
+                            {probing === shell.id ? (
+                              <LoaderCircle className="spin" size={14} />
+                            ) : (
+                              <PlugZap size={14} />
+                            )}
+                          </button>
+                          <button
+                            className="icon-button"
+                            title="编辑"
+                            onClick={() => {
+                              setEditingShell(shell);
+                              setDialog("shell");
+                            }}
+                          >
+                            <FilePenLine size={14} />
+                          </button>
+                          <button
+                            className="button compact connect"
+                            onClick={() => void connect(shell)}
+                            disabled={connecting === shell.id}
+                          >
+                            <TerminalSquare size={13} />
+                            连接
+                          </button>
+                        </div>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+
+              {filteredShells.length > PAGE_SIZE && (
+                <div className="pagination">
                   <button
-                    className="icon-button danger"
-                    title="删除"
-                    onClick={() => void removeShell(shell)}
+                    className="button compact"
+                    disabled={page === 0}
+                    onClick={() => setPage(page - 1)}
                   >
-                    <Trash2 size={16} />
+                    上一页
                   </button>
+                  <span className="pagination-info">
+                    第 {page + 1} / {pageCount} 页（共 {filteredShells.length} 项）
+                  </span>
                   <button
-                    className="icon-button"
-                    title="探测"
-                    onClick={() => void probe(shell)}
-                    disabled={probing === shell.id}
+                    className="button compact"
+                    disabled={page >= pageCount - 1}
+                    onClick={() => setPage(page + 1)}
                   >
-                    {probing === shell.id ? (
-                      <LoaderCircle className="spin" size={18} />
-                    ) : (
-                      <ChevronRight size={18} />
-                    )}
+                    下一页
                   </button>
-                  <button
-                    className="button compact connect"
-                    onClick={() => void connect(shell)}
-                    disabled={connecting === shell.id}
-                  >
-                    {connecting === shell.id ? "连接中…" : "连接"}
-                  </button>
-                </article>
-              ))}
-            </div>
-            {filteredShells.length > PAGE_SIZE && (
-              <div className="pager">
-                <button className="button compact" disabled={page === 0} onClick={() => setPage(page - 1)}>
-                  上一页
-                </button>
-                <span className="pager-info">
-                  第 {page + 1} / {pageCount} 页（共 {filteredShells.length}）
-                </span>
-                <button
-                  className="button compact"
-                  disabled={page >= pageCount - 1}
-                  onClick={() => setPage(page + 1)}
-                >
-                  下一页
-                </button>
-              </div>
-            )}
+                </div>
+              )}
             </>
-            
           )}
         </Panel>
 
-        <Panel eyebrow="最近活动" title="审计事件">
+        <Panel eyebrow="ACTIVITY LOG" title="安全审计事件">
           {data.auditEvents.length === 0 ? (
-            <Empty icon={<Activity />} title="暂无审计事件" />
+            <Empty icon={<Activity size={24} />} title="暂无活动事件" />
           ) : (
             <div className="timeline">
               {data.auditEvents.slice(0, 8).map((event) => (
@@ -583,47 +813,59 @@ export function DashboardView({
 
       <section className="panel workspace-panel">
         <div className="panel-heading">
-          <div>
-            <p className="eyebrow">授权边界</p>
-            <h2>工作空间</h2>
+          <div className="panel-heading-title">
+            <p className="eyebrow">SECURITY BOUNDARY</p>
+            <h2>授权工作空间</h2>
           </div>
+          <button className="button compact primary" onClick={() => setDialog("workspace")}>
+            <CirclePlus size={14} />
+            新建 Workspace
+          </button>
         </div>
         <div className="workspace-cards">
           {data.workspaces.map((workspace) => {
             const expiry = expiryInfo(workspace);
+            const shellCount = data.shells.filter((shell) => shell.workspaceId === workspace.id).length;
             return (
-            <article key={workspace.id} className="workspace-card">
-              <FolderKanban size={21} />
-              <div>
-                <strong>{workspace.name}</strong>
-                <span>{workspace.authorizationScope}</span>
-              </div>
-              <small>
-                {data.shells.filter((shell) => shell.workspaceId === workspace.id).length} 个配置
-              </small>
-              <span className={`expiry-badge ${expiry.kind}`}>{expiry.label}</span>
-              <span className="workspace-ops">
-                <button
-                  className="icon-button"
-                  title="编辑"
-                  onClick={() => { setEditingWorkspace(workspace); setDialog("workspace"); }}
-                >
-                  <FilePenLine size={15} />
-                </button>
-                <button
-                  className="icon-button danger"
-                  title="删除"
-                  onClick={() => void removeWorkspace(workspace)}
-                >
-                  <Trash2 size={15} />
-                </button>
-              </span>
-            </article>
+              <article key={workspace.id} className="workspace-card">
+                <div className="workspace-card-head">
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <FolderKanban size={18} color="var(--accent)" />
+                    <strong>{workspace.name}</strong>
+                  </div>
+                  <span className={`expiry-badge ${expiry.kind}`}>{expiry.label}</span>
+                </div>
+                <p className="workspace-card-scope" title="授权目标范围">
+                  {workspace.authorizationScope}
+                </p>
+                <div className="workspace-card-meta">
+                  <small style={{ color: "var(--text-faint)" }}>{shellCount} 个端点配置</small>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    <button
+                      className="icon-button"
+                      title="编辑工作区"
+                      onClick={() => {
+                        setEditingWorkspace(workspace);
+                        setDialog("workspace");
+                      }}
+                    >
+                      <FilePenLine size={14} />
+                    </button>
+                    <button
+                      className="icon-button danger"
+                      title="删除工作区"
+                      onClick={() => void removeWorkspace(workspace)}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                </div>
+              </article>
             );
           })}
           {data.workspaces.length === 0 && (
-            <p className="muted">
-              创建 Workspace 后，所有 Shell 和审计记录都将按项目隔离。
+            <p className="muted" style={{ padding: "16px 20px" }}>
+              创建 Workspace 后，所有 Shell 配置和审计轨迹将按授权空间物理隔离。
             </p>
           )}
         </div>
@@ -633,7 +875,10 @@ export function DashboardView({
       {dialog === "workspace" && (
         <WorkspaceDialog
           initial={editingWorkspace}
-          onClose={() => { setDialog(null); setEditingWorkspace(null); }}
+          onClose={() => {
+            setDialog(null);
+            setEditingWorkspace(null);
+          }}
           onCreated={loadDashboard}
         />
       )}
@@ -641,7 +886,10 @@ export function DashboardView({
         <ShellDialog
           workspaces={data.workspaces}
           initial={editingShell}
-          onClose={() => { setDialog(null); setEditingShell(null); }}
+          onClose={() => {
+            setDialog(null);
+            setEditingShell(null);
+          }}
           onCreated={loadDashboard}
         />
       )}
@@ -658,8 +906,10 @@ function WorkspaceDialog({
   onClose: () => void;
   onCreated: () => Promise<void>;
 }) {
+  const toast = useToast();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -673,36 +923,42 @@ function WorkspaceDialog({
       };
       if (initial) {
         await api.updateWorkspace({ id: initial.id, ...input });
+        toast.success(`工作区 ${input.name} 已更新`, "保存成功");
       } else {
         await api.createWorkspace(input);
+        toast.success(`工作区 ${input.name} 创建成功`, "创建成功");
       }
       await onCreated();
       onClose();
     } catch (cause) {
-      setError(errorText(cause));
+      const msg = errorText(cause);
+      setError(msg);
+      toast.error(msg, "操作失败");
     } finally {
       setBusy(false);
     }
   }
+
   return (
     <Dialog title={initial ? "编辑授权 Workspace" : "新建授权 Workspace"} onClose={onClose}>
       <form onSubmit={(event) => void submit(event)}>
         {error && <p className="form-note error">{error}</p>}
         <label>
-          项目名称
-          <input name="name" required defaultValue={initial?.name} placeholder="例如：授权测试项目" />
+          项目空间名称
+          <input name="name" required defaultValue={initial?.name} placeholder="例如：某系统渗透测试项目" />
         </label>
         <label>
-          授权范围
+          授权目标范围 (IP / 域名 / CIDR)
           <textarea
             name="scope"
             required
             defaultValue={initial?.authorizationScope}
-            placeholder="例如：localhost、10.0.0.0/24 或测试域名"
+            placeholder="例如：127.0.0.1、192.168.1.0/24 或 test.local"
           />
+          <span className="field-hint">真实网络发包将自动校验目标是否属于此授权范围</span>
         </label>
         <label>
-          授权到期日
+          授权到期时间
           <input name="expiresAt" type="date" defaultValue={initial?.expiresAt?.slice(0, 10)} />
         </label>
         <div className="dialog-actions">
@@ -729,6 +985,7 @@ function ShellDialog({
   onClose: () => void;
   onCreated: () => Promise<void>;
 }) {
+  const toast = useToast();
   const [protocols, setProtocols] = useState<ProtocolMeta[]>([]);
   const [protocolId, setProtocolId] = useState(initial?.protocolId ?? "builtin.mock.v1");
   const [encoders, setEncoders] = useState<[string, string][]>([]);
@@ -750,7 +1007,7 @@ function ShellDialog({
   async function runTest() {
     if (!formRef.current) return;
     const form = new FormData(formRef.current);
-    setTestState({ busy: true, ok: false, message: "正在探测目标…" });
+    setTestState({ busy: true, ok: false, message: "正在探测目标连通性…" });
     try {
       const result = await api.testConnection(
         String(form.get("endpoint")),
@@ -764,16 +1021,18 @@ function ShellDialog({
       setTestState({
         busy: false,
         ok: true,
-        message: `连接成功：${result.server} · ${result.runtime} · ${result.currentDir}`,
+        message: `✓ 连接成功：${result.server} · ${result.runtime} · 目录: ${result.currentDir}`,
       });
+      toast.success("目标端点与密钥握手成功", "测试通过");
     } catch (cause) {
-      setTestState({ busy: false, ok: false, message: `连接失败：${errorText(cause)}` });
+      const msg = `连接失败：${errorText(cause)}`;
+      setTestState({ busy: false, ok: false, message: msg });
+      toast.error(msg, "测试未通过");
     }
   }
 
   const selected = protocols.find((protocol) => protocol.id === protocolId);
-  const connectionTestable =
-    selected?.requiresNetwork === true && settings.httpEnabled;
+  const connectionTestable = selected?.requiresNetwork === true && settings.httpEnabled;
   const networkProtocols = protocols.filter((protocol) => protocol.requiresNetwork);
   const networkLocked = networkProtocols.length > 0 && !settings.httpEnabled;
   const editing = initial !== null;
@@ -792,6 +1051,7 @@ function ShellDialog({
           password: form.get("password") ? String(form.get("password")) : initial.password,
           tags: parseTags(String(form.get("tags") ?? "")),
         });
+        toast.success(`Shell「${form.get("name")}」已更新`, "保存成功");
       } else {
         await api.createShell({
           workspaceId: String(form.get("workspaceId")),
@@ -807,18 +1067,21 @@ function ShellDialog({
               ? JSON.stringify({ encoder: encoderId })
               : undefined,
         });
+        toast.success(`Shell「${form.get("name")}」登记完成`, "登记成功");
       }
       await onCreated();
       onClose();
     } catch (cause) {
-      setError(errorText(cause));
+      const msg = errorText(cause);
+      setError(msg);
+      toast.error(msg, "登记失败");
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <Dialog title={editing ? "编辑 Shell" : "登记 Shell"} onClose={onClose}>
+    <Dialog title={editing ? "编辑 Shell 配置" : "登记 Shell 端点"} onClose={onClose}>
       <form ref={formRef} onSubmit={(event) => void submit(event)}>
         {error && <p className="form-note error">{error}</p>}
         {testState && (
@@ -827,63 +1090,68 @@ function ShellDialog({
           </p>
         )}
         <label>
-          Workspace
+          所属 Workspace
           <select name="workspaceId" required defaultValue={initial?.workspaceId} disabled={editing}>
             {workspaces.map((item) => (
               <option key={item.id} value={item.id}>
-                {item.name}
+                {item.name} ({item.authorizationScope})
               </option>
             ))}
           </select>
         </label>
         <label>
-          名称
-          <input name="name" required defaultValue={initial?.name} placeholder="例如：本地测试端点" />
+          Shell 名称
+          <input name="name" required defaultValue={initial?.name} placeholder="例如：测试主机-Nginx-PHP" />
         </label>
         <label>
-          Endpoint
+          端点 URL
           <input
             name="endpoint"
             required
             defaultValue={initial?.endpoint ?? "mock://local"}
-            placeholder="http://目标/shell.php"
+            placeholder="http://192.168.1.100/shell.php"
           />
         </label>
         <label>
-          标签
+          标签 (Tags)
           <input
             name="tags"
             defaultValue={initial?.tags.join(", ")}
-            placeholder="可选：生产, 测试（逗号分隔）"
+            placeholder="可选：生产环境, Linux, Nginx (逗号分隔)"
           />
         </label>
         {editing ? (
           <p className="form-note">
-            协议与运行时不可在编辑中变更（{initial.protocolId}）。
+            协议与运行时不可在编辑中变更（当前：{initial.protocolId} · {initial.runtime}）。
           </p>
         ) : (
           <>
             <label>
-              协议
+              连接协议
               <select
                 value={protocolId}
                 onChange={(event) => setProtocolId(event.target.value)}
                 disabled={networkLocked && protocolId !== "builtin.mock.v1"}
               >
                 {protocols.map((protocol) => (
-                  <option key={protocol.id} value={protocol.id} disabled={protocol.requiresNetwork && !settings.httpEnabled}>
-                    {protocol.displayName}
-                    {protocol.requiresNetwork ? "（真实网络）" : "（本地）"}
+                  <option
+                    key={protocol.id}
+                    value={protocol.id}
+                    disabled={protocol.requiresNetwork && !settings.httpEnabled}
+                  >
+                    {protocol.displayName} {protocol.requiresNetwork ? "（真实网络）" : "（本地沙箱）"}
                   </option>
                 ))}
               </select>
             </label>
             <label>
-              运行时
+              目标运行时
               <select name="runtime">
                 <option value="php">PHP</option>
                 <option value="jsp">JSP</option>
                 <option value="aspnet">ASP.NET</option>
+                <option value="python">Python</option>
+                <option value="node">Node.js</option>
               </select>
             </label>
           </>
@@ -892,7 +1160,12 @@ function ShellDialog({
           <>
             <label>
               连接密码
-              <input name="password" type="password" required={!editing} placeholder={editing ? "留空保持原密码" : "WebShell 鉴权密码"} />
+              <input
+                name="password"
+                type="password"
+                required={!editing}
+                placeholder={editing ? "留空保持原密码" : "WebShell 鉴权密钥"}
+              />
             </label>
             {!editing && protocolId === "builtin.php.v1" && (
               <label>
@@ -905,21 +1178,21 @@ function ShellDialog({
                   ))}
                 </select>
                 <span className="field-hint">
-                  与目标 stub 的解码方式一致；可在「生成 Webshell」中生成配套 stub。
+                  需与目标 stub 的解码方式一致；可在「生成 Webshell」中生成配套代码。
                 </span>
               </label>
             )}
-            
+
             {!editing && settings.httpEnabled && (
               <label className="confirm-row">
-                <input name="confirm" type="checkbox" />
-                <span>我已确认目标位于授权范围内，且有权进行测试</span>
+                <input name="confirm" type="checkbox" required />
+                <span>我已确认该端点位于所属 Workspace 授权范围内</span>
               </label>
             )}
             {!editing && !settings.httpEnabled && (
               <p className="form-note">
                 <ShieldCheck size={15} />
-                真实网络协议尚未在「设置」中开启，请先前往设置页确认授权声明。
+                真实网络协议尚未在「系统设置」中开启，请先前往设置页开启真实网络协议。
               </p>
             )}
           </>
@@ -927,17 +1200,18 @@ function ShellDialog({
         {!editing && !selected?.requiresNetwork && (
           <p className="form-note">
             <ShieldCheck size={15} />
-            当前选择的是本地 Mock 协议，不会产生真实网络流量。
+            当前选择的是本地 Mock 协议，用于离线模拟测试，不会产生真实对外网络流量。
           </p>
         )}
         <div className="dialog-actions">
           {connectionTestable && !editing && (
             <button
               type="button"
-              className="button"
+              className="button secondary"
               disabled={testState?.busy}
               onClick={() => void runTest()}
             >
+              {testState?.busy ? <LoaderCircle className="spin" size={13} /> : <PlugZap size={13} />}
               {testState?.busy ? "测试中…" : "测试连接"}
             </button>
           )}

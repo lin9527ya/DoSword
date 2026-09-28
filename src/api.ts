@@ -184,6 +184,11 @@ export const api = {
   listRequestLog: (endpoint?: string | null) =>
     invoke<RequestRecord[]>("list_request_log", { endpoint: endpoint ?? null }),
   clearRequestLog: () => invoke<void>("clear_request_log"),
+  testProxyUpstream: (proxy?: string | null, timeoutSecs?: number | null) =>
+    invoke<{ ok: boolean; latency_ms: number; message: string; exit_ip?: string | null }>(
+      "test_proxy_upstream",
+      { proxy: proxy ?? null, timeoutSecs: timeoutSecs ?? null }
+    ),
 };
 
 // --- Base64 工具（编辑器/上传下载用） ---
@@ -200,14 +205,21 @@ export const b64 = {
     return btoa(binary);
   },
   decodeBytes(value: string): Uint8Array {
-    const binary = atob(value);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  },
-  decodeText(value: string): string {
+    if (!value) return new Uint8Array();
     try {
-      return new TextDecoder("utf-8").decode(this.decodeBytes(value));
+      const clean = value.replace(/[\s\r\n]+/g, "");
+      const binary = atob(clean);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    } catch {
+      return new Uint8Array();
+    }
+  },
+  decodeText(value: string, encoding: string = "utf-8"): string {
+    try {
+      const bytes = this.decodeBytes(value);
+      return new TextDecoder(encoding, { fatal: false }).decode(bytes);
     } catch {
       return "";
     }

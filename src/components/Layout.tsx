@@ -1,7 +1,18 @@
-import { Activity, Boxes, Braces, FileCode2, LayoutDashboard, Settings, ShieldCheck, TerminalSquare } from "lucide-react";
+import {
+  Activity,
+  ArrowLeftRight,
+  Boxes,
+  FileCode2,
+  LayoutDashboard,
+  Settings,
+  ShieldCheck,
+  TerminalSquare,
+  X,
+} from "lucide-react";
 import { useEffect } from "react";
 import type { ReactNode } from "react";
 import type { ShellTab, View } from "../views/types";
+import { StatusBar } from "./StatusBar";
 
 type NavItem = {
   key: string;
@@ -9,19 +20,20 @@ type NavItem = {
   icon: ReactNode;
   view?: View;
   soon?: boolean;
+  shortcut?: string;
 };
 
 const NAV_ITEMS: NavItem[] = [
-  { key: "dashboard", label: "总览", icon: <LayoutDashboard size={18} />, view: { kind: "dashboard" } },
-  { key: "sessions", label: "终端会话", icon: <TerminalSquare size={18} />, view: { kind: "sessions" } },
-  { key: "files", label: "文件传输", icon: <FileCode2 size={18} />, soon: true },
-  { key: "debug", label: "请求调试", icon: <Braces size={18} />, view: { kind: "debug" } },
-  { key: "database", label: "数据库", icon: <Boxes size={18} />, soon: true },
+  { key: "dashboard", label: "总览", icon: <LayoutDashboard size={17} />, view: { kind: "dashboard" }, shortcut: "Ctrl+N" },
+  { key: "sessions", label: "终端会话", icon: <TerminalSquare size={17} />, view: { kind: "sessions" }, shortcut: "Ctrl+T" },
+  { key: "debug", label: "请求调试", icon: <ArrowLeftRight size={17} />, view: { kind: "debug" }, shortcut: "Ctrl+R" },
+  { key: "files", label: "批量文件", icon: <FileCode2 size={17} />, view: { kind: "files" }, shortcut: "Ctrl+M" },
+  { key: "database", label: "数据库", icon: <Boxes size={17} />, view: { kind: "database" }, shortcut: "Ctrl+D" },
 ];
 
 const BOTTOM_ITEMS: NavItem[] = [
-  { key: "audit", label: "审计日志", icon: <Activity size={18} />, view: { kind: "audit" } },
-  { key: "settings", label: "设置", icon: <Settings size={18} />, view: { kind: "settings" } },
+  { key: "audit", label: "审计日志", icon: <Activity size={17} />, view: { kind: "audit" } },
+  { key: "settings", label: "系统设置", icon: <Settings size={17} />, view: { kind: "settings" } },
 ];
 
 export function Layout({
@@ -43,7 +55,7 @@ export function Layout({
 }) {
   const activeKey = view.kind === "shell" ? "dashboard" : view.kind;
 
-  // 全局快捷键：Ctrl+T 会话页 / Ctrl+N 总览 / Ctrl+F 搜索总览 / F5 刷新 / Ctrl+W 关闭标签
+  // 全局快捷键：Ctrl+T 会话页 / Ctrl+N 总览 / Ctrl+R 请求调试 / Ctrl+M 批量文件 / Ctrl+D 数据库 / F5 刷新 / Ctrl+W 关闭标签
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       const mod = event.ctrlKey || event.metaKey;
@@ -53,9 +65,15 @@ export function Layout({
       } else if (mod && event.key.toLowerCase() === "n") {
         event.preventDefault();
         onNavigate({ kind: "dashboard" });
-      } else if (mod && event.key.toLowerCase() === "f") {
+      } else if (mod && event.key.toLowerCase() === "r") {
         event.preventDefault();
-        onNavigate({ kind: "dashboard" });
+        onNavigate({ kind: "debug" });
+      } else if (mod && event.key.toLowerCase() === "m") {
+        event.preventDefault();
+        onNavigate({ kind: "files" });
+      } else if (mod && event.key.toLowerCase() === "d") {
+        event.preventDefault();
+        onNavigate({ kind: "database" });
       } else if (event.key === "F5") {
         event.preventDefault();
         onNavigate({ kind: "dashboard" });
@@ -72,16 +90,17 @@ export function Layout({
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <ShieldCheck size={25} />
+          <ShieldCheck size={24} className="brand-icon" />
           <span>DoSword</span>
+          <span className="brand-badge">v2.0</span>
         </div>
-        <div className="workspace-label">AUTHORIZED WORKSPACE</div>
+        <div className="workspace-label">WORKSPACE ENGINE</div>
         <nav>
           {NAV_ITEMS.map((item) =>
             item.soon ? (
-              <button key={item.key} className="nav-item" title="规划于 V2.0">
+              <button key={item.key} className="nav-item" title="规划中" style={{ opacity: 0.6 }}>
                 {item.icon}
-                <span className="nav-label">{item.label}</span>
+                <span>{item.label}</span>
                 <em className="nav-flag">规划中</em>
               </button>
             ) : (
@@ -89,9 +108,11 @@ export function Layout({
                 key={item.key}
                 className={`nav-item ${activeKey === item.key ? "active" : ""}`}
                 onClick={() => item.view && onNavigate(item.view)}
+                title={item.shortcut ? `${item.label} (${item.shortcut})` : item.label}
               >
                 {item.icon}
-                {item.label}
+                <span>{item.label}</span>
+                {item.shortcut && <kbd>{item.shortcut}</kbd>}
               </button>
             ),
           )}
@@ -104,44 +125,49 @@ export function Layout({
               onClick={() => item.view && onNavigate(item.view)}
             >
               {item.icon}
-              {item.label}
+              <span>{item.label}</span>
             </button>
           ))}
           <div className="safety-note">
             <ShieldCheck size={16} />
             <span>
-              真实网络协议默认关闭
+              真实网络协议受安全门保护
               <br />
-              仅在授权范围内使用
+              请在授权测试范围内使用
             </span>
           </div>
         </div>
       </aside>
       <div className="content">
-        {shellTabs.length > 0 && (
-          <div className="shell-tabs">
-            {shellTabs.map((tab) => (
-              <span
-                key={tab.id}
-                className={`shell-tab ${activeTab === tab.id ? "active" : ""}`}
-                onClick={() => onSelectTab?.(tab.id)}
-                title={tab.name || tab.shellId}
-              >
-                {tab.shellId}
-                <button
-                  className="shell-tab-close"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onCloseTab?.(tab.id);
-                  }}
+        <div className="content-inner">
+          {shellTabs.length > 0 && (
+            <div className="shell-tabs">
+              {shellTabs.map((tab) => (
+                <span
+                  key={tab.id}
+                  className={`shell-tab ${activeTab === tab.id ? "active" : ""}`}
+                  onClick={() => onSelectTab?.(tab.id)}
+                  title={tab.name || tab.shellId}
                 >
-                  ×
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
-        <main>{children}</main>
+                  <span className="shell-tab-dot" />
+                  <span>{tab.name || tab.shellId}</span>
+                  <button
+                    className="shell-tab-close"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onCloseTab?.(tab.id);
+                    }}
+                    title="关闭标签页 (Ctrl+W)"
+                  >
+                    <X size={12} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <main className="app-main">{children}</main>
+        </div>
+        <StatusBar activeSessionCount={shellTabs.length} />
       </div>
     </div>
   );

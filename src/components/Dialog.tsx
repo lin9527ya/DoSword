@@ -4,10 +4,16 @@ export function Dialog({
   title,
   onClose,
   children,
+  footer,
+  size = "medium",
+  className = "",
 }: {
   title: string;
   onClose: () => void;
   children: ReactNode;
+  footer?: ReactNode;
+  size?: "small" | "medium" | "large" | "xlarge" | "full";
+  className?: string;
 }) {
   const dialogRef = useRef<HTMLElement>(null);
 
@@ -47,17 +53,20 @@ export function Dialog({
   return (
     <div className="dialog-backdrop" onMouseDown={onClose} role="dialog" aria-modal="true" aria-label={title}>
       <section
-        className="dialog"
+        className={`dialog dialog-${size} ${className}`.trim()}
         ref={dialogRef}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <div className="dialog-title">
           <h2>{title}</h2>
-          <button className="icon-button" onClick={onClose}>
+          <button className="icon-button" onClick={onClose} title="关闭 (Esc)">
             ×
           </button>
         </div>
-        {children}
+        <div className="dialog-content">
+          {children}
+        </div>
+        {footer && <div className="dialog-footer">{footer}</div>}
       </section>
     </div>
   );

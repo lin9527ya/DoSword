@@ -8,15 +8,28 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
-  // P10: xterm 单独分包（体积大且仅在终端使用），主包首屏更小
+  // 构建体积与速度兼顾：vendor 拆分 + esbuild 压缩 + 按路由懒加载
   build: {
+    target: "esnext",
+    minify: "esbuild",
+    sourcemap: false,
+    chunkSizeWarningLimit: 500,
+    cssCodeSplit: true,
     rollupOptions: {
       output: {
         manualChunks: {
+          react: ["react", "react-dom"],
           xterm: ["@xterm/xterm", "@xterm/addon-fit"],
+          vendor: ["lucide-react"],
         },
       },
     },
+  },
+  optimizeDeps: {
+    include: ["react", "react-dom", "@xterm/xterm", "@xterm/addon-fit", "lucide-react"],
+  },
+  esbuild: {
+    drop: process.env.NODE_ENV === "production" ? ["console", "debugger"] : [],
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
@@ -36,8 +49,13 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell Vite to ignore watching rust build outputs and backend source
+      ignored: [
+        "**/src-tauri/**",
+        "**/target/**",
+        "**/crates/**",
+        "**/.git/**",
+      ],
     },
   },
 }));

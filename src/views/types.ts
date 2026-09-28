@@ -5,6 +5,8 @@ export type View =
   | { kind: "shell"; shellId: string; sessionId?: string; shellName?: string }
   | { kind: "sessions" }
   | { kind: "debug" }
+  | { kind: "files" }
+  | { kind: "database" }
   | { kind: "audit" }
   | { kind: "settings" };
 

@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
-import { Activity, Download } from "lucide-react";
+import {
+  Activity,
+  CheckCircle2,
+  Download,
+  LoaderCircle,
+  RefreshCw,
+  XCircle,
+} from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { api, b64, errorText, shortTime } from "../api";
 import type { AuditEvent } from "../api";
 import { Empty, ErrorBanner, Panel } from "../components/common";
+import { useToast } from "../components/Toast";
 
 const PAGE_SIZE = 50;
 
@@ -23,8 +31,8 @@ const ACTION_LABELS: Record<string, string> = {
   "file.write": "写入文件",
   "file.upload": "上传文件",
   "file.download": "下载文件",
-  "file.delete": "删除",
-  "file.rename": "重命名",
+  "file.delete": "删除文件",
+  "file.rename": "重命名/移动",
   "file.mkdir": "新建目录",
   "db.probe": "数据库探测",
   "db.query": "数据库查询",
@@ -41,6 +49,7 @@ function csvCell(value: string): string {
 }
 
 export function AuditView() {
+  const toast = useToast();
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -48,27 +57,33 @@ export function AuditView() {
   const [filter, setFilter] = useState<string>("");
   const [outcome, setOutcome] = useState<string>("");
   const [page, setPage] = useState(0);
+  const [selectedEvent, setSelectedEvent] = useState<AuditEvent | null>(null);
 
-  const load = useCallback(async (targetPage: number, action: string, result: string) => {
-    setLoading(true);
-    setError("");
-    try {
-      const data = await api.listAudit({
-        workspaceId: null,
-        action: action || null,
-        outcome: result || null,
-        limit: PAGE_SIZE,
-        offset: targetPage * PAGE_SIZE,
-      });
-      setEvents(data.events);
-      setTotal(data.total);
-      setPage(targetPage);
-    } catch (cause) {
-      setError(errorText(cause));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const load = useCallback(
+    async (targetPage: number, action: string, result: string) => {
+      setLoading(true);
+      setError("");
+      try {
+        const data = await api.listAudit({
+          workspaceId: null,
+          action: action || null,
+          outcome: result || null,
+          limit: PAGE_SIZE,
+          offset: targetPage * PAGE_SIZE,
+        });
+        setEvents(data.events);
+        setTotal(data.total);
+        setPage(targetPage);
+      } catch (cause) {
+        const msg = errorText(cause);
+        setError(msg);
+        toast.error(msg, "加载审计日志失败");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [toast],
+  );
 
   useEffect(() => {
     void load(0, filter, outcome);
@@ -77,28 +92,29 @@ export function AuditView() {
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   async function exportCsv() {
-    const localPath = await save({
-      defaultPath: `dosword-audit-${new Date().toISOString().slice(0, 10)}.csv`,
-      filters: [{ name: "CSV", extensions: ["csv"] }],
-    });
-    if (!localPath) return;
-    const rows = [
-      ["时间", "操作", "结果", "详情", "Workspace", "Shell"],
-      ...events.map((event) => [
-        event.createdAt,
-        actionLabel(event.action),
-        event.outcome,
-        event.detail,
-        event.workspaceId || "",
-        event.shellId ?? "",
-      ]),
-    ];
-    const csv = "\uFEFF" + rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
     try {
+      const localPath = await save({
+        defaultPath: `dosword-audit-${new Date().toISOString().slice(0, 10)}.csv`,
+        filters: [{ name: "CSV 表格文件", extensions: ["csv"] }],
+      });
+      if (!localPath) return;
+      const rows = [
+        ["时间", "操作类型", "执行结果", "详细轨迹", "Workspace ID", "Shell ID"],
+        ...events.map((event) => [
+          event.createdAt,
+          actionLabel(event.action),
+          event.outcome,
+          event.detail,
+          event.workspaceId || "",
+          event.shellId ?? "",
+        ]),
+      ];
+      const csv = "\uFEFF" + rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
       const bytes = new TextEncoder().encode(csv);
       await api.writeLocalFile(localPath, b64.encodeBytes(bytes));
+      toast.success(`已成功导出 ${events.length} 条审计日志`, "导出完成");
     } catch (cause) {
-      setError(`导出失败：${errorText(cause)}`);
+      toast.error(errorText(cause), "导出失败");
     }
   }
 
@@ -106,56 +122,101 @@ export function AuditView() {
     <>
       <header className="topbar">
         <div>
-          <p className="eyebrow">审计轨迹</p>
-          <h1>审计日志</h1>
+          <p className="eyebrow">SECURITY TRACEABILITY</p>
+          <h1>安全审计轨迹</h1>
         </div>
         <div className="top-actions">
-          <select className="select" value={outcome} onChange={(event) => setOutcome(event.target.value)}>
+          <select
+            className="select"
+            value={outcome}
+            onChange={(event) => setOutcome(event.target.value)}
+          >
             <option value="">全部结果</option>
-            <option value="success">成功</option>
-            <option value="error">失败</option>
+            <option value="success">成功 (Success)</option>
+            <option value="error">失败 (Error)</option>
           </select>
-          <select className="select" value={filter} onChange={(event) => setFilter(event.target.value)}>
-            <option value="">全部操作</option>
+          <select
+            className="select"
+            value={filter}
+            onChange={(event) => setFilter(event.target.value)}
+          >
+            <option value="">全部操作类型</option>
             {Object.entries(ACTION_LABELS).map(([action, label]) => (
               <option key={action} value={action}>
                 {label}
               </option>
             ))}
           </select>
-          <button className="button secondary" onClick={() => void load(page, filter, outcome)}>
+          <button
+            className="button secondary"
+            onClick={() => void load(page, filter, outcome)}
+            title="刷新日志"
+          >
+            <RefreshCw size={14} />
             刷新
           </button>
-          <button className="button secondary" onClick={() => void exportCsv()} disabled={events.length === 0}>
-            <Download size={16} />
+          <button
+            className="button secondary"
+            onClick={() => void exportCsv()}
+            disabled={events.length === 0}
+            title="导出当前筛选结果为 CSV"
+          >
+            <Download size={14} />
             导出 CSV
           </button>
         </div>
       </header>
+
       {error && <ErrorBanner message={error} />}
-      <Panel eyebrow="事件日志" title={`审计事件（${total}）`}>
+
+      <Panel eyebrow="AUDIT EVENTS" title={`操作记录 (${total})`}>
         {loading ? (
-          <Empty icon={<Activity />} title="正在读取审计日志" />
+          <Empty icon={<LoaderCircle className="spin" size={24} />} title="正在检索审计日志…" />
         ) : events.length === 0 ? (
-          <Empty icon={<Activity />} title="暂无审计事件" detail="所有连接、命令与文件操作都会记录在这里。" />
+          <Empty
+            icon={<Activity size={28} />}
+            title="暂无审计事件"
+            detail="所有 Workspace、Shell 注册、连接握手、命令执行、文件上传下载等操作均会自动在本地持久化审计。"
+          />
         ) : (
           <>
             <div className="audit-table">
               <div className="audit-head">
                 <span>时间</span>
-                <span>操作</span>
-                <span>结果</span>
-                <span>详情</span>
+                <span>操作类型</span>
+                <span>执行结果</span>
+                <span>详细信息</span>
               </div>
               {events.map((event) => (
-                <div className="audit-row" key={event.id}>
-                  <span className="mono">{shortTime(event.createdAt)}</span>
-                  <span className="mono">{actionLabel(event.action)}</span>
-                  <span className={`audit-outcome ${event.outcome}`}>{event.outcome}</span>
-                  <span className="detail">{event.detail}</span>
+                <div
+                  className="audit-row"
+                  key={event.id}
+                  onClick={() => setSelectedEvent(event)}
+                  style={{ cursor: "pointer" }}
+                >
+                  <span className="mono" style={{ color: "var(--text-faint)", fontSize: 11 }}>
+                    {shortTime(event.createdAt)}
+                  </span>
+                  <span className="mono" style={{ fontWeight: 600, color: "var(--text)" }}>
+                    {actionLabel(event.action)}
+                  </span>
+                  <div>
+                    <span className={`audit-outcome ${event.outcome}`}>
+                      {event.outcome === "success" ? (
+                        <CheckCircle2 size={11} style={{ marginRight: 3 }} />
+                      ) : (
+                        <XCircle size={11} style={{ marginRight: 3 }} />
+                      )}
+                      {event.outcome}
+                    </span>
+                  </div>
+                  <span className="detail" title={event.detail}>
+                    {event.detail}
+                  </span>
                 </div>
               ))}
             </div>
+
             <div className="pagination">
               <button
                 className="button compact"
@@ -165,7 +226,7 @@ export function AuditView() {
                 上一页
               </button>
               <span className="pagination-info">
-                第 {page + 1} / {pageCount} 页（共 {total} 条）
+                第 {page + 1} / {pageCount} 页（共 {total} 条审计记录）
               </span>
               <button
                 className="button compact"
@@ -178,6 +239,79 @@ export function AuditView() {
           </>
         )}
       </Panel>
+
+      {selectedEvent && (
+        <div
+          className="dialog-backdrop"
+          onClick={() => setSelectedEvent(null)}
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="dialog-title">
+              <h2>审计记录详情 #{selectedEvent.id}</h2>
+              <button className="icon-button" onClick={() => setSelectedEvent(null)}>
+                ×
+              </button>
+            </div>
+            <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+              <div className="info-row">
+                <span>操作动作</span>
+                <code>{actionLabel(selectedEvent.action)} ({selectedEvent.action})</code>
+              </div>
+              <div className="info-row">
+                <span>发生时间</span>
+                <code>{selectedEvent.createdAt}</code>
+              </div>
+              <div className="info-row">
+                <span>执行状态</span>
+                <span className={`audit-outcome ${selectedEvent.outcome}`}>
+                  {selectedEvent.outcome}
+                </span>
+              </div>
+              {selectedEvent.workspaceId && (
+                <div className="info-row">
+                  <span>Workspace</span>
+                  <code>{selectedEvent.workspaceId}</code>
+                </div>
+              )}
+              {selectedEvent.shellId && (
+                <div className="info-row">
+                  <span>Shell ID</span>
+                  <code>{selectedEvent.shellId}</code>
+                </div>
+              )}
+              <div>
+                <span className="eyebrow" style={{ display: "block", marginBottom: 6 }}>
+                  详细操作载荷 / 轨迹说明
+                </span>
+                <pre
+                  style={{
+                    background: "var(--code-bg)",
+                    padding: 12,
+                    borderRadius: "var(--radius-md)",
+                    border: "1px solid var(--border)",
+                    fontFamily: "var(--font-mono)",
+                    fontSize: 12,
+                    lineHeight: 1.5,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-all",
+                    maxHeight: 260,
+                    overflow: "auto",
+                  }}
+                >
+                  {selectedEvent.detail}
+                </pre>
+              </div>
+              <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+                <button className="button primary" onClick={() => setSelectedEvent(null)}>
+                  关闭
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

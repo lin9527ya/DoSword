@@ -1,12 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
-import { LoaderCircle, TerminalSquare, Unplug } from "lucide-react";
+import {
+  ExternalLink,
+  LoaderCircle,
+  RefreshCw,
+  TerminalSquare,
+  Unplug,
+} from "lucide-react";
 import { api, errorText, shortTime } from "../api";
 import type { SessionInfo } from "../api";
-import { Empty, ErrorBanner } from "../components/common";
-import { Panel } from "../components/common";
+import { Empty, ErrorBanner, Panel } from "../components/common";
+import { useToast } from "../components/Toast";
 import type { View } from "./types";
 
 export function SessionsView({ onNavigate }: { onNavigate: (view: View) => void }) {
+  const toast = useToast();
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -17,69 +24,109 @@ export function SessionsView({ onNavigate }: { onNavigate: (view: View) => void 
     try {
       setSessions(await api.listSessions());
     } catch (cause) {
-      setError(errorText(cause));
+      const msg = errorText(cause);
+      setError(msg);
+      toast.error(msg, "读取会话失败");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [toast]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
   async function disconnect(sessionId: string) {
-    setError("");
     try {
       await api.disconnectShell(sessionId);
+      toast.info(`会话 ${sessionId} 已安全断开`, "已断开连接");
       await load();
     } catch (cause) {
-      setError(errorText(cause));
+      toast.error(errorText(cause), "断开失败");
     }
+  }
+
+  async function disconnectAll() {
+    for (const session of sessions) {
+      try {
+        await api.disconnectShell(session.sessionId);
+      } catch {
+        // 忽略
+      }
+    }
+    toast.info("已断开所有活跃会话", "批量断开");
+    await load();
   }
 
   return (
     <>
       <header className="topbar">
         <div>
-          <p className="eyebrow">活跃连接</p>
-          <h1>终端会话</h1>
+          <p className="eyebrow">ACTIVE SESSIONS</p>
+          <h1>终端活跃会话</h1>
+        </div>
+        <div className="top-actions">
+          <button className="button secondary" onClick={() => void load()}>
+            <RefreshCw size={14} />
+            刷新
+          </button>
+          {sessions.length > 0 && (
+            <button className="button danger" onClick={() => void disconnectAll()}>
+              <Unplug size={14} />
+              断开全部
+            </button>
+          )}
         </div>
       </header>
+
       {error && <ErrorBanner message={error} />}
-      <Panel eyebrow="会话列表" title="活跃会话">
+
+      <Panel
+        eyebrow="SESSION REGISTRY"
+        title={`活跃会话 (${sessions.length})`}
+      >
         {loading ? (
-          <Empty icon={<LoaderCircle className="spin" />} title="正在读取会话" />
+          <Empty icon={<LoaderCircle className="spin" size={24} />} title="正在检索活跃会话…" />
         ) : sessions.length === 0 ? (
-          <Empty icon={<TerminalSquare />} title="暂无活跃会话" detail="在总览中连接 Shell 后会出现在这里。" />
+          <Empty
+            icon={<TerminalSquare size={28} />}
+            title="暂无活跃终端会话"
+            detail="在总览列表中点击「连接」建立会话后，将在此持久保持并可快速切换。"
+            action={
+              <button className="button primary compact" onClick={() => onNavigate({ kind: "dashboard" })}>
+                前往环境总览
+              </button>
+            }
+          />
         ) : (
           <div className="shell-list">
             {sessions.map((session) => (
-              <article className="shell-row" key={session.sessionId}>
+              <article className="shell-row" key={session.sessionId} style={{ gridTemplateColumns: "10px minmax(220px, 1fr) 90px 140px 100px 76px" }}>
                 <div className="status-dot online" />
                 <div className="shell-identity">
-                  <strong>会话 {session.sessionId}</strong>
-                  <span>{session.server}</span>
+                  <strong>会话 #{session.sessionId}</strong>
+                  <span>{session.server || "目标服务器已连接"}</span>
                 </div>
-                <code>活跃</code>
+                <span className="runtime-badge php">ACTIVE</span>
                 <div className="last-seen">
-                  <span>最后使用</span>
+                  <span>最后交互</span>
                   <small>{shortTime(new Date(session.lastUsedAt * 1000).toISOString())}</small>
                 </div>
                 <button
-                  className="icon-button"
-                  title="打开会话"
+                  className="button compact connect"
                   onClick={() =>
                     onNavigate({ kind: "shell", shellId: session.profileId, sessionId: session.sessionId })
                   }
                 >
-                  <TerminalSquare size={16} />
+                  <ExternalLink size={13} />
+                  进入会话
                 </button>
                 <button
                   className="icon-button danger"
-                  title="断开"
+                  title="断开会话"
                   onClick={() => void disconnect(session.sessionId)}
                 >
-                  <Unplug size={16} />
+                  <Unplug size={15} />
                 </button>
               </article>
             ))}

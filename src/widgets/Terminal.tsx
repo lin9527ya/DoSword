@@ -1,26 +1,24 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import { Eraser, TerminalSquare, Zap } from "lucide-react";
 import { api } from "../api";
 
-/**
- * 基于 xterm.js 的命令终端。
- * HTTP WebShell 无 PTY、非交互流，这里采用行编辑模式：
- * 输入行收集 → Enter 触发执行 → 输出回显。
- */
 const HISTORY_KEY = "dosword:term-history";
 
 type ViewMode = "ansi" | "text" | "json" | "hex";
 
-const VIEW_LABELS: Record<ViewMode, string> = {
-  ansi: "ANSI",
-  text: "文本",
-  json: "JSON",
-  hex: "HEX",
-};
+const QUICK_COMMANDS = [
+  { label: "身份与内核", cmd: "whoami && id && uname -a" },
+  { label: "网络监听端口", cmd: "netstat -tuln || ss -tuln || netstat -ano" },
+  { label: "IP 与网卡配置", cmd: "ip addr || ifconfig || ipconfig /all" },
+  { label: "活跃进程列表", cmd: "ps aux || tasklist /svc" },
+  { label: "系统用户列表", cmd: "cat /etc/passwd || net user" },
+  { label: "磁盘空间", cmd: "df -h || wmic logicaldisk get caption,size,freespace" },
+  { label: "SUID 特权文件", cmd: "find / -perm -4000 -type f 2>/dev/null" },
+];
 
-/** 剥离 ANSI 转义序列（文本/JSON 模式用）。 */
 function stripAnsi(text: string): string {
   return text
     .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "")
@@ -28,7 +26,6 @@ function stripAnsi(text: string): string {
     .replace(/\x1b[()][0-9A-Z]/g, "");
 }
 
-/** 按查看格式渲染输出文本。 */
 function renderOutput(stdout: string, mode: ViewMode): string {
   switch (mode) {
     case "text":
@@ -60,6 +57,7 @@ function renderOutput(stdout: string, mode: ViewMode): string {
   }
 }
 
+/** 默认标准非交互式终端：输入指令 -> HTTP 传输 -> 即时回显（支持 ANSI、多编码、历史命令） */
 export function Terminal({
   sessionId,
   currentDir,
@@ -68,7 +66,6 @@ export function Terminal({
 }: {
   sessionId: string;
   currentDir?: string;
-  /** 是否活动（非活动时暂停轮询但保持 PTY 连接，切回不丢历史）。 */
   active?: boolean;
   onCwdChange?: (cwd: string) => void;
 }) {
@@ -79,60 +76,34 @@ export function Terminal({
   const historyRef = useRef<string[]>([]);
   const historyIndexRef = useRef(-1);
   const busyRef = useRef(false);
+  const lastSizeRef = useRef({ w: 0, h: 0 });
+
   const currentDirRef = useRef(currentDir);
   currentDirRef.current = currentDir;
-  const [ready, setReady] = useState(false);
+
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
+
+  const onCwdChangeRef = useRef(onCwdChange);
+  onCwdChangeRef.current = onCwdChange;
+
   const [viewMode, setViewMode] = useState<ViewMode>("ansi");
   const viewModeRef = useRef<ViewMode>("ansi");
   viewModeRef.current = viewMode;
-  const [ptyId, setPtyId] = useState<string | null>(null);
-  const ptyIdRef = useRef<string | null>(null);
-  ptyIdRef.current = ptyId;
-  const [ptyFailed, setPtyFailed] = useState(false);
-  const ptyFailedRef = useRef(false);
-  ptyFailedRef.current = ptyFailed;
+
   const [outputEncoding, setOutputEncoding] = useState<"utf-8" | "gbk">("utf-8");
   const encodingRef = useRef<"utf-8" | "gbk">("utf-8");
   encodingRef.current = outputEncoding;
-  const pollTimerRef = useRef<number | null>(null);
-  const activeRef = useRef(true);
-  activeRef.current = active;
 
   useEffect(() => {
     try {
       historyRef.current = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
     } catch {
-      // 历史记录损坏时忽略
+      // 忽略
     }
   }, []);
 
-  const prompt = () => `dosword@target:${currentDirRef.current ?? "~"}$ `;
-
-  async function pollPty(id: string) {
-    if (!activeRef.current) return;
-    try {
-      const result = await api.ptyRead(id);
-      if (result.data) {
-        const bytes = b64decodeToUint8(result.data);
-        termRef.current?.write(bytes);
-      }
-      if (result.closed) {
-        if (pollTimerRef.current !== null) {
-          window.clearInterval(pollTimerRef.current);
-          pollTimerRef.current = null;
-        }
-        setPtyId(null);
-        termRef.current?.write(`\r\n\x1b[31m[交互式会话已断开]\x1b[0m\r\n`);
-        if (termRef.current) termRef.current.write(prompt());
-      }
-    } catch {
-      // 轮询失败忽略（下次重试）
-    }
-  }
-
-  function b64encode(text: string): string {
-    return btoa(unescape(encodeURIComponent(text)));
-  }
+  const getPrompt = useCallback(() => `dosword@target:${currentDirRef.current ?? "~"}$ `, []);
 
   function b64decodeToUint8(data: string): Uint8Array {
     const binary = atob(data);
@@ -141,43 +112,45 @@ export function Terminal({
     return bytes;
   }
 
-  async function run(command: string) {
-    if (!command.trim() || busyRef.current) return;
-    busyRef.current = true;
-    const term = termRef.current;
-    if (!term) return;
-    term.write(`\r\n`);
-    try {
-      const output = await api.executeCommand(sessionId, command);
-      let display = output.stdout;
-      if (output.rawB64 && encodingRef.current === "gbk") {
-        const bytes = b64decodeToUint8(output.rawB64);
-        try {
-          display = new TextDecoder("gbk").decode(bytes);
-        } catch {
-          display = output.stdout;
+  const runCommand = useCallback(
+    async (command: string) => {
+      if (!command.trim() || busyRef.current) return;
+      busyRef.current = true;
+      const term = termRef.current;
+      if (!term) return;
+      term.write(`\r\n`);
+      try {
+        const output = await api.executeCommand(sessionIdRef.current, command);
+        let display = output.stdout;
+        if (output.rawB64 && encodingRef.current === "gbk") {
+          const bytes = b64decodeToUint8(output.rawB64);
+          try {
+            display = new TextDecoder("gbk").decode(bytes);
+          } catch {
+            display = output.stdout;
+          }
+        }
+        term.write(renderOutput(display, viewModeRef.current).replace(/\n$/, "") + "\r\n");
+        if (output.cwd) {
+          currentDirRef.current = output.cwd;
+          onCwdChangeRef.current?.(output.cwd);
+        }
+      } catch (error) {
+        term.write(`\x1b[31m${String(error)}\x1b[0m\r\n`);
+      } finally {
+        busyRef.current = false;
+        if (term) {
+          term.write(getPrompt());
+          bufferRef.current = "";
+          historyIndexRef.current = -1;
         }
       }
-      term.write(renderOutput(display, viewModeRef.current).replace(/\n$/, "") + "\r\n");
-      if (output.cwd) onCwdChange?.(output.cwd);
-    } catch (error) {
-      term.write(`\x1b[31m${String(error)}\x1b[0m\r\n`);
-    } finally {
-      busyRef.current = false;
-      if (term) {
-        term.write(prompt());
-        bufferRef.current = "";
-        historyIndexRef.current = -1;
-      }
-    }
-  }
+    },
+    [getPrompt],
+  );
 
-  function changeViewMode(next: ViewMode) {
-    setViewMode(next);
-    const term = termRef.current;
-    if (!term) return;
-    term.write(`\r\n\x1b[90m[输出格式: ${VIEW_LABELS[next]}——仅影响后续输出]\x1b[0m\r\n${prompt()}`);
-  }
+  const runCommandRef = useRef(runCommand);
+  runCommandRef.current = runCommand;
 
   function pushHistory(command: string) {
     const history = historyRef.current;
@@ -186,100 +159,126 @@ export function Terminal({
     try {
       localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
     } catch {
-      // 忽略存储失败
+      // 忽略
     }
   }
 
+  function clearScreen() {
+    const term = termRef.current;
+    if (!term) return;
+    term.clear();
+    term.write(getPrompt());
+  }
+
+  // 严格安全的自适应尺寸调整，防止死循环横向伸展
+  const safeFit = useCallback(() => {
+    const container = containerRef.current;
+    const fit = fitRef.current;
+    if (!container || !fit) return;
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    if (w <= 100 || h <= 100) return;
+    if (Math.abs(w - lastSizeRef.current.w) < 4 && Math.abs(h - lastSizeRef.current.h) < 4) {
+      return;
+    }
+    lastSizeRef.current = { w, h };
+    try {
+      fit.fit();
+    } catch {
+      // 忽略
+    }
+  }, []);
+
+  useEffect(() => {
+    if (active) {
+      const timer = setTimeout(safeFit, 50);
+      return () => clearTimeout(timer);
+    }
+  }, [active, safeFit]);
+
+  // 核心：XTerm 终端实例仅在挂载时初始化一次，绝不因 state 或回调变化而重新销毁
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
     const term = new XTerm({
-      fontFamily: '"IBM Plex Mono", monospace',
+      fontFamily: '"JetBrains Mono", "IBM Plex Mono", Consolas, "Fira Code", monospace',
       fontSize: 13,
-      // 输出换行自动转 CRLF（修复 ls 等列对齐输出错乱）
+      lineHeight: 1.45,
       convertEol: true,
+      cursorBlink: true,
+      cursorStyle: "block",
       theme: {
-        background: "#111310",
-        foreground: "#d6d8d2",
-        cursor: "#b6d77d",
-        selectionBackground: "#33402a",
-        black: "#3a3f37",
-        green: "#a9d36a",
-        brightGreen: "#b6d77d",
-        red: "#d47568",
-        brightRed: "#e08a7d",
-        yellow: "#d0c66a",
-        brightYellow: "#dcd27a",
+        background: "#080a0c",
+        foreground: "#d4d4d4",
+        cursor: "#22c55e",
+        black: "#000000",
+        red: "#ef4444",
+        green: "#22c55e",
+        yellow: "#eab308",
+        blue: "#3b82f6",
+        magenta: "#a855f7",
+        cyan: "#06b6d4",
+        white: "#f3f4f6",
+        brightBlack: "#4b5563",
+        brightRed: "#f87171",
+        brightGreen: "#4ade80",
+        brightYellow: "#fde047",
+        brightBlue: "#60a5fa",
+        brightMagenta: "#c084fc",
+        brightCyan: "#22d3ee",
+        brightWhite: "#ffffff",
       },
-      scrollback: 2000,
     });
+
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(container);
-    fit.fit();
     termRef.current = term;
     fitRef.current = fit;
-    setReady(true);
 
-    const resizeObserver = new ResizeObserver(() => fit.fit());
+    term.write(
+      `\x1b[32mDoSword 终端就绪 (非交互命令模式)\x1b[0m  \x1b[90m(支持 ANSI 彩色高亮、目录跟踪、GBK/UTF-8 切换)\x1b[0m\r\n${getPrompt()}`,
+    );
+
+    // 使用防抖 ResizeObserver
+    let rafId: number | null = null;
+    const resizeObserver = new ResizeObserver(() => {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(safeFit);
+    });
     resizeObserver.observe(container);
 
-    // 尝试建立交互式 PTY 会话（失败降级为命令模式）
-    void api
-      .startPty(sessionId)
-      .then((pty) => {
-        if (!termRef.current) return;
-        setPtyId(pty.ptyId);
-        term.write(`\r\n\x1b[90m[交互式会话已建立（PTY），可直接输入命令，如同本地 shell]\x1b[0m\r\n`);
-        // 轮询输出
-        pollTimerRef.current = window.setInterval(() => {
-          void pollPty(pty.ptyId);
-        }, 80);
-      })
-      .catch(() => {
-        if (!termRef.current) return;
-        ptyFailedRef.current = true;
-        setPtyFailed(true);
-        term.write(`\r\n\x1b[33m[交互式会话不可用（目标不支持），已降级为命令模式]\x1b[0m\r\n${prompt()}`);
-      });
-
     term.onData((data) => {
-      const term = termRef.current;
-      if (!term) return;
-      // PTY 交互模式：直接转发到目标 shell（由远端回显，本地不回显）
-      if (ptyIdRef.current) {
-        void api.ptyWrite(ptyIdRef.current, b64encode(data)).catch(() => {});
-        return;
-      }
-      // 命令模式：粘贴多行 / 已提交
+      const t = termRef.current;
+      if (!t) return;
       if (data === "\r") {
         const command = bufferRef.current;
         if (command.trim()) {
           pushHistory(command);
           historyIndexRef.current = -1;
-          term.write(`\r\n`);
-          void run(command);
+          void runCommandRef.current(command);
         } else {
-          term.write(`\r\n${prompt()}`);
+          t.write(`\r\n${getPrompt()}`);
         }
         return;
       }
-      // 退格
       if (data === "\x7f") {
         if (bufferRef.current.length > 0) {
           bufferRef.current = bufferRef.current.slice(0, -1);
-          term.write("\b \b");
+          t.write("\b \b");
         }
         return;
       }
-      // 清空当前输入
       if (data === "\x03") {
         bufferRef.current = "";
-        term.write("\r\n" + prompt());
+        t.write("\r\n" + getPrompt());
         return;
       }
-      // 历史：上/下
+      if (data === "\x0c") {
+        clearScreen();
+        return;
+      }
       if (data === "\x1b[A" || data === "\x1b[B") {
         const history = historyRef.current;
         if (history.length === 0) return;
@@ -288,75 +287,100 @@ export function Terminal({
         } else {
           historyIndexRef.current = Math.max(historyIndexRef.current - 1, -1);
         }
-        const entry = historyIndexRef.current >= 0 ? history[history.length - 1 - historyIndexRef.current] : "";
-        term.write("\r\x1b[K" + prompt() + entry);
+        const entry =
+          historyIndexRef.current >= 0
+            ? history[history.length - 1 - historyIndexRef.current]
+            : "";
+        t.write("\r\x1b[K" + getPrompt() + entry);
         bufferRef.current = entry;
         return;
       }
-      // 常规字符（含粘贴）
       if (data.length === 1 && data.charCodeAt(0) >= 0x20) {
         bufferRef.current += data;
-        term.write(data);
+        t.write(data);
       } else if (data.length > 1) {
-        // 粘贴内容
         const clean = data.replace(/[\r\n]+/g, "");
         bufferRef.current += clean;
-        term.write(clean);
+        t.write(clean);
       }
     });
 
     return () => {
+      if (rafId) cancelAnimationFrame(rafId);
       resizeObserver.disconnect();
-      if (pollTimerRef.current !== null) {
-        window.clearInterval(pollTimerRef.current);
-        pollTimerRef.current = null;
-      }
-      if (ptyIdRef.current) {
-        void api.ptyClose(ptyIdRef.current).catch(() => {});
-      }
       term.dispose();
       termRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <div className="terminal-wrap">
+      {/* 终端控制条 */}
       <div className="term-toolbar">
-        {!ptyId && !ptyFailed && (
-          <span className="term-toolbar-label">输出编码</span>
-        )}
-        {!ptyId && !ptyFailed && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", minWidth: 0 }}>
+          <span className="term-toolbar-label term-pty-fail">
+            <TerminalSquare size={12} /> 非交互式命令终端
+          </span>
+
+          <span className="term-toolbar-label">编码</span>
           <select
             className="select term-encoding"
             value={outputEncoding}
             onChange={(event) => setOutputEncoding(event.target.value as "utf-8" | "gbk")}
-            title="Windows 目标（chcp 936）输出请选 GBK"
+            title="Windows 目标如果出现乱码请选择 GBK"
           >
-            <option value="utf-8">UTF-8</option>
-            <option value="gbk">GBK</option>
+            <option value="utf-8">UTF-8 (Linux/Mac)</option>
+            <option value="gbk">GBK (Windows CMD)</option>
           </select>
-        )}
-        {ptyId ? (
-          <span className="term-toolbar-label term-pty-badge">交互式会话（PTY）</span>
-        ) : ptyFailed ? (
-          <span className="term-toolbar-label term-pty-fail">命令模式（PTY 不可用）</span>
-        ) : (
-          <>
-            <span className="term-toolbar-label">输出格式</span>
-        <select
-          className="select term-view-mode"
-          value={viewMode}
-          onChange={(event) => changeViewMode(event.target.value as ViewMode)}
-        >
-          <option value="ansi">ANSI 颜色</option>
-          <option value="text">普通文本</option>
-          <option value="json">JSON</option>
-          <option value="hex">HEX</option>
-        </select>
-          </>
-        )}
+
+          <span className="term-toolbar-label">格式</span>
+          <select
+            className="select term-view-mode"
+            value={viewMode}
+            onChange={(event) => setViewMode(event.target.value as ViewMode)}
+          >
+            <option value="ansi">ANSI 彩色输出</option>
+            <option value="text">纯文本 (无 ANSI)</option>
+            <option value="json">JSON 格式化</option>
+            <option value="hex">十六进制 HEX</option>
+          </select>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+          <button className="button compact secondary" onClick={clearScreen} title="清空终端屏幕 (Ctrl+L)">
+            <Eraser size={13} />
+            清屏
+          </button>
+        </div>
       </div>
-      <div className="terminal-box" ref={containerRef} data-ready={ready} />
+
+      {/* 终端主体窗口容器（包含固定边界与防溢出限制） */}
+      <div className="terminal-box" ref={containerRef} />
+
+      {/* 快速侦察指令芯片栏 */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", paddingTop: 2 }}>
+        <span style={{ fontSize: 11, color: "var(--text-faint)", fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>
+          <Zap size={12} color="var(--accent)" /> 快捷指令:
+        </span>
+        {QUICK_COMMANDS.map((qc) => (
+          <button
+            key={qc.cmd}
+            className="file-bookmark-chip"
+            style={{ fontSize: 11.5, padding: "3px 8px" }}
+            onClick={() => {
+              const term = termRef.current;
+              if (term) {
+                term.write(qc.cmd);
+                void runCommand(qc.cmd);
+              }
+            }}
+            title={qc.cmd}
+          >
+            {qc.label}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

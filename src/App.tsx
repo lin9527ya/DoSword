@@ -1,11 +1,16 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Layout } from "./components/Layout";
 import { DashboardView } from "./views/DashboardView";
 import { SessionsView } from "./views/SessionsView";
 import { RequestDebugView } from "./views/RequestDebugView";
+import { GlobalFilesView } from "./views/GlobalFilesView";
+import { GlobalDatabaseView } from "./views/GlobalDatabaseView";
 import { SettingsView } from "./views/SettingsView";
 import { AuditView } from "./views/AuditView";
 import { ShellDetailView } from "./shells/ShellDetailView";
+import { ToastProvider } from "./components/Toast";
+import { ErrorBoundary } from "./components/common";
+import { applyTheme } from "./theme";
 import type { ShellTab, View } from "./views/types";
 import "./styles/base.css";
 import "./styles/layout.css";
@@ -19,28 +24,44 @@ function App() {
   const [shellTabs, setShellTabs] = useState<ShellTab[]>([]);
   const [activeTab, setActiveTab] = useState<string | null>(null);
 
-  const navigate = useCallback((view: View) => {
-    if (view.kind === "shell") {
-      // 多 Shell 标签页：同一 shell 复用标签，其余追加
-      setShellTabs((prev) => {
-        const existing = prev.find((tab) => tab.shellId === view.shellId);
-        if (existing) {
-          setActiveTab(existing.id);
-          return prev;
-        }
-        const tab: ShellTab = {
-          id: `shell-${tabSeq++}`,
-          shellId: view.shellId,
-          sessionId: view.sessionId,
-          name: view.shellName,
-        };
-        setActiveTab(tab.id);
-        return [...prev, tab];
-      });
-    } else {
-      setMainView(view);
-    }
+  useEffect(() => {
+    applyTheme();
   }, []);
+
+  const navigate = useCallback(
+    (view: View) => {
+      if (view.kind === "shell") {
+        const existing = shellTabs.find((tab) => tab.shellId === view.shellId);
+        if (existing) {
+          if (view.sessionId && existing.sessionId !== view.sessionId) {
+            setShellTabs((prev) =>
+              prev.map((t) =>
+                t.id === existing.id
+                  ? { ...t, sessionId: view.sessionId, name: view.shellName ?? t.name }
+                  : t,
+              ),
+            );
+          }
+          setActiveTab(existing.id);
+        } else {
+          const newTabId = `shell-${tabSeq++}`;
+          const newTab: ShellTab = {
+            id: newTabId,
+            shellId: view.shellId,
+            sessionId: view.sessionId,
+            name: view.shellName,
+          };
+          setShellTabs((prev) => [...prev, newTab]);
+          setActiveTab(newTabId);
+        }
+      } else {
+        // 切换至主功能视图时，清空当前活跃 shell 标签，确保立即呈现所选主视图
+        setActiveTab(null);
+        setMainView(view);
+      }
+    },
+    [shellTabs],
+  );
 
   const closeTab = useCallback((id: string) => {
     setShellTabs((prev) => {
@@ -58,33 +79,41 @@ function App() {
   const activeShell = shellTabs.find((tab) => tab.id === activeTab) ?? null;
 
   return (
-    <Layout
-      view={activeShell ? { kind: "shell", shellId: activeShell.shellId, sessionId: activeShell.sessionId } : mainView}
-      onNavigate={navigate}
-      shellTabs={shellTabs}
-      activeTab={activeTab}
-      onSelectTab={setActiveTab}
-      onCloseTab={closeTab}
-    >
-      {activeShell ? (
-        <ShellDetailView
-          key={activeShell.id}
-          shellId={activeShell.shellId}
-          initialSessionId={activeShell.sessionId}
+    <ToastProvider>
+      <ErrorBoundary>
+        <Layout
+          view={activeShell ? { kind: "shell", shellId: activeShell.shellId, sessionId: activeShell.sessionId } : mainView}
           onNavigate={navigate}
-        />
-      ) : mainView.kind === "dashboard" ? (
-        <DashboardView onNavigate={navigate} />
-      ) : mainView.kind === "sessions" ? (
-        <SessionsView onNavigate={navigate} />
-      ) : mainView.kind === "debug" ? (
-        <RequestDebugView />
-      ) : mainView.kind === "audit" ? (
-        <AuditView />
-      ) : (
-        <SettingsView />
-      )}
-    </Layout>
+          shellTabs={shellTabs}
+          activeTab={activeTab}
+          onSelectTab={setActiveTab}
+          onCloseTab={closeTab}
+        >
+          {activeShell ? (
+            <ShellDetailView
+              key={activeShell.id}
+              shellId={activeShell.shellId}
+              initialSessionId={activeShell.sessionId}
+              onNavigate={navigate}
+            />
+          ) : mainView.kind === "dashboard" ? (
+            <DashboardView onNavigate={navigate} />
+          ) : mainView.kind === "sessions" ? (
+            <SessionsView onNavigate={navigate} />
+          ) : mainView.kind === "debug" ? (
+            <RequestDebugView />
+          ) : mainView.kind === "files" ? (
+            <GlobalFilesView onNavigate={navigate} />
+          ) : mainView.kind === "database" ? (
+            <GlobalDatabaseView onNavigate={navigate} />
+          ) : mainView.kind === "audit" ? (
+            <AuditView />
+          ) : (
+            <SettingsView />
+          )}
+        </Layout>
+      </ErrorBoundary>
+    </ToastProvider>
   );
 }
 
