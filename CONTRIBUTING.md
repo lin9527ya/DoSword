@@ -9,7 +9,7 @@
 
 | 依赖 | 版本 |
 |---|---|
-| Rust | stable（`rust-toolchain.toml` 已固定，`edition 2024` 需 ≥ 1.85） |
+| Rust | **1.98.1**（`rust-toolchain.toml` 已钉死具体版本，`edition 2024` 需 ≥ 1.85） |
 | Node.js | ≥ 22.13（CI 用 24；pnpm 11 依赖 `node:sqlite` 内置模块，Node 20 不可用） |
 | pnpm | 11.x —— 由 `package.json` 的 `packageManager` 固定，CI 自动读取该字段 |
 | PHP | 可选，跑真实协议往返测试时需要（`php-cli`） |

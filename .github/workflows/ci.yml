@@ -18,8 +18,11 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev             libayatana-appindicator3-dev patchelf
         if: runner.os == 'Linux'
 
-      - name: 安装 Rust 工具链
-        uses: dtolnay/rust-toolchain@stable
+      - name: 安装 Rust 工具链（版本与 rust-toolchain.toml 一致，不用浮动的 stable）
+        # 钉死版本：clippy -D warnings 门禁下，stable 引入新 lint 会让 CI 无预警变红。
+        # 升级工具链时同步改 rust-toolchain.toml 与本行的版本号。
+        # .github/workflows/ci.yml
+        uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy, rustfmt
 

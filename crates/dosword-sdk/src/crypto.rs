@@ -39,11 +39,14 @@ pub fn chacha20_block(key: &[u8], counter: u32, nonce: &[u8]) -> [u8; 64] {
     state[1] = 0x3320_646e;
     state[2] = 0x7962_2d32;
     state[3] = 0x6b20_6574;
-    for (i, chunk) in key.chunks_exact(4).enumerate() {
+    // 长度已断言为 4 的倍数，as_chunks 保证无余数（相比 chunks_exact 不产生尾部残片）
+    let (key_words, _) = key.as_chunks::<4>();
+    for (i, chunk) in key_words.iter().enumerate() {
         state[4 + i] = le32(chunk);
     }
     state[12] = counter;
-    for (i, chunk) in nonce.chunks_exact(4).enumerate() {
+    let (nonce_words, _) = nonce.as_chunks::<4>();
+    for (i, chunk) in nonce_words.iter().enumerate() {
         state[13 + i] = le32(chunk);
     }
     let initial = state;
