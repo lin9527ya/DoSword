@@ -1487,32 +1487,6 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
         }
     }
 
-    /// 轮询等待 mock HTTP 服务就绪。
-    ///
-    /// 替代固定 sleep —— CI runner 负载高时 python3 可能超过固定等待时间才 listen，
-    /// 表现为「error sending request」的假失败；同时把 python3 缺失显式暴露出来，
-    /// 而不是被 `.ok()` 吞掉后报一个误导性的网络错误。
-    fn wait_mock_ready(port: u16) -> bool {
-        use std::io::{Read, Write};
-        for _ in 0..100 {
-            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                if stream
-                    .write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-                    .is_ok()
-                {
-                    let mut buf = [0u8; 64];
-                    // 服务端只实现 do_POST，GET 会返回 501 —— 有响应即说明已就绪
-                    if matches!(stream.read(&mut buf), Ok(n) if n > 0) {
-                        return true;
-                    }
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        false
-    }
-
     #[test]
     fn jsp_protocol_round_trip_against_mock_server() {
         let script = std::env::temp_dir().join("dosword_jsp_mock.py");
@@ -1528,7 +1502,7 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             eprintln!("跳过 jsp 往返：未检测到 python3 可执行文件（mock server 需要）");
             return;
         };
-        if !wait_mock_ready(port) {
+        if !crate::protocol::wait_http_ready(port, 10_000) {
             eprintln!("跳过 jsp 往返：mock server 未在 10 秒内就绪");
             return;
         }
@@ -1585,7 +1559,7 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             eprintln!("跳过 asp 往返：未检测到 python3 可执行文件（mock server 需要）");
             return;
         };
-        if !wait_mock_ready(port) {
+        if !crate::protocol::wait_http_ready(port, 10_000) {
             eprintln!("跳过 asp 往返：mock server 未在 10 秒内就绪");
             return;
         }
@@ -1652,9 +1626,14 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             .stderr(std::process::Stdio::null())
             .spawn();
         let Some(mut child) = child.ok() else {
+            eprintln!("跳过 python CGI 往返：未检测到 python3 可执行文件");
             return;
         };
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        if !crate::protocol::wait_http_ready(port, 10_000) {
+            eprintln!("跳过 python CGI 往返：服务器未在 10 秒内就绪");
+            let _ = child.kill();
+            return;
+        }
         let url = format!("http://127.0.0.1:{port}/cgi-bin/shell.py");
         let settings = settings();
         let mut p = profile(&url);
@@ -1757,9 +1736,14 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             .stderr(std::process::Stdio::null())
             .spawn();
         let Some(mut child) = child.ok() else {
+            eprintln!("跳过 node stub 往返：未检测到 node 可执行文件");
             return;
         };
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        if !crate::protocol::wait_http_ready(port, 10_000) {
+            eprintln!("跳过 node stub 往返：服务器未在 10 秒内就绪");
+            let _ = child.kill();
+            return;
+        }
         let url = format!("http://127.0.0.1:{port}/");
         let settings = settings();
         let mut p = profile(&url);

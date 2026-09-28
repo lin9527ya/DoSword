@@ -2340,14 +2340,16 @@ mod tests {
         let mock_script = std::env::temp_dir().join("dosword_redis_mock.py");
         let _ = std::fs::write(&mock_script, REDIS_MOCK);
         let port: u16 = 19000 + (std::process::id() % 1000) as u16;
-        let _mock = std::process::Command::new("python3")
+        let mock = std::process::Command::new("python3")
             .arg(&mock_script)
             .arg(port.to_string())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok();
-        std::thread::sleep(std::time::Duration::from_millis(500));
+            .spawn();
+        if mock.is_err() || !crate::protocol::wait_tcp_ready(port, 10_000) {
+            eprintln!("跳过 redis 驱动用例：python3 mock 未就绪");
+            return;
+        }
         let mut profile = profile(&url);
         profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
         let result = (|| -> Result<(), ProtocolError> {
@@ -3130,7 +3132,10 @@ except Exception as e:
         else {
             return;
         };
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        if !crate::protocol::wait_http_ready(port, 10_000) {
+            eprintln!("跳过 open_basedir 用例：php 服务器未在 10 秒内就绪");
+            return;
+        }
         let url2 = format!("http://127.0.0.1:{port}/shell.php");
         let mut profile2 = profile(&url2);
         profile2.protocol_params = r#"{"encoder":"native"}"#.to_string();
@@ -3207,7 +3212,11 @@ except Exception as e:
         let Some(mut child) = child.ok() else {
             return;
         };
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        if !crate::protocol::wait_http_ready(port, 10_000) {
+            eprintln!("跳过：php 服务器未在 10 秒内就绪");
+            let _ = child.kill();
+            return;
+        }
         let url = format!("http://127.0.0.1:{port}/shell.php");
         let mut profile = profile(&url);
         profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
