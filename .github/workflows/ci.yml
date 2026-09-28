@@ -48,7 +48,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node 24：pnpm 11 要求 Node >= 22.13（依赖 node:sqlite 内置模块），
+          # 且与本地开发环境（v24）保持一致
+          node-version: 24
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
@@ -79,7 +81,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
 
       - name: 前端依赖漏洞扫描
