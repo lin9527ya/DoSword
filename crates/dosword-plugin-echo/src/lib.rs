@@ -216,7 +216,7 @@ impl Protocol for EchoProtocol {
         let echo = session
             .as_any()
             .downcast_ref::<EchoSession>()
-            .expect("会话类型不匹配");
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
         let payload = serde_json::json!({"ok": true, "data": {"stdout": command}});
         let start = Instant::now();
         let value = self.send_frame(echo, &B64.encode(payload.to_string().as_bytes()), settings)?;
@@ -312,7 +312,7 @@ mod tests {
             chunk_size_mb: 4,
             allow_arbitrary_code: true,
             audit_retention_days: 90,
-        gzip_enabled: true,
+            gzip_enabled: true,
         }
     }
 

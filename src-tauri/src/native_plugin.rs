@@ -108,7 +108,7 @@ impl FeaturePlugin for NativeFeaturePlugin {
         _settings: &AppSettings,
     ) -> Result<serde_json::Value, ProtocolError> {
         self.execute_json(runtime, params)
-            .map_err(|error| ProtocolError::ServerError(error))
+            .map_err(ProtocolError::ServerError)
     }
 }
 

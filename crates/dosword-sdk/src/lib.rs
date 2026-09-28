@@ -25,7 +25,7 @@ pub use encoder::{
 pub use plugin::{
     FeatureManifest, FeaturePlugin, FeaturePluginRegistry, NativePlugin, NativePluginAbi,
     ParamSpec, PluginExecution, PluginKind, PluginManifest, PluginRegistry, ProtocolPlugin,
-    ScriptFeaturePlugin, ScriptPluginDef,
+    ScriptFeaturePlugin, ScriptPluginDef, validate_plugin_id,
 };
 pub use protocol::{Protocol, ProtocolError, SessionState};
 

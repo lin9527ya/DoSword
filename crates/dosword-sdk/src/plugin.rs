@@ -329,6 +329,32 @@ pub struct ScriptPluginDef {
     pub execution: PluginExecution,
 }
 
+/// 校验插件 id 是否可用作文件名。
+///
+/// 插件 id 会被拼进 `plugins_dir.join(format!("{id}.plugin"))` 一类的路径，
+/// 因此必须同时排除路径分隔符（`/`、`\`）、父目录跳转（`..`）、绝对路径
+/// 与前导点（`.` / `..` 及隐藏文件），只允许 `[A-Za-z0-9._-]`。
+/// 宿主在安装与卸载两侧都应调用本函数。
+pub fn validate_plugin_id(id: &str) -> Result<(), String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("插件 id 不能为空".to_string());
+    }
+    if id.len() > 128 {
+        return Err("插件 id 过长（上限 128 字符）".to_string());
+    }
+    if id.starts_with('.') {
+        return Err("插件 id 不能以点开头".to_string());
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err("插件 id 只允许字母、数字、点、下划线与连字符".to_string());
+    }
+    Ok(())
+}
+
 /// 基于 .plugin 清单的脚本型功能插件（命令型 / 代码型）。
 pub struct ScriptFeaturePlugin {
     manifest: FeatureManifest,
@@ -340,9 +366,7 @@ impl ScriptFeaturePlugin {
     pub fn from_json(content: &str) -> Result<Self, String> {
         let def: ScriptPluginDef =
             serde_json::from_str(content).map_err(|error| format!("插件清单解析失败：{error}"))?;
-        if def.id.trim().is_empty() {
-            return Err("插件 id 不能为空".to_string());
-        }
+        validate_plugin_id(&def.id)?;
         Ok(Self {
             manifest: FeatureManifest {
                 id: def.id,
@@ -488,6 +512,9 @@ impl FeaturePluginRegistry {
         let _ = registry.register(Box::new(crate::feature_plugins::EvalCodePlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::RealCmdPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::SocksProxyPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::PortForwardPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::PortMapPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::NetworkProxyPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::HttpProxyPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::BypassOpenBasedirPlugin));
         let _ = registry.register(Box::new(crate::bypass::BypassScanPlugin));
@@ -570,6 +597,52 @@ mod script_plugin_tests {
     }
 
     #[test]
+    fn validate_plugin_id_accepts_legitimate_ids() {
+        for id in ["demo.cmd.v1", "bypass_open_basedir", "zip", "a-b_c.1"] {
+            assert!(validate_plugin_id(id).is_ok(), "{id} 应被接受");
+        }
+        // 首尾空白应被 trim 后接受
+        assert!(validate_plugin_id("  zip  ").is_ok());
+    }
+
+    #[test]
+    fn validate_plugin_id_rejects_path_traversal() {
+        for id in [
+            "",
+            "   ",
+            "..",
+            ".",
+            "../../../../home/kali/x",
+            "..\\..\\windows",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "/tmp/evil",
+            ".hidden",
+            "a b",
+            "a\0b",
+            &"x".repeat(129),
+        ] {
+            assert!(validate_plugin_id(id).is_err(), "{id:?} 应被拒绝");
+        }
+    }
+
+    #[test]
+    fn script_plugin_with_traversal_id_rejected() {
+        let content = r#"{
+            "id": "../../../../tmp/evil",
+            "name": "x",
+            "version": "1.0.0",
+            "description": "",
+            "category": "general",
+            "languages": ["php"],
+            "params": [],
+            "execution": {"type": "command", "commands": {"default": "id"}}
+        }"#;
+        assert!(ScriptFeaturePlugin::from_json(content).is_err());
+    }
+
+    #[test]
     fn render_template_replaces_params() {
         let params = serde_json::json!({"limit": 5, "path": "/var/www", "flag": true});
         assert_eq!(
@@ -600,6 +673,9 @@ mod feature_tests {
         assert!(ids.contains(&"bypass_fastcgi".to_string()), "{ids:?}");
         assert!(ids.contains(&"bypass_iconv".to_string()), "{ids:?}");
         assert!(ids.contains(&"socks_proxy".to_string()), "{ids:?}");
+        assert!(ids.contains(&"port_forward".to_string()), "{ids:?}");
+        assert!(ids.contains(&"port_map".to_string()), "{ids:?}");
+        assert!(ids.contains(&"network_proxy".to_string()), "{ids:?}");
         assert!(ids.contains(&"http_proxy".to_string()), "{ids:?}");
         assert!(ids.contains(&"p_eval_code".to_string()), "{ids:?}");
         // 重复注册拒绝
