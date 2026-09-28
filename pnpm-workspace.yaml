@@ -1,2 +1,8 @@
+# pnpm 10+ 的配置统一放在本文件（package.json 的 "pnpm" 字段已不再被读取）
 allowBuilds:
   esbuild: true
+
+# 依赖覆盖：postcss（经 vite 引入，仅构建期）依赖的 nanoid <3.3.18 存在
+# GHSA-2v37-7h3g-55p8（size 为 0 的自定义生成器可无限循环）
+overrides:
+  nanoid: ^3.3.18

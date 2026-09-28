@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 私密漏洞上报
+    url: https://github.com/lin9527ya/DoSword/security/advisories/new
+    about: 报告 DoSword 自身的安全漏洞（请勿开公开 Issue）
+  - name: 使用问题与讨论
+    url: https://github.com/lin9527ya/DoSword/discussions
+    about: 安装、配置、协议联调等使用类问题

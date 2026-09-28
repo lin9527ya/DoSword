@@ -2,6 +2,8 @@
 name = "dosword-sdk"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "DoSword 协议 SDK：协议插件开发者依赖的纯接口库（零 tauri 依赖）"
 
 [lib]

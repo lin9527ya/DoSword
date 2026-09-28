@@ -1,0 +1,4 @@
+[toolchain]
+# edition 2024 需要 Rust >= 1.85；本地与 CI 均跟随 stable。
+channel = "stable"
+components = ["clippy", "rustfmt"]

@@ -1,7 +1,9 @@
 [package]
 name = "dosword-plugin-bin"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "二进制 .plugin 示例（cdylib，dlopen 加载）"
 
 [lib]

@@ -42,9 +42,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 不指定 version：pnpm 版本以 package.json 的 packageManager 字段为准，
+      # 避免本地与 CI 版本漂移（pnpm 10+ 已把配置从 package.json 迁到 pnpm-workspace.yaml）
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - uses: actions/setup-node@v4
         with:
@@ -58,3 +58,40 @@ jobs:
 
       - name: 构建
         run: pnpm build
+
+  security:
+    name: 密钥与依赖扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks 需要完整历史才能扫出历史提交里的密钥
+          fetch-depth: 0
+
+      - name: gitleaks 密钥扫描（全历史）
+        run: |
+          GITLEAKS_VERSION=8.28.0
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks detect --source . --redact --no-banner --exit-code 1
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: 前端依赖漏洞扫描
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm audit --audit-level=high
+
+      - name: 安装 cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Rust 依赖漏洞扫描
+        # 只对 vulnerability 失败；unmaintained / unsound / yanked 属 warning，不阻塞
+        run: cargo audit

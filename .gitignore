@@ -12,9 +12,26 @@ dist
 dist-ssr
 *.local
 
+# 包管理器：仓库以 pnpm 为准（CI 用 pnpm install --frozen-lockfile）
+# 提交 package-lock.json 会与 pnpm-lock.yaml 冲突并误导 Dependabot
+package-lock.json
+npm-shrinkwrap.json
+
+# 本地运行时数据：SQLite 库、WAL、环境变量与凭据文件
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+.env
+.env.*
+!.env.example
+
 # 大体积会话导出/临时归档（勿提交）
 webshell优化.json
 webshell优化.zip
+
+# 早期 ts-rs 默认导出路径的残留（权威生成物见 src/generated/domain.ts）
+src-tauri/src/generated/
 
 # Editor directories and files
 .vscode/*

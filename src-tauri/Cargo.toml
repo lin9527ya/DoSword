@@ -1,8 +1,9 @@
 [package]
 name = "dosword"
 version.workspace = true
-description = "Authorized WebShell workspace manager"
-authors = ["DoSword Contributors"]
+description = "面向授权安全测试的 WebShell 管理客户端（Tauri 桌面应用）"
+authors.workspace = true
+repository.workspace = true
 edition.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -34,7 +35,9 @@ encoding_rs = "0.8"
 libloading = "0.8"
 getrandom = "0.3"
 ipnet = "2"
+lru.workspace = true
+parking_lot.workspace = true
 ts-rs.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "charset", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "charset", "cookies", "socks"] }
 dosword-sdk = { path = "../crates/dosword-sdk" }
 dosword-plugin-echo = { path = "../crates/dosword-plugin-echo" }

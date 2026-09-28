@@ -2,6 +2,8 @@
 name = "dosword-plugin-echo"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "DoSword 示例协议插件：ECHO 协议（演示 SDK 三步接入）"
 
 [lib]
