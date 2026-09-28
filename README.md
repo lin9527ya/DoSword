@@ -1,5 +1,7 @@
 # DoSword
 
+[![CI](https://github.com/lin9527ya/DoSword/actions/workflows/ci.yml/badge.svg)](https://github.com/lin9527ya/DoSword/actions/workflows/ci.yml)
+
 DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客户端（Tauri 2 + React 19 + SQLite）。
 
 > **仅限授权使用**：请在拥有书面授权的渗透测试项目、自有资产或 CTF / 教学环境中使用。
