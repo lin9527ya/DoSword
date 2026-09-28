@@ -1920,6 +1920,12 @@ mod tests {
         ];
         let settings = settings();
         for encoder_id in encoders {
+            if encoder_id == "native_des" && !php_supports_des_ecb() {
+                eprintln!(
+                    "跳过 native_des：当前 php 的 OpenSSL 不支持 DES-ECB（OpenSSL 3 需加载 legacy provider）"
+                );
+                continue;
+            }
             let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", false)
             else {
                 eprintln!("跳过 {encoder_id}：未检测到 php 可执行文件");
@@ -1960,6 +1966,12 @@ mod tests {
         ];
         let settings = settings();
         for encoder_id in encoders {
+            if encoder_id == "native_des" && !php_supports_des_ecb() {
+                eprintln!(
+                    "跳过 native_des session：当前 php 的 OpenSSL 不支持 DES-ECB（OpenSSL 3 需加载 legacy provider）"
+                );
+                continue;
+            }
             let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", true)
             else {
                 eprintln!("跳过 {encoder_id} session：未检测到 php");
@@ -2705,6 +2717,9 @@ port = int(sys.argv[1]); outfile = sys.argv[2]
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", port)); srv.listen(2)
+# 就绪标记：测试轮询此文件而不是固定 sleep —— 监听只 accept 一次，
+# 用 TCP 探活会把唯一的 accept 吃掉，故用标记文件通知「已在监听」
+open(outfile + ".ready", "w").close()
 srv.settimeout(20)
 try:
     conn, _ = srv.accept()
@@ -3257,16 +3272,34 @@ except Exception as e:
             let rport: u16 = 25000 + (std::process::id() % 500) as u16;
             let outfile =
                 std::env::temp_dir().join(format!("rev_disable_{}.txt", std::process::id()));
+            let ready =
+                std::env::temp_dir().join(format!("rev_disable_{}.txt.ready", std::process::id()));
             let _ = std::fs::remove_file(&outfile);
-            let _ = std::process::Command::new("python3")
+            let _ = std::fs::remove_file(&ready);
+            let listener = std::process::Command::new("python3")
                 .arg(&listener_script)
                 .arg(rport.to_string())
                 .arg(outfile.to_string_lossy().into_owned())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .spawn()
-                .ok();
-            std::thread::sleep(std::time::Duration::from_millis(400));
+                .spawn();
+            if listener.is_err() {
+                eprintln!("跳过 pcntl 反弹向量：未检测到 python3 可执行文件（listener 需要）");
+                return Ok(());
+            }
+            // 轮询就绪标记，替代固定 sleep —— CI runner 负载高时 400ms 内可能尚未 bind
+            let mut listener_ready = false;
+            for _ in 0..100 {
+                if ready.exists() {
+                    listener_ready = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if !listener_ready {
+                eprintln!("跳过 pcntl 反弹向量：listener 未在 10 秒内就绪");
+                return Ok(());
+            }
             let out = dosword_sdk::bypass::BypassReversePcntlPlugin.execute(
                 &protocol,
                 php,
@@ -3297,6 +3330,22 @@ except Exception as e:
     }
 
     // --- Level B：真实 PHP 往返（本机装有 php 时执行） ---
+
+    /// 探测当前 php 的 openssl 是否支持 DES-ECB。
+    ///
+    /// OpenSSL 3 把 DES 等算法移入 legacy provider 且默认不加载，
+    /// Ubuntu 24.04 的 php8.3 即属此类（php8.0 链接自带 OpenSSL 1.0.2 则可用）。
+    /// 环境不支持时跳过 native_des 用例，而不是报一个与代码无关的假失败。
+    fn php_supports_des_ecb() -> bool {
+        let probe = "$r = @openssl_encrypt('12345678', 'DES-ECB', '12345678', OPENSSL_RAW_DATA); \
+                     echo ($r === false || strlen($r) === 0) ? '0' : '1';";
+        std::process::Command::new("php")
+            .arg("-r")
+            .arg(probe)
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "1")
+            .unwrap_or(false)
+    }
 
     /// 在本机临时目录写入指定编码器生成的 stub 并起 `php -S`，
     /// 返回 (endpoint, 临时目录, 进程)。若无 php 可执行则返回 None（跳过测试）。
