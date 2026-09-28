@@ -22,61 +22,84 @@ pub struct AppState {
     dir_cache: Mutex<DirCache>,
 }
 
-/// 目录列表缓存（LRU + TTL 5s）：容量 256，满则淘汰最久未使用条目（P7）。
-/// 键 = (session_id, path)；写操作按会话失效。
-/// 目录列表缓存（TTL 5s）：容量 256，满则淘汰最旧条目（P6：存 Arc，惰性过期，
-/// 免整份 DirListing clone 与 LRU 移位 O(n) 开销）。
+/// 目录列表缓存：`lru::LruCache` + TTL 5s + Arc 共享（O(1) 淘汰，免深拷贝）。
+/// 键 = (session_id, path)；写操作按会话批量失效。容量 256，命中时提升热度。
 pub struct DirCache {
-    map: std::collections::HashMap<(String, String), (std::time::Instant, std::sync::Arc<dosword_sdk::domain::DirListing>)>,
-    order: std::collections::VecDeque<(String, String)>,
-    cap: usize,
+    inner: lru::LruCache<
+        (String, String),
+        (
+            std::time::Instant,
+            std::sync::Arc<dosword_sdk::domain::DirListing>,
+        ),
+    >,
+    ttl: std::time::Duration,
+}
+
+impl Default for DirCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DirCache {
     pub fn new() -> Self {
         Self {
-            map: std::collections::HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            cap: 256,
+            inner: lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()),
+            ttl: std::time::Duration::from_secs(5),
         }
     }
 
-    /// 命中且未过期时返回 Arc（clone 是引用计数，非深拷贝）。
+    /// 命中且未过期时返回 Arc（引用计数，LruCache::get 会提升热度）。
     pub fn get(
         &mut self,
         key: &(String, String),
         ttl: std::time::Duration,
     ) -> Option<std::sync::Arc<dosword_sdk::domain::DirListing>> {
-        let (hit_at, listing) = self.map.get(key)?;
+        let (hit_at, listing) = self.inner.get(key)?;
         if hit_at.elapsed() > ttl {
             return None;
         }
         Some(std::sync::Arc::clone(listing))
     }
 
+    /// 使用默认 TTL 的快捷 get
+    pub fn get_ttl(
+        &mut self,
+        key: &(String, String),
+    ) -> Option<std::sync::Arc<dosword_sdk::domain::DirListing>> {
+        self.get(key, self.ttl)
+    }
+
     pub fn insert(
         &mut self,
         key: (String, String),
-        value: (std::time::Instant, std::sync::Arc<dosword_sdk::domain::DirListing>),
+        value: (
+            std::time::Instant,
+            std::sync::Arc<dosword_sdk::domain::DirListing>,
+        ),
     ) {
-        if !self.map.contains_key(&key) {
-            while self.map.len() >= self.cap {
-                match self.order.pop_front() {
-                    Some(oldest) => {
-                        self.map.remove(&oldest);
-                    }
-                    None => break,
-                }
-            }
-            self.order.push_back(key.clone());
-        }
-        self.map.insert(key, value);
+        self.inner.put(key, value);
     }
 
     /// 失效某会话的全部目录缓存（写操作后调用，保证一致性）。
     pub fn invalidate_session(&mut self, session_id: &str) {
-        self.order.retain(|key| key.0 != session_id);
-        self.map.retain(|key, _| key.0 != session_id);
+        let keys: Vec<(String, String)> = self
+            .inner
+            .iter()
+            .filter(|(k, _)| k.0 == session_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys {
+            self.inner.pop(&k);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }
 
@@ -105,45 +128,43 @@ pub fn run() {
             std::fs::create_dir_all(&app_data)?;
             let database = Database::open(app_data.join("dosword.sqlite3"))?;
             // P5：启动时按保留期清理过期审计（设置 0 表示不清理）
-            if let Ok(settings) = database.get_settings() {
-                if settings.audit_retention_days > 0 {
-                    let _ = database.purge_audit(settings.audit_retention_days);
-                }
+            if let Ok(settings) = database.get_settings()
+                && settings.audit_retention_days > 0
+            {
+                let _ = database.purge_audit(settings.audit_retention_days);
             }
             let plugins_dir = app_data.join("plugins");
-            if plugins_dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
-                    let mut registry = dosword_sdk::FeaturePluginRegistry::builtin();
-                    for entry in entries.flatten() {
-                        let file_name = entry.file_name().to_string_lossy().into_owned();
-                        if file_name.ends_with(".plugin") {
-                            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                                if let Ok(plugin) =
-                                    dosword_sdk::ScriptFeaturePlugin::from_json(&content)
-                                {
-                                    let id = plugin.manifest().id.clone();
-                                    if registry.register(Box::new(plugin)).is_ok() {
-                                        registry.installed.insert(id);
-                                    }
-                                }
+            if plugins_dir.exists()
+                && let Ok(entries) = std::fs::read_dir(&plugins_dir)
+            {
+                let mut registry = dosword_sdk::FeaturePluginRegistry::builtin();
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name().to_string_lossy().into_owned();
+                    if file_name.ends_with(".plugin") {
+                        if let Ok(content) = std::fs::read_to_string(entry.path())
+                            && let Ok(plugin) =
+                                dosword_sdk::ScriptFeaturePlugin::from_json(&content)
+                        {
+                            let id = plugin.manifest().id.clone();
+                            if registry.register(Box::new(plugin)).is_ok() {
+                                registry.installed.insert(id);
                             }
-                        } else if file_name.contains(".native.") {
-                            // 二进制插件：动态加载（失败跳过，不阻塞启动）
-                            if let Ok(plugin) =
-                                crate::native_plugin::NativeFeaturePlugin::load(&entry.path())
-                            {
-                                if let Ok(manifest) = plugin.abi_manifest() {
-                                    let id = manifest.id.clone();
-                                    if registry.register(Box::new(plugin)).is_ok() {
-                                        registry.installed.insert(id);
-                                    }
-                                }
+                        }
+                    } else if file_name.contains(".native.") {
+                        // 二进制插件：动态加载（失败跳过，不阻塞启动）
+                        if let Ok(plugin) =
+                            crate::native_plugin::NativeFeaturePlugin::load(&entry.path())
+                            && let Ok(manifest) = plugin.abi_manifest()
+                        {
+                            let id = manifest.id.clone();
+                            if registry.register(Box::new(plugin)).is_ok() {
+                                registry.installed.insert(id);
                             }
                         }
                     }
-                    app.manage(build_app_state(database, registry));
-                    return Ok(());
                 }
+                app.manage(build_app_state(database, registry));
+                return Ok(());
             }
             app.manage(build_app_state(
                 database,

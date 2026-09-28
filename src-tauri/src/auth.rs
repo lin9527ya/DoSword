@@ -4,7 +4,8 @@
 //! - 以逗号、中文顿号、空格或分号分隔的多个条目
 //! - 支持：精确 host（`example.com`）、后缀通配（`*.example.com`）、
 //!   IPv4/IPv6 字面量、CIDR（`10.0.0.0/8`）、裸通配（`*`）
-//! - 无法解析的条目按"人工已确认"放行，审计中注明无法自动校验
+//! - **失败即拒绝**：无法解析的条目不会匹配任何主机，端点缺主机名、URL 解析失败、
+//!   到期时间格式异常同样一律按禁止处理。任何一项校验无法判定为通过，结果都是 Err。
 
 use chrono::{DateTime, Local, NaiveDate};
 use url::Url;
@@ -116,7 +117,7 @@ pub fn require_session_alive(db: &Database, shell: &ShellProfile) -> Result<(), 
 pub fn workspace_alive_from_snapshot(expires_at: Option<&str>) -> Result<(), String> {
     match expires_at {
         None => Ok(()),
-        Some(expires_at) if expires_at.is_empty() => Ok(()),
+        Some("") => Ok(()),
         Some(expires_at) => {
             let expires = parse_expiry(expires_at)?;
             if Local::now() > expires {
@@ -171,87 +172,74 @@ mod tests {
 
     #[test]
     fn exact_host_matches() {
-        assert_eq!(
+        assert!(
             scope_allows(
                 "example.com",
                 &Url::parse("http://example.com/shell.php").unwrap()
             )
-            .0,
-            true
+            .0
         );
-        assert_eq!(
-            scope_allows(
+        assert!(
+            !scope_allows(
                 "example.com",
                 &Url::parse("http://other.com/shell.php").unwrap()
             )
-            .0,
-            false
+            .0
         );
     }
 
     #[test]
     fn suffix_wildcard_matches() {
-        assert_eq!(
+        assert!(
             scope_allows(
                 "*.example.com",
                 &Url::parse("http://sub.example.com/a.php").unwrap()
             )
-            .0,
-            true
+            .0
         );
-        assert_eq!(
+        assert!(
             scope_allows(
                 "*.example.com",
                 &Url::parse("http://example.com/a.php").unwrap()
             )
             .0,
-            true,
             "裸域也应匹配 *. 后缀"
         );
-        assert_eq!(
-            scope_allows(
+        assert!(
+            !scope_allows(
                 "*.example.com",
                 &Url::parse("http://evil-example.com/a.php").unwrap()
             )
             .0,
-            false,
             "不应匹配相似后缀"
         );
     }
 
     #[test]
     fn cidr_matches() {
-        assert_eq!(
-            scope_allows("10.0.0.0/8", &Url::parse("http://10.1.2.3/a.php").unwrap()).0,
-            true
-        );
-        assert_eq!(
-            scope_allows(
+        assert!(scope_allows("10.0.0.0/8", &Url::parse("http://10.1.2.3/a.php").unwrap()).0);
+        assert!(
+            !scope_allows(
                 "10.0.0.0/8",
                 &Url::parse("http://192.168.1.1/a.php").unwrap()
             )
-            .0,
-            false
+            .0
         );
     }
 
     #[test]
     fn wildcard_allows_everything() {
-        assert_eq!(
-            scope_allows("*", &Url::parse("http://anything.example/x.php").unwrap()).0,
-            true
-        );
+        assert!(scope_allows("*", &Url::parse("http://anything.example/x.php").unwrap()).0);
     }
 
     #[test]
     fn multiple_tokens_separated_by_commas() {
-        assert_eq!(
+        assert!(
             scope_allows(
                 "10.0.0.0/8, *.corp.example; localhost",
                 &Url::parse("http://svc.corp.example/a.php").unwrap()
             )
-            .0,
-            true
+            .0
         );
     }
 

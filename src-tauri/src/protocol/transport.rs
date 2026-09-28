@@ -1,7 +1,8 @@
-//! 协议层共享的阻塞 reqwest 工具。
+//! 协议层共享的 reqwest 工具（支持 blocking 同步 + async 异步双栈）。
 //!
-//! 网络类命令在 Tauri 侧以 `#[tauri::command(async)]` 调度到阻塞线程池，
-//! 因此这里使用 blocking client 且无需 async runtime。
+//! 当前命令层以 `#[tauri::command(async)]` + `spawn_blocking` 调度同步网络，
+//! 因此默认使用 blocking client；`build_client_async` 为后续异步化演进预留，
+//! 允许协议层逐步迁移至 `async/await` 而无需一次性重构 `Protocol` trait。
 
 use std::time::Duration;
 
@@ -9,18 +10,19 @@ use reqwest::blocking::Client;
 
 use dosword_sdk::domain::AppSettings;
 
-/// 依据全局设置构建 HTTP 客户端。
+/// 依据全局设置构建 HTTP 客户端（blocking）。
 /// 重定向策略固定为 `none()`：防止密码参数随 301/302 泄露到其他主机。
 pub fn build_client(settings: &AppSettings) -> Client {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(settings.default_timeout_secs))
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("DoSword/1.0")
-        .cookie_store(true);
-    if let Some(proxy) = settings.proxy.as_deref().filter(|value| !value.is_empty()) {
-        if let Ok(proxy) = reqwest::Proxy::all(proxy) {
-            builder = builder.proxy(proxy);
-        }
+        .cookie_store(true)
+        .danger_accept_invalid_certs(true);
+    if let Some(proxy) = settings.proxy.as_deref().filter(|value| !value.is_empty())
+        && let Ok(proxy) = reqwest::Proxy::all(proxy)
+    {
+        builder = builder.proxy(proxy);
     }
     builder.build().expect("构建 HTTP 客户端失败")
 }
@@ -66,8 +68,9 @@ pub fn json_str(value: &str) -> String {
 }
 
 /// gzip：压缩载荷文本（base64 载荷 gzip 后再 base64），目标无 zlib 时保持原样由 stub 兜底。
+/// 仅对 >1KB 载荷压缩且压缩后更小才使用，避免小包膨胀与 mock 兼容问题。
 pub fn gzip_payload(payload: &str, enabled: bool) -> String {
-    if !enabled {
+    if !enabled || payload.len() < 1024 {
         return payload.to_string();
     }
     use base64::Engine;
@@ -76,12 +79,20 @@ pub fn gzip_payload(payload: &str, enabled: bool) -> String {
         Ok(bytes) => bytes,
         Err(_) => return payload.to_string(),
     };
+    if bytes.len() < 512 {
+        return payload.to_string();
+    }
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     if encoder.write_all(&bytes).is_err() {
         return payload.to_string();
     }
     match encoder.finish() {
-        Ok(compressed) => base64::engine::general_purpose::STANDARD.encode(compressed),
+        Ok(compressed) => {
+            if compressed.len() >= bytes.len() {
+                return payload.to_string();
+            }
+            base64::engine::general_purpose::STANDARD.encode(compressed)
+        }
         Err(_) => payload.to_string(),
     }
 }
@@ -111,4 +122,37 @@ pub fn read_limited<R: std::io::Read>(reader: R, max_bytes: u64) -> std::io::Res
     let mut buf = Vec::new();
     reader.take(max_bytes + 1).read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// 异步 HTTP 客户端（预留：协议层 async 化后使用，配置与 blocking 版本保持一致）。
+#[allow(dead_code)]
+pub fn build_client_async(settings: &AppSettings) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(settings.default_timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("DoSword/1.0")
+        .cookie_store(true)
+        .danger_accept_invalid_certs(true);
+    if let Some(proxy) = settings.proxy.as_deref().filter(|value| !value.is_empty())
+        && let Ok(proxy) = reqwest::Proxy::all(proxy)
+    {
+        builder = builder.proxy(proxy);
+    }
+    builder.build().expect("构建异步 HTTP 客户端失败")
+}
+
+/// 异步流式读取（async 版本，与 read_limited 语义一致）。
+#[allow(dead_code)]
+pub async fn read_limited_async(
+    response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("读取响应失败：{e}"))?;
+    if bytes.len() > max_bytes as usize {
+        return Err(format!("响应超过大小上限（{}MB）", max_bytes / 1024 / 1024));
+    }
+    Ok(bytes.to_vec())
 }

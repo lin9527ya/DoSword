@@ -172,7 +172,8 @@ impl SessionManager {
     }
 
     /// 列出全部活跃会话的元信息（不含协议状态）。
-    pub fn list(&self) -> Vec<(String, String, String, u64)> {
+    pub fn list(&mut self) -> Vec<(String, String, String, u64)> {
+        self.purge_expired();
         self.sessions
             .values()
             .map(|session| {
@@ -184,6 +185,12 @@ impl SessionManager {
                 )
             })
             .collect()
+    }
+
+    /// 存活会话数（诊断用；当前无调用点，保留为会话表的自然访问器）。
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.sessions.len()
     }
 
     fn purge_expired(&mut self) {

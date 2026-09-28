@@ -200,7 +200,7 @@ fn default_chunk_mb() -> u64 {
 }
 
 fn default_allow_code() -> bool {
-    false
+    true
 }
 
 fn default_audit_retention_days() -> u64 {

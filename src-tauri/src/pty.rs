@@ -4,20 +4,20 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub struct PtyRegistry {
-    sessions: Mutex<HashMap<String, Arc<Mutex<TcpStream>>>>,
+    sessions: parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<TcpStream>>>>,
     /// pty_id -> 所属 Shell 会话 id（断开 Shell 时级联清理 PTY）。
-    owner: Mutex<HashMap<String, String>>,
+    owner: parking_lot::Mutex<HashMap<String, String>>,
     counter: std::sync::atomic::AtomicU64,
 }
 
 impl PtyRegistry {
     pub fn new() -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
-            owner: Mutex::new(HashMap::new()),
+            sessions: parking_lot::Mutex::new(HashMap::new()),
+            owner: parking_lot::Mutex::new(HashMap::new()),
             counter: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -32,14 +32,8 @@ impl PtyRegistry {
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(80)));
         self.sessions
             .lock()
-            .map_err(|_| ())
-            .map(|mut map| {
-                map.insert(id.clone(), Arc::new(Mutex::new(stream)));
-            })
-            .ok();
-        if let Ok(mut owner) = self.owner.lock() {
-            owner.insert(id.clone(), session_id.to_string());
-        }
+            .insert(id.clone(), Arc::new(parking_lot::Mutex::new(stream)));
+        self.owner.lock().insert(id.clone(), session_id.to_string());
         id
     }
 
@@ -49,11 +43,10 @@ impl PtyRegistry {
         let stream = self
             .sessions
             .lock()
-            .map_err(|_| "PTY 锁异常".to_string())?
             .get(id)
             .cloned()
             .ok_or_else(|| "PTY 会话不存在或已关闭".to_string())?;
-        let mut guard = stream.lock().map_err(|_| "PTY 流锁异常".to_string())?;
+        let mut guard = stream.lock();
         guard
             .write_all(data)
             .map_err(|error| format!("PTY 写入失败：{error}"))
@@ -65,11 +58,10 @@ impl PtyRegistry {
         let stream = self
             .sessions
             .lock()
-            .map_err(|_| "PTY 锁异常".to_string())?
             .get(id)
             .cloned()
             .ok_or_else(|| "PTY 会话不存在或已关闭".to_string())?;
-        let mut guard = stream.lock().map_err(|_| "PTY 流锁异常".to_string())?;
+        let mut guard = stream.lock();
         let mut buf = vec![0u8; 8192];
         match guard.read(&mut buf) {
             Ok(0) => Err("PTY 连接已关闭".to_string()),
@@ -85,12 +77,8 @@ impl PtyRegistry {
 
     /// 关闭并移除 PTY 会话。
     pub fn close(&self, id: &str) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.remove(id);
-        }
-        if let Ok(mut owner) = self.owner.lock() {
-            owner.remove(id);
-        }
+        self.sessions.lock().remove(id);
+        self.owner.lock().remove(id);
     }
 
     /// 清理某 Shell 会话关联的全部 PTY（断开 Shell 时调用）。
@@ -98,20 +86,18 @@ impl PtyRegistry {
         let ids: Vec<String> = self
             .owner
             .lock()
-            .map(|owner| {
-                owner
-                    .iter()
-                    .filter(|(_, owner_session)| owner_session == &session_id)
-                    .map(|(id, _)| id.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Ok(mut sessions) = self.sessions.lock() {
+            .iter()
+            .filter(|(_, owner_session)| owner_session == &session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        {
+            let mut sessions = self.sessions.lock();
             for id in &ids {
                 sessions.remove(id);
             }
         }
-        if let Ok(mut owner) = self.owner.lock() {
+        {
+            let mut owner = self.owner.lock();
             for id in &ids {
                 owner.remove(id);
             }
@@ -121,7 +107,7 @@ impl PtyRegistry {
     /// 当前存活的 PTY 数量（测试与诊断用）。
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.sessions.lock().map(|s| s.len()).unwrap_or(0)
+        self.sessions.lock().len()
     }
 }
 

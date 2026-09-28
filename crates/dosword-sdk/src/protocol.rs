@@ -24,6 +24,8 @@ pub enum ProtocolError {
     ParseError(String),
     /// 服务器返回了业务错误（ok=false）。
     ServerError(String),
+    /// 会话状态与当前协议不匹配（内部不变式被破坏，非用户操作问题）。
+    SessionInvalid(String),
     /// 当前协议不支持该操作。
     NotSupported(String),
 }
@@ -38,6 +40,7 @@ impl fmt::Display for ProtocolError {
             ProtocolError::AuthFailed(detail) => write!(f, "鉴权失败：{detail}"),
             ProtocolError::ParseError(detail) => write!(f, "响应解析失败：{detail}"),
             ProtocolError::ServerError(detail) => write!(f, "服务器错误：{detail}"),
+            ProtocolError::SessionInvalid(detail) => write!(f, "会话状态无效：{detail}"),
             ProtocolError::NotSupported(detail) => write!(f, "操作不受支持：{detail}"),
         }
     }

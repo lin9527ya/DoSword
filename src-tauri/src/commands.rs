@@ -608,12 +608,14 @@ fn encode_text_impl(text: &str, encoding: &str) -> Result<String, String> {
 #[tauri::command]
 /// S4：本地路径安全校验——规范化并拒绝敏感系统目录（防止被攻破的前端读写任意本地文件）。
 fn sanitize_local_path(path: &str, for_write: bool) -> Result<std::path::PathBuf, String> {
-    let deny = ["/etc", "/proc", "/sys", "/root", "/boot", "/dev", "/var/lib", "/usr"];
+    let deny = [
+        "/etc", "/proc", "/sys", "/root", "/boot", "/dev", "/var/lib", "/usr",
+    ];
     if for_write {
         let p = std::path::Path::new(path);
         let parent = p.parent().ok_or_else(|| "路径缺少父目录".to_string())?;
-        let canon_parent = std::fs::canonicalize(parent)
-            .map_err(|error| format!("路径无效：{error}"))?;
+        let canon_parent =
+            std::fs::canonicalize(parent).map_err(|error| format!("路径无效：{error}"))?;
         for prefix in deny {
             if canon_parent.starts_with(prefix) {
                 return Err(format!("拒绝访问敏感目录：{prefix}"));
@@ -650,7 +652,7 @@ pub fn export_shells(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 fn export_shells_impl(state: &AppState) -> Result<String, String> {
-    let mut database = state
+    let database = state
         .database
         .lock()
         .map_err(|_| "数据库锁异常".to_string())?;
@@ -804,7 +806,7 @@ pub async fn write_local_file(
 #[tauri::command]
 pub async fn list_audit(filter: AuditFilter, app: AppHandle) -> Result<AuditPage, String> {
     blocking(app, move |state| {
-        let mut database = state
+        let database = state
             .database
             .lock()
             .map_err(|_| "数据库锁异常".to_string())?;
@@ -844,9 +846,7 @@ pub async fn install_native_plugin(source_path: String, app: AppHandle) -> Resul
     let plugin =
         crate::native_plugin::NativeFeaturePlugin::load(std::path::Path::new(&source_path))?;
     let id = plugin.abi_manifest()?.id.clone();
-    if id.is_empty() || id.contains("..") {
-        return Err("插件 id 非法".to_string());
-    }
+    dosword_sdk::validate_plugin_id(&id).map_err(|error| format!("插件 id 非法：{error}"))?;
     let ext = std::path::Path::new(&source_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -898,6 +898,8 @@ pub async fn install_plugin(content: String, app: AppHandle) -> Result<(), Strin
 /// 卸载外部插件（删除注册与数据目录文件）。
 #[tauri::command]
 pub async fn uninstall_plugin(plugin_id: String, app: AppHandle) -> Result<(), String> {
+    // plugin_id 由前端直接传入，且下面会拼进文件路径，必须先校验（防路径穿越）
+    dosword_sdk::validate_plugin_id(&plugin_id)?;
     let data_dir = app
         .path()
         .app_data_dir()
@@ -999,24 +1001,24 @@ pub async fn run_feature_plugin(
                     .join("&")
             })
             .unwrap_or_default();
-        if let Ok(mut sessions) = state.sessions.lock() {
-            if let Ok(session) = sessions.get_mut(&session_id) {
-                let _ = state
-                    .database
-                    .lock()
-                    .map_err(|_| "数据库锁异常".to_string())
-                    .and_then(|database| {
-                        database
-                            .record_audit(
-                                Some(&session.workspace_id),
-                                Some(&session.profile_id),
-                                "plugin.run",
-                                "success",
-                                &format!("插件：{plugin_id}（{summary}）"),
-                            )
-                            .map_err(|error| error.to_string())
-                    });
-            }
+        if let Ok(mut sessions) = state.sessions.lock()
+            && let Ok(session) = sessions.get_mut(&session_id)
+        {
+            let _ = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())
+                .and_then(|database| {
+                    database
+                        .record_audit(
+                            Some(&session.workspace_id),
+                            Some(&session.profile_id),
+                            "plugin.run",
+                            "success",
+                            &format!("插件：{plugin_id}（{summary}）"),
+                        )
+                        .map_err(|error| error.to_string())
+                });
         }
         Ok(output)
     })
@@ -1128,26 +1130,13 @@ fn batch_update_shells_impl(
     tags: Option<Vec<String>>,
     password: Option<String>,
 ) -> Result<usize, String> {
-    let mut updated = 0usize;
-    let database = state
+    let mut database = state
         .database
         .lock()
         .map_err(|_| "数据库锁异常".to_string())?;
-    for id in ids {
-        if let Ok(Some(shell)) = database.shell(id) {
-            let input = UpdateShell {
-                id: id.clone(),
-                name: shell.name.clone(),
-                endpoint: shell.endpoint.clone(),
-                password: password.clone().or(Some(shell.password)),
-                tags: tags.clone().or(Some(shell.tags)),
-            };
-            if database.update_shell(&input).is_ok() {
-                updated += 1;
-            }
-        }
-    }
-    Ok(updated)
+    database
+        .batch_update_shells(ids, tags.as_ref(), password.as_deref())
+        .map_err(|e| e.to_string())
 }
 
 /// Repeater：手工构造并发送一次 HTTP 请求（不经协议，仅走传输层）。
@@ -1340,8 +1329,7 @@ pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectRe
                     .workspace(&shell.workspace_id)
                     .ok()
                     .flatten()
-                    .map(|workspace| workspace.expires_at)
-                    .flatten()
+                    .and_then(|workspace| workspace.expires_at)
             };
             if let Ok(session) = sessions.get_mut(&session_id) {
                 session.profile = Some(shell.clone());
@@ -1571,7 +1559,7 @@ pub async fn disconnect_shell(session_id: String, app: AppHandle) -> Result<(), 
 #[tauri::command]
 pub async fn list_sessions(app: AppHandle) -> Result<Vec<SessionInfo>, String> {
     blocking(app, move |state| {
-        let sessions = state
+        let mut sessions = state
             .sessions
             .lock()
             .map_err(|_| "会话锁异常".to_string())?;
@@ -1622,7 +1610,7 @@ fn session_ctx<'a>(state: &'a AppState, session_id: &str) -> Result<SessionCtx<'
         )
     };
 
-    let mut database = state
+    let database = state
         .database
         .lock()
         .map_err(|_| "数据库锁异常".to_string())?;
@@ -1763,7 +1751,7 @@ pub async fn execute_command(
                 Some(&ctx.shell.id),
                 "shell.exec",
                 "error",
-            error,
+                error,
             )
         })?;
         audit(
@@ -1789,10 +1777,10 @@ pub async fn list_dir(
         let ctx = session_ctx(state, &session_id)?;
         // 目录缓存（TTL 5s）：命中直接返回，避免大目录重复网络往返
         let cache_key = (session_id.clone(), path.clone());
-        if let Ok(mut cache) = state.dir_cache.lock() {
-            if let Some(listing) = cache.get(&cache_key, std::time::Duration::from_secs(5)) {
-                return Ok((*listing).clone());
-            }
+        if let Ok(mut cache) = state.dir_cache.lock()
+            && let Some(listing) = cache.get(&cache_key, std::time::Duration::from_secs(5))
+        {
+            return Ok((*listing).clone());
         }
         let listing = with_session(state, &session_id, |session| {
             ctx.protocol.list_dir(session, &path, &ctx.settings)
@@ -1804,14 +1792,17 @@ pub async fn list_dir(
                 Some(&ctx.shell.id),
                 "file.list",
                 "error",
-            error,
+                error,
             )
         })?;
         let listing_arc = std::sync::Arc::new(listing);
         if let Ok(mut cache) = state.dir_cache.lock() {
             cache.insert(
                 cache_key,
-                (std::time::Instant::now(), std::sync::Arc::clone(&listing_arc)),
+                (
+                    std::time::Instant::now(),
+                    std::sync::Arc::clone(&listing_arc),
+                ),
             );
         }
         audit(
@@ -1852,7 +1843,6 @@ pub async fn batch_list_dir(
             std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(workers);
                 for worker in 0..workers {
-                    let path_list = path_list;
                     let session_id = session_id_ref;
                     let settings = settings_ref;
                     handles.push(scope.spawn(move || {
@@ -1863,9 +1853,10 @@ pub async fn batch_list_dir(
                             // 批量浏览同样命中目录缓存（避免重复网络往返）
                             let cache_key = (session_id.clone(), path.clone());
                             let listing = {
-                                let cache_hit = state.dir_cache.lock().ok().and_then(|mut cache| {
-                                    cache.get(&cache_key, std::time::Duration::from_secs(5))
-                                });
+                                let cache_hit =
+                                    state.dir_cache.lock().ok().and_then(|mut cache| {
+                                        cache.get(&cache_key, std::time::Duration::from_secs(5))
+                                    });
                                 match cache_hit {
                                     Some(listing) => (*listing).clone(),
                                     None => {
@@ -1898,8 +1889,7 @@ pub async fn batch_list_dir(
                             };
                             out.push((
                                 path.clone(),
-                                serde_json::to_value(listing)
-                                    .map_err(|error| error.to_string()),
+                                serde_json::to_value(listing).map_err(|error| error.to_string()),
                             ));
                             index += workers;
                         }
@@ -1913,7 +1903,7 @@ pub async fn batch_list_dir(
             });
         let mut results = serde_json::Map::new();
         for (path, value) in collected {
-            results.insert(path, value.map_err(|error| error)?);
+            results.insert(path, value?);
         }
         Ok(serde_json::Value::Object(results))
     })
@@ -1938,7 +1928,7 @@ pub async fn read_file(
                 Some(&ctx.shell.id),
                 "file.read",
                 "error",
-            error,
+                error,
             )
         })?;
         let content_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -1983,7 +1973,7 @@ pub async fn write_file(
                 Some(&ctx.shell.id),
                 "file.write",
                 "error",
-            error,
+                error,
             )
         })?;
         invalidate_dir_cache(state, &session_id);
@@ -2042,7 +2032,7 @@ pub async fn upload_file(
                     Some(&ctx.shell.id),
                     "file.upload",
                     "error",
-                error,
+                    error,
                 )
             })?;
             byte_offset += decoded.len() as u64;
@@ -2069,7 +2059,7 @@ pub async fn upload_file(
                     Some(&ctx.shell.id),
                     "file.upload",
                     "error",
-                error,
+                    error,
                 )
             })?;
         }
@@ -2111,7 +2101,7 @@ pub async fn write_chunk(
                 Some(&ctx.shell.id),
                 "file.write",
                 "error",
-            error,
+                error,
             )
         })?;
         invalidate_dir_cache(state, &session_id);
@@ -2161,7 +2151,7 @@ pub async fn download_file(
                     Some(&ctx.shell.id),
                     "file.download",
                     "error",
-                error,
+                    error,
                 )
             })?;
             if chunk.is_empty() {
@@ -2203,7 +2193,7 @@ pub async fn delete_path(session_id: String, path: String, app: AppHandle) -> Re
                 Some(&ctx.shell.id),
                 "file.delete",
                 "error",
-            error,
+                error,
             )
         })?;
         audit(
@@ -2239,7 +2229,7 @@ pub async fn rename_path(
                 Some(&ctx.shell.id),
                 "file.rename",
                 "error",
-            error,
+                error,
             )
         })?;
         audit(
@@ -2276,7 +2266,7 @@ pub async fn touch_path(
                 Some(&ctx.shell.id),
                 "file.touch",
                 "error",
-            error,
+                error,
             )
         })?;
         audit(
@@ -2307,7 +2297,7 @@ pub async fn create_dir(session_id: String, path: String, app: AppHandle) -> Res
                 Some(&ctx.shell.id),
                 "file.mkdir",
                 "error",
-            error,
+                error,
             )
         })?;
         audit(
@@ -2367,7 +2357,7 @@ pub async fn db_probe(
                 Some(&ctx.shell.id),
                 "db.probe",
                 "error",
-            error,
+                error,
             )
         })?;
         audit(
@@ -2408,7 +2398,7 @@ pub async fn db_query(
                 Some(&ctx.shell.id),
                 "db.query",
                 "error",
-            error,
+                error,
             )
         })?;
         let sql_preview: String = sql.chars().take(120).collect();
@@ -2631,7 +2621,7 @@ mod tests {
         let shell = add_shell(&state, &wid, MOCK_PROTOCOL_ID);
         let count = batch_update_shells_impl(
             &state,
-            &[shell.id.clone()],
+            std::slice::from_ref(&shell.id),
             Some(vec!["prod".to_string()]),
             None,
         )

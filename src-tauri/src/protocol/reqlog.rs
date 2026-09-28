@@ -4,8 +4,8 @@
 //! 等所有真实网络协议统一经此模块记录（A1：JSP 系列协议此前不入日志）。
 
 use std::collections::VecDeque;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
 
 use dosword_sdk::domain::RequestRecord;
 
@@ -14,14 +14,15 @@ const DEBUG_PREVIEW_LEN: usize = 2048;
 /// 环缓冲容量。
 const DEBUG_LOG_CAP: usize = 200;
 
-static REQUEST_LOG: LazyLock<Mutex<VecDeque<RequestRecord>>> =
-    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(DEBUG_LOG_CAP)));
+static REQUEST_LOG: LazyLock<parking_lot::Mutex<VecDeque<RequestRecord>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(VecDeque::with_capacity(DEBUG_LOG_CAP)));
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// 记录一条协议请求（由各协议通道的发送函数调用）。
 ///
 /// 性能注意（P1）：先对载荷 / 响应做截断，再执行密码脱敏替换——
 /// 避免对整块（最大 4MB+ base64）字符串做全量 replace 与分配。
+#[allow(clippy::too_many_arguments)] // 协议帧字段固定，拆结构体反而增加调用方噪声
 pub fn record_request(
     protocol_id: &str,
     action: &str,
@@ -55,7 +56,7 @@ pub fn record_request(
     } else {
         record.response.replace(password, "***")
     };
-    let mut log = REQUEST_LOG.lock().expect("请求日志锁异常");
+    let mut log = REQUEST_LOG.lock();
     if log.len() >= DEBUG_LOG_CAP {
         log.pop_front();
     }
@@ -74,16 +75,16 @@ fn truncate(value: &str) -> String {
 
 /// 列出请求记录（可选按端点 / 协议过滤），新记录在前。
 pub fn list_requests(endpoint: Option<&str>, protocol: Option<&str>) -> Vec<RequestRecord> {
-    let log = REQUEST_LOG.lock().expect("请求日志锁异常");
+    let log = REQUEST_LOG.lock();
     log.iter()
         .rev()
-        .filter(|record| endpoint.map_or(true, |target| record.endpoint == target))
-        .filter(|record| protocol.map_or(true, |target| record.protocol_id == target))
+        .filter(|record| endpoint.is_none_or(|target| record.endpoint == target))
+        .filter(|record| protocol.is_none_or(|target| record.protocol_id == target))
         .cloned()
         .collect()
 }
 
 /// 清空请求记录。
 pub fn clear_requests() {
-    REQUEST_LOG.lock().expect("请求日志锁异常").clear();
+    REQUEST_LOG.lock().clear();
 }
