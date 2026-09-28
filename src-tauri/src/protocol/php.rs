@@ -3333,9 +3333,11 @@ except Exception as e:
 
     /// 探测当前 php 的 openssl 是否支持 DES-ECB。
     ///
-    /// OpenSSL 3 把 DES 等算法移入 legacy provider 且默认不加载，
-    /// Ubuntu 24.04 的 php8.3 即属此类（php8.0 链接自带 OpenSSL 1.0.2 则可用）。
-    /// 环境不支持时跳过 native_des 用例，而不是报一个与代码无关的假失败。
+    /// OpenSSL 3 把 DES 等算法移入 legacy provider，若未加载则
+    /// `openssl_encrypt(..., 'DES-ECB', ...)` 直接返回 false。是否受影响取决于
+    /// PHP / OpenSSL 的构建与配置（本项目 CI 的 php8.3 实测支持；某些发行版或
+    /// 自编译环境不支持）。环境不支持时跳过 native_des 用例并打印原因，
+    /// 而不是报一个与代码逻辑无关的假失败。
     fn php_supports_des_ecb() -> bool {
         let probe = "$r = @openssl_encrypt('12345678', 'DES-ECB', '12345678', OPENSSL_RAW_DATA); \
                      echo ($r === false || strlen($r) === 0) ? '0' : '1';";
