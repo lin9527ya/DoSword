@@ -114,6 +114,63 @@ python3 scripts/mock_shell.py --port 18080 --password secret
 
 在 DoSword 中登记 `http://127.0.0.1:18080/shell.php`（协议选 PHP、密码 `secret`）即可联调全部功能。
 
+## MCP 集成（把能力交给 AI 客户端）
+
+DoSword 可作为 **MCP（Model Context Protocol）服务器**，把 Shell 管理能力暴露给
+Claude Desktop / Cursor / 自研 agent。**默认关闭**，且只监听 `127.0.0.1`。
+
+> ⚠️ 开启 MCP 等于把你手上有授权的 WebShell 交给一个模型来调用。能力按级别授权，
+> 执行级默认需要人工确认，所有调用都写审计。详见 [SECURITY.md](SECURITY.md)。
+
+### 启用
+
+1. 「设置 → AI / MCP」→ 勾选「启用 MCP 服务」（令牌首次会自动生成）。
+2. 保存设置；页签顶部会显示 `运行中 · http://127.0.0.1:7317/mcp · N 个工具`。
+3. 点「复制 JSON」，粘到客户端配置里（Claude Desktop：`claude_desktop_config.json`；
+   Cursor：`mcp.json`）：
+
+```json
+{
+  "mcpServers": {
+    "dosword": {
+      "url": "http://127.0.0.1:7317/mcp",
+      "headers": { "Authorization": "Bearer <在设置页复制的令牌>" }
+    }
+  }
+}
+```
+
+### 能力分级（默认值）
+
+| 级别 | 默认 | 工具 |
+|---|---|---|
+| 只读 | **开** | `dosword_workspaces_list`、`dosword_shells_list`（**不含密码**，仅 `hasPassword`）、`dosword_sessions_list`、`dosword_probe_session`、`dosword_settings_get`（令牌已清空、代理已脱敏）、`dosword_protocols_list`、`dosword_plugins_list`、`dosword_encoders_list`、`dosword_audit_query`、`dosword_fs_list`、`dosword_fs_read`（偏移分块） |
+| 写入 | 关 | `dosword_shell_connect`/`_disconnect`、`dosword_fs_write`（支持追加偏移）、`dosword_fs_mkdir`/`_rename`/`_delete`/`_touch`、`dosword_db_probe`、`dosword_db_query`（`SELECT`/`SHOW`/`EXPLAIN` 自动按只读处理，其余按写入） |
+| 执行 | 关 | `dosword_exec`、`dosword_plugin_run`、`dosword_generate_stub` |
+
+**不通过 MCP 暴露**：Workspace / Shell 的增删改、插件安装、修改设置、本地文件读写、
+`http_send` 原始请求、PTY。授权登记表只能由人在 GUI 里维护——agent 无法给自己扩权。
+
+### 执行级人工确认
+
+默认开启。执行级工具被调用时不会立即执行，而是返回待批准 id 并在设置页出现
+「待确认操作」；点「批准」后 **120 秒内、参数完全一致**的重试才会执行（一次性消费，
+再次调用需再次批准）。这样「模型想执行什么」始终由人过目。
+
+### 观测
+
+- 每次调用写审计 `mcp.<tool>`（含 `denied` / `pending` / `error`），可在「审计轨迹」按 `mcp.` 过滤。
+- 「最近调用」表（时间/工具/级别/结果/耗时）保留最近 200 条，仅内存，不落盘。
+- 限流默认 120 次/分、并发 4、单次请求体 ≤1 MiB、结果文本超 256 KiB 自动截断。
+
+### 关闭
+
+取消勾选「启用 MCP 服务」并保存 → 端口立即释放，客户端断开。若要彻底不编译该模块：
+
+```bash
+cargo build -p dosword --no-default-features   # 去掉 mcp feature 与 rmcp/axum 依赖树
+```
+
 ## 开发
 
 ```bash

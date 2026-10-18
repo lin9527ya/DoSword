@@ -7,6 +7,30 @@
 
 ## [未发布]
 
+### 新增
+
+- **MCP 服务端**（`src-tauri/src/mcp/`，cargo feature `mcp` 默认开启）：把 DoSword 能力
+  以 MCP 工具暴露给 Claude Desktop / Cursor 等 AI 客户端
+  - 传输：Streamable HTTP，仅绑定 `127.0.0.1`，Host 校验限定回环（防 DNS rebinding），
+    请求体上限 1 MiB，`CancellationToken` 优雅停机
+  - 鉴权：`Authorization: Bearer <64 hex>`，常量时间比较；令牌由 getrandom 生成、
+    可轮换、UI 掩码、任何工具输出中不出现
+  - 能力分级：read（默认开）/ write / exec（默认关），逐级在设置页授权
+  - 执行级**人工确认**：返回待批准 id，GUI 批准后 120 秒内同参数重试才生效（一次性）
+  - 23 个工具：Workspace/Shell/会话/设置/协议/插件/编码器/审计查询、目录列表、
+    偏移分块读文件、会话连接与断开、写文件/建目录/重命名/删除/改时间戳、
+    数据库探测与查询（含只读语句自动分级）、命令执行、插件运行、生成 stub
+  - 治理：每次调用写审计 `mcp.<tool>`（success/denied/error/pending）、最近调用环形缓冲
+    （设置页可见）、滑动窗口限流（默认 120 次/分）、并发 4、单调用超时、结果 256 KiB 截断
+  - 脱敏：Shell 列表改 `ShellSummary`（无密码，仅 `hasPassword`）、设置视图清空
+    `mcpToken` 并掩码代理地址
+  - 新增命令：`mcp_status/start/stop/rotate_token/recent_calls/clear_log/
+    pending_approvals/resolve_approval`；设置页新增「AI / MCP」页签
+    （状态、端口、令牌、三级开关、确认模式、客户端配置一键复制、待确认操作、调用日志）
+  - 新增底层命令 `read_chunk`（与 `write_chunk` 对称的偏移读，返回 `FileChunk`）
+  - 明确不暴露：Workspace/Shell 增删改、插件安装、改设置、本地文件读写、`http_send`、PTY
+  - `cargo build --no-default-features` 可完全裁掉 MCP 模块与 rmcp/axum 依赖树
+
 ### 修复（阻断级）
 
 - **分块上传/下载对全部可选编码器均不可用**：`read_chunk`/`write_chunk` 缺少
