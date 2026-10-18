@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Blocks,
+  Bot,
   ChevronsLeft,
   ChevronsRight,
   Clock,
+  Copy,
   Edit3,
   Globe,
   HardDrive,
@@ -11,6 +13,7 @@ import {
   PackageOpen,
   Palette,
   Plus,
+  RefreshCw,
   Save,
   Search,
   Shield,
@@ -24,14 +27,29 @@ import {
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, b64, errorText } from "../api";
-import type { AppSettings, FeatureManifest, PluginManifest, ProxyTestResult } from "../api";
+import type {
+  AppSettings,
+  FeatureManifest,
+  McpCallRecord,
+  McpPendingApproval,
+  McpStatus,
+  PluginManifest,
+  ProxyTestResult,
+} from "../api";
 import { Dialog } from "../components/Dialog";
 import { ErrorBanner, Metric, Panel, UpwardPageSizeSelect } from "../components/common";
 import { applyTheme, THEME_KEY, currentTheme } from "../theme";
 import { useToast } from "../components/Toast";
 import { PluginStudioModal } from "../components/PluginStudioModal";
 
-type SettingsTab = "security" | "network" | "plugins" | "encoder" | "backup" | "appearance";
+type SettingsTab =
+  | "security"
+  | "network"
+  | "mcp"
+  | "plugins"
+  | "encoder"
+  | "backup"
+  | "appearance";
 
 const DISABLED_PLUGINS_KEY = "dosword:disabled-plugins";
 
@@ -58,6 +76,11 @@ export function SettingsView() {
   const [backupDir, setBackupDir] = useState(() => localStorage.getItem("dosword:backup-dir") ?? "");
   // 输入草稿：逐字符只改草稿，失焦/回车/点「立即备份」才提交（避免每敲一键触发全量备份）
   const [backupDirDraft, setBackupDirDraft] = useState(backupDir);
+  // MCP：运行状态、调用日志、待确认操作
+  const [mcpStatus, setMcpStatus] = useState<McpStatus | null>(null);
+  const [mcpCalls, setMcpCalls] = useState<McpCallRecord[]>([]);
+  const [mcpPending, setMcpPending] = useState<McpPendingApproval[]>([]);
+  const [mcpBusy, setMcpBusy] = useState(false);
   const [backupEnabled, setBackupEnabled] = useState(() => localStorage.getItem("dosword:backup-enabled") === "1");
   const [backupNote, setBackupNote] = useState("");
   const [customStub, setCustomStub] = useState("");
@@ -315,6 +338,81 @@ export function SettingsView() {
     })();
   }, [loadFeaturePlugins]);
 
+  // ---- MCP 服务端：状态轮询与控制 ----
+  // 仅在「AI / MCP」页签激活时轮询，避免后台常驻请求。
+  useEffect(() => {
+    if (activeTab !== "mcp") return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const [status, calls, pending] = await Promise.all([
+          api.mcpStatus(),
+          api.mcpRecentCalls(50),
+          api.mcpPendingApprovals(),
+        ]);
+        if (cancelled) return;
+        setMcpStatus(status);
+        setMcpCalls(calls);
+        setMcpPending(pending);
+      } catch {
+        // 关闭 mcp feature 的构建会返回明确错误：页签内已提示，这里静默
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeTab]);
+
+  async function toggleMcp(next: boolean) {
+    setMcpBusy(true);
+    try {
+      const status = next ? await api.mcpStart() : await api.mcpStop();
+      setMcpStatus(status);
+      setSettings((prev) => (prev ? { ...prev, mcpEnabled: next } : prev));
+      toast.success(next ? `MCP 服务已启动（${status.endpoint ?? ""}）` : "MCP 服务已停止");
+    } catch (cause) {
+      toast.error(errorText(cause), next ? "启动失败" : "停止失败");
+    } finally {
+      setMcpBusy(false);
+    }
+  }
+
+  async function rotateMcpToken() {
+    if (!window.confirm("轮换后旧令牌立即失效，所有已配置的 AI 客户端都需要更新。继续？")) return;
+    setMcpBusy(true);
+    try {
+      const token = await api.mcpRotateToken();
+      setSettings((prev) => (prev ? { ...prev, mcpToken: token } : prev));
+      toast.success("令牌已轮换：请把新的客户端配置复制到 AI 客户端");
+    } catch (cause) {
+      toast.error(errorText(cause), "轮换失败");
+    } finally {
+      setMcpBusy(false);
+    }
+  }
+
+  async function resolveApproval(id: string, approve: boolean) {
+    try {
+      await api.mcpResolveApproval(id, approve);
+      setMcpPending((prev) => prev.filter((item) => item.id !== id));
+      toast.success(approve ? "已批准：agent 可在 120 秒内以相同参数重试" : "已拒绝该执行请求");
+    } catch (cause) {
+      toast.error(errorText(cause), "操作失败");
+    }
+  }
+
+  async function copyText(text: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success(`${label}已复制到剪贴板`);
+    } catch (cause) {
+      toast.error(errorText(cause), "复制失败");
+    }
+  }
+
   async function save() {
     if (!settings) return;
     if (settings.httpEnabled && !confirmDialog) {
@@ -334,6 +432,24 @@ export function SettingsView() {
       toast.error(msg, "保存失败");
     }
   }
+
+  // AI 客户端配置片段（令牌/端点变化时自动更新）
+  const mcpClientConfig = useMemo(() => {
+    const endpoint =
+      mcpStatus?.endpoint ?? `http://127.0.0.1:${settings?.mcpPort ?? 7317}/mcp`;
+    return JSON.stringify(
+      {
+        mcpServers: {
+          dosword: {
+            url: endpoint,
+            headers: { Authorization: `Bearer ${settings?.mcpToken ?? ""}` },
+          },
+        },
+      },
+      null,
+      2,
+    );
+  }, [mcpStatus?.endpoint, settings?.mcpPort, settings?.mcpToken]);
 
   if (!settings) {
     return (
@@ -422,6 +538,13 @@ export function SettingsView() {
         >
           <Globe size={15} />
           通信性能与代理
+        </button>
+        <button
+          className={`detail-tab ${activeTab === "mcp" ? "active" : ""}`}
+          onClick={() => setActiveTab("mcp")}
+        >
+          <Bot size={15} />
+          AI / MCP
         </button>
         <button
           className={`detail-tab ${activeTab === "plugins" ? "active" : ""}`}
@@ -723,6 +846,302 @@ export function SettingsView() {
       )}
 
       {/* 3. 插件与扩展模块 */}
+      {activeTab === "mcp" && (
+        <Panel eyebrow="AI / MCP" title="把 DoSword 能力以 MCP 工具暴露给 AI 客户端">
+          <div className="settings-body">
+            <label className="toggle-row">
+              <div>
+                <strong>启用 MCP 服务（仅监听 127.0.0.1）</strong>
+                <span>
+                  开启后 Claude Desktop / Cursor 等客户端可通过 Streamable HTTP 调用工具；
+                  关闭时不监听任何端口。访问令牌等同密码，请勿外传。
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.mcpEnabled}
+                disabled={mcpBusy}
+                onChange={(event) => void toggleMcp(event.target.checked)}
+              />
+            </label>
+
+            <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+              <label style={{ flex: "1 1 180px" }}>
+                MCP 端口（1024–65535）
+                <input
+                  type="number"
+                  min={1024}
+                  max={65535}
+                  value={settings.mcpPort}
+                  onChange={(event) =>
+                    setSettings({ ...settings, mcpPort: Number(event.target.value) })
+                  }
+                />
+              </label>
+              <label style={{ flex: "1 1 180px" }}>
+                每分钟调用上限
+                <input
+                  type="number"
+                  min={1}
+                  max={6000}
+                  value={settings.mcpMaxCallsPerMin}
+                  onChange={(event) =>
+                    setSettings({ ...settings, mcpMaxCallsPerMin: Number(event.target.value) })
+                  }
+                />
+              </label>
+            </div>
+
+            <div>
+              <strong>访问令牌</strong>
+              <div style={{ display: "flex", gap: 10, marginTop: 6, alignItems: "center" }}>
+                <code className="mono" style={{ flex: 1, wordBreak: "break-all" }}>
+                  {settings.mcpToken
+                    ? `${settings.mcpToken.slice(0, 12)}…${settings.mcpToken.slice(-6)}`
+                    : "（尚未生成：启动服务时自动生成）"}
+                </code>
+                <button
+                  type="button"
+                  className="button compact secondary"
+                  disabled={!settings.mcpToken}
+                  onClick={() => void copyText(settings.mcpToken, "访问令牌")}
+                >
+                  <Copy size={13} /> 复制
+                </button>
+                <button
+                  type="button"
+                  className="button compact secondary"
+                  disabled={mcpBusy}
+                  onClick={() => void rotateMcpToken()}
+                >
+                  <RefreshCw size={13} /> 轮换
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <strong>运行状态</strong>
+              <div style={{ marginTop: 6, fontSize: 13, color: "var(--muted)" }}>
+                {mcpStatus?.running
+                  ? `运行中 · ${mcpStatus.endpoint ?? ""} · ${mcpStatus.toolCount} 个工具`
+                  : "未运行"}
+                {mcpStatus?.lastError ? ` · 最近错误：${mcpStatus.lastError}` : ""}
+              </div>
+            </div>
+
+            <label className="toggle-row">
+              <div>
+                <strong>只读级（建议保持开启）</strong>
+                <span>列目录、按偏移读文件、查会话/审计/设置/插件目录。不会改动目标。</span>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.mcpTierRead}
+                onChange={(event) =>
+                  setSettings({ ...settings, mcpTierRead: event.target.checked })
+                }
+              />
+            </label>
+
+            <label className="toggle-row">
+              <div>
+                <strong>写入级</strong>
+                <span>
+                  写文件、建目录、重命名、删除、连接/断开会话、数据库探测与非只读 SQL。
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.mcpTierWrite}
+                onChange={(event) =>
+                  setSettings({ ...settings, mcpTierWrite: event.target.checked })
+                }
+              />
+            </label>
+
+            <label className="toggle-row">
+              <div>
+                <strong>执行级（高风险）</strong>
+                <span>命令执行、插件运行、生成 webshell 载荷。建议保持关闭或配合人工确认。</span>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.mcpTierExec}
+                onChange={(event) =>
+                  setSettings({ ...settings, mcpTierExec: event.target.checked })
+                }
+              />
+            </label>
+
+            <label className="toggle-row">
+              <div>
+                <strong>执行级需人工确认</strong>
+                <span>
+                  开启后每次执行级调用都会进入「待确认操作」；批准后 120 秒内以相同参数重试才生效，
+                  且批准是一次性的。
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.mcpRequireConfirm}
+                onChange={(event) =>
+                  setSettings({ ...settings, mcpRequireConfirm: event.target.checked })
+                }
+              />
+            </label>
+
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <strong>AI 客户端配置</strong>
+                <button
+                  type="button"
+                  className="button compact secondary"
+                  onClick={() => void copyText(mcpClientConfig, "客户端配置")}
+                >
+                  <Copy size={13} /> 复制 JSON
+                </button>
+              </div>
+              <pre
+                className="mono"
+                style={{
+                  marginTop: 6,
+                  padding: 10,
+                  background: "var(--surface-2, rgba(127,127,127,.08))",
+                  borderRadius: 8,
+                  fontSize: 12,
+                  overflowX: "auto",
+                }}
+              >
+                {mcpClientConfig}
+              </pre>
+              <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                先保存设置并启动服务，再把这段配置粘到 AI 客户端；令牌轮换后需要重新复制。
+              </span>
+            </div>
+
+            {mcpPending.length > 0 && (
+              <div>
+                <strong>待确认操作（{mcpPending.length}）</strong>
+                <div style={{ display: "grid", gap: 8, marginTop: 6 }}>
+                  {mcpPending.map((item) => (
+                    <div
+                      key={item.id}
+                      style={{
+                        display: "flex",
+                        gap: 10,
+                        alignItems: "center",
+                        padding: 8,
+                        border: "1px solid var(--border, rgba(127,127,127,.25))",
+                        borderRadius: 8,
+                      }}
+                    >
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div className="mono" style={{ fontSize: 12 }}>
+                          {item.tool}
+                        </div>
+                        <div
+                          style={{ fontSize: 12, color: "var(--muted)", wordBreak: "break-all" }}
+                        >
+                          {item.summary}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="button compact primary"
+                        onClick={() => void resolveApproval(item.id, true)}
+                      >
+                        批准
+                      </button>
+                      <button
+                        type="button"
+                        className="button compact danger"
+                        onClick={() => void resolveApproval(item.id, false)}
+                      >
+                        拒绝
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <strong>最近调用（{mcpCalls.length}）</strong>
+                <button
+                  type="button"
+                  className="button compact secondary"
+                  onClick={() =>
+                    void api.mcpClearLog().then(() => {
+                      setMcpCalls([]);
+                      toast.success("调用日志已清空");
+                    })
+                  }
+                >
+                  <Trash2 size={13} /> 清空
+                </button>
+              </div>
+              <div style={{ marginTop: 6, maxHeight: 240, overflowY: "auto", fontSize: 12 }}>
+                {mcpCalls.length === 0 && (
+                  <span style={{ color: "var(--muted)" }}>暂无调用记录</span>
+                )}
+                {mcpCalls
+                  .slice()
+                  .reverse()
+                  .map((call, index) => (
+                    <div
+                      key={`${call.at}-${index}`}
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        padding: "4px 0",
+                        borderBottom: "1px solid var(--border, rgba(127,127,127,.15))",
+                      }}
+                    >
+                      <span
+                        className="mono"
+                        style={{ width: 62, flexShrink: 0, color: "var(--muted)" }}
+                      >
+                        {new Date(call.at * 1000).toLocaleTimeString()}
+                      </span>
+                      <span
+                        className="mono"
+                        style={{
+                          flex: 1,
+                          minWidth: 0,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {call.tool}
+                      </span>
+                      <span style={{ width: 46, color: "var(--muted)" }}>{call.tier}</span>
+                      <span
+                        style={{
+                          width: 58,
+                          color:
+                            call.outcome === "success"
+                              ? "var(--ok, #2e9e5b)"
+                              : "var(--danger, #d9534f)",
+                        }}
+                      >
+                        {call.outcome}
+                      </span>
+                      <span
+                        className="mono"
+                        style={{ width: 64, textAlign: "right", color: "var(--muted)" }}
+                      >
+                        {call.durationMs}ms
+                      </span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+          </div>
+        </Panel>
+      )}
+
       {activeTab === "plugins" && (
         <Panel
           eyebrow="EXTENSIONS & MODULES"

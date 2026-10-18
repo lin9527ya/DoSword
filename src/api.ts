@@ -25,6 +25,10 @@ import type {
   HttpSendResult,
   ImportResult,
   ProxyTestResult,
+  FileChunk,
+  McpStatus,
+  McpCallRecord,
+  McpPendingApproval,
   FeatureManifest,
 } from "./generated/domain";
 
@@ -175,6 +179,20 @@ export const api = {
       timeoutSecs: timeoutSecs ?? null,
       probeUrl: probeUrl ?? null,
     }),
+  readChunk: (sessionId: string, path: string, offset: number, length: number) =>
+    invoke<FileChunk>("read_chunk", { sessionId, path, offset, length }),
+
+  // --- MCP 服务端 ---
+  mcpStatus: () => invoke<McpStatus>("mcp_status"),
+  mcpStart: () => invoke<McpStatus>("mcp_start"),
+  mcpStop: () => invoke<McpStatus>("mcp_stop"),
+  mcpRotateToken: () => invoke<string>("mcp_rotate_token"),
+  mcpRecentCalls: (limit?: number) =>
+    invoke<McpCallRecord[]>("mcp_recent_calls", { limit: limit ?? null }),
+  mcpClearLog: () => invoke<void>("mcp_clear_log"),
+  mcpPendingApprovals: () => invoke<McpPendingApproval[]>("mcp_pending_approvals"),
+  mcpResolveApproval: (id: string, approve: boolean) =>
+    invoke<McpPendingApproval>("mcp_resolve_approval", { id, approve }),
 };
 
 // --- Base64 工具（编辑器/上传下载用） ---
