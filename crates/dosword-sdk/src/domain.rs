@@ -136,6 +136,70 @@ pub struct ProbeResult {
     pub disable_functions: String,
     /// 哥斯拉风格环境详情（OsInfo/CurrentUser/服务器/会话/配置等）。
     pub info: std::collections::HashMap<String, String>,
+    /// stub 自报的协议元数据（能力协商）。旧 stub 可能为 None。
+    #[serde(default)]
+    pub capabilities: Option<TargetCapabilities>,
+}
+
+/// 目标 stub 自报的协议元数据：协议版本 + 能力位图 + 载荷形态。
+///
+/// 参考冰蝎 / 哥斯拉的能力握手：客户端不能假设目标具备某能力。
+/// 旧 stub 不上报（`None`）→ 按兼容模式放行但按旧行为处理；
+/// 新 stub 上报后可精确判定，缺能力时给出可执行错误而不是莫名失败。
+#[derive(Debug, Clone, Serialize, Deserialize, TS, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetCapabilities {
+    /// 协议版本（1 = 旧 stub 未上报；2 = 上报能力位图）
+    #[ts(type = "number")]
+    pub proto_version: u32,
+    /// 能力标识：chunked / stream / db / plugin / exec / memory / gzip
+    pub capabilities: Vec<String>,
+    /// 载荷形态：file（落地文件）/ memory（内存马）
+    pub shell_type: String,
+}
+
+impl TargetCapabilities {
+    /// 从 probe/connect 返回的 `info` 映射构造。旧 stub 没有 `ProtoVersion` 时返回 None。
+    pub fn from_info(info: &std::collections::HashMap<String, String>) -> Option<Self> {
+        let proto_version = info
+            .get("ProtoVersion")
+            .map(|value| value.trim().parse::<u32>().unwrap_or(1))?;
+        let mut capabilities = info
+            .get("Capabilities")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|item| item.trim().to_ascii_lowercase())
+                    .filter(|item| !item.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        // 旧 stub 只报 ChunkedTransfer 时折算成能力位
+        if !capabilities.iter().any(|item| item == "chunked")
+            && info.get("ChunkedTransfer").map(String::as_str) == Some("1")
+        {
+            capabilities.push("chunked".to_string());
+        }
+        let shell_type = info
+            .get("ShellType")
+            .cloned()
+            .unwrap_or_else(|| "file".to_string());
+        Some(Self {
+            proto_version,
+            capabilities,
+            shell_type,
+        })
+    }
+
+    pub fn supports(&self, capability: &str) -> bool {
+        let needle = capability.to_ascii_lowercase();
+        self.capabilities.contains(&needle)
+    }
+
+    /// 分块读写是否可用（chunked 能力）。
+    pub fn supports_chunked(&self) -> bool {
+        self.supports("chunked")
+    }
 }
 
 /// HTTP 手工请求结果（Repeater）。
@@ -434,6 +498,9 @@ pub struct ConnectResult {
     pub extensions: Vec<String>,
     pub disable_functions: String,
     pub info: std::collections::HashMap<String, String>,
+    /// stub 自报的协议元数据（能力协商）。旧 stub 可能为 None。
+    #[serde(default)]
+    pub capabilities: Option<TargetCapabilities>,
 }
 
 impl ConnectResult {
@@ -450,6 +517,7 @@ impl ConnectResult {
             arch: probe.arch,
             extensions: probe.extensions,
             disable_functions: probe.disable_functions,
+            capabilities: probe.capabilities,
             info: probe.info,
         }
     }
@@ -561,6 +629,7 @@ mod ts_bindings {
             ("UpdateWorkspace", UpdateWorkspace::decl()),
             ("UpdateShell", UpdateShell::decl()),
             ("ProbeResult", ProbeResult::decl()),
+            ("TargetCapabilities", TargetCapabilities::decl()),
             ("AppSettings", AppSettings::decl()),
             ("CommandOutput", CommandOutput::decl()),
             ("DirListing", DirListing::decl()),
@@ -622,5 +691,62 @@ mod ts_bindings {
                 "src/generated/domain.ts 与当前 Rust 类型不一致，已重新生成，请再次运行 pnpm gen:types"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn info(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn new_stub_reports_version_and_capabilities() {
+        let map = info(&[
+            ("ProtoVersion", "2"),
+            ("Capabilities", "chunked,stream,db,plugin,exec"),
+            ("ShellType", "file"),
+        ]);
+        let caps = TargetCapabilities::from_info(&map).expect("应解析出能力");
+        assert_eq!(caps.proto_version, 2);
+        assert!(caps.supports_chunked());
+        assert!(caps.supports("db"));
+        assert!(caps.supports("EXEC"), "能力判定应忽略大小写");
+        assert!(!caps.supports("memory"));
+        assert_eq!(caps.shell_type, "file");
+    }
+
+    #[test]
+    fn legacy_stub_without_version_returns_none() {
+        // 旧 stub 只报 ChunkedTransfer、不报 ProtoVersion → None（调用方按兼容模式处理）
+        let map = info(&[("ChunkedTransfer", "1")]);
+        assert!(TargetCapabilities::from_info(&map).is_none());
+    }
+
+    #[test]
+    fn legacy_chunked_flag_is_folded_into_capabilities() {
+        // 有 ProtoVersion 但无 Capabilities 列表时，ChunkedTransfer=1 折算成 chunked 能力位
+        let map = info(&[("ProtoVersion", "2"), ("ChunkedTransfer", "1")]);
+        let caps = TargetCapabilities::from_info(&map).expect("应解析出能力");
+        assert!(caps.supports_chunked());
+        assert_eq!(caps.shell_type, "file", "未上报时默认为落地文件型");
+    }
+
+    #[test]
+    fn capability_list_is_trimmed_and_lowercased() {
+        let map = info(&[
+            ("ProtoVersion", "2"),
+            ("Capabilities", " Chunked , DB ,, "),
+            ("ShellType", "memory"),
+        ]);
+        let caps = TargetCapabilities::from_info(&map).expect("应解析出能力");
+        assert_eq!(caps.capabilities, vec!["chunked", "db"]);
+        assert_eq!(caps.shell_type, "memory");
     }
 }

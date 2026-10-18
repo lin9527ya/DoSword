@@ -51,7 +51,24 @@ disableFunctions: string,
 /**
  * 哥斯拉风格环境详情（OsInfo/CurrentUser/服务器/会话/配置等）。
  */
-info: { [key in string]?: string }, };
+info: { [key in string]?: string }, 
+/**
+ * stub 自报的协议元数据（能力协商）。旧 stub 可能为 None。
+ */
+capabilities: TargetCapabilities | null, };
+export type TargetCapabilities = { 
+/**
+ * 协议版本（1 = 旧 stub 未上报；2 = 上报能力位图）
+ */
+protoVersion: number, 
+/**
+ * 能力标识：chunked / stream / db / plugin / exec / memory / gzip
+ */
+capabilities: Array<string>, 
+/**
+ * 载荷形态：file（落地文件）/ memory（内存马）
+ */
+shellType: string, };
 export type AppSettings = { 
 /**
  * 是否允许发起真实网络请求（安全门总开关，默认关闭）。
@@ -169,7 +186,11 @@ version: string, description: string,
  * 能力列表（空 = 全支持）。
  */
 capabilities: Array<string>, };
-export type ConnectResult = { sessionId: string, server: string, webServer: string, runtime: string, currentDir: string, separator: string, message: string, phpSapi: string, arch: string, extensions: Array<string>, disableFunctions: string, info: { [key in string]?: string }, };
+export type ConnectResult = { sessionId: string, server: string, webServer: string, runtime: string, currentDir: string, separator: string, message: string, phpSapi: string, arch: string, extensions: Array<string>, disableFunctions: string, info: { [key in string]?: string }, 
+/**
+ * stub 自报的协议元数据（能力协商）。旧 stub 可能为 None。
+ */
+capabilities: TargetCapabilities | null, };
 export type SessionInfo = { sessionId: string, profileId: string, server: string, lastUsedAt: number, };
 export type DbConnection = { driver: string, host: string | null, port: number | null, username: string | null, password: string | null, dbname: string | null, };
 export type DbProbeResult = { driver: string, databases: Array<string>, message: string, };

@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use dosword_sdk::domain::{
     AppSettings, CommandOutput, DbConnection, DbProbeResult, DbQueryResult, DirListing, FileEntry,
-    ProbeResult, ShellProfile,
+    ProbeResult, ShellProfile, TargetCapabilities,
 };
 
 use super::transport::{build_client, form_escape, json_str};
@@ -298,6 +298,7 @@ impl PhpProtocol {
             .unwrap_or("")
             .to_string();
 
+        let info = info_map(&value);
         Ok(ProbeResult {
             status: "online".to_string(),
             server,
@@ -310,7 +311,9 @@ impl PhpProtocol {
             arch,
             extensions,
             disable_functions,
-            info: info_map(&value),
+            // 能力协商：新 stub 上报 ProtoVersion/Capabilities，旧 stub 为 None
+            capabilities: TargetCapabilities::from_info(&info),
+            info,
         })
     }
 
@@ -347,6 +350,7 @@ impl PhpProtocol {
                 })
                 .unwrap_or_default(),
             disable_functions: get("disable_functions"),
+            capabilities: None,
             info: info_map(&value),
         })
     }

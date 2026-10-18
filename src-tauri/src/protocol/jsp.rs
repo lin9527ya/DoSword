@@ -193,6 +193,7 @@ fn ensure_info(session: &JspSession, settings: &AppSettings) -> Result<ProbeResu
         arch: "".to_string(),
         extensions: vec![],
         disable_functions: "".to_string(),
+        capabilities: None,
         info: std::collections::HashMap::new(),
     };
     if let Ok(mut slot) = session.info.lock() {

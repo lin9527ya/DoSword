@@ -189,6 +189,7 @@ impl Protocol for EchoProtocol {
             arch: "".to_string(),
             extensions: vec![],
             disable_functions: "".to_string(),
+            capabilities: None,
             info: std::collections::HashMap::new(),
         })
     }
