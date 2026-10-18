@@ -2053,6 +2053,9 @@ mod tests {
                     .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
                 assert!(php.chunked, "stub 应上报 ChunkedTransfer 能力");
                 // 三块顺序写入（含非 ASCII 与二进制字节）
+                // 目标路径必须落在 php -S 的服务目录里：写根目录（如 /chunked.bin）
+                // 会因权限被拒，属于测试自身的环境错误而非协议问题
+                let remote = format!("{}/chunked.bin", dir.display());
                 let chunks: [Vec<u8>; 3] = [
                     "第一块数据".as_bytes().to_vec(),
                     vec![0u8, 1, 2, 255, 254, 253],
@@ -2062,7 +2065,7 @@ mod tests {
                 for chunk in &chunks {
                     PhpProtocol.write_chunk(
                         session_state.as_ref(),
-                        "/chunked.bin",
+                        &remote,
                         chunk,
                         offset,
                         &settings,
@@ -2070,23 +2073,17 @@ mod tests {
                     offset += chunk.len() as u64;
                 }
                 let expected: Vec<u8> = chunks.concat();
-                let whole =
-                    PhpProtocol.read_file(session_state.as_ref(), "/chunked.bin", &settings)?;
+                let whole = PhpProtocol.read_file(session_state.as_ref(), &remote, &settings)?;
                 assert_eq!(whole, expected, "整文件内容应一致");
 
                 // 偏移 + 长度切片
-                let slice = PhpProtocol.read_chunk(
-                    session_state.as_ref(),
-                    "/chunked.bin",
-                    4,
-                    6,
-                    &settings,
-                )?;
+                let slice =
+                    PhpProtocol.read_chunk(session_state.as_ref(), &remote, 4, 6, &settings)?;
                 assert_eq!(slice, expected[4..10].to_vec(), "偏移读取内容应一致");
                 // length=0 表示读到文件尾
                 let tail = PhpProtocol.read_chunk(
                     session_state.as_ref(),
-                    "/chunked.bin",
+                    &remote,
                     (expected.len() - 4) as u64,
                     0,
                     &settings,
@@ -2095,7 +2092,7 @@ mod tests {
                 // 越界偏移返回空（EOF 信号），不得报错
                 let eof = PhpProtocol.read_chunk(
                     session_state.as_ref(),
-                    "/chunked.bin",
+                    &remote,
                     expected.len() as u64,
                     16,
                     &settings,
@@ -2132,17 +2129,21 @@ mod tests {
             stub.contains("FILE_APPEND"),
             "NATIVE stub 的顺序分块写入应使用 FILE_APPEND"
         );
-        // 能力标记必须在 NATIVE 与分阶段（session）两条通道上都存在
-        let session_stub = encoder
-            .stub_session("php", "secret")
-            .expect("生成 session stub");
+        // 分阶段（session）通道：处理器代码才是真正被注入目标 session 的产物。
+        // 注意不能用 encoder.stub_session()——NATIVE 编码器没有分阶段模板，
+        // stub_session 会回退为普通 NATIVE stub。
+        let handler = dosword_sdk::encoder::session_handler_code();
         assert!(
-            session_stub.contains("ChunkedTransfer"),
-            "分阶段 stub 的 probe 必须上报分块能力"
+            handler.contains("ChunkedTransfer"),
+            "分阶段处理器的 probe 必须上报分块能力"
         );
         assert!(
-            session_stub.contains("$l > 0 ? $l : null"),
-            "分阶段 stub 的 read 必须支持长度参数"
+            handler.contains("$l > 0 ? $l : null"),
+            "分阶段处理器的 read 必须支持长度参数"
+        );
+        assert!(
+            handler.contains("FILE_APPEND"),
+            "分阶段处理器的顺序分块写入应使用 FILE_APPEND"
         );
     }
 

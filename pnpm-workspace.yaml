@@ -6,3 +6,6 @@ allowBuilds:
 # GHSA-2v37-7h3g-55p8（size 为 0 的自定义生成器可无限循环）
 overrides:
   nanoid: ^3.3.18
+  # source-map-js <1.2.2 存在 GHSA-68fv-2mgg-jv7q（索引式 source-map 段偏移
+  # 可造成事件循环 DoS）；同样是仅构建期的传递依赖（vite → postcss）
+  source-map-js: ^1.2.2

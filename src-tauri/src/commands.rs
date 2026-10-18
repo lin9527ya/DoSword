@@ -2990,13 +2990,30 @@ mod tests {
     }
 
     /// 回归：登记前的连通性测试此前只检查全局开关，可探测任意主机（SSRF）。
+    ///
+    /// 用 TEST-NET-1（192.0.2.1，RFC 5737 黑洞地址）避免依赖真实外网；
+    /// 超时压到 1 秒，保证用例快速失败。
     #[test]
     fn test_connection_requires_scope_unless_overridden() {
+        let enable_network = |state: &AppState| {
+            state
+                .database
+                .lock()
+                .unwrap()
+                .update_settings(&AppSettings {
+                    http_enabled: true,
+                    default_timeout_secs: 1,
+                    ..AppSettings::default()
+                })
+                .unwrap();
+        };
+
+        // 开启真实网络但没有 Workspace → 必须被范围校验拒绝
         let state = app_state();
-        // 无任何 Workspace → 未命中授权范围
+        enable_network(&state);
         let denied = test_connection_impl(
             &state,
-            "http://93.184.216.34/shell.php",
+            "http://192.0.2.1/shell.php",
             "secret",
             "builtin.php.v1",
             None,
@@ -3005,31 +3022,23 @@ mod tests {
         );
         let message = denied.unwrap_err();
         assert!(
-            message.contains("不在任何 Workspace") || message.contains("未启用"),
-            "越界目标应被拒绝：{message}"
+            message.contains("不在任何 Workspace"),
+            "越界目标应被范围校验拒绝：{message}"
         );
 
-        // 显式覆盖：放行到协议层（真实网络未开启 → 由协议层报"未启用"，但不再是范围拒绝）
+        // 显式覆盖 → 通过范围校验，仅因目标不可达而失败（错误不应再是范围拒绝）
         let state2 = app_state();
-        state2
-            .database
-            .lock()
-            .unwrap()
-            .update_settings(&AppSettings {
-                http_enabled: true,
-                ..AppSettings::default()
-            })
-            .unwrap();
+        enable_network(&state2);
         let overridden = test_connection_impl(
             &state2,
-            "http://93.184.216.34/shell.php",
+            "http://192.0.2.1/shell.php",
             "secret",
             "builtin.php.v1",
             None,
             None,
             true,
         );
-        let err = overridden.expect_err("外网目标应连接失败");
+        let err = overridden.expect_err("不可达目标应连接失败");
         assert!(
             !err.contains("不在任何 Workspace"),
             "显式覆盖后不应再被范围拒绝：{err}"
