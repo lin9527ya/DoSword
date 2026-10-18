@@ -1818,6 +1818,7 @@ mod tests {
             gzip_enabled: true,
             tls_verify: false,
             allow_arbitrary_local_paths: false,
+            ..AppSettings::default()
         }
     }
 

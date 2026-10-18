@@ -94,7 +94,39 @@ tlsVerify: boolean,
  * 是否允许读写任意本地路径（默认 false：仅限用户目录 / 系统临时目录）。
  * 影响导入导出、下载保存与备份目录；敏感系统目录始终拒绝。
  */
-allowArbitraryLocalPaths: boolean, };
+allowArbitraryLocalPaths: boolean, 
+/**
+ * MCP 总开关（默认关闭）。关闭时不监听任何端口。
+ */
+mcpEnabled: boolean, 
+/**
+ * MCP 监听端口（仅绑定 127.0.0.1）。
+ */
+mcpPort: number, 
+/**
+ * 访问令牌（64 位十六进制）。启用时生成，可轮换；等同密码，任何工具输出中不出现。
+ */
+mcpToken: string, 
+/**
+ * 只读工具（列目录/读文件/查询/会话信息），默认开启。
+ */
+mcpTierRead: boolean, 
+/**
+ * 写入工具（写文件/建目录/重命名/删除/连接与断开），默认关闭。
+ */
+mcpTierWrite: boolean, 
+/**
+ * 执行工具（命令执行/插件执行/生成载荷），默认关闭。
+ */
+mcpTierExec: boolean, 
+/**
+ * 执行级操作需人在 GUI 二次确认（默认开启）。
+ */
+mcpRequireConfirm: boolean, 
+/**
+ * 每分钟最大调用次数（令牌桶）。
+ */
+mcpMaxCallsPerMin: number, };
 export type CommandOutput = { stdout: string, durationMs: number, 
 /**
  * 命令执行后的服务器工作目录（终端据此更新提示符）。
@@ -166,6 +198,36 @@ content: string, };
 export type HttpSendResult = { status: number, statusText: string, headers: Array<[string, string]>, body: string, durationMs: number, };
 export type ImportResult = { imported: number, skipped: number, };
 export type ProxyTestResult = { ok: boolean, latencyMs: number, message: string, exitIp: string | null, };
+export type McpStatus = { running: boolean, port: number | null, 
+/**
+ * 完整端点，如 `http://127.0.0.1:7317/mcp`
+ */
+endpoint: string | null, 
+/**
+ * 当前启用的工具数量
+ */
+toolCount: number, 
+/**
+ * 启动时间（Unix 秒）
+ */
+startedAt: number | null, 
+/**
+ * 最近一次启动失败原因（绑定失败等）
+ */
+lastError: string | null, };
+export type McpCallRecord = { at: number, tool: string, 
+/**
+ * read / write / exec
+ */
+tier: string, 
+/**
+ * success / denied / error
+ */
+outcome: string, 
+/**
+ * 参数摘要（已脱敏）
+ */
+summary: string, durationMs: number, };
 export type PluginManifest = { id: string, name: string, version: string, kind: PluginKind, description: string, 
 /**
  * 声明的能力列表：["files"] ["terminal"] ["database"] 等。

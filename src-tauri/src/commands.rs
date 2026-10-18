@@ -2871,6 +2871,204 @@ pub async fn db_query(
 }
 
 // ---------------------------------------------------------------------------
+// MCP 服务端控制（cargo feature `mcp`）。
+//
+// 这些命令在关闭 feature 时仍保留定义：前端调用面保持稳定，仅返回明确错误，
+// 避免出现「前端有调用、后端无此命令」的契约缺口。
+// ---------------------------------------------------------------------------
+
+/// 读取 MCP 设置（若令牌为空则生成一个并落库：启用前必须先有令牌）。
+///
+/// 注意：`audit()` 内部会再取一次数据库锁，因此此处**不能**在持有 guard 时调用，
+/// 否则 std::sync::Mutex 非重入会直接死锁。
+#[cfg(feature = "mcp")]
+fn ensure_mcp_settings(state: &AppState) -> Result<AppSettings, String> {
+    let mut settings = {
+        let database = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?;
+        database.get_settings().map_err(|error| error.to_string())?
+    };
+    if settings.mcp_token.trim().is_empty() {
+        settings.mcp_token = crate::mcp::generate_token();
+        {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            database
+                .update_settings(&settings)
+                .map_err(|error| error.to_string())?;
+        }
+        audit(
+            state,
+            "system",
+            None,
+            "mcp.token",
+            "success",
+            "首次启用 MCP：已生成访问令牌",
+        );
+    }
+    Ok(settings)
+}
+
+#[tauri::command]
+pub async fn mcp_status(app: AppHandle) -> Result<dosword_sdk::domain::McpStatus, String> {
+    #[cfg(feature = "mcp")]
+    {
+        Ok(app.state::<crate::mcp::McpState>().status())
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = app;
+        Err("本构建未启用 MCP 支持（cargo feature `mcp`）".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn mcp_start(app: AppHandle) -> Result<dosword_sdk::domain::McpStatus, String> {
+    #[cfg(feature = "mcp")]
+    {
+        // 令牌与端口：锁作用域内读取，避免跨 await 持有数据库锁
+        let settings = {
+            let state = app.state::<AppState>();
+            let mut settings = ensure_mcp_settings(&state)?;
+            settings.mcp_enabled = true;
+            state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?
+                .update_settings(&settings)
+                .map_err(|error| error.to_string())?;
+            audit(
+                &state,
+                "system",
+                None,
+                "mcp.start",
+                "success",
+                &format!("启动 MCP 服务：127.0.0.1:{}", settings.mcp_port),
+            );
+            settings
+        };
+
+        let state = app.state::<crate::mcp::McpState>();
+        state.start(app.clone(), &settings).await?;
+        Ok(state.status())
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = app;
+        Err("本构建未启用 MCP 支持（cargo feature `mcp`）".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn mcp_stop(app: AppHandle) -> Result<dosword_sdk::domain::McpStatus, String> {
+    #[cfg(feature = "mcp")]
+    {
+        {
+            let state = app.state::<AppState>();
+            let mut settings = ensure_mcp_settings(&state)?;
+            settings.mcp_enabled = false;
+            state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?
+                .update_settings(&settings)
+                .map_err(|error| error.to_string())?;
+            audit(
+                &state,
+                "system",
+                None,
+                "mcp.stop",
+                "success",
+                "停止 MCP 服务",
+            );
+        }
+        let state = app.state::<crate::mcp::McpState>();
+        state.stop();
+        Ok(state.status())
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = app;
+        Err("本构建未启用 MCP 支持（cargo feature `mcp`）".to_string())
+    }
+}
+
+/// 轮换访问令牌并返回新令牌（服务运行中会以新令牌重启）。
+#[tauri::command]
+pub async fn mcp_rotate_token(app: AppHandle) -> Result<String, String> {
+    #[cfg(feature = "mcp")]
+    {
+        let (settings, running) = {
+            let state = app.state::<AppState>();
+            let mut settings = ensure_mcp_settings(&state)?;
+            settings.mcp_token = crate::mcp::generate_token();
+            state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?
+                .update_settings(&settings)
+                .map_err(|error| error.to_string())?;
+            audit(
+                &state,
+                "system",
+                None,
+                "mcp.token",
+                "override",
+                "轮换 MCP 访问令牌（旧令牌立即失效）",
+            );
+            let running = app.state::<crate::mcp::McpState>().is_running();
+            (settings, running)
+        };
+
+        if running {
+            let state = app.state::<crate::mcp::McpState>();
+            state.start(app.clone(), &settings).await?;
+        }
+        Ok(settings.mcp_token)
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = app;
+        Err("本构建未启用 MCP 支持（cargo feature `mcp`）".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn mcp_recent_calls(
+    limit: Option<u32>,
+    app: AppHandle,
+) -> Result<Vec<dosword_sdk::domain::McpCallRecord>, String> {
+    #[cfg(feature = "mcp")]
+    {
+        let limit = limit.unwrap_or(50).clamp(1, 200) as usize;
+        Ok(app.state::<crate::mcp::McpState>().recent(limit))
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = (limit, app);
+        Err("本构建未启用 MCP 支持（cargo feature `mcp`）".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn mcp_clear_log(app: AppHandle) -> Result<(), String> {
+    #[cfg(feature = "mcp")]
+    {
+        app.state::<crate::mcp::McpState>().clear_log();
+        Ok(())
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = app;
+        Err("本构建未启用 MCP 支持（cargo feature `mcp`）".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 命令层测试：直接构造 AppState（内存库 + 会话管理器 + 内置协议），
 // 验证统一流程：会话上下文解析、授权门、锁外执行。
 // ---------------------------------------------------------------------------

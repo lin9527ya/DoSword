@@ -1,5 +1,7 @@
 mod auth;
 mod commands;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod native_plugin;
 mod protocol;
 mod pty;
@@ -134,10 +136,10 @@ pub fn run() {
                 let _ = database.purge_audit(settings.audit_retention_days);
             }
             let plugins_dir = app_data.join("plugins");
+            let mut registry = dosword_sdk::FeaturePluginRegistry::builtin();
             if plugins_dir.exists()
                 && let Ok(entries) = std::fs::read_dir(&plugins_dir)
             {
-                let mut registry = dosword_sdk::FeaturePluginRegistry::builtin();
                 for entry in entries.flatten() {
                     let file_name = entry.file_name().to_string_lossy().into_owned();
                     if file_name.ends_with(".plugin") {
@@ -163,13 +165,13 @@ pub fn run() {
                         }
                     }
                 }
-                app.manage(build_app_state(database, registry));
-                return Ok(());
             }
-            app.manage(build_app_state(
-                database,
-                dosword_sdk::FeaturePluginRegistry::builtin(),
-            ));
+            app.manage(build_app_state(database, registry));
+
+            // MCP 服务端：装配状态；若设置里已启用则自动拉起（失败只记录，不阻塞启动）
+            #[cfg(feature = "mcp")]
+            mcp::bootstrap(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -229,6 +231,12 @@ pub fn run() {
             commands::db_query,
             commands::list_request_log,
             commands::clear_request_log,
+            commands::mcp_status,
+            commands::mcp_start,
+            commands::mcp_stop,
+            commands::mcp_rotate_token,
+            commands::mcp_recent_calls,
+            commands::mcp_clear_log,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start DoSword");

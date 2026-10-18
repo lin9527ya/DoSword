@@ -18,6 +18,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = ["mcp"]
+# MCP 服务端（把 DoSword 能力暴露给 AI 客户端）。关闭后不编译该模块、
+# 也不引入 rmcp/axum 依赖树（减小二进制体积与攻击面）。
+mcp = ["dep:rmcp", "dep:axum", "dep:schemars", "dep:tokio-util"]
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
@@ -39,5 +45,18 @@ lru.workspace = true
 parking_lot.workspace = true
 ts-rs.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "charset", "cookies", "socks"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "macros"] }
 dosword-sdk = { path = "../crates/dosword-sdk" }
 dosword-plugin-echo = { path = "../crates/dosword-plugin-echo" }
+
+# —— MCP 服务端（可选依赖，见 [features].mcp） ——
+# 锁定补丁版本：rmcp 处于 3.x 快速演进期，工具层与 SDK 之间另有自有 trait 隔离。
+rmcp = { version = "=3.5.1", features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-streamable-http-server",
+], optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"], optional = true }
+schemars = { version = "1", features = ["derive"], optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }

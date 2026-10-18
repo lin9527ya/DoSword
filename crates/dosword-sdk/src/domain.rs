@@ -211,6 +211,79 @@ pub struct AppSettings {
     /// 影响导入导出、下载保存与备份目录；敏感系统目录始终拒绝。
     #[serde(default = "default_allow_any_path")]
     pub allow_arbitrary_local_paths: bool,
+
+    // —— MCP 服务端（把能力暴露给 AI 客户端） ——
+    /// MCP 总开关（默认关闭）。关闭时不监听任何端口。
+    #[serde(default)]
+    pub mcp_enabled: bool,
+    /// MCP 监听端口（仅绑定 127.0.0.1）。
+    #[serde(default = "default_mcp_port")]
+    pub mcp_port: u16,
+    /// 访问令牌（64 位十六进制）。启用时生成，可轮换；等同密码，任何工具输出中不出现。
+    #[serde(default)]
+    pub mcp_token: String,
+    /// 只读工具（列目录/读文件/查询/会话信息），默认开启。
+    #[serde(default = "default_true")]
+    pub mcp_tier_read: bool,
+    /// 写入工具（写文件/建目录/重命名/删除/连接与断开），默认关闭。
+    #[serde(default)]
+    pub mcp_tier_write: bool,
+    /// 执行工具（命令执行/插件执行/生成载荷），默认关闭。
+    #[serde(default)]
+    pub mcp_tier_exec: bool,
+    /// 执行级操作需人在 GUI 二次确认（默认开启）。
+    #[serde(default = "default_true")]
+    pub mcp_require_confirm: bool,
+    /// 每分钟最大调用次数（令牌桶）。
+    #[serde(default = "default_mcp_rate")]
+    pub mcp_max_calls_per_min: u32,
+}
+
+fn default_mcp_port() -> u16 {
+    7317
+}
+
+fn default_mcp_rate() -> u32 {
+    120
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// MCP 服务运行状态（供设置页展示）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct McpStatus {
+    pub running: bool,
+    pub port: Option<u16>,
+    /// 完整端点，如 `http://127.0.0.1:7317/mcp`
+    pub endpoint: Option<String>,
+    /// 当前启用的工具数量
+    #[ts(type = "number")]
+    pub tool_count: u32,
+    /// 启动时间（Unix 秒）
+    #[ts(type = "number | null")]
+    pub started_at: Option<u64>,
+    /// 最近一次启动失败原因（绑定失败等）
+    pub last_error: Option<String>,
+}
+
+/// MCP 单次调用记录（设置页「最近调用」用，仅内存环形缓冲）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct McpCallRecord {
+    #[ts(type = "number")]
+    pub at: u64,
+    pub tool: String,
+    /// read / write / exec
+    pub tier: String,
+    /// success / denied / error
+    pub outcome: String,
+    /// 参数摘要（已脱敏）
+    pub summary: String,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
 }
 
 fn default_tls_verify() -> bool {
@@ -250,6 +323,14 @@ impl Default for AppSettings {
             gzip_enabled: true,
             tls_verify: false,
             allow_arbitrary_local_paths: false,
+            mcp_enabled: false,
+            mcp_port: 7317,
+            mcp_token: String::new(),
+            mcp_tier_read: true,
+            mcp_tier_write: false,
+            mcp_tier_exec: false,
+            mcp_require_confirm: true,
+            mcp_max_calls_per_min: 120,
         }
     }
 }
@@ -467,6 +548,8 @@ mod ts_bindings {
             ("HttpSendResult", HttpSendResult::decl()),
             ("ImportResult", ImportResult::decl()),
             ("ProxyTestResult", ProxyTestResult::decl()),
+            ("McpStatus", McpStatus::decl()),
+            ("McpCallRecord", McpCallRecord::decl()),
             ("PluginManifest", crate::plugin::PluginManifest::decl()),
             ("PluginKind", crate::plugin::PluginKind::decl()),
             ("FeatureManifest", crate::plugin::FeatureManifest::decl()),
