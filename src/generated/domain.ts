@@ -143,6 +143,23 @@ export type FileEntry = { name: string, path: string, isDir: boolean, size: numb
  */
 perms: string, };
 export type FileContent = { name: string, size: number, contentB64: string, };
+export type FileChunk = { 
+/**
+ * 分块内容（Base64）
+ */
+dataB64: string, 
+/**
+ * 本次读取的起始偏移
+ */
+offset: number, 
+/**
+ * 本次实际读到的字节数（0 表示已在文件尾）
+ */
+size: number, 
+/**
+ * 是否已到文件尾（`length = 0` 表示整段读完）
+ */
+eof: boolean, };
 export type ProtocolMeta = { id: string, displayName: string, requiresNetwork: boolean, 
 /**
  * 插件版本（来自插件清单）。
@@ -228,6 +245,15 @@ outcome: string,
  * 参数摘要（已脱敏）
  */
 summary: string, durationMs: number, };
+export type McpPendingApproval = { id: string, tool: string, 
+/**
+ * 参数摘要（已脱敏）
+ */
+summary: string, 
+/**
+ * 发起时间（Unix 秒）
+ */
+requestedAt: number, };
 export type PluginManifest = { id: string, name: string, version: string, kind: PluginKind, description: string, 
 /**
  * 声明的能力列表：["files"] ["terminal"] ["database"] 等。

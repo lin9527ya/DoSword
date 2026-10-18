@@ -175,6 +175,22 @@ pub struct ProxyTestResult {
     pub exit_ip: Option<String>,
 }
 
+/// 分块读取结果（MCP `fs_read` 与前端分块预览共用）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChunk {
+    /// 分块内容（Base64）
+    pub data_b64: String,
+    /// 本次读取的起始偏移
+    #[ts(type = "number")]
+    pub offset: u64,
+    /// 本次实际读到的字节数（0 表示已在文件尾）
+    #[ts(type = "number")]
+    pub size: u64,
+    /// 是否已到文件尾（`length = 0` 表示整段读完）
+    pub eof: bool,
+}
+
 /// 全局应用设置（app_settings 表单行 JSON）。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -267,6 +283,19 @@ pub struct McpStatus {
     pub started_at: Option<u64>,
     /// 最近一次启动失败原因（绑定失败等）
     pub last_error: Option<String>,
+}
+
+/// MCP 执行级操作的待确认请求（须由人在设置页批准）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPendingApproval {
+    pub id: String,
+    pub tool: String,
+    /// 参数摘要（已脱敏）
+    pub summary: String,
+    /// 发起时间（Unix 秒）
+    #[ts(type = "number")]
+    pub requested_at: u64,
 }
 
 /// MCP 单次调用记录（设置页「最近调用」用，仅内存环形缓冲）。
@@ -537,6 +566,7 @@ mod ts_bindings {
             ("DirListing", DirListing::decl()),
             ("FileEntry", FileEntry::decl()),
             ("FileContent", FileContent::decl()),
+            ("FileChunk", FileChunk::decl()),
             ("ProtocolMeta", ProtocolMeta::decl()),
             ("ConnectResult", ConnectResult::decl()),
             ("SessionInfo", SessionInfo::decl()),
@@ -550,6 +580,7 @@ mod ts_bindings {
             ("ProxyTestResult", ProxyTestResult::decl()),
             ("McpStatus", McpStatus::decl()),
             ("McpCallRecord", McpCallRecord::decl()),
+            ("McpPendingApproval", McpPendingApproval::decl()),
             ("PluginManifest", crate::plugin::PluginManifest::decl()),
             ("PluginKind", crate::plugin::PluginKind::decl()),
             ("FeatureManifest", crate::plugin::FeatureManifest::decl()),

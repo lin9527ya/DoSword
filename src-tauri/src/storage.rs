@@ -449,7 +449,7 @@ impl Database {
         Ok(())
     }
 
-    fn list_workspaces(&self) -> rusqlite::Result<Vec<Workspace>> {
+    pub fn list_workspaces(&self) -> rusqlite::Result<Vec<Workspace>> {
         let mut statement = self.connection.prepare(
             "SELECT id, name, authorization_scope, expires_at, created_at
              FROM workspaces ORDER BY created_at DESC",

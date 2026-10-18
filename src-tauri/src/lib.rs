@@ -227,6 +227,7 @@ pub fn run() {
             commands::create_dir,
             commands::touch_path,
             commands::write_chunk,
+            commands::read_chunk,
             commands::db_probe,
             commands::db_query,
             commands::list_request_log,
@@ -237,6 +238,8 @@ pub fn run() {
             commands::mcp_rotate_token,
             commands::mcp_recent_calls,
             commands::mcp_clear_log,
+            commands::mcp_pending_approvals,
+            commands::mcp_resolve_approval,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start DoSword");

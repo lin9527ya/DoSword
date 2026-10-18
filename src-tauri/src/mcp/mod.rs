@@ -5,26 +5,36 @@
 //!   内建（`allowed_hosts` 默认仅回环），防 DNS rebinding。
 //! - 总开关默认关闭；`Authorization: Bearer <token>` 鉴权；能力按
 //!   read / write / exec 三级授权（只读默认开）。
+//! - exec 级默认要求**人工确认**：工具返回待批准 id，人在设置页批准后
+//!   120 秒内重试才生效（一次性消费）。
 //! - 每次工具调用写审计（`mcp.<tool>`）并进内存环形缓冲，供设置页展示。
 //! - 不提供任何改写授权登记表（Workspace / Shell 增删改）的工具：
 //!   授权范围只能由人在 GUI 里维护。
 //!
 //! 该模块由 cargo feature `mcp` 控制编译（默认开启）。
 
-mod auth;
+pub mod auth;
+pub mod redact;
 mod server;
+mod tools;
 
-use std::collections::VecDeque;
-use std::sync::Mutex;
+pub(crate) use server::DoswordMcp;
 
-use dosword_sdk::domain::{AppSettings, McpCallRecord, McpStatus};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use dosword_sdk::domain::{AppSettings, McpCallRecord, McpPendingApproval, McpStatus};
 use tauri::{AppHandle, Manager};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-/// 「最近调用」环形缓冲容量。
-/// P1 起由工具层写入；P0 仅有测试使用，故允许未使用。
-#[allow(dead_code)]
-const LOG_CAPACITY: usize = 200;
+/// 「最近调用」环形缓冲容量
+pub const LOG_CAPACITY: usize = 200;
+/// 待批准请求的有效期：超时后需重新发起
+pub const APPROVAL_TTL: Duration = Duration::from_secs(120);
+/// 同时执行的工具调用上限
+pub const MAX_CONCURRENCY: usize = 4;
 
 struct Runtime {
     port: u16,
@@ -32,17 +42,48 @@ struct Runtime {
     cancel: CancellationToken,
 }
 
-/// MCP 运行状态（Tauri managed state）。
+struct PendingApproval {
+    tool: String,
+    summary: String,
+    requested_at: Instant,
+}
+
 #[derive(Default)]
+struct Approvals {
+    /// 待人工确认：id → 请求
+    pending: HashMap<String, PendingApproval>,
+    /// 已批准：`tool|summary` → 批准时间（一次性消费）
+    approved: HashMap<String, Instant>,
+}
+
+/// MCP 运行状态（Tauri managed state）。
 pub struct McpState {
     runtime: Mutex<Option<Runtime>>,
     log: Mutex<VecDeque<McpCallRecord>>,
     last_error: Mutex<Option<String>>,
+    /// 限流：最近一分钟内的调用时刻
+    rate: Mutex<VecDeque<Instant>>,
+    /// 并发闸门
+    slots: Arc<Semaphore>,
+    approvals: Mutex<Approvals>,
+}
+
+impl Default for McpState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl McpState {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            runtime: Mutex::new(None),
+            log: Mutex::new(VecDeque::new()),
+            last_error: Mutex::new(None),
+            rate: Mutex::new(VecDeque::new()),
+            slots: Arc::new(Semaphore::new(MAX_CONCURRENCY)),
+            approvals: Mutex::new(Approvals::default()),
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -67,7 +108,7 @@ impl McpState {
             running,
             port,
             endpoint: port.map(|port| format!("http://127.0.0.1:{port}/mcp")),
-            tool_count: server::tool_count() as u32,
+            tool_count: tools::tool_count() as u32,
             started_at,
             last_error: self.last_error.lock().ok().and_then(|guard| guard.clone()),
         }
@@ -128,8 +169,6 @@ impl McpState {
         }
     }
 
-    /// 写入一条调用记录（P1 工具层调用）。
-    #[allow(dead_code)]
     pub fn record(&self, record: McpCallRecord) {
         if let Ok(mut guard) = self.log.lock() {
             if guard.len() >= LOG_CAPACITY {
@@ -160,6 +199,137 @@ impl McpState {
             *guard = message;
         }
     }
+
+    // ---- 限流与并发 ----
+
+    /// 滑动窗口限流：每分钟最多 `per_min` 次。超限返回可读错误。
+    pub fn check_rate(&self, per_min: u32) -> Result<(), String> {
+        let per_min = per_min.max(1) as usize;
+        let mut guard = match self.rate.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Ok(()),
+        };
+        let now = Instant::now();
+        while let Some(front) = guard.front() {
+            if now.duration_since(*front) >= Duration::from_secs(60) {
+                guard.pop_front();
+            } else {
+                break;
+            }
+        }
+        if guard.len() >= per_min {
+            return Err(format!(
+                "调用频率超限（每分钟上限 {per_min} 次）：请降低轮询频率，或在设置中提高上限"
+            ));
+        }
+        guard.push_back(now);
+        Ok(())
+    }
+
+    /// 取得一个并发槽位（最多 [`MAX_CONCURRENCY`] 个工具调用同时进行）。
+    pub async fn acquire_slot(&self) -> Result<OwnedSemaphorePermit, String> {
+        Arc::clone(&self.slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| "MCP 并发闸门已关闭".to_string())
+    }
+
+    // ---- 执行级人工确认 ----
+
+    /// 登记一个待批准请求，返回批准 id。
+    pub fn request_approval(&self, tool: &str, summary: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        if let Ok(mut guard) = self.approvals.lock() {
+            prune_approvals(&mut guard);
+            guard.pending.insert(
+                id.clone(),
+                PendingApproval {
+                    tool: tool.to_string(),
+                    summary: summary.to_string(),
+                    requested_at: Instant::now(),
+                },
+            );
+        }
+        id
+    }
+
+    /// 待批准列表（已过期条目自动清理）。
+    pub fn pending_approvals(&self) -> Vec<McpPendingApproval> {
+        let mut guard = match self.approvals.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Vec::new(),
+        };
+        prune_approvals(&mut guard);
+        let mut out: Vec<McpPendingApproval> = guard
+            .pending
+            .iter()
+            .map(|(id, pending)| McpPendingApproval {
+                id: id.clone(),
+                tool: pending.tool.clone(),
+                summary: pending.summary.clone(),
+                requested_at: now_unix().saturating_sub(pending.requested_at.elapsed().as_secs()),
+            })
+            .collect();
+        out.sort_by_key(|item| item.requested_at);
+        out
+    }
+
+    /// 批准或拒绝：返回（被处理的请求是否获批）。
+    pub fn resolve_approval(
+        &self,
+        id: &str,
+        approve: bool,
+    ) -> Result<(McpPendingApproval, bool), String> {
+        let mut guard = self
+            .approvals
+            .lock()
+            .map_err(|_| "审批队列锁异常".to_string())?;
+        prune_approvals(&mut guard);
+        let pending = guard
+            .pending
+            .remove(id)
+            .ok_or_else(|| "待确认请求不存在或已超时，请让 agent 重新发起".to_string())?;
+        if approve {
+            guard.approved.insert(
+                approval_key(&pending.tool, &pending.summary),
+                Instant::now(),
+            );
+        }
+        let record = McpPendingApproval {
+            id: id.to_string(),
+            tool: pending.tool,
+            summary: pending.summary,
+            requested_at: now_unix().saturating_sub(pending.requested_at.elapsed().as_secs()),
+        };
+        Ok((record, approve))
+    }
+
+    /// 消费一次批准（一次性）：命中则返回 true 并移除。
+    pub fn consume_approval(&self, tool: &str, summary: &str) -> bool {
+        let mut guard = match self.approvals.lock() {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
+        prune_approvals(&mut guard);
+        guard
+            .approved
+            .remove(&approval_key(tool, summary))
+            .is_some()
+    }
+}
+
+fn approval_key(tool: &str, summary: &str) -> String {
+    format!("{tool}|{summary}")
+}
+
+fn prune_approvals(approvals: &mut Approvals) {
+    let now = Instant::now();
+    approvals
+        .pending
+        .retain(|_, pending| now.duration_since(pending.requested_at) < APPROVAL_TTL);
+    approvals
+        .approved
+        .retain(|_, approved_at| now.duration_since(*approved_at) < APPROVAL_TTL);
 }
 
 /// 应用启动时装配 MCP 状态，并在设置允许的情况下自动拉起服务。
@@ -229,9 +399,11 @@ mod tests {
 
     #[test]
     fn tokens_are_unique() {
-        let a = generate_token();
-        let b = generate_token();
-        assert_ne!(a, b, "连续两次生成的令牌不应相同");
+        assert_ne!(
+            generate_token(),
+            generate_token(),
+            "连续两次生成的令牌不应相同"
+        );
     }
 
     #[test]
@@ -249,17 +421,64 @@ mod tests {
         }
         let recent = state.recent(3);
         assert_eq!(recent.len(), 3);
-        // 最新的三条，按时间升序
         assert_eq!(recent[0].tool, format!("t{}", LOG_CAPACITY + 2));
         assert_eq!(recent[2].tool, format!("t{}", LOG_CAPACITY + 4));
     }
 
     #[test]
     fn status_without_runtime_is_stopped() {
-        let state = McpState::new();
-        let status = state.status();
+        let status = McpState::new().status();
         assert!(!status.running);
         assert!(status.port.is_none());
         assert!(status.endpoint.is_none());
+    }
+
+    #[test]
+    fn rate_limit_rejects_after_quota() {
+        let state = McpState::new();
+        for _ in 0..3 {
+            assert!(state.check_rate(3).is_ok());
+        }
+        let error = state.check_rate(3).unwrap_err();
+        assert!(error.contains("调用频率超限"), "{error}");
+    }
+
+    #[test]
+    fn approval_is_required_then_one_shot() {
+        let state = McpState::new();
+        // 未批准 → 消费失败
+        assert!(!state.consume_approval("dosword_exec", "ls -la"));
+
+        let id = state.request_approval("dosword_exec", "ls -la");
+        let pending = state.pending_approvals();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].tool, "dosword_exec");
+
+        let (resolved, approved) = state.resolve_approval(&id, true).expect("批准");
+        assert!(approved);
+        assert_eq!(resolved.summary, "ls -la");
+        assert!(state.pending_approvals().is_empty());
+
+        // 批准后放行一次
+        assert!(state.consume_approval("dosword_exec", "ls -la"));
+        // 一次性：第二次不再放行
+        assert!(!state.consume_approval("dosword_exec", "ls -la"));
+    }
+
+    #[test]
+    fn denied_approval_does_not_authorize() {
+        let state = McpState::new();
+        let id = state.request_approval("dosword_plugin_run", "{\"id\":\"x\"}");
+        let (_, approved) = state.resolve_approval(&id, false).expect("拒绝");
+        assert!(!approved);
+        assert!(!state.consume_approval("dosword_plugin_run", "{\"id\":\"x\"}"));
+    }
+
+    #[test]
+    fn resolving_unknown_approval_reports_expired() {
+        let state = McpState::new();
+        let error = state.resolve_approval("not-a-real-id", true).unwrap_err();
+        assert!(error.contains("不存在或已超时"), "{error}");
     }
 }

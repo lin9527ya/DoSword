@@ -6,7 +6,7 @@ use url::Url;
 
 use dosword_sdk::domain::{
     AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
-    CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing,
+    CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing, FileChunk,
     FileContent, GenerateShellResult, HttpSendResult, ImportResult, ProbeResult, ProtocolMeta,
     ProxyTestResult, RequestRecord, SessionInfo, ShellProfile, UpdateShell, UpdateWorkspace,
     Workspace,
@@ -1590,8 +1590,25 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
         .map_err(|error| error.to_string())
 }
 
+/// 设置保存后按最新设置同步 MCP 服务（启用→重启，关闭→停止）。
+#[cfg(feature = "mcp")]
+fn schedule_mcp_sync(app: AppHandle, settings: AppSettings) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<crate::mcp::McpState>();
+        if settings.mcp_enabled {
+            if let Err(error) = state.start(app.clone(), &settings).await {
+                state.set_error(Some(error));
+            }
+        } else {
+            state.stop();
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn update_settings(input: AppSettings, app: AppHandle) -> Result<(), String> {
+    #[cfg(feature = "mcp")]
+    let mcp_handle = app.clone();
     blocking(app, move |state| {
         // 设置范围钳位：此前完全不校验，chunk > max_file_size 会让**每次分块读取**
         // 都被响应上限拒绝（下载必失败），0 秒超时会让请求立即失败。
@@ -1600,6 +1617,14 @@ pub async fn update_settings(input: AppSettings, app: AppHandle) -> Result<(), S
         input.chunk_size_mb = input.chunk_size_mb.clamp(1, 64);
         input.max_file_size_mb = input.max_file_size_mb.clamp(1, 512);
         input.audit_retention_days = input.audit_retention_days.min(3650);
+        // MCP：端口与限流钳位；启用但无令牌时自动生成（避免"启用了却连不上"）
+        input.mcp_port = input.mcp_port.clamp(1024, 65535);
+        input.mcp_max_calls_per_min = input.mcp_max_calls_per_min.clamp(1, 6000);
+        input.mcp_token = input.mcp_token.trim().to_string();
+        #[cfg(feature = "mcp")]
+        if input.mcp_enabled && input.mcp_token.is_empty() {
+            input.mcp_token = crate::mcp::generate_token();
+        }
         if input.chunk_size_mb > input.max_file_size_mb {
             input.chunk_size_mb = input.max_file_size_mb;
         }
@@ -1668,6 +1693,23 @@ pub async fn update_settings(input: AppSettings, app: AppHandle) -> Result<(), S
                         removed.len()
                     ),
                 );
+            }
+        }
+
+        // MCP：任何 mcp_* 字段变化都同步服务状态（启用→重启，关闭→停止）。
+        // 此处位于阻塞线程、不能跨 await 持锁，故交给异步运行时调度。
+        #[cfg(feature = "mcp")]
+        {
+            let mcp_changed = previous.mcp_enabled != input.mcp_enabled
+                || previous.mcp_port != input.mcp_port
+                || previous.mcp_token != input.mcp_token
+                || previous.mcp_tier_read != input.mcp_tier_read
+                || previous.mcp_tier_write != input.mcp_tier_write
+                || previous.mcp_tier_exec != input.mcp_tier_exec
+                || previous.mcp_require_confirm != input.mcp_require_confirm
+                || previous.mcp_max_calls_per_min != input.mcp_max_calls_per_min;
+            if mcp_changed {
+                schedule_mcp_sync(mcp_handle, input.clone());
             }
         }
         Ok(())
@@ -2564,6 +2606,49 @@ pub async fn write_chunk(
     .await
 }
 
+/// 分块读取远端文件（`length = 0` 表示读到文件尾）。
+///
+/// 与 `write_chunk` 对称：MCP 的 `fs_read` 用它做偏移读取，避免把整个文件
+/// 读进上下文；前端后续做分块预览也可复用。
+///
+/// 只对**失败**写审计：成功读取由调用方（MCP 工具层）统一记 `mcp.<tool>`，
+/// 否则 agent 轮询读会瞬间冲垮审计表。
+#[tauri::command]
+pub async fn read_chunk(
+    session_id: String,
+    path: String,
+    offset: u64,
+    length: u64,
+    app: AppHandle,
+) -> Result<FileChunk, String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        let data = with_session(state, &session_id, |session| {
+            ctx.protocol
+                .read_chunk(session, &path, offset, length, &ctx.settings)
+        })
+        .inspect_err(|error| {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "file.read",
+                "error",
+                error,
+            )
+        })?;
+        let size = data.len() as u64;
+        Ok(FileChunk {
+            data_b64: base64::engine::general_purpose::STANDARD.encode(&data),
+            offset,
+            size,
+            // length = 0 表示"一直读到文件尾"，本次已读完；否则不足请求长度即到尾
+            eof: length == 0 || size < length,
+        })
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn download_file(
     session_id: String,
@@ -3064,6 +3149,59 @@ pub async fn mcp_clear_log(app: AppHandle) -> Result<(), String> {
     #[cfg(not(feature = "mcp"))]
     {
         let _ = app;
+        Err("本构建未启用 MCP 支持（cargo feature `mcp`）".to_string())
+    }
+}
+
+/// 待人工确认的执行级操作。
+#[tauri::command]
+pub async fn mcp_pending_approvals(
+    app: AppHandle,
+) -> Result<Vec<dosword_sdk::domain::McpPendingApproval>, String> {
+    #[cfg(feature = "mcp")]
+    {
+        Ok(app.state::<crate::mcp::McpState>().pending_approvals())
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = app;
+        Err("本构建未启用 MCP 支持（cargo feature `mcp`）".to_string())
+    }
+}
+
+/// 批准或拒绝一个执行级操作。批准后 120 秒内、参数完全一致的重试才会生效（一次性）。
+#[tauri::command]
+pub async fn mcp_resolve_approval(
+    id: String,
+    approve: bool,
+    app: AppHandle,
+) -> Result<dosword_sdk::domain::McpPendingApproval, String> {
+    #[cfg(feature = "mcp")]
+    {
+        let (record, approved) = app
+            .state::<crate::mcp::McpState>()
+            .resolve_approval(&id, approve)?;
+        {
+            let state = app.state::<AppState>();
+            audit(
+                &state,
+                "system",
+                None,
+                "mcp.approval",
+                if approved { "success" } else { "denied" },
+                &format!(
+                    "执行级操作{}：{}｜{}",
+                    if approved { "已批准" } else { "已拒绝" },
+                    record.tool,
+                    record.summary
+                ),
+            );
+        }
+        Ok(record)
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = (id, approve, app);
         Err("本构建未启用 MCP 支持（cargo feature `mcp`）".to_string())
     }
 }
