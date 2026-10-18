@@ -20,10 +20,14 @@ const QUICK_COMMANDS = [
 ];
 
 function stripAnsi(text: string): string {
+  // ANSI 转义序列必须以 ESC(0x1b)/BEL(0x07) 等控制字符匹配：这是该函数的目的，
+  // 故在此显式豁免 no-control-regex（仅本函数）。
+  /* eslint-disable no-control-regex */
   return text
     .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "")
     .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
     .replace(/\x1b[()][0-9A-Z]/g, "");
+  /* eslint-enable no-control-regex */
 }
 
 function renderOutput(stdout: string, mode: ViewMode): string {

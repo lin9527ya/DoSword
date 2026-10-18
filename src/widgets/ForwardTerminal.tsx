@@ -18,6 +18,8 @@ export function ForwardTerminal({
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const pollTimerRef = useRef<number | null>(null);
+  const pollInFlightRef = useRef(false);
+  const failCountRef = useRef(0);
   const offsetRef = useRef<number>(0);
   const isRunningRef = useRef<boolean>(false);
   const lastSizeRef = useRef({ w: 0, h: 0 });
@@ -48,6 +50,11 @@ export function ForwardTerminal({
 
   const pollRead = useCallback(async () => {
     if (!isRunningRef.current) return;
+    // in-flight 互斥 + 自递归调度：此前是 80ms setInterval 且无互斥，
+    // 单次 RPC 超过 80ms 时会并发叠加、两个请求带同一 offset，
+    // 导致终端输出重复回放，晚到的旧响应还会把 offset 写回较小值。
+    if (pollInFlightRef.current) return;
+    pollInFlightRef.current = true;
     try {
       const res = (await api.runFeaturePlugin(sessionIdRef.current, "super_terminal", {
         action: "read",
@@ -56,18 +63,30 @@ export function ForwardTerminal({
       })) as { ok?: boolean; dataB64?: string; offset?: number };
 
       if (res && res.ok) {
+        failCountRef.current = 0;
         if (res.dataB64) {
           const text = b64.decodeText(res.dataB64);
           if (text) {
             termRef.current?.write(text.replace(/\r?\n/g, "\r\n"));
           }
         }
-        if (typeof res.offset === "number") {
+        // offset 只允许前进，避免旧响应把读取位置回退造成重复输出
+        if (typeof res.offset === "number" && res.offset > offsetRef.current) {
           offsetRef.current = res.offset;
         }
       }
-    } catch {
-      // 忽略偶发轮询异常
+    } catch (cause) {
+      failCountRef.current += 1;
+      if (failCountRef.current === 5) {
+        termRef.current?.write(
+          `\r\n\x1b[33m[!] 终端读取连续失败：${errorText(cause)}（继续重试中）\x1b[0m\r\n`,
+        );
+      }
+    } finally {
+      pollInFlightRef.current = false;
+      if (isRunningRef.current) {
+        pollTimerRef.current = window.setTimeout(() => void pollRead(), 80);
+      }
     }
   }, []);
 
@@ -107,11 +126,12 @@ export function ForwardTerminal({
         toast.success("交互式终端已启动", "PTY 就绪");
 
         if (pollTimerRef.current !== null) {
-          window.clearInterval(pollTimerRef.current);
+          window.clearTimeout(pollTimerRef.current);
+          pollTimerRef.current = null;
         }
-        pollTimerRef.current = window.setInterval(() => {
-          void pollRead();
-        }, 80);
+        pollInFlightRef.current = false;
+        failCountRef.current = 0;
+        pollTimerRef.current = window.setTimeout(() => void pollRead(), 80);
       } else {
         term?.write(`\x1b[31m[-] 启动失败: ${res?.error ?? "未知错误"}\x1b[0m\r\n`);
         toast.error(`启动终端失败：${res?.error ?? "目标不支持管道或 proc_open"}`);
@@ -129,7 +149,7 @@ export function ForwardTerminal({
     isRunningRef.current = false;
     setRunning(false);
     if (pollTimerRef.current !== null) {
-      window.clearInterval(pollTimerRef.current);
+      window.clearTimeout(pollTimerRef.current);
       pollTimerRef.current = null;
     }
     const term = termRef.current;
@@ -226,7 +246,7 @@ export function ForwardTerminal({
       if (rafId) cancelAnimationFrame(rafId);
       resizeObserver.disconnect();
       if (pollTimerRef.current !== null) {
-        window.clearInterval(pollTimerRef.current);
+        window.clearTimeout(pollTimerRef.current);
         pollTimerRef.current = null;
       }
       if (isRunningRef.current) {

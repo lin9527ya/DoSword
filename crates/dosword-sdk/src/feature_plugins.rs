@@ -40,7 +40,10 @@ fn basename_cmd(path: &str) -> &str {
 }
 
 /// S13：命令型载荷参数校验——host 仅允许主机名/IP 字符集。
-fn validate_host_arg(host: &str) -> Result<(), String> {
+///
+/// 对宿主公开：`start_pty_session` 的回调地址同样必须走这一校验，
+/// 否则用户输入的地址会直接进入目标侧载荷模板。
+pub fn validate_host_arg(host: &str) -> Result<(), String> {
     if host.is_empty() || host.len() > 255 {
         return Err("host 参数无效".to_string());
     }

@@ -8,7 +8,8 @@ use dosword_sdk::domain::{
     AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
     CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing,
     FileContent, GenerateShellResult, HttpSendResult, ImportResult, ProbeResult, ProtocolMeta,
-    RequestRecord, SessionInfo, ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
+    ProxyTestResult, RequestRecord, SessionInfo, ShellProfile, UpdateShell, UpdateWorkspace,
+    Workspace,
 };
 use dosword_sdk::encoder::{EncoderRegistry, STUB_LANGUAGES};
 use dosword_sdk::plugin::FeaturePlugin;
@@ -22,6 +23,38 @@ fn validate_text(value: &str, field: &str) -> Result<(), String> {
         Err(format!("{field} 不能为空"))
     } else {
         Ok(())
+    }
+}
+
+/// 按**字符**截断（不是字节）：`str::len()` 是字节数，`&s[..64]` 会落在多字节
+/// 字符中间并 panic——release 构建 `panic = "abort"`（Cargo.toml）会终止整个
+/// 进程并丢失全部活动会话。超出时追加省略号。
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// base64 载荷切片：非 ASCII 输入按字节边界切会 panic，这里返回显式错误。
+fn base64_slice(value: &str, start: usize, end: usize) -> Result<&str, String> {
+    value
+        .get(start..end)
+        .ok_or_else(|| "文件内容不是合法 Base64（含非 ASCII 字符）".to_string())
+}
+
+/// 审计用 URL：去掉 query 与 fragment（可能含密码 / token），只留 scheme://host/path。
+fn redact_url(value: &str) -> String {
+    match Url::parse(value) {
+        Ok(mut url) => {
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => value.to_string(),
     }
 }
 
@@ -409,6 +442,8 @@ pub async fn delete_shell(shell_id: String, app: AppHandle) -> Result<(), String
 }
 
 /// 登记前连通性测试：用表单中的临时配置（不落库）对目标执行一次探测。
+///
+/// 真实网络协议同样受授权范围约束（联合范围，`allow_unscoped` 显式覆盖）。
 #[tauri::command]
 pub async fn test_connection(
     endpoint: String,
@@ -416,6 +451,7 @@ pub async fn test_connection(
     protocol_id: String,
     protocol_params: Option<String>,
     runtime: Option<String>,
+    allow_unscoped: Option<bool>,
     app: AppHandle,
 ) -> Result<ProbeResult, String> {
     blocking(app, move |state| {
@@ -426,6 +462,7 @@ pub async fn test_connection(
             &protocol_id,
             protocol_params.as_deref(),
             runtime.as_deref(),
+            allow_unscoped.unwrap_or(false),
         )
     })
     .await
@@ -438,6 +475,7 @@ fn test_connection_impl(
     protocol_id: &str,
     protocol_params: Option<&str>,
     runtime: Option<&str>,
+    allow_unscoped: bool,
 ) -> Result<ProbeResult, String> {
     let settings = state
         .database
@@ -454,6 +492,43 @@ fn test_connection_impl(
     }
     parse_endpoint(endpoint)?;
     validate_text(password, "连接密码")?;
+    if protocol.requires_network() {
+        let scope_result = {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            auth::require_in_any_scope(&database, endpoint)
+        };
+        match scope_result {
+            Ok(reason) => {
+                audit(
+                    state,
+                    "system",
+                    None,
+                    "shell.test_connection",
+                    "success",
+                    &format!("{endpoint}（{reason}）"),
+                );
+            }
+            Err(error) if allow_unscoped => {
+                audit(
+                    state,
+                    "system",
+                    None,
+                    "shell.test_connection",
+                    "override",
+                    &format!("{endpoint}（{error}；用户显式覆盖授权范围）"),
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "{error}：请先把目标登记到某个 Workspace 的授权范围，\
+                     或勾选「允许未授权范围目标」（会记入审计）"
+                ));
+            }
+        }
+    }
     let profile = ShellProfile {
         id: String::new(),
         workspace_id: String::new(),
@@ -604,40 +679,143 @@ fn encode_text_impl(text: &str, encoding: &str) -> Result<String, String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
 }
 
-/// 读取本地文件（Shell 导入用）。
-#[tauri::command]
-/// S4：本地路径安全校验——规范化并拒绝敏感系统目录（防止被攻破的前端读写任意本地文件）。
-fn sanitize_local_path(path: &str, for_write: bool) -> Result<std::path::PathBuf, String> {
-    let deny = [
-        "/etc", "/proc", "/sys", "/root", "/boot", "/dev", "/var/lib", "/usr",
-    ];
-    if for_write {
-        let p = std::path::Path::new(path);
-        let parent = p.parent().ok_or_else(|| "路径缺少父目录".to_string())?;
+/// S4：本地路径安全校验（跨平台）。
+///
+/// 历史实现只拒绝 `/etc`、`/proc` 等 POSIX 前缀——在 Windows 上
+/// `canonicalize()` 返回 `\\?\C:\…`，字符串前缀永不匹配，等于**没有校验**：
+/// 被攻破的前端（或恶意插件）可读写任意用户文件（含存明文密码的 SQLite）。
+///
+/// 现行策略：
+/// 1. 必须绝对路径；拒绝 UNC（`\\server\share`）、设备/扩展长度前缀与 ADS（`name:stream`）；
+/// 2. 规范化后按**路径组件**比较，拒绝系统目录；
+/// 3. 默认只允许用户主目录 / 系统临时目录之内，越界需显式开启
+///    `allow_arbitrary_local_paths`（设置 → 安全门禁）。
+fn sanitize_local_path(
+    state: &AppState,
+    path: &str,
+    for_write: bool,
+) -> Result<std::path::PathBuf, String> {
+    let raw = std::path::Path::new(path);
+    if !raw.is_absolute() {
+        return Err("必须使用绝对路径".to_string());
+    }
+    let normalized = path.replace('/', "\\");
+    if normalized.starts_with("\\\\") || normalized.starts_with("\\?\\") {
+        return Err("拒绝 UNC / 设备路径".to_string());
+    }
+    if let Some(name) = raw.file_name().and_then(|name| name.to_str())
+        && name.contains(':')
+    {
+        return Err("拒绝备用数据流（ADS）路径".to_string());
+    }
+
+    let resolved = if for_write {
+        let parent = raw.parent().ok_or_else(|| "路径缺少父目录".to_string())?;
         let canon_parent =
             std::fs::canonicalize(parent).map_err(|error| format!("路径无效：{error}"))?;
-        for prefix in deny {
-            if canon_parent.starts_with(prefix) {
-                return Err(format!("拒绝访问敏感目录：{prefix}"));
-            }
-        }
-        Ok(canon_parent.join(p.file_name().unwrap_or_default()))
+        canon_parent.join(raw.file_name().unwrap_or_default())
     } else {
-        let canonical =
-            std::fs::canonicalize(path).map_err(|error| format!("路径无效：{error}"))?;
-        for prefix in deny {
-            if canonical.starts_with(prefix) {
-                return Err(format!("拒绝访问敏感目录：{prefix}"));
+        let canonical = std::fs::canonicalize(raw).map_err(|error| format!("路径无效：{error}"))?;
+        if !canonical.is_file() {
+            return Err("仅支持读取普通文件".to_string());
+        }
+        canonical
+    };
+
+    for denied in denied_local_roots() {
+        if resolved.starts_with(&denied) {
+            return Err(format!("拒绝访问系统目录：{}", denied.display()));
+        }
+    }
+
+    let allow_outside = state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())?
+        .get_settings()
+        .map_err(|error| error.to_string())?
+        .allow_arbitrary_local_paths;
+    if !allow_outside {
+        let allowed = allowed_local_roots();
+        if !allowed.is_empty() && !allowed.iter().any(|root| resolved.starts_with(root)) {
+            return Err(format!(
+                "路径不在允许范围内（默认仅限用户目录 / 系统临时目录）：{}；\
+                 如确需其他目录，请在「设置 → 安全门禁」开启「允许任意本地路径」",
+                resolved.display()
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+/// 一律拒绝的系统目录（按平台）。
+fn denied_local_roots() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut roots = Vec::new();
+        for key in [
+            "SystemRoot",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramData",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                roots.push(std::path::PathBuf::from(value));
             }
         }
-        Ok(canonical)
+        roots
     }
+    #[cfg(not(windows))]
+    {
+        [
+            "/etc", "/proc", "/sys", "/root", "/boot", "/dev", "/var/lib", "/usr",
+        ]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect()
+    }
+}
+
+/// 默认允许的根目录：用户主目录 + 系统临时目录。
+fn allowed_local_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    for key in ["USERPROFILE", "HOME"] {
+        if let Ok(value) = std::env::var(key)
+            && !value.trim().is_empty()
+            && let Ok(canonical) = std::fs::canonicalize(&value)
+        {
+            roots.push(canonical);
+        }
+    }
+    if let Ok(temp) = std::fs::canonicalize(std::env::temp_dir()) {
+        roots.push(temp);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 #[tauri::command]
 pub async fn read_local_file(path: String, app: AppHandle) -> Result<String, String> {
-    blocking(app, move |_state| {
-        let safe = sanitize_local_path(&path, false)?;
+    blocking(app, move |state| {
+        let safe = sanitize_local_path(state, &path, false)?;
+        // 读取前先看大小：避免把一个 10GB 文件整块读进内存再 base64（×1.33）
+        let limit = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .get_settings()
+            .map_err(|error| error.to_string())?
+            .max_file_size_mb
+            .saturating_mul(1024 * 1024);
+        if let Ok(metadata) = std::fs::metadata(&safe)
+            && metadata.len() > limit
+        {
+            return Err(format!(
+                "本地文件超过大小上限（{}MB），请提高上限或改用命令行导入",
+                limit / 1024 / 1024
+            ));
+        }
         std::fs::read(&safe)
             .map_err(|error| format!("读取本地文件失败：{error}"))
             .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
@@ -793,12 +971,21 @@ pub async fn write_local_file(
     content_b64: String,
     app: AppHandle,
 ) -> Result<(), String> {
-    blocking(app, move |_state| {
+    blocking(app, move |state| {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&content_b64)
             .map_err(|_| "内容不是合法 Base64".to_string())?;
-        let safe = sanitize_local_path(&path, true)?;
-        std::fs::write(&safe, &bytes).map_err(|error| format!("写入本地文件失败：{error}"))
+        let safe = sanitize_local_path(state, &path, true)?;
+        std::fs::write(&safe, &bytes).map_err(|error| format!("写入本地文件失败：{error}"))?;
+        audit(
+            state,
+            "system",
+            None,
+            "local.write",
+            "success",
+            &format!("写入本地文件：{}（{} 字节）", safe.display(), bytes.len()),
+        );
+        Ok(())
     })
     .await
 }
@@ -927,6 +1114,9 @@ pub async fn uninstall_plugin(plugin_id: String, app: AppHandle) -> Result<(), S
 }
 
 /// 在已连接会话上执行功能插件。
+///
+/// 走 `session_ctx`（与文件/命令操作同一套检查）：授权范围、Workspace 到期、
+/// 真实网络开关都会复查——插件此前绕过了这些门，可在授权过期后继续执行。
 #[tauri::command]
 pub async fn run_feature_plugin(
     session_id: String,
@@ -935,31 +1125,18 @@ pub async fn run_feature_plugin(
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
     blocking(app, move |state| {
-        let (session, protocol_id, runtime) = {
+        let ctx = session_ctx(state, &session_id)?;
+        let session = {
             let mut sessions = state
                 .sessions
                 .lock()
                 .map_err(|_| "会话锁异常".to_string())?;
-            let session = sessions
+            sessions
                 .get_mut(&session_id)
-                .map_err(|error| error.to_string())?;
-            let runtime = {
-                let database = state
-                    .database
-                    .lock()
-                    .map_err(|_| "数据库锁异常".to_string())?;
-                database
-                    .shell(&session.profile_id)
-                    .map_err(|error| error.to_string())?
-                    .map(|shell| shell.runtime)
-                    .unwrap_or_else(|| "php".to_string())
-            };
-            (session.state.clone(), session.protocol_id.clone(), runtime)
+                .map_err(|error| error.to_string())?
+                .state
+                .clone()
         };
-        let protocol = state
-            .protocols
-            .get(&protocol_id)
-            .ok_or_else(|| format!("未知协议：{protocol_id}"))?;
         let plugin = {
             let registry_guard = state
                 .feature_plugins
@@ -970,14 +1147,19 @@ pub async fn run_feature_plugin(
                 .ok_or_else(|| format!("未知功能插件：{plugin_id}"))?
                 .clone()
         };
-        let settings = state
-            .database
-            .lock()
-            .map_err(|_| "数据库锁异常".to_string())?
-            .get_settings()
-            .map_err(|error| error.to_string())?;
+        let runtime = if ctx.shell.runtime.is_empty() {
+            "php"
+        } else {
+            ctx.shell.runtime.as_str()
+        };
         let output = plugin
-            .execute(protocol, session.as_ref(), &runtime, &params, &settings)
+            .execute(
+                ctx.protocol,
+                session.as_ref(),
+                runtime,
+                &params,
+                &ctx.settings,
+            )
             .map_err(|error| format!("插件执行失败：{error}"))?;
         // S9：插件执行审计（含参数摘要，不含代码体）
         let summary: String = params
@@ -986,13 +1168,7 @@ pub async fn run_feature_plugin(
                 obj.iter()
                     .map(|(key, value)| {
                         let text = match value {
-                            serde_json::Value::String(s) => {
-                                if s.len() > 64 {
-                                    format!("{}…", &s[..64])
-                                } else {
-                                    s.clone()
-                                }
-                            }
+                            serde_json::Value::String(s) => truncate_chars(s, 64),
                             other => other.to_string(),
                         };
                         format!("{key}={text}")
@@ -1140,12 +1316,16 @@ fn batch_update_shells_impl(
 }
 
 /// Repeater：手工构造并发送一次 HTTP 请求（不经协议，仅走传输层）。
+///
+/// 默认要求目标命中**任一** Workspace 的授权范围；`allow_unscoped` 为显式覆盖
+/// （审计 outcome 记 `override`）。此前该入口只检查全局开关，可打任意主机。
 #[tauri::command]
 pub async fn http_send(
     method: String,
     url: String,
     headers: Vec<(String, String)>,
     body: String,
+    allow_unscoped: Option<bool>,
     app: AppHandle,
 ) -> Result<HttpSendResult, String> {
     blocking(app, move |state| {
@@ -1158,6 +1338,36 @@ pub async fn http_send(
             .map_err(|error| error.to_string())?;
         if !settings.http_enabled {
             return Err("真实网络协议尚未在「设置」中开启授权声明".to_string());
+        }
+        let allow_unscoped = allow_unscoped.unwrap_or(false);
+        let scope_result = {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            auth::require_in_any_scope(&database, &url)
+        };
+        match scope_result {
+            Ok(_) => {}
+            Err(error) if allow_unscoped => {
+                audit(
+                    state,
+                    "system",
+                    None,
+                    "http.send",
+                    "override",
+                    &format!(
+                        "{method} {}（{error}；用户显式覆盖授权范围）",
+                        redact_url(&url)
+                    ),
+                );
+            }
+            Err(error) => {
+                return Err(format!(
+                    "{error}：请先把目标登记到某个 Workspace 的授权范围，\
+                     或勾选「允许未授权范围目标」（会记入审计）"
+                ));
+            }
         }
         let client = crate::protocol::transport::build_client(&settings);
         let method_str = method;
@@ -1184,7 +1394,7 @@ pub async fn http_send(
                 None,
                 "http.send",
                 "error",
-                &format!("{method_str} {url}：{error}"),
+                &format!("{method_str} {}：{error}", redact_url(&url)),
             );
             format!("请求失败：{error}")
         })?;
@@ -1207,7 +1417,8 @@ pub async fn http_send(
         let max_bytes = settings.max_file_size_mb.saturating_mul(1024 * 1024) as usize;
         if bytes.len() > max_bytes {
             let detail = format!(
-                "{method_str} {url}：响应超过大小上限（{}MB）",
+                "{method_str} {}：响应超过大小上限（{}MB）",
+                redact_url(&url),
                 settings.max_file_size_mb
             );
             audit(state, "system", None, "http.send", "error", &detail);
@@ -1222,7 +1433,8 @@ pub async fn http_send(
             "http.send",
             "success",
             &format!(
-                "{method_str} {url} → HTTP {status}（{} 字节，{duration_ms}ms）",
+                "{method_str} {} → HTTP {status}（{} 字节，{duration_ms}ms）",
+                redact_url(&url),
                 bytes.len()
             ),
         );
@@ -1242,6 +1454,131 @@ pub fn list_plugins(state: State<'_, AppState>) -> Vec<PluginManifest> {
     state.protocols.plugin_manifests()
 }
 
+/// 代理探测的默认目标：返回纯文本出口 IP。
+const DEFAULT_PROXY_PROBE_URL: &str = "https://api.ipify.org";
+
+/// 代理连通性测试：用当前设置（可被入参临时覆盖）构建客户端访问探测地址。
+///
+/// 该命令**会产生真实外网流量**，因此写审计（`settings.proxy_test`）；
+/// 不携带任何 Shell 凭据。网络失败返回 `ok=false` 而非 Err，便于前端展示原因。
+#[tauri::command]
+pub async fn test_proxy_upstream(
+    proxy: Option<String>,
+    timeout_secs: Option<u64>,
+    probe_url: Option<String>,
+    app: AppHandle,
+) -> Result<ProxyTestResult, String> {
+    blocking(app, move |state| {
+        test_proxy_upstream_impl(state, proxy.as_deref(), timeout_secs, probe_url.as_deref())
+    })
+    .await
+}
+
+fn test_proxy_upstream_impl(
+    state: &AppState,
+    proxy: Option<&str>,
+    timeout_secs: Option<u64>,
+    probe_url: Option<&str>,
+) -> Result<ProxyTestResult, String> {
+    let mut settings = state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())?
+        .get_settings()
+        .map_err(|error| error.to_string())?;
+    // 表单里可能刚改过代理/超时但尚未保存：以入参为准
+    settings.proxy = proxy
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    settings.default_timeout_secs = timeout_secs
+        .unwrap_or(settings.default_timeout_secs)
+        .clamp(1, 60);
+
+    let target = probe_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_PROXY_PROBE_URL);
+    let url = parse_endpoint(target)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("探测地址仅支持 http / https".to_string());
+    }
+    // 代理地址格式错误必须是硬错误：本命令的目的就是验证代理，静默直连会误导用户
+    if let Some(proxy) = settings.proxy.as_deref() {
+        reqwest::Proxy::all(proxy).map_err(|error| format!("代理地址无效：{error}"))?;
+    }
+
+    let client = crate::protocol::transport::build_client(&settings);
+    let started = std::time::Instant::now();
+    let response = match client.get(url.as_str()).send() {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format!("代理测试失败：{error}");
+            audit(
+                state,
+                "system",
+                None,
+                "settings.proxy_test",
+                "error",
+                &message,
+            );
+            return Ok(ProxyTestResult {
+                ok: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+                message,
+                exit_ip: None,
+            });
+        }
+    };
+    let status = response.status();
+    let bytes = crate::protocol::transport::read_limited(response, 64 * 1024)
+        .map_err(|error| format!("读取响应失败：{error}"))?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    if !status.is_success() {
+        let message = format!("上游返回 HTTP {}", status.as_u16());
+        audit(
+            state,
+            "system",
+            None,
+            "settings.proxy_test",
+            "error",
+            &format!("{message}（{latency_ms}ms）"),
+        );
+        return Ok(ProxyTestResult {
+            ok: false,
+            latency_ms,
+            message,
+            exit_ip: None,
+        });
+    }
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    // 仅当响应本身就是一行 IP 时才回填出口 IP（兼容任意探测地址）
+    let exit_ip = if text.len() <= 64 && text.parse::<std::net::IpAddr>().is_ok() {
+        Some(text)
+    } else {
+        None
+    };
+    let via = settings.proxy.as_deref().unwrap_or("直连");
+    let message = match &exit_ip {
+        Some(ip) => format!("代理连通正常（{via}），出口 IP {ip}"),
+        None => format!("连通正常（{via}）"),
+    };
+    audit(
+        state,
+        "system",
+        None,
+        "settings.proxy_test",
+        "success",
+        &format!("{message}（{latency_ms}ms）"),
+    );
+    Ok(ProxyTestResult {
+        ok: true,
+        latency_ms,
+        message,
+        exit_ip,
+    })
+}
+
 /// P16：高频微操作改同步 command（免 spawn_blocking 调度开销）。
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
@@ -1256,6 +1593,27 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 #[tauri::command]
 pub async fn update_settings(input: AppSettings, app: AppHandle) -> Result<(), String> {
     blocking(app, move |state| {
+        // 设置范围钳位：此前完全不校验，chunk > max_file_size 会让**每次分块读取**
+        // 都被响应上限拒绝（下载必失败），0 秒超时会让请求立即失败。
+        let mut input = input;
+        input.default_timeout_secs = input.default_timeout_secs.clamp(1, 600);
+        input.chunk_size_mb = input.chunk_size_mb.clamp(1, 64);
+        input.max_file_size_mb = input.max_file_size_mb.clamp(1, 512);
+        input.audit_retention_days = input.audit_retention_days.min(3650);
+        if input.chunk_size_mb > input.max_file_size_mb {
+            input.chunk_size_mb = input.max_file_size_mb;
+        }
+        // 代理地址格式错误必须是硬错误：静默直连会让用户以为流量走了代理（去匿名化）
+        if let Some(proxy) = input
+            .proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            reqwest::Proxy::all(proxy).map_err(|error| format!("代理地址无效：{error}"))?;
+        } else {
+            input.proxy = None;
+        }
         let previous = state
             .database
             .lock()
@@ -1280,6 +1638,37 @@ pub async fn update_settings(input: AppSettings, app: AppHandle) -> Result<(), S
         // P6：设置变更后失效全部会话上下文缓存
         if let Ok(mut sessions) = state.sessions.lock() {
             sessions.invalidate_context_all();
+        }
+        // 关闭真实网络 = 立即失效全部活跃会话（含其 PTY 流）：
+        // 否则已建立的会话会绕过总开关继续发包
+        if previous.http_enabled && !input.http_enabled {
+            let removed = {
+                let mut sessions = state
+                    .sessions
+                    .lock()
+                    .map_err(|_| "会话锁异常".to_string())?;
+                let ids: Vec<String> = sessions.list_ids();
+                for id in &ids {
+                    sessions.remove(id);
+                }
+                ids
+            };
+            for session_id in &removed {
+                state.ptys.close_for_session(session_id);
+            }
+            if !removed.is_empty() {
+                audit(
+                    state,
+                    "system",
+                    None,
+                    "settings.update",
+                    "success",
+                    &format!(
+                        "已关闭真实网络：强制断开 {} 个活跃会话及其 PTY",
+                        removed.len()
+                    ),
+                );
+            }
         }
         Ok(())
     })
@@ -1385,6 +1774,7 @@ pub async fn register_custom_encoder(stub: String, app: AppHandle) -> Result<(),
 #[tauri::command]
 pub async fn start_pty_session(
     session_id: String,
+    callback_host: Option<String>,
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
     blocking(app, move |state| {
@@ -1399,9 +1789,21 @@ pub async fn start_pty_session(
                 .ok_or_else(|| "会话不存在或已过期，请重新连接".to_string())?;
             (shell.state.clone(), ())
         };
+        // 回调地址：目标从**它的**网络位置回连本机，因此必须是目标可达的地址
+        // （默认 127.0.0.1 仅适用于本机目标/端口转发场景）。
+        let callback = callback_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("127.0.0.1")
+            .to_string();
+        dosword_sdk::feature_plugins::validate_host_arg(&callback)
+            .map_err(|error| format!("回调地址无效：{error}"))?;
+        let loopback = matches!(callback.as_str(), "127.0.0.1" | "localhost" | "::1");
+        let bind_addr = if loopback { "127.0.0.1:0" } else { "0.0.0.0:0" };
         // 1) 本地监听随机端口
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|error| format!("PTY 监听绑定失败：{error}"))?;
+        let listener = std::net::TcpListener::bind(bind_addr)
+            .map_err(|error| format!("PTY 监听绑定失败（{bind_addr}）：{error}"))?;
         listener
             .set_nonblocking(true)
             .map_err(|error| format!("PTY 监听设置失败：{error}"))?;
@@ -1425,7 +1827,7 @@ pub async fn start_pty_session(
             protocol,
             session.as_ref(),
             runtime,
-            &serde_json::json!({"host": "127.0.0.1", "port": port, "background": true}),
+            &serde_json::json!({"host": callback, "port": port, "background": true}),
             &ctx.settings,
         )
         .map_err(|error| format!("PTY 反弹载荷执行失败：{error}"))?;
@@ -1441,13 +1843,13 @@ pub async fn start_pty_session(
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
         loop {
             match listener.accept() {
-                Ok((stream, _)) => {
+                Ok((stream, peer)) => {
                     let pty_id = state.ptys.insert(&session_id, stream);
                     // S9：PTY 会话建立审计
                     let _ = state
                         .database
                         .lock()
-                        .map_err(|_| "会话锁异常".to_string())
+                        .map_err(|_| "数据库锁异常".to_string())
                         .and_then(|database| {
                             database
                                 .record_audit(
@@ -1455,17 +1857,24 @@ pub async fn start_pty_session(
                                     Some(&session_id),
                                     "pty.start",
                                     "success",
-                                    "建立交互式 PTY 会话",
+                                    &format!(
+                                        "建立交互式 PTY 会话（回调 {callback}:{port}，来源 {peer}）"
+                                    ),
                                 )
                                 .map_err(|error| error.to_string())
                         });
-                    return Ok(serde_json::json!({ "ptyId": pty_id, "port": port }));
+                    return Ok(serde_json::json!({
+                        "ptyId": pty_id,
+                        "port": port,
+                        "callbackHost": callback,
+                    }));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() > deadline {
-                        return Err(
-                            "PTY 会话建立超时（目标未回连，可能缺少可执行命令通道）".to_string()
-                        );
+                        return Err(format!(
+                            "PTY 会话建立超时（目标未回连 {callback}:{port}）：\
+                             请确认回调地址是目标可达的本机地址（跨网段/NAT 场景需端口转发）"
+                        ));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(120));
                 }
@@ -1476,10 +1885,32 @@ pub async fn start_pty_session(
     .await
 }
 
+/// 复检 PTY 归属会话是否仍然存活（过期/断开的会话不得继续操作其 PTY 流）。
+///
+/// 会话 TTL 到期或 `http_enabled` 被关闭时，PTY 必须一并失效，
+/// 否则交互式 shell 会绕过授权门继续可用。
+fn require_pty_owner_alive(state: &AppState, pty_id: &str) -> Result<String, String> {
+    let owner = state
+        .ptys
+        .owner_of(pty_id)
+        .ok_or_else(|| "PTY 会话不存在或已关闭".to_string())?;
+    let mut sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| "会话锁异常".to_string())?;
+    if sessions.get(&owner).is_none() {
+        drop(sessions);
+        state.ptys.close(pty_id);
+        return Err("PTY 所属会话已过期或已断开，交互式终端已失效".to_string());
+    }
+    Ok(owner)
+}
+
 /// 向 PTY 会话写入数据（base64）。
 #[tauri::command]
 pub async fn pty_write(pty_id: String, data_b64: String, app: AppHandle) -> Result<(), String> {
     blocking(app, move |state| {
+        require_pty_owner_alive(state, &pty_id)?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data_b64)
             .map_err(|error| format!("PTY 输入解码失败：{error}"))?;
@@ -1491,16 +1922,25 @@ pub async fn pty_write(pty_id: String, data_b64: String, app: AppHandle) -> Resu
 /// 非阻塞读取 PTY 输出（base64）。
 #[tauri::command]
 pub async fn pty_read(pty_id: String, app: AppHandle) -> Result<serde_json::Value, String> {
-    blocking(app, move |state| match state.ptys.read(&pty_id) {
-        Ok(bytes) => Ok(serde_json::json!({
-            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-            "closed": false,
-        })),
-        Err(error) => Ok(serde_json::json!({
-            "data": "",
-            "closed": true,
-            "error": error,
-        })),
+    blocking(app, move |state| {
+        if let Err(error) = require_pty_owner_alive(state, &pty_id) {
+            return Ok(serde_json::json!({
+                "data": "",
+                "closed": true,
+                "error": error,
+            }));
+        }
+        match state.ptys.read(&pty_id) {
+            Ok(bytes) => Ok(serde_json::json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                "closed": false,
+            })),
+            Err(error) => Ok(serde_json::json!({
+                "data": "",
+                "closed": true,
+                "error": error,
+            })),
+        }
     })
     .await
 }
@@ -1519,6 +1959,8 @@ pub async fn pty_close(pty_id: String, app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn get_session_probe(session_id: String, app: AppHandle) -> Result<ProbeResult, String> {
     blocking(app, move |state| {
+        // 与文件/命令操作一致：过期检查（快照优先，缺失时回退查库）
+        let _ctx = session_ctx(state, &session_id)?;
         let mut sessions = state
             .sessions
             .lock()
@@ -1688,6 +2130,9 @@ fn is_reconnectable(error: &ProtocolError) -> bool {
 }
 
 /// E4：重建协议会话（连接成功则替换 SessionManager 中的状态与信息）。
+///
+/// 重连同样要过授权门：目标可能已超出授权范围、Workspace 可能已到期、
+/// 真实网络开关可能已被关闭——此前直接 `protocol.connect` 会绕过全部检查。
 fn reconnect_session(state: &AppState, session_id: &str) -> Result<(), String> {
     let (profile_id, protocol_id, cached_profile) = {
         let mut sessions = state
@@ -1718,6 +2163,7 @@ fn reconnect_session(state: &AppState, session_id: &str) -> Result<(), String> {
         .protocols
         .get(&protocol_id)
         .ok_or_else(|| format!("未知协议：{protocol_id}"))?;
+    require_authorized_for(state, &profile, &settings)?;
     let (new_state, probe) = protocol
         .connect(&profile, &settings)
         .map_err(|error| format!("自动重连失败：{error}"))?;
@@ -2014,7 +2460,7 @@ pub async fn upload_file(
                 break;
             }
             let decoded = base64::engine::general_purpose::STANDARD
-                .decode(&content_b64[b64_offset..end])
+                .decode(base64_slice(&content_b64, b64_offset, end)?)
                 .map_err(|_| "文件内容不是合法 Base64".to_string())?;
             with_session(state, &session_id, |session| {
                 ctx.protocol.write_chunk(
@@ -2041,7 +2487,7 @@ pub async fn upload_file(
         // 尾部不足 4 字符的残余
         if b64_offset < total {
             let decoded = base64::engine::general_purpose::STANDARD
-                .decode(&content_b64[b64_offset..])
+                .decode(base64_slice(&content_b64, b64_offset, total)?)
                 .map_err(|_| "文件内容不是合法 Base64".to_string())?;
             with_session(state, &session_id, |session| {
                 ctx.protocol.write_chunk(
@@ -2128,7 +2574,7 @@ pub async fn download_file(
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
         // S4：下载目标必须是用户选定（save 对话框）的普通路径，拒绝敏感目录
-        let safe = sanitize_local_path(&local_path, true)?;
+        let safe = sanitize_local_path(state, &local_path, true)?;
         // 分块拉取（块大小由设置配置，默认 4MB），避免大文件一次性占用内存与超时；
         // P3：逐块流式写盘（不再整文件累积在内存后一次性写入）
         let chunk_size = ctx.settings.chunk_size_mb.max(1) * 1024 * 1024;
@@ -2156,6 +2602,15 @@ pub async fn download_file(
             })?;
             if chunk.is_empty() {
                 break;
+            }
+            // 护栏：返回块大于请求长度说明目标忽略了偏移（旧版 stub），
+            // 此时"短块 = EOF"永不成立 → 会无限追加写满本地磁盘，必须立即中止。
+            if chunk.len() as u64 > chunk_size {
+                return Err(format!(
+                    "下载中止：目标返回 {} 字节，超过单块请求长度 {chunk_size} 字节；\
+                     可能是目标 stub 不支持偏移读取，请重新生成并上传 stub",
+                    chunk.len()
+                ));
             }
             file.write_all(&chunk)
                 .map_err(|error| format!("写入本地文件失败：{error}"))?;
@@ -2497,6 +2952,7 @@ mod tests {
             MOCK_PROTOCOL_ID,
             None,
             None,
+            false,
         );
         assert!(result.is_ok(), "mock 协议探测应成功：{result:?}");
         assert_eq!(result.unwrap().status, "online");
@@ -2505,8 +2961,15 @@ mod tests {
     #[test]
     fn test_connection_unknown_protocol_rejected() {
         let state = app_state();
-        let result =
-            test_connection_impl(&state, "mock://local", "secret", "unknown.v1", None, None);
+        let result = test_connection_impl(
+            &state,
+            "mock://local",
+            "secret",
+            "unknown.v1",
+            None,
+            None,
+            false,
+        );
         assert!(result.is_err(), "未知协议应报错");
         assert!(result.unwrap_err().contains("未知协议"));
     }
@@ -2514,9 +2977,63 @@ mod tests {
     #[test]
     fn test_connection_invalid_endpoint_rejected() {
         let state = app_state();
-        let result =
-            test_connection_impl(&state, "not-a-url", "secret", MOCK_PROTOCOL_ID, None, None);
+        let result = test_connection_impl(
+            &state,
+            "not-a-url",
+            "secret",
+            MOCK_PROTOCOL_ID,
+            None,
+            None,
+            false,
+        );
         assert!(result.is_err(), "非法 URL 应报错");
+    }
+
+    /// 回归：登记前的连通性测试此前只检查全局开关，可探测任意主机（SSRF）。
+    #[test]
+    fn test_connection_requires_scope_unless_overridden() {
+        let state = app_state();
+        // 无任何 Workspace → 未命中授权范围
+        let denied = test_connection_impl(
+            &state,
+            "http://93.184.216.34/shell.php",
+            "secret",
+            "builtin.php.v1",
+            None,
+            None,
+            false,
+        );
+        let message = denied.unwrap_err();
+        assert!(
+            message.contains("不在任何 Workspace") || message.contains("未启用"),
+            "越界目标应被拒绝：{message}"
+        );
+
+        // 显式覆盖：放行到协议层（真实网络未开启 → 由协议层报"未启用"，但不再是范围拒绝）
+        let state2 = app_state();
+        state2
+            .database
+            .lock()
+            .unwrap()
+            .update_settings(&AppSettings {
+                http_enabled: true,
+                ..AppSettings::default()
+            })
+            .unwrap();
+        let overridden = test_connection_impl(
+            &state2,
+            "http://93.184.216.34/shell.php",
+            "secret",
+            "builtin.php.v1",
+            None,
+            None,
+            true,
+        );
+        let err = overridden.expect_err("外网目标应连接失败");
+        assert!(
+            !err.contains("不在任何 Workspace"),
+            "显式覆盖后不应再被范围拒绝：{err}"
+        );
     }
 
     #[test]
@@ -2743,5 +3260,89 @@ mod tests {
         let result = load_shell_and_settings(&state, "nope");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("不存在"));
+    }
+
+    /// 回归：本地路径策略（此前只拒 POSIX 前缀，Windows 上等于没有校验）。
+    #[test]
+    fn sanitize_local_path_enforces_policy() {
+        let state = app_state();
+
+        // 相对路径一律拒绝
+        assert!(sanitize_local_path(&state, "relative.txt", false).is_err());
+        // UNC / 设备路径拒绝
+        assert!(sanitize_local_path(&state, r"\\server\share\a.txt", false).is_err());
+        assert!(sanitize_local_path(&state, r"\\?\C:\Windows\win.ini", false).is_err());
+        // 备用数据流（ADS）拒绝
+        let ads = std::env::temp_dir().join("dosword-ads:secret");
+        let err = sanitize_local_path(&state, &ads.to_string_lossy(), true).unwrap_err();
+        assert!(err.contains("ADS"), "{err}");
+
+        // 系统临时目录属于默认允许根
+        let writable = std::env::temp_dir().join("dosword-policy-write.txt");
+        assert!(
+            sanitize_local_path(&state, &writable.to_string_lossy(), true).is_ok(),
+            "临时目录应在默认允许范围内"
+        );
+
+        // 读取必须是已存在的普通文件
+        let missing = std::env::temp_dir().join("dosword-policy-missing.txt");
+        let _ = std::fs::remove_file(&missing);
+        assert!(sanitize_local_path(&state, &missing.to_string_lossy(), false).is_err());
+        std::fs::write(&missing, b"x").unwrap();
+        assert!(sanitize_local_path(&state, &missing.to_string_lossy(), false).is_ok());
+        let _ = std::fs::remove_file(&missing);
+
+        // 目录不能当作文件读取
+        let dir = std::env::temp_dir();
+        assert!(sanitize_local_path(&state, &dir.to_string_lossy(), false).is_err());
+
+        // 系统目录始终拒绝（写入路径按父目录判定）
+        #[cfg(windows)]
+        if let Ok(root) = std::env::var("SystemRoot") {
+            let target = std::path::Path::new(&root).join("dosword-should-not-write.txt");
+            let err = sanitize_local_path(&state, &target.to_string_lossy(), true).unwrap_err();
+            assert!(err.contains("系统目录"), "{err}");
+        }
+        #[cfg(not(windows))]
+        assert!(sanitize_local_path(&state, "/etc/dosword-test", true).is_err());
+    }
+
+    /// 回归：插件参数摘要曾用 `&s[..64]`（字节切片）截断，中文等多字节字符
+    /// 落在第 64 字节中间会 panic；release `panic="abort"` 会终止整个进程。
+    #[test]
+    fn truncate_chars_never_splits_multibyte() {
+        // 62 个 ASCII + 中文：第 64 字节落在「中」的中间（旧实现此处 panic）
+        let value = format!("{}中文测试", "a".repeat(62));
+        let out = truncate_chars(&value, 64);
+        assert!(out.ends_with('…'), "超长应截断：{out}");
+        assert_eq!(out.chars().count(), 65, "64 字符 + 省略号");
+
+        // 纯中文（每字符 3 字节）
+        let chinese = "中".repeat(100);
+        assert_eq!(truncate_chars(&chinese, 64).chars().count(), 65);
+
+        // 恰好 64 字符不截断、无省略号
+        let exact = "b".repeat(64);
+        assert_eq!(truncate_chars(&exact, 64), exact);
+
+        // 空串与多字节边界
+        assert_eq!(truncate_chars("", 64), "");
+        assert_eq!(truncate_chars("中文", 64), "中文");
+    }
+
+    /// 回归：上传分块曾用 `&content_b64[a..b]`（字节切片），非 ASCII 输入 panic。
+    #[test]
+    fn base64_slice_rejects_non_ascii_instead_of_panicking() {
+        // 合法 ASCII 分块照常返回
+        assert_eq!(base64_slice("QUJDRA==", 0, 4).unwrap(), "QUJD");
+        assert_eq!(base64_slice("QUJDRA==", 4, 8).unwrap(), "RA==");
+        // 多字节字符边界 → 显式错误而非 panic
+        let cjk = "中文中文";
+        assert!(base64_slice(cjk, 0, 2).is_err(), "非字符边界必须报错");
+        assert!(base64_slice(cjk, 1, 3).is_err());
+        // 越界同样报错
+        assert!(base64_slice("QUJD", 0, 99).is_err());
+        // 整串区间（0..len）永远是合法字符边界，不应报错
+        assert_eq!(base64_slice(cjk, 0, cjk.len()).unwrap(), cjk);
     }
 }

@@ -1466,6 +1466,8 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             allow_arbitrary_code: true,
             audit_retention_days: 90,
             gzip_enabled: true,
+            tls_verify: false,
+            allow_arbitrary_local_paths: false,
         }
     }
 

@@ -232,7 +232,11 @@ nav {
   max-width: 100%;
   width: 100%;
   min-height: 0;
-  overflow: hidden;
+  /* 视图内容超出窗口时必须可滚动：此前从 html/body 到 .app-main 全是
+     overflow:hidden，且 .main-grid/.shell-list/.audit-table 均无滚动容器，
+     导致审计翻页按钮、授权工作空间等区域在小窗口下被裁掉且不可达。 */
+  overflow-y: auto;
+  overflow-x: hidden;
   box-sizing: border-box;
 }
 

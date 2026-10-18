@@ -15,26 +15,35 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
   > `~/.local/share/io.dosword.desktop/dosword.sqlite3` 与所有导出文件
 - 审计日志贯穿所有操作（连接 / 命令 / 文件 / 设置），分页查询与 CSV 导出
 - **标准 PHP WebShell 协议**（类蚁剑）：探测、连接、命令执行、文件浏览/读写/上传/下载/删除/重命名/建目录
-- **编码方式：NATIVE 内置功能分发系列**（同一骨架，D盾零检出形态，载荷加密可选）
+- **编码方式：NATIVE 内置功能分发系列**（同一骨架，载荷加密可选）
   - 功能函数（命令/文件/数据库）直接内置在 stub（业务化命名），
     客户端按操作名 md5 哈希分发调用（stub 仅含哈希数字比较）
-  - 敏感函数（shell_exec/file_get_contents/scandir/openssl_decrypt 等）全部
-    crc32b 符号表查表调用，stub 无任何明文敏感函数 / eval / php://input
-  - 自定义 HTTP 头鉴权（X-Debug-Key，头名与 token XOR 加密嵌入）
+  - 敏感函数（file_get_contents/scandir/openssl_decrypt 等）**尽量**经
+    crc32b 符号表查表调用（哥斯拉式符号表，运行时从 get_defined_functions() 解析）
+    > ⚠️ **诚实声明（勿轻信"零检出"）**：stub 中仍存在明文特征——命令执行降级链
+    > 的候选函数数组（`shell_exec`/`exec`/`system`/`passthru`/`popen`）、
+    > `@exec(`、`@popen(`、`@eval($c)`（run_code 通道）与 `$_POST['formData']`。
+    > 且 `__DEC__('密文','密钥')` 的第二参就把 XOR 密钥写在文件里，
+    > 所谓"XOR 加密嵌入"不具备抗提取能力（一条 `php -r` 即可还原全部字符串）。
+    > 另：stub 内嵌 `md5(密码)` 与其前 16 位令牌——**拿到 stub 即等于拿到会话密钥**，
+    > 请像对待私钥一样保管 stub 文件。
+    > 抗查杀能力取决于目标环境的具体规则，本项目不承诺任何免杀效果。
+  - 自定义 HTTP 头鉴权（X-Debug-Key；JSP 用 servlet 报文头原名，ASPX 兼容两种键名）
   - 请求参数业务化 formData；载荷/响应全程加密，**加密方式可选**：
     - `native`：XOR 循环加密（md5 派生密钥，默认）
-    - `native_aes_ecb` / `native_aes_cbc`：AES-256（密钥=md5 hex 全部
+    - `native_aes_ecb` / `native_aes_cbc`：AES-**256**（密钥=md5 hex 全部
       32 字节，CBC 用 md5 后 16 字节作 IV，cipher 名与密钥 XOR 嵌入）
     - `native_des`：DES-ECB（密钥=md5 前 8 字节）
-- **现代流密码自实现变体（NATIVE 骨架 + 纯 PHP 算法，无 eval / 无敏感特征）**：
+- **现代流密码自实现变体（NATIVE 骨架 + 纯 PHP 算法）**：
   - `native_chacha20`：ChaCha20（RFC 8439，TLS 1.3/SSH/WireGuard 标准流密码）
     密钥 = 密码 md5 hex ASCII（256 位），nonce 12 字节随载荷明文携带；
-    请求 counter=0 / 响应 counter=1，载荷 `b64(nonce+密文)`
+    请求 counter=0 / 响应 counter=1（响应使用**全新随机 nonce**，避免与请求
+    密钥流重叠），载荷 `b64(nonce+密文)`
   - `native_rabbit`：Rabbit（RFC 4503，eSTREAM 最终推荐流密码）
     密钥 = 密码 md5（128 位），IV 8 字节随载荷携带；请求密钥流偏移 0 /
-    响应偏移 64 字节（平方运算 16 位拆分，任意 PHP int 位宽精确）
+    响应偏移 64 字节且**响应使用全新随机 IV**（平方运算 16 位拆分，任意 PHP int 位宽精确）
   - 与 native 系列一致：功能函数内置分发（md5 哈希）、crc32b 符号表、
-    X-Debug-Key 头鉴权、formData 参数、**无 eval / 无敏感函数明文**
+    X-Debug-Key 头鉴权、formData 参数
   - 算法在 Rust SDK 与 PHP stub 内各自纯实现（无 openssl/mcrypt），
     以 RFC 官方向量互验（ChaCha20 块/加密向量、Rabbit 密钥/IV 向量）
   - 要求 64 位 PHP（32 位位运算不可靠）
@@ -49,27 +58,36 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
   crc32b 符号表查表调用与字符串拆分，stub 无明文敏感特征；参数为业务语义
   token/data；密钥由连接密码运行时派生；兼容 PHP 5.3+（自加密编码器需
   openssl 扩展）
-- **生成 Webshell**：PHP / ASP / ASPX / JSP 四种语言 × 编码器生成服务端 stub（自加密 stub 含 openssl 解密逻辑；当前连接协议仅 PHP 可用）
-- 分块上传下载（4MB 块 + fseek），上传带进度条
-- **数据库管理**（PDO，MySQL / PostgreSQL / SQLite）：连接探测、数据库/表浏览、SQL 执行、结果网格
-- **请求调试**（协议帧检查器）：进程内环缓冲记录每条协议载荷与响应，密码自动脱敏
+- **生成 Webshell**：PHP / ASP / ASPX / JSP / Python / Node 六种语言 × 编码器生成服务端 stub
+  > 语言可用性（实测口径）：PHP 全功能；Python（CGI）与 Node 可用；
+  > **JSP / ASPX / ASP 当前无法端到端使用**——生成的 stub 未经真实容器验证，
+  > 详见 `docs/优化拓展方案.md` 的「已知缺口」一节，勿用于真实评估。
+- 分块上传下载（块大小可配，默认 4MB；`read/write` 走偏移读取 + 顺序追加写），上传带进度条
+  > 需要**用当前版本重新生成并上传 stub**：旧 stub 未上报 `ChunkedTransfer` 能力，
+  > 客户端会明确报错而不是退化为"整文件返回/从头覆写"
+- **数据库管理**（PDO / JDBC / Python / Node）：连接探测、数据库/表浏览、SQL 执行、结果网格
+- **请求调试**（协议帧检查器）：进程内环缓冲记录每条协议载荷与响应，密码与派生令牌自动脱敏
 - 本地 Mock 协议（默认）：不产生任何网络流量
 - 命令终端（xterm.js，多 Tab、cwd 追踪、历史持久化）、文件管理器、设置页、审计页
 - 命令层异步化（阻塞线程池），网络操作不冻结 UI、多会话互不阻塞
 
-安全姿态（三层防线）：
+安全姿态（三层防线 + 可配置加固）：
 
-1. 真实网络协议**默认关闭**，需在「设置」中二次确认后开启
+1. 真实网络协议**默认关闭**，需在「设置」中二次确认后开启；关闭时会**强制断开**全部活跃会话
 2. 创建 HTTP Shell 时必须勾选「我已确认目标位于授权范围内」
-3. 后端校验 endpoint 落在 Workspace 授权范围内（精确主机 / `*.suffix` / CIDR / 通配），每次操作复查授权到期
+3. 后端校验 endpoint 落在 Workspace 授权范围内（精确主机 / `*.suffix` / CIDR / 通配），每次操作复查授权到期；
+   请求调试与「测试连接」同样受联合范围约束，越界需显式勾选覆盖并记入审计
+4. 「设置 → 安全门禁」可配置：**校验 TLS 证书**（默认关闭，见 SECURITY.md）、
+   **允许任意本地路径**（默认仅限用户目录/临时目录）、**允许 run_code 任意代码执行**
 
 ## 使用真实 PHP 协议
 
 ### 1. 生成服务端 stub（到授权目标）
 
-总览 → 生成 Webshell：选择语言（PHP/ASP/ASPX/JSP）、编码方式（XOR_BASE64 / BASE64）与连接密码，
-生成脚本内容并可保存。上传到目标站点（如 `shell.php`）。stub 不保存明文密码——
-密钥由密码的 md5 派生并内嵌，客户端与 stub 自动一致。
+总览 → 生成 Webshell：选择语言（PHP/ASP/ASPX/JSP/Python/Node）、编码方式
+（默认 `native`，可选 AES/ChaCha20/Rabbit 等）与连接密码，生成脚本内容并可保存。
+上传到目标站点（如 `shell.php`）。stub 不保存明文密码——内嵌的是密码的 md5
+派生密钥（**等价于密码本身，务必保管好 stub**），客户端与 stub 自动一致。
 
 ### 2. 开启真实网络
 
@@ -113,8 +131,14 @@ sudo apt-get install librsvg2-dev libayatana-appindicator3-dev patchelf
 ## 检查
 
 ```bash
-pnpm build
-cargo test --manifest-path src-tauri/Cargo.toml   # 含真实 PHP 往返测试（需本机有 php）
+pnpm check          # TypeScript 类型检查
+pnpm check:ipc      # IPC 契约：前端 invoke 名 ↔ 后端 generate_handler! 注册
+pnpm lint           # ESLint（含 react-hooks 规则）
+pnpm build          # 前端构建
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
+cargo test --workspace                                # 含真实 PHP 往返测试（需本机有 php）
+DOSWORD_REQUIRE_PHP=1 cargo test --workspace           # 缺 php 直接失败（CI 使用，防"跳过＝假绿"）
 ```
 
 ## 跨平台构建

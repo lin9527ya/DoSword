@@ -187,6 +187,12 @@ impl SessionManager {
             .collect()
     }
 
+    /// 全部活跃会话 id（设置变更时批量失效用）。
+    pub fn list_ids(&mut self) -> Vec<String> {
+        self.purge_expired();
+        self.sessions.keys().cloned().collect()
+    }
+
     /// 存活会话数（诊断用；当前无调用点，保留为会话表的自然访问器）。
     #[allow(dead_code)]
     pub fn len(&self) -> usize {

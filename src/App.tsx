@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { api } from "./api";
 import { Layout } from "./components/Layout";
 import { DashboardView } from "./views/DashboardView";
 import { SessionsView } from "./views/SessionsView";
@@ -66,6 +67,12 @@ function App() {
   const closeTab = useCallback((id: string) => {
     setShellTabs((prev) => {
       const index = prev.findIndex((tab) => tab.id === id);
+      const closing = prev[index];
+      // 关闭标签即断开该 Shell 的会话：此前只改数组，会话会一直活到 TTL（4h），
+      // 在「终端会话」页仍可见可用，属于隐式泄漏（PTY 也一并级联清理）。
+      if (closing?.sessionId) {
+        void api.disconnectShell(closing.sessionId).catch(() => {});
+      }
       const next = prev.filter((tab) => tab.id !== id);
       setActiveTab((current) => {
         if (current !== id) return current;

@@ -72,12 +72,15 @@ export function ShellDetailView({
     }
   }, [shellId, sessionId, info, toast]);
 
-  function openTerminal(dir?: string) {
-    const id = ++terminalSeq.current;
-    const target = dir ?? info?.currentDir ?? "/";
-    setTerminals((prev) => [...prev, { id, dir: target }]);
-    setActiveTerminal(id);
-  }
+  const openTerminal = useCallback(
+    (dir?: string) => {
+      const id = ++terminalSeq.current;
+      const target = dir ?? info?.currentDir ?? "/";
+      setTerminals((prev) => [...prev, { id, dir: target }]);
+      setActiveTerminal(id);
+    },
+    [info?.currentDir],
+  );
 
   function closeTerminal(id: number) {
     setTerminals((prev) => {
@@ -91,10 +94,15 @@ export function ShellDetailView({
     setTerminals((prev) => prev.map((item) => (item.id === id ? { ...item, dir } : item)));
   }
 
+  // 建立会话后自动开一个终端；依赖 terminals.length，
+  // 否则手动关掉全部终端后不会再自动打开（此前缺该依赖）
   useEffect(() => {
     if (sessionId && terminals.length === 0) openTerminal();
-  }, [sessionId]);
+  }, [sessionId, terminals.length, openTerminal]);
 
+  // 拉取 Shell 档案与协议能力：只依赖 shellId。
+  // 此前依赖 ensureConnected（随 sessionId/info 变化），导致每次会话状态更新
+  // 都重新拉一次 dashboard + listProtocols（打开一个 Shell 会发 3 次 dashboard）。
   useEffect(() => {
     void api
       .dashboard()
@@ -111,8 +119,11 @@ export function ShellDetailView({
           .catch(() => {});
       })
       .catch((cause) => setError(errorText(cause)));
+  }, [shellId]);
+
+  useEffect(() => {
     void ensureConnected();
-  }, [shellId, ensureConnected]);
+  }, [ensureConnected]);
 
   async function disconnect() {
     if (!sessionId) return;

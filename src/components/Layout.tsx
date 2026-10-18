@@ -56,8 +56,20 @@ export function Layout({
   const activeKey = view.kind === "shell" ? "dashboard" : view.kind;
 
   // 全局快捷键：Ctrl+T 会话页 / Ctrl+N 总览 / Ctrl+R 请求调试 / Ctrl+M 批量文件 / Ctrl+D 数据库 / F5 刷新 / Ctrl+W 关闭标签
+  // 注意：焦点在输入框 / 终端 / 可编辑区时不拦截（否则在终端里按 Ctrl+W 会关标签、
+  // 在路径或 SQL 输入框里按 Ctrl+D 会跳页并丢弃输入）。
   useEffect(() => {
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      const element = target as HTMLElement | null;
+      if (!element || !element.tagName) return false;
+      const tag = element.tagName.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return true;
+      if (element.isContentEditable) return true;
+      // xterm 的输入走隐藏 textarea，但事件目标可能是终端容器
+      return !!element.closest?.(".xterm, .terminal-box, [data-shortcut-scope]");
+    };
     const handler = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target)) return;
       const mod = event.ctrlKey || event.metaKey;
       if (mod && event.key.toLowerCase() === "t") {
         event.preventDefault();

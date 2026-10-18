@@ -12,13 +12,15 @@ use dosword_sdk::domain::AppSettings;
 
 /// 依据全局设置构建 HTTP 客户端（blocking）。
 /// 重定向策略固定为 `none()`：防止密码参数随 301/302 泄露到其他主机。
+/// TLS 校验由 `settings.tls_verify` 控制（默认关闭：被测目标常用自签名证书，
+/// 关闭意味着无法防御中间人；SECURITY.md 已记录该取舍）。
 pub fn build_client(settings: &AppSettings) -> Client {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(settings.default_timeout_secs))
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("DoSword/1.0")
         .cookie_store(true)
-        .danger_accept_invalid_certs(true);
+        .danger_accept_invalid_certs(!settings.tls_verify);
     if let Some(proxy) = settings.proxy.as_deref().filter(|value| !value.is_empty())
         && let Ok(proxy) = reqwest::Proxy::all(proxy)
     {
@@ -27,13 +29,18 @@ pub fn build_client(settings: &AppSettings) -> Client {
     builder.build().expect("构建 HTTP 客户端失败")
 }
 
-/// 快速表单转义（P2）：base64 载荷只需转义 + 与 =；密码等短值额外转义 &（防参数注入）。
+/// 快速表单转义（P2）：base64 载荷只需转义 + 与 =；密码等短值额外转义 & 与 %。
+///
+/// `%` 必须转义为 `%25`：PHP 表单解析会做百分号解码，密码含 `%41` 时
+/// 服务端会拿到 `A`，派生密钥与客户端不一致（鉴权恒失败）；
+/// 同时避免脱敏时"原始密码"与报文中的转义形态对不上。
 /// 相比 url::form_urlencoded 的全量百分号编码，避免对每块（最大 4MB+）载荷
 /// 做一次全串遍历与分配；正斜杠在 PHP 表单解析中原样保留，百分号不出现在 base64 中。
 pub fn form_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
+            '%' => out.push_str("%25"),
             '&' => out.push_str("%26"),
             '+' => out.push_str("%2B"),
             '=' => out.push_str("%3D"),
@@ -132,7 +139,7 @@ pub fn build_client_async(settings: &AppSettings) -> reqwest::Client {
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("DoSword/1.0")
         .cookie_store(true)
-        .danger_accept_invalid_certs(true);
+        .danger_accept_invalid_certs(!settings.tls_verify);
     if let Some(proxy) = settings.proxy.as_deref().filter(|value| !value.is_empty())
         && let Ok(proxy) = reqwest::Proxy::all(proxy)
     {
@@ -155,4 +162,32 @@ pub async fn read_limited_async(
         return Err(format!("响应超过大小上限（{}MB）", max_bytes / 1024 / 1024));
     }
     Ok(bytes.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：`%` 未转义会让密码在 PHP 表单解析后变形（`%41` → `A`），
+    /// 客户端与服务端派生出的密钥不一致，鉴权恒失败。
+    #[test]
+    fn form_escape_covers_percent_and_delimiters() {
+        assert_eq!(form_escape("abc"), "abc");
+        assert_eq!(form_escape("a%41b"), "a%2541b");
+        assert_eq!(form_escape("p&s=s+1"), "p%26s%3Ds%2B1");
+        // base64 字母表（含 + / =）仍可用，且不产生 %XX 序列
+        let b64 = form_escape("QUJD+RA==/x");
+        assert_eq!(b64, "QUJD%2BRA%3D%3D/x");
+        assert!(!b64.contains('%') || b64.matches("%2B").count() == 1);
+    }
+
+    /// 回归：`read_limited` 读上限 +1 字节，调用方据此识别超限。
+    #[test]
+    fn read_limited_boundary() {
+        let data = [7u8; 32];
+        let ok = read_limited(&data[..], 64).unwrap();
+        assert_eq!(ok.len(), 32);
+        let over = read_limited(&data[..], 16).unwrap();
+        assert_eq!(over.len(), 17, "上限+1 用于让调用方识别超限");
+    }
 }

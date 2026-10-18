@@ -20,8 +20,10 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// 记录一条协议请求（由各协议通道的发送函数调用）。
 ///
-/// 性能注意（P1）：先对载荷 / 响应做截断，再执行密码脱敏替换——
-/// 避免对整块（最大 4MB+ base64）字符串做全量 replace 与分配。
+/// 脱敏说明：载荷/响应中可能同时出现密码的**多种形态**——原始密码、
+/// 表单转义形态（`%26`/`%2B`/`%3D`/`%25`）、PHP 单引号转义形态，以及由密码
+/// 派生的 16 位令牌（`X-Debug-Key` 与载荷内 `token`）。全部按长串优先替换。
+/// 先脱敏再截断：反序会让跨截断点的密钥残留半截。
 #[allow(clippy::too_many_arguments)] // 协议帧字段固定，拆结构体反而增加调用方噪声
 pub fn record_request(
     protocol_id: &str,
@@ -33,12 +35,7 @@ pub fn record_request(
     response: &str,
     password: &str,
 ) {
-    // 载荷脱敏：密码字面量替换为 ***（密码为空时跳过，避免 replace("") 异常）
-    let payload = if password.is_empty() {
-        truncate(code)
-    } else {
-        truncate(code).replace(password, "***")
-    };
+    let secrets = secret_variants(password);
     let mut record = RequestRecord {
         id: REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed),
         protocol_id: protocol_id.to_string(),
@@ -47,20 +44,43 @@ pub fn record_request(
         created_at: chrono::Utc::now().to_rfc3339(),
         status,
         duration_ms,
-        payload,
-        response: truncate(response),
+        payload: truncate(&redact(code, &secrets)),
+        response: truncate(&redact(response, &secrets)),
     };
-    // 响应里可能残留明文密码（如 AUTH_FAIL 回显外的场景），一并脱敏
-    record.response = if password.is_empty() {
-        record.response
-    } else {
-        record.response.replace(password, "***")
-    };
+    record.action = record.action.replace('\n', " ");
     let mut log = REQUEST_LOG.lock();
     if log.len() >= DEBUG_LOG_CAP {
         log.pop_front();
     }
     log.push_back(record);
+}
+
+/// 需要脱敏的密文变体（长串优先，避免短变体先命中留下残片）。
+fn secret_variants(password: &str) -> Vec<String> {
+    if password.is_empty() {
+        return Vec::new();
+    }
+    let mut variants = vec![
+        password.to_string(),
+        super::transport::form_escape(password),
+        super::transport::php_single_quote(password),
+    ];
+    // 派生令牌：md5(密码) 前 16 位（头鉴权与分阶段载荷内 token 同值）
+    let digest = dosword_sdk::encoder::md5_hex(password);
+    if digest.len() >= 16 {
+        variants.push(digest[..16].to_string());
+    }
+    variants.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    variants.dedup();
+    variants
+}
+
+fn redact(value: &str, secrets: &[String]) -> String {
+    let mut out = value.to_string();
+    for secret in secrets {
+        out = out.replace(secret.as_str(), "***");
+    }
+    out
 }
 
 fn truncate(value: &str) -> String {
@@ -87,4 +107,44 @@ pub fn list_requests(endpoint: Option<&str>, protocol: Option<&str>) -> Vec<Requ
 /// 清空请求记录。
 pub fn clear_requests() {
     REQUEST_LOG.lock().clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：脱敏必须覆盖密码的各种转义形态与派生令牌，且先脱敏后截断。
+    #[test]
+    fn redaction_covers_escaped_forms_and_derived_token() {
+        let password = "pa%26ss=1+";
+        let token = &dosword_sdk::encoder::md5_hex(password)[..16];
+        let escaped = super::super::transport::form_escape(password);
+        let quoted = super::super::transport::php_single_quote(password);
+        assert_ne!(escaped, password, "该密码应存在转义形态差异");
+        let code = format!("pass={password}&token={token}&q={quoted}&k={escaped}");
+        let variants = secret_variants(password);
+
+        let redacted = redact(&code, &variants);
+        assert!(!redacted.contains(password), "原始密码不应残留：{redacted}");
+        assert!(!redacted.contains(token), "派生令牌不应残留：{redacted}");
+        assert!(!redacted.contains(&escaped), "转义形态不应残留：{redacted}");
+        assert!(
+            !redacted.contains(&quoted),
+            "引号转义形态不应残留：{redacted}"
+        );
+        assert!(redacted.contains("***"));
+
+        // 空密码不应产生任何变体（避免 replace("") 异常）
+        assert!(secret_variants("").is_empty());
+    }
+
+    /// 截断按字符（不是字节），且不会把多字节字符切成半个。
+    #[test]
+    fn truncate_is_char_safe() {
+        let long = "中".repeat(DEBUG_PREVIEW_LEN + 10);
+        let out = truncate(&long);
+        assert!(out.ends_with("…（已截断）"));
+        // 2048 字符 + 换行 + "…（已截断）"
+        assert_eq!(out.chars().count(), DEBUG_PREVIEW_LEN + 1 + 6);
+    }
 }

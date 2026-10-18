@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, b64, errorText } from "../api";
-import type { AppSettings, FeatureManifest, PluginManifest } from "../api";
+import type { AppSettings, FeatureManifest, PluginManifest, ProxyTestResult } from "../api";
 import { Dialog } from "../components/Dialog";
 import { ErrorBanner, Metric, Panel, UpwardPageSizeSelect } from "../components/common";
 import { applyTheme, THEME_KEY, currentTheme } from "../theme";
@@ -56,6 +56,8 @@ export function SettingsView() {
   const [saved, setSaved] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState(false);
   const [backupDir, setBackupDir] = useState(() => localStorage.getItem("dosword:backup-dir") ?? "");
+  // 输入草稿：逐字符只改草稿，失焦/回车/点「立即备份」才提交（避免每敲一键触发全量备份）
+  const [backupDirDraft, setBackupDirDraft] = useState(backupDir);
   const [backupEnabled, setBackupEnabled] = useState(() => localStorage.getItem("dosword:backup-enabled") === "1");
   const [backupNote, setBackupNote] = useState("");
   const [customStub, setCustomStub] = useState("");
@@ -64,12 +66,7 @@ export function SettingsView() {
 
   // 代理连通性测试状态
   const [proxyTesting, setProxyTesting] = useState(false);
-  const [proxyTestResult, setProxyTestResult] = useState<{
-    ok: boolean;
-    latency_ms: number;
-    message: string;
-    exit_ip?: string | null;
-  } | null>(null);
+  const [proxyTestResult, setProxyTestResult] = useState<ProxyTestResult | null>(null);
 
   async function handleTestProxy() {
     if (!settings) return;
@@ -79,13 +76,13 @@ export function SettingsView() {
       const res = await api.testProxyUpstream(settings.proxy, settings.defaultTimeoutSecs);
       setProxyTestResult(res);
       if (res.ok) {
-        toast.success(res.message, `代理连通有效 (${res.latency_ms}ms)`);
+        toast.success(res.message, `代理连通有效 (${res.latencyMs}ms)`);
       } else {
         toast.error(res.message, "代理测试失败");
       }
     } catch (e) {
       const msg = errorText(e);
-      setProxyTestResult({ ok: false, latency_ms: 0, message: msg });
+      setProxyTestResult({ ok: false, latencyMs: 0, message: msg, exitIp: null });
       toast.error(msg, "代理测试异常");
     } finally {
       setProxyTesting(false);
@@ -280,16 +277,20 @@ export function SettingsView() {
     }
   }
 
+  /// 提交备份配置（输入框的每次按键不再触发落盘与提示）。
   function saveBackupConfig(enabled: boolean, dir: string) {
     setBackupEnabled(enabled);
     setBackupDir(dir);
     localStorage.setItem("dosword:backup-enabled", enabled ? "1" : "0");
-    localStorage.setItem("dosword:backup-dir", dir);
+    localStorage.setItem("dosword:backup-dir", dir.trim());
     toast.info(enabled ? "已开启定时自动备份 (每小时导出)" : "已关闭自动备份");
   }
 
+  // 自动备份定时器：只在「开关 / 已提交目录」变化时重建，
+  // 输入框逐字符变化不再触发全量备份（此前每敲一键 = 一次导出 + 一条提示）。
   useEffect(() => {
     if (!backupEnabled) return;
+    if (!backupDir.trim()) return;
     void runBackup();
     const timer = setInterval(() => void runBackup(), 60 * 60 * 1000);
     return () => clearInterval(timer);
@@ -482,6 +483,55 @@ export function SettingsView() {
                 }
               />
             </label>
+
+            <label className="toggle-row">
+              <div>
+                <strong>校验目标 TLS 证书</strong>
+                <span>
+                  默认关闭：被测目标常用自签名证书。关闭时无法防御中间人攻击，
+                  请仅在可信网络中使用；开启后要求证书链可信。
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.tlsVerify}
+                onChange={(event) => setSettings({ ...settings, tlsVerify: event.target.checked })}
+              />
+            </label>
+
+            <label className="toggle-row">
+              <div>
+                <strong>允许任意本地路径（导入/导出/下载/备份）</strong>
+                <span>
+                  默认仅允许用户主目录与系统临时目录内的路径；开启后其余目录也可读写
+                  （系统目录始终拒绝）。仅在确有需要时开启。
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.allowArbitraryLocalPaths}
+                onChange={(event) =>
+                  setSettings({ ...settings, allowArbitraryLocalPaths: event.target.checked })
+                }
+              />
+            </label>
+
+            <label className="toggle-row">
+              <div>
+                <strong>允许 run_code 任意代码执行通道</strong>
+                <span>
+                  关闭后功能插件中的代码执行/部分 Bypass 向量会被拒绝；
+                  命令、文件、数据库与终端不受影响。
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                checked={settings.allowArbitraryCode}
+                onChange={(event) =>
+                  setSettings({ ...settings, allowArbitraryCode: event.target.checked })
+                }
+              />
+            </label>
           </div>
         </Panel>
       )}
@@ -601,15 +651,15 @@ export function SettingsView() {
                       {proxyTestResult.ok ? "✅ " : "❌ "}
                       {proxyTestResult.message}
                     </div>
-                    {proxyTestResult.exit_ip && (
+                    {proxyTestResult.exitIp && (
                       <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>
-                        出口 IP: <code>{proxyTestResult.exit_ip}</code>
+                        出口 IP: <code>{proxyTestResult.exitIp}</code>
                       </div>
                     )}
                   </div>
                   {proxyTestResult.ok && (
                     <span className="badge" style={{ background: "rgba(34, 197, 94, 0.15)", color: "var(--success)" }}>
-                      耗时 {proxyTestResult.latency_ms}ms
+                      耗时 {proxyTestResult.latencyMs}ms
                     </span>
                   )}
                 </div>
@@ -1056,18 +1106,29 @@ export function SettingsView() {
               <input
                 type="checkbox"
                 checked={backupEnabled}
-                onChange={(event) => saveBackupConfig(event.target.checked, backupDir)}
+                onChange={(event) => saveBackupConfig(event.target.checked, backupDirDraft)}
               />
             </label>
             <div className="repeater-row" style={{ marginTop: 8 }}>
               <input
                 className="backup-dir"
-                value={backupDir}
-                onChange={(event) => saveBackupConfig(backupEnabled, event.target.value)}
+                value={backupDirDraft}
+                onChange={(event) => setBackupDirDraft(event.target.value)}
+                onBlur={() => saveBackupConfig(backupEnabled, backupDirDraft)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") saveBackupConfig(backupEnabled, backupDirDraft);
+                }}
                 placeholder="本地备份绝对路径，例如 /home/kali/dosword-backups"
                 spellCheck={false}
               />
-              <button className="button primary compact" onClick={() => void runBackup()} disabled={!backupDir.trim()}>
+              <button
+                className="button primary compact"
+                onClick={() => {
+                  saveBackupConfig(backupEnabled, backupDirDraft);
+                  void runBackup();
+                }}
+                disabled={!backupDirDraft.trim()}
+              >
                 立即备份
               </button>
             </div>

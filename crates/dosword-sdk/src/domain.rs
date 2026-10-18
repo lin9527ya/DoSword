@@ -161,6 +161,20 @@ pub struct ImportResult {
     pub skipped: usize,
 }
 
+/// 代理连通性测试结果（设置页「测试代理连通性」）。
+///
+/// `exit_ip` 仅在探测地址返回极短的纯 IP 文本时回填（如 `api.ipify.org`），
+/// 其他探测地址一律为 `None`。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestResult {
+    pub ok: bool,
+    #[ts(type = "number")]
+    pub latency_ms: u64,
+    pub message: String,
+    pub exit_ip: Option<String>,
+}
+
 /// 全局应用设置（app_settings 表单行 JSON）。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -189,6 +203,22 @@ pub struct AppSettings {
     /// 传输压缩（gzip，目标支持 zlib 时启用，大文件/慢网络加速）。
     #[serde(default = "default_gzip")]
     pub gzip_enabled: bool,
+    /// 是否校验 TLS 证书（默认 **false**：被测目标常用自签名证书，
+    /// 严格校验会让工具不可用；开启后需目标证书链可信）。
+    #[serde(default = "default_tls_verify")]
+    pub tls_verify: bool,
+    /// 是否允许读写任意本地路径（默认 false：仅限用户目录 / 系统临时目录）。
+    /// 影响导入导出、下载保存与备份目录；敏感系统目录始终拒绝。
+    #[serde(default = "default_allow_any_path")]
+    pub allow_arbitrary_local_paths: bool,
+}
+
+fn default_tls_verify() -> bool {
+    false
+}
+
+fn default_allow_any_path() -> bool {
+    false
 }
 
 fn default_gzip() -> bool {
@@ -218,6 +248,8 @@ impl Default for AppSettings {
             max_file_size_mb: 32,
             audit_retention_days: 90,
             gzip_enabled: true,
+            tls_verify: false,
+            allow_arbitrary_local_paths: false,
         }
     }
 }
@@ -432,8 +464,13 @@ mod ts_bindings {
             ("DbQueryResult", DbQueryResult::decl()),
             ("RequestRecord", RequestRecord::decl()),
             ("GenerateShellResult", GenerateShellResult::decl()),
+            ("HttpSendResult", HttpSendResult::decl()),
+            ("ImportResult", ImportResult::decl()),
+            ("ProxyTestResult", ProxyTestResult::decl()),
             ("PluginManifest", crate::plugin::PluginManifest::decl()),
             ("PluginKind", crate::plugin::PluginKind::decl()),
+            ("FeatureManifest", crate::plugin::FeatureManifest::decl()),
+            ("ParamSpec", crate::plugin::ParamSpec::decl()),
         ];
         types
     }

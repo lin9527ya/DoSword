@@ -113,6 +113,40 @@ pub fn require_session_alive(db: &Database, shell: &ShellProfile) -> Result<(), 
     check_workspace_authorized(workspace.as_ref())
 }
 
+/// 端点是否落在**任一** Workspace 的授权范围内（联合范围）。
+///
+/// 用于没有绑定具体 Shell 的原始发包入口（请求调试 `http_send`、
+/// 登记前连通性测试 `test_connection`）：这些入口此前只检查全局开关，
+/// 可以打任意主机（含 127.0.0.1 / 169.254.169.254），与 README 宣称的
+/// 「后端校验 endpoint 落在授权范围内」不一致。
+///
+/// 返回 Ok(说明) 表示命中；Err 表示未命中任何范围（调用方可要求显式覆盖）。
+pub fn require_in_any_scope(db: &Database, endpoint: &str) -> Result<String, String> {
+    let url = Url::parse(endpoint).map_err(|_| "端点解析失败，已按禁止处理".to_string())?;
+    let workspaces = db
+        .dashboard()
+        .map_err(|error| format!("读取授权范围失败：{error}"))?
+        .workspaces;
+    let mut expired_hits: Vec<String> = Vec::new();
+    for workspace in &workspaces {
+        let (allowed, reason) = scope_allows(&workspace.authorization_scope, &url);
+        if !allowed {
+            continue;
+        }
+        // 命中范围但已过期：不算放行，但要给出可诊断的原因
+        if check_workspace_authorized(Some(workspace)).is_err() {
+            expired_hits.push(format!("{}（{}，已过期）", workspace.name, reason));
+            continue;
+        }
+        return Ok(format!("{}：{}", workspace.name, reason));
+    }
+    if expired_hits.is_empty() {
+        Err("目标不在任何 Workspace 的授权范围内".to_string())
+    } else {
+        Err(format!("命中的授权范围已过期：{}", expired_hits.join("；")))
+    }
+}
+
 /// P5：基于快照的过期检查（免查库）。快照缺失/为空视为未设置过期。
 pub fn workspace_alive_from_snapshot(expires_at: Option<&str>) -> Result<(), String> {
     match expires_at {
@@ -282,5 +316,27 @@ mod tests {
         let result = require_authorized(&db, &shell);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("不在授权范围内"));
+    }
+
+    #[test]
+    fn union_scope_allows_hit_and_rejects_outsider() {
+        let db = db_with_workspace("*.corp.example, 10.0.0.0/8", None);
+        // 命中任一范围即可（原始发包入口用联合范围校验）
+        assert!(require_in_any_scope(&db, "https://a.corp.example/x.php").is_ok());
+        assert!(require_in_any_scope(&db, "http://10.1.2.3/x.php").is_ok());
+        // 范围外（含云元数据地址）一律拒绝
+        let err =
+            require_in_any_scope(&db, "http://169.254.169.254/latest/meta-data/").unwrap_err();
+        assert!(err.contains("不在任何 Workspace"), "{err}");
+        assert!(require_in_any_scope(&db, "http://127.0.0.1:8080/").is_err());
+        // 非法 URL 失败即拒绝
+        assert!(require_in_any_scope(&db, "not-a-url").is_err());
+    }
+
+    #[test]
+    fn union_scope_rejects_expired_workspace_hit() {
+        let db = db_with_workspace("localhost", Some("2000-01-01T00:00:00+08:00".into()));
+        let err = require_in_any_scope(&db, "http://localhost/a.php").unwrap_err();
+        assert!(err.contains("过期"), "{err}");
     }
 }

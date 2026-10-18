@@ -203,10 +203,12 @@ export function FileManager({
     }
     const sorted = [...list].sort((a, b) => {
       if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-      let r = 0;
-      if (sortBy === "size") r = a.size - b.size;
-      else if (sortBy === "modified") r = (a.modified ?? "").localeCompare(b.modified ?? "");
-      else r = a.name.localeCompare(b.name);
+      const r =
+        sortBy === "size"
+          ? a.size - b.size
+          : sortBy === "modified"
+            ? (a.modified ?? "").localeCompare(b.modified ?? "")
+            : a.name.localeCompare(b.name);
       return r * sortDir;
     });
     return sorted;
@@ -1294,6 +1296,12 @@ export function FileManager({
                 className="button primary"
                 onClick={async () => {
                   const mode = chmodValue.trim();
+                  // 权限码必须严格校验：该值会被拼进远端命令，且默认值来自
+                  // 目标返回的 perms 字段（被控目标可注入 `0755;cmd`）。
+                  if (!/^[0-7]{3,4}$/.test(mode)) {
+                    toast.error("权限码必须为 3-4 位八进制数字（如 0755 / 644）", "格式非法");
+                    return;
+                  }
                   try {
                     const res = await api.executeCommand(sessionId, `chmod ${mode} "${chmodTarget.path}"`);
                     const out = (res.stdout || "").toLowerCase();

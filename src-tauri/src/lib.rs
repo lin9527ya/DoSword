@@ -188,6 +188,7 @@ pub fn run() {
             commands::run_feature_plugin,
             commands::refresh_shell_status,
             commands::http_send,
+            commands::test_proxy_upstream,
             commands::encode_text,
             commands::backup_shells,
             commands::batch_update_shells,

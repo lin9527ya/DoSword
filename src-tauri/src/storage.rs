@@ -689,6 +689,8 @@ mod tests {
             allow_arbitrary_code: true,
             audit_retention_days: 30,
             gzip_enabled: true,
+            tls_verify: false,
+            allow_arbitrary_local_paths: false,
         };
         db.update_settings(&updated).unwrap();
         let loaded = db.get_settings().unwrap();

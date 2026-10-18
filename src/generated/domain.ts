@@ -84,7 +84,17 @@ auditRetentionDays: number,
 /**
  * 传输压缩（gzip，目标支持 zlib 时启用，大文件/慢网络加速）。
  */
-gzipEnabled: boolean, };
+gzipEnabled: boolean, 
+/**
+ * 是否校验 TLS 证书（默认 **false**：被测目标常用自签名证书，
+ * 严格校验会让工具不可用；开启后需目标证书链可信）。
+ */
+tlsVerify: boolean, 
+/**
+ * 是否允许读写任意本地路径（默认 false：仅限用户目录 / 系统临时目录）。
+ * 影响导入导出、下载保存与备份目录；敏感系统目录始终拒绝。
+ */
+allowArbitraryLocalPaths: boolean, };
 export type CommandOutput = { stdout: string, durationMs: number, 
 /**
  * 命令执行后的服务器工作目录（终端据此更新提示符）。
@@ -153,6 +163,9 @@ filename: string,
  * 脚本内容。
  */
 content: string, };
+export type HttpSendResult = { status: number, statusText: string, headers: Array<[string, string]>, body: string, durationMs: number, };
+export type ImportResult = { imported: number, skipped: number, };
+export type ProxyTestResult = { ok: boolean, latencyMs: number, message: string, exitIp: string | null, };
 export type PluginManifest = { id: string, name: string, version: string, kind: PluginKind, description: string, 
 /**
  * 声明的能力列表：["files"] ["terminal"] ["database"] 等。
@@ -160,3 +173,29 @@ export type PluginManifest = { id: string, name: string, version: string, kind: 
  */
 capabilities: Array<string>, };
 export type PluginKind = "protocol" | "feature";
+export type FeatureManifest = { id: string, name: string, version: string, description: string, 
+/**
+ * 类别：general（通用）/ php / jsp / aspnet（语言专用）。
+ */
+category: string, 
+/**
+ * 支持的语言（协议 runtime）：["php","jsp","aspnet"]；空 = 通用。
+ */
+languages: Array<string>, 
+/**
+ * 参数 schema。
+ */
+params: Array<ParamSpec>, 
+/**
+ * 插件类型：feature（功能）/ crypto（加密器）/ loader（加载器），默认 feature。
+ */
+kind: string, };
+export type ParamSpec = { name: string, label: string, 
+/**
+ * "string" | "int" | "bool" | "select"
+ */
+type: string, default: string | number | boolean | null, 
+/**
+ * select 选项。
+ */
+options: Array<string> | null, };

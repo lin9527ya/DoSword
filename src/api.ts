@@ -22,37 +22,13 @@ import type {
   RequestRecord,
   PluginManifest,
   GenerateShellResult,
+  HttpSendResult,
+  ImportResult,
+  ProxyTestResult,
+  FeatureManifest,
 } from "./generated/domain";
 
 export type * from "./generated/domain";
-
-// 功能插件类型（ts-rs 生成的 domain.ts 未包含，本地定义）
-export type ParamSpec = {
-  name: string;
-  label: string;
-  type: string;
-  default: string | number | boolean | null;
-  options: string[] | null;
-};
-
-export type HttpSendResult = {
-  status: number;
-  statusText: string;
-  headers: [string, string][];
-  body: string;
-  durationMs: number;
-};
-
-export type FeatureManifest = {
-  id: string;
-  name: string;
-  version: string;
-  description: string;
-  category: string;
-  languages: string[];
-  params: ParamSpec[];
-  kind: string;
-};
 
 // --- invoke 封装 ---
 
@@ -106,7 +82,7 @@ export const api = {
   exportShells: () => invoke<string>("export_shells"),
   backupShells: (backupDir: string) => invoke<string>("backup_shells", { backupDir }),
   importShells: (payload: string, workspaceId: string) =>
-    invoke<{ imported: number; skipped: number }>("import_shells", { payload, workspaceId }),
+    invoke<ImportResult>("import_shells", { payload, workspaceId }),
   readLocalFile: (path: string) => invoke<string>("read_local_file", { path }),
   encodeText: (text: string, encoding: string) =>
     invoke<string>("encode_text", { text, encoding }),
@@ -115,12 +91,15 @@ export const api = {
     tags?: string[],
     password?: string,
   ) => invoke<number>("batch_update_shells", { ids, tags, password }),
-  httpSend: (request: {
-    method: string;
-    url: string;
-    headers: [string, string][];
-    body: string;
-  }) => invoke<HttpSendResult>("http_send", request),
+  httpSend: (
+    request: {
+      method: string;
+      url: string;
+      headers: [string, string][];
+      body: string;
+    },
+    allowUnscoped?: boolean,
+  ) => invoke<HttpSendResult>("http_send", { ...request, allowUnscoped: allowUnscoped ?? false }),
   listEncoders: () => invoke<[string, string][]>("list_encoders"),
   registerCustomEncoder: (stub: string) => invoke<void>("register_custom_encoder", { stub }),
   generateShell: (language: string, encoderId: string, password: string, session: boolean) =>
@@ -135,6 +114,7 @@ export const api = {
     protocolId: string,
     protocolParams?: string,
     runtime?: string,
+    allowUnscoped?: boolean,
   ) =>
     invoke<ProbeResult>("test_connection", {
       endpoint,
@@ -142,13 +122,18 @@ export const api = {
       protocolId,
       protocolParams,
       runtime,
+      allowUnscoped: allowUnscoped ?? false,
     }),
   getSettings: () => invoke<AppSettings>("get_settings"),
   updateSettings: (input: AppSettings) => invoke<void>("update_settings", { input }),
   connectShell: (shellId: string) => invoke<ConnectResult>("connect_shell", { shellId }),
   disconnectShell: (sessionId: string) => invoke<void>("disconnect_shell", { sessionId }),
   getSessionProbe: (sessionId: string) => invoke<ProbeResult>("get_session_probe", { sessionId }),
-  startPty: (sessionId: string) => invoke<{ ptyId: string; port: number }>("start_pty_session", { sessionId }),
+  startPty: (sessionId: string, callbackHost?: string | null) =>
+    invoke<{ ptyId: string; port: number; callbackHost: string }>("start_pty_session", {
+      sessionId,
+      callbackHost: callbackHost ?? null,
+    }),
   ptyWrite: (ptyId: string, dataB64: string) => invoke<void>("pty_write", { ptyId, dataB64 }),
   ptyRead: (ptyId: string) => invoke<{ data: string; closed: boolean; error?: string }>("pty_read", { ptyId }),
   ptyClose: (ptyId: string) => invoke<void>("pty_close", { ptyId }),
@@ -184,11 +169,12 @@ export const api = {
   listRequestLog: (endpoint?: string | null) =>
     invoke<RequestRecord[]>("list_request_log", { endpoint: endpoint ?? null }),
   clearRequestLog: () => invoke<void>("clear_request_log"),
-  testProxyUpstream: (proxy?: string | null, timeoutSecs?: number | null) =>
-    invoke<{ ok: boolean; latency_ms: number; message: string; exit_ip?: string | null }>(
-      "test_proxy_upstream",
-      { proxy: proxy ?? null, timeoutSecs: timeoutSecs ?? null }
-    ),
+  testProxyUpstream: (proxy?: string | null, timeoutSecs?: number | null, probeUrl?: string | null) =>
+    invoke<ProxyTestResult>("test_proxy_upstream", {
+      proxy: proxy ?? null,
+      timeoutSecs: timeoutSecs ?? null,
+      probeUrl: probeUrl ?? null,
+    }),
 };
 
 // --- Base64 工具（编辑器/上传下载用） ---

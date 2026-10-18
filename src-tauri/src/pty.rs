@@ -81,6 +81,11 @@ impl PtyRegistry {
         self.owner.lock().remove(id);
     }
 
+    /// 该 PTY 归属的 Shell 会话 id（供命令层复检授权/存活状态）。
+    pub fn owner_of(&self, id: &str) -> Option<String> {
+        self.owner.lock().get(id).cloned()
+    }
+
     /// 清理某 Shell 会话关联的全部 PTY（断开 Shell 时调用）。
     pub fn close_for_session(&self, session_id: &str) {
         let ids: Vec<String> = self

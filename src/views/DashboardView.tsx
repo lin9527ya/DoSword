@@ -993,6 +993,8 @@ function ShellDialog({
   const [settings, setSettings] = useState<{ httpEnabled: boolean }>({ httpEnabled: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // 连通性测试默认要求目标命中某个 Workspace 的授权范围
+  const [allowUnscoped, setAllowUnscoped] = useState(false);
   const [testState, setTestState] = useState<
     { busy: boolean; ok: boolean; message: string } | null
   >(null);
@@ -1017,6 +1019,7 @@ function ShellDialog({
           ? JSON.stringify({ encoder: encoderId })
           : undefined,
         String(form.get("runtime") ?? "php"),
+        allowUnscoped,
       );
       setTestState({
         busy: false,
@@ -1187,6 +1190,16 @@ function ShellDialog({
               <label className="confirm-row">
                 <input name="confirm" type="checkbox" required />
                 <span>我已确认该端点位于所属 Workspace 授权范围内</span>
+              </label>
+            )}
+            {!editing && settings.httpEnabled && (
+              <label className="confirm-row" title="默认仅允许命中某个 Workspace 授权范围的目标">
+                <input
+                  type="checkbox"
+                  checked={allowUnscoped}
+                  onChange={(event) => setAllowUnscoped(event.target.checked)}
+                />
+                <span>允许未授权范围目标（越界测试将记入审计日志）</span>
               </label>
             )}
             {!editing && !settings.httpEnabled && (
