@@ -157,6 +157,18 @@ Claude Desktop / Cursor / 自研 agent。**默认关闭**，且只监听 `127.0.
 「待确认操作」；点「批准」后 **120 秒内、参数完全一致**的重试才会执行（一次性消费，
 再次调用需再次批准）。这样「模型想执行什么」始终由人过目。
 
+### 资源与提示词
+
+除工具外还提供只读**资源**（客户端可主动引用/附加到上下文）与一个**指引提示词**：
+
+| 资源 | 内容 |
+|---|---|
+| dosword://shells | 已登记 Shell 的脱敏摘要（无密码，仅 hasPassword） |
+| dosword://sessions | 活跃会话（sessionId / profileId / server / lastUsedAt） |
+| dosword://audit/recent | 最近 20 条审计事件（含命令原文，请谨慎外传） |
+
+提示词 dosword_guidance：说明授权边界、三级权限、执行级确认流程与安全用法。
+
 ### 观测
 
 - 每次调用写审计 `mcp.<tool>`（含 `denied` / `pending` / `error`），可在「审计轨迹」按 `mcp.` 过滤。

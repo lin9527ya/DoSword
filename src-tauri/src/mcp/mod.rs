@@ -15,6 +15,7 @@
 
 pub mod auth;
 pub mod redact;
+mod resources;
 mod server;
 mod tools;
 

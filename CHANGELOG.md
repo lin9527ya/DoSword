@@ -28,6 +28,9 @@
     pending_approvals/resolve_approval`；设置页新增「AI / MCP」页签
     （状态、端口、令牌、三级开关、确认模式、客户端配置一键复制、待确认操作、调用日志）
   - 新增底层命令 `read_chunk`（与 `write_chunk` 对称的偏移读，返回 `FileChunk`）
+  - 资源与提示词：`dosword://shells` / `dosword://sessions` / `dosword://audit/recent`
+    三个只读资源（经脱敏层、审计详情截断）与提示词 `dosword_guidance`
+    （授权边界、三级权限、执行级确认流程、安全用法）；`get_info` 已宣告 resources/prompts 能力
   - 明确不暴露：Workspace/Shell 增删改、插件安装、改设置、本地文件读写、`http_send`、PTY
   - `cargo build --no-default-features` 可完全裁掉 MCP 模块与 rmcp/axum 依赖树
 

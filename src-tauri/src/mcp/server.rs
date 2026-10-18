@@ -32,7 +32,61 @@ pub struct DoswordMcp {
 #[rmcp::tool_handler]
 impl ServerHandler for DoswordMcp {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, rmcp::model::ErrorData> {
+        Ok(rmcp::model::ListResourcesResult::with_all_items(
+            super::resources::list_resources(),
+        ))
+    }
+
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, rmcp::model::ErrorData> {
+        match super::resources::read_resource(&self.app, &request.uri) {
+            Ok(contents) => Ok(rmcp::model::ReadResourceResult::new(contents).into()),
+            Err(message) => Err(rmcp::model::ErrorData::resource_not_found(
+                message,
+                Some(serde_json::json!({ "uri": request.uri })),
+            )),
+        }
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::ListPromptsResult, rmcp::model::ErrorData> {
+        Ok(rmcp::model::ListPromptsResult::with_all_items(
+            super::resources::list_prompts(),
+        ))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResponse, rmcp::model::ErrorData> {
+        match super::resources::get_prompt(&request.name) {
+            Some(messages) => Ok(rmcp::model::GetPromptResult::new(messages).into()),
+            None => Err(rmcp::model::ErrorData::invalid_params(
+                format!("未知提示词：{}", request.name),
+                None,
+            )),
+        }
     }
 }
 
