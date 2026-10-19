@@ -12,6 +12,7 @@ pub mod encoder;
 pub mod feature_plugins;
 pub mod jsp_stub;
 pub mod node_stub;
+pub mod php_impl;
 pub mod plugin;
 pub mod protocol;
 pub mod python_stub;

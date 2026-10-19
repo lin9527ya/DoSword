@@ -123,6 +123,24 @@ pub fn gunzip_if_needed(text: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(out)
 }
 
+/// gzip：响应**字节**若为 gzip 流则解压（按魔数 1f 8b 判断），否则原样返回。
+///
+/// 与 [`gunzip_if_needed`] 的区别：后者处理 base64 文本（NATIVE 的密文层压缩），
+/// 本函数处理二进制流（分阶段载荷的帧内压缩：帧内容先 gzip 再 base64，
+/// 客户端 base64 解码后拿到的是 gzip 字节，不能先做 UTF-8 转换）。
+pub fn gunzip_bytes_if_needed(bytes: Vec<u8>) -> Vec<u8> {
+    use std::io::Read;
+    if bytes.len() < 2 || bytes[0] != 0x1f || bytes[1] != 0x8b {
+        return bytes;
+    }
+    let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut out = Vec::new();
+    match decoder.read_to_end(&mut out) {
+        Ok(_) => out,
+        Err(_) => bytes,
+    }
+}
+
 /// S10：流式读取响应（上限 max_bytes+1），避免恶意目标撑爆内存。
 pub fn read_limited<R: std::io::Read>(reader: R, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read;

