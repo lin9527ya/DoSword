@@ -8,8 +8,8 @@ use dosword_sdk::domain::{
     AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
     CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing, FileChunk,
     FileContent, GenerateShellResult, HttpSendResult, ImportResult, MemoryShell,
-    MemshellCapability, ProbeResult, ProtocolMeta, ProxyTestResult, RequestRecord, SessionInfo,
-    ShellProfile, TransferOutcome, UpdateShell, UpdateWorkspace, Workspace,
+    MemshellCapability, PlaybookReport, ProbeResult, ProtocolMeta, ProxyTestResult, RequestRecord,
+    SessionInfo, ShellProfile, TransferOutcome, UpdateShell, UpdateWorkspace, Workspace,
 };
 use dosword_sdk::encoder::{EncoderRegistry, STUB_LANGUAGES};
 use dosword_sdk::plugin::FeaturePlugin;
@@ -1851,7 +1851,10 @@ pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectRe
 }
 
 /// 建立会话的内部实现，返回 `(探测结果, session_id)`。供命令层与批量编排复用。
-fn connect_shell_impl(state: &AppState, shell_id: &str) -> Result<(ConnectResult, String), String> {
+pub fn connect_shell_impl(
+    state: &AppState,
+    shell_id: &str,
+) -> Result<(ConnectResult, String), String> {
     let (shell, settings) = load_shell_and_settings(state, shell_id)?;
     let _auth_reason = require_authorized_for(state, &shell, &settings)?;
 
@@ -2158,25 +2161,53 @@ pub async fn get_session_probe(session_id: String, app: AppHandle) -> Result<Pro
 
 #[tauri::command]
 pub async fn disconnect_shell(session_id: String, app: AppHandle) -> Result<(), String> {
+    blocking(app, move |state| disconnect_shell_impl(state, &session_id)).await
+}
+
+/// 断开会话的内部实现（命令层与 Playbook 共用）。
+pub fn disconnect_shell_impl(state: &AppState, session_id: &str) -> Result<(), String> {
+    if let Some(session) = state
+        .sessions
+        .lock()
+        .map_err(|_| "会话锁异常".to_string())?
+        .remove(session_id)
+    {
+        // F2：断开会话时级联清理其全部 PTY 流
+        state.ptys.close_for_session(session_id);
+        audit(
+            state,
+            &session.workspace_id,
+            Some(&session.profile_id),
+            "shell.disconnect",
+            "success",
+            "断开连接",
+        );
+    }
+    Ok(())
+}
+
+/// W6：执行一份 YAML Playbook（CI / 脚本化回归）。
+///
+/// 动作直接复用服务层（授权复查、审计、会话管理全部沿用既有门禁）；
+/// 返回逐步骤报告，任何一步失败（含断言）`ok=false`，便于 CI 判定。
+#[tauri::command]
+pub async fn run_playbook(yaml: String, app: AppHandle) -> Result<PlaybookReport, String> {
     blocking(app, move |state| {
-        if let Some(session) = state
-            .sessions
-            .lock()
-            .map_err(|_| "会话锁异常".to_string())?
-            .remove(&session_id)
-        {
-            // F2：断开会话时级联清理其全部 PTY 流
-            state.ptys.close_for_session(&session_id);
-            audit(
-                state,
-                &session.workspace_id,
-                Some(&session.profile_id),
-                "shell.disconnect",
-                "success",
-                "断开连接",
-            );
-        }
-        Ok(())
+        let report = crate::playbook::run(state, &yaml)?;
+        audit(
+            state,
+            "system",
+            None,
+            "playbook.run",
+            if report.ok { "success" } else { "error" },
+            &format!(
+                "Playbook「{}」：{} 步，{}",
+                report.name,
+                report.steps.len(),
+                if report.ok { "通过" } else { "失败" }
+            ),
+        );
+        Ok(report)
     })
     .await
 }
@@ -2246,16 +2277,16 @@ pub async fn heartbeat_sessions(app: AppHandle) -> Result<Vec<SessionInfo>, Stri
 // 最后锁内写审计。
 
 /// 会话命令上下文：会话、所属 Shell 与全局设置（已通过授权复查）。
-struct SessionCtx<'a> {
-    workspace_id: String,
-    shell: ShellProfile,
-    settings: AppSettings,
-    protocol: &'a dyn Protocol,
+pub struct SessionCtx<'a> {
+    pub workspace_id: String,
+    pub shell: ShellProfile,
+    pub settings: AppSettings,
+    pub protocol: &'a dyn Protocol,
 }
 
 /// 从会话 ID 解析出会话命令上下文。
 /// 锁内完成：会话取出 → Shell 查询 → 授权轻量复查（仅过期检查）→ 协议解析。
-fn session_ctx<'a>(state: &'a AppState, session_id: &str) -> Result<SessionCtx<'a>, String> {
+pub fn session_ctx<'a>(state: &'a AppState, session_id: &str) -> Result<SessionCtx<'a>, String> {
     let (profile_id, protocol_id, cached_profile, cached_settings, cached_workspace_expires) = {
         let mut sessions = state
             .sessions
@@ -2333,7 +2364,7 @@ fn acquire_token(
     }
 }
 
-fn with_session<T>(
+pub fn with_session<T>(
     state: &AppState,
     session_id: &str,
     mut f: impl FnMut(&dyn SessionState) -> Result<T, ProtocolError>,

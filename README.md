@@ -110,6 +110,18 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
     远端大小未变时续传，完成后原子改名
   - **背压**：每会话一个令牌桶（PTY 轮询与文件分块共享，容量 120 / 每秒补充 40），
     超限返回明确错误或空轮询，避免 agent 高频请求打满目标
+- **扩展与自动化（W6）**
+  - **WASM 沙箱插件**：插件目录下的 `<name>.wasm` + 同名 `<name>.wasm.json` 清单。
+    插件只能调用**声明过**的宿主能力（`fs.read` 限于插件目录内、`http`、`exec`），
+    未声明的导入在实例化阶段即失败；每次执行新建 Store，燃料 5×10⁷、内存上限 64 MiB，
+    宿主调用 10s 超时 / 1 MiB 结果上限。
+  - **Playbook**：YAML 描述批量操作（connect / disconnect / exec / list_dir / read_file /
+    write_file / db_probe / db_query / plugin），支持 `${步骤id.字段}` 变量与
+    `contains` / `equals` 断言；失败默认中止，`continue_on_error` 可覆盖。
+    动作用的是与 GUI/MCP 相同的服务层（授权复查与审计一致），不依赖 MCP 服务是否开启。
+  - **CLI**：`dosword-cli` 复用桌面端同一服务层与数据目录，子命令
+    `shells` / `exec` / `fs ls|read|write` / `db query` / `playbook run` / `stub generate`，
+    全部支持 `--json`，便于脚本与 agent 调度。
 - **生成 Webshell**：PHP / ASP / ASPX / JSP / Python / Node 六种语言 × 编码器生成服务端 stub
   > 语言可用性（实测口径）：PHP 全功能；Python（CGI）与 Node 可用；
   > **JSP / ASPX / ASP 当前无法端到端使用**——生成的 stub 未经真实容器验证，

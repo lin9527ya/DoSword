@@ -19,10 +19,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [features]
-default = ["mcp"]
+default = ["mcp", "wasm"]
 # MCP 服务端（把 DoSword 能力暴露给 AI 客户端）。关闭后不编译该模块、
 # 也不引入 rmcp/axum 依赖树（减小二进制体积与攻击面）。
 mcp = ["dep:rmcp", "dep:axum", "dep:schemars", "dep:tokio-util"]
+# WASM 沙箱插件（W6）：wasmtime 运行时 + 能力声明校验。
+# 关闭后可完全裁掉 wasmtime/cranelift 依赖树。
+wasm = ["dep:wasmtime"]
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -60,3 +63,9 @@ rmcp = { version = "=3.5.1", features = [
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"], optional = true }
 schemars = { version = "1", features = ["derive"], optional = true }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
+wasmtime = { version = "49.0.3", default-features = false, features = ["cranelift", "runtime", "wat"], optional = true }
+clap = { version = "4.6.7", features = ["derive"] }
+serde_yaml = "0.9.34"
+
+[dev-dependencies]
+wat = "1.262.0"

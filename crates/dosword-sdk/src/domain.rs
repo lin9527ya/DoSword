@@ -527,6 +527,33 @@ impl ConnectResult {
     }
 }
 
+/// W6 Playbook 执行报告（YAML 批量操作的机器可读结果）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybookReport {
+    pub name: String,
+    pub ok: bool,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+    pub steps: Vec<PlaybookStepReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybookStepReport {
+    #[ts(type = "number")]
+    pub index: usize,
+    pub id: Option<String>,
+    pub action: String,
+    pub ok: bool,
+    #[ts(type = "number")]
+    pub duration_ms: u64,
+    pub error: Option<String>,
+    /// 动作返回的 JSON（结构随动作而异）。
+    #[ts(type = "unknown")]
+    pub result: Option<serde_json::Value>,
+}
+
 /// 文件传输结果（W4 断点续传）：本次字节数与续传起点。
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -710,6 +737,8 @@ mod ts_bindings {
             ("ConnectResult", ConnectResult::decl()),
             ("SessionInfo", SessionInfo::decl()),
             ("TransferOutcome", TransferOutcome::decl()),
+            ("PlaybookReport", PlaybookReport::decl()),
+            ("PlaybookStepReport", PlaybookStepReport::decl()),
             ("DbConnection", DbConnection::decl()),
             ("DbProbeResult", DbProbeResult::decl()),
             ("DbQueryResult", DbQueryResult::decl()),

@@ -1,17 +1,22 @@
 mod auth;
-mod commands;
+pub mod commands;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod memshell;
 mod native_plugin;
+pub mod playbook;
 mod protocol;
 mod proxy_chain;
 mod pty;
 mod session;
-mod storage;
+pub mod storage;
+#[cfg(feature = "wasm")]
+pub mod wasm_plugin;
 
 use std::sync::Mutex;
 
+#[cfg(feature = "wasm")]
+use dosword_sdk::FeaturePlugin as _;
 use protocol::ProtocolRegistry;
 use session::SessionManager;
 use storage::Database;
@@ -135,8 +140,102 @@ impl DirCache {
     }
 }
 
+impl AppState {
+    /// 只读访问数据库（CLI 用来列出 Shell；桌面端命令走内部字段）。
+    pub fn database(&self) -> &Mutex<Database> {
+        &self.database
+    }
+}
+
+/// 加载功能插件：内置 + 插件目录中的脚本（`.plugin`）/
+/// 原生（`.native.*`）/ WASM（`.wasm` + 同名 `.wasm.json` 清单）。
+///
+/// 加载失败只跳过，不阻塞启动（与原有行为一致）。
+pub fn load_feature_plugins(plugins_dir: &std::path::Path) -> dosword_sdk::FeaturePluginRegistry {
+    let mut registry = dosword_sdk::FeaturePluginRegistry::builtin();
+    let Ok(entries) = std::fs::read_dir(plugins_dir) else {
+        return registry;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if file_name.ends_with(".plugin") {
+            if let Ok(content) = std::fs::read_to_string(entry.path())
+                && let Ok(plugin) = dosword_sdk::ScriptFeaturePlugin::from_json(&content)
+            {
+                let id = plugin.manifest().id.clone();
+                if registry.register(Box::new(plugin)).is_ok() {
+                    registry.installed.insert(id);
+                }
+            }
+        } else if file_name.contains(".native.") {
+            // 二进制插件：动态加载（失败跳过）
+            if let Ok(plugin) = crate::native_plugin::NativeFeaturePlugin::load(&entry.path())
+                && let Ok(manifest) = plugin.abi_manifest()
+            {
+                let id = manifest.id.clone();
+                if registry.register(Box::new(plugin)).is_ok() {
+                    registry.installed.insert(id);
+                }
+            }
+        } else if file_name.ends_with(".wasm") {
+            // WASM 沙箱插件（能力声明见 wasm_plugin 模块文档）
+            #[cfg(feature = "wasm")]
+            if let Ok(plugin) = crate::wasm_plugin::WasmFeaturePlugin::load(&entry.path()) {
+                let id = plugin.manifest().id.clone();
+                if registry.register(Box::new(plugin)).is_ok() {
+                    registry.installed.insert(id);
+                }
+            }
+        }
+    }
+    registry
+}
+
+/// 默认数据目录（与 Tauri `app_data_dir` 一致：`<XDG_DATA_HOME>/io.dosword.desktop`），
+/// 供 CLI 与桌面端共享同一个 SQLite 与插件目录。
+pub fn default_data_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".local/share"))
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        base.join("io.dosword.desktop")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        home.join("Library/Application Support/io.dosword.desktop")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        base.join("io.dosword.desktop")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        std::path::PathBuf::from(".")
+    }
+}
+
+/// 测试用 AppState（内存库 + 内置插件），供跨模块测试复用。
+#[cfg(test)]
+pub(crate) fn test_app_state() -> AppState {
+    build_app_state(
+        Database::open(":memory:").expect("内存数据库"),
+        dosword_sdk::FeaturePluginRegistry::builtin(),
+    )
+}
+
 /// Q9：统一装配 AppState（两处启动路径复用）。
-fn build_app_state(
+pub fn build_app_state(
     database: Database,
     feature_plugins: dosword_sdk::FeaturePluginRegistry,
 ) -> AppState {
@@ -169,36 +268,7 @@ pub fn run() {
                 let _ = database.purge_audit(settings.audit_retention_days);
             }
             let plugins_dir = app_data.join("plugins");
-            let mut registry = dosword_sdk::FeaturePluginRegistry::builtin();
-            if plugins_dir.exists()
-                && let Ok(entries) = std::fs::read_dir(&plugins_dir)
-            {
-                for entry in entries.flatten() {
-                    let file_name = entry.file_name().to_string_lossy().into_owned();
-                    if file_name.ends_with(".plugin") {
-                        if let Ok(content) = std::fs::read_to_string(entry.path())
-                            && let Ok(plugin) =
-                                dosword_sdk::ScriptFeaturePlugin::from_json(&content)
-                        {
-                            let id = plugin.manifest().id.clone();
-                            if registry.register(Box::new(plugin)).is_ok() {
-                                registry.installed.insert(id);
-                            }
-                        }
-                    } else if file_name.contains(".native.") {
-                        // 二进制插件：动态加载（失败跳过，不阻塞启动）
-                        if let Ok(plugin) =
-                            crate::native_plugin::NativeFeaturePlugin::load(&entry.path())
-                            && let Ok(manifest) = plugin.abi_manifest()
-                        {
-                            let id = manifest.id.clone();
-                            if registry.register(Box::new(plugin)).is_ok() {
-                                registry.installed.insert(id);
-                            }
-                        }
-                    }
-                }
-            }
+            let registry = load_feature_plugins(&plugins_dir);
             app.manage(build_app_state(database, registry));
 
             // MCP 服务端：装配状态；若设置里已启用则自动拉起（失败只记录，不阻塞启动）
@@ -249,6 +319,7 @@ pub fn run() {
             commands::pty_close,
             commands::list_sessions,
             commands::heartbeat_sessions,
+            commands::run_playbook,
             commands::execute_command,
             commands::list_dir,
             commands::batch_list_dir,

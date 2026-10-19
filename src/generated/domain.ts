@@ -249,6 +249,12 @@ export type TransferOutcome = { bytes: number,
  * 0 = 从头开始；> 0 = 从该偏移续传。
  */
 resumedFrom: number, };
+export type PlaybookReport = { name: string, ok: boolean, durationMs: number, steps: Array<PlaybookStepReport>, };
+export type PlaybookStepReport = { index: number, id: string | null, action: string, ok: boolean, durationMs: number, error: string | null, 
+/**
+ * 动作返回的 JSON（结构随动作而异）。
+ */
+result: unknown, };
 export type DbConnection = { driver: string, host: string | null, port: number | null, username: string | null, password: string | null, dbname: string | null, };
 export type DbProbeResult = { driver: string, databases: Array<string>, message: string, };
 export type DbQueryResult = { columns: Array<string>, 

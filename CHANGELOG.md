@@ -85,6 +85,28 @@ PHP 侧此前是「三条通道、三套能力」：同一个目标换个编码�
 - 分阶段载荷的 gzip 改为**明文层**压缩（`{"n":..,"z":1,"d":base64(gzip(请求))}`）：
   密文层压缩对高熵密文收益接近零，而 base64 载荷的 33% 膨胀可以被真正收回。
 
+### 新增（扩展与自动化 W6）
+
+- **WASM 沙箱插件**（cargo feature `wasm`，默认开启）：插件目录下的
+  `<name>.wasm` + 同名 `.wasm.json` 清单，由 wasmtime 运行。
+  - 能力声明制：`fs.read`（限于插件目录内，防目录穿越）/ `http` / `exec`；
+    未声明的导入**不链接**，插件在实例化阶段即失败（link-time denial）
+  - 资源限制：每次执行新建 Store（状态隔离），燃料 5×10⁷、内存 64 MiB、
+    宿主调用 10s 超时 / 1 MiB 结果上限
+  - ABI：`memory` + `dsw_alloc` + `dsw_execute(req_ptr, req_len) -> i64`
+  - `--no-default-features` 可完全裁掉 wasmtime/cranelift 依赖树
+- **Playbook**：YAML 描述的批量操作序列（connect / disconnect / exec / list_dir /
+  read_file / write_file / db_probe / db_query / plugin），支持 `${步骤id.字段}`
+  变量替换与 `contains` / `equals` 断言；失败默认中止。动作复用命令层服务函数，
+  授权范围复查、到期检查、审计与 GUI 完全一致，不依赖 MCP 服务开启。
+  新增命令 `run_playbook` 与 `PlaybookReport` / `PlaybookStepReport` DTO。
+- **CLI**：新增 `dosword-cli`（与桌面端同一 crate，链接同一服务层），
+  子命令 `shells` / `exec` / `fs ls|read|write` / `db query` / `playbook run` /
+  `stub generate`，支持 `--data-dir`（默认与桌面端一致）与 `--json`。
+- 测试：WASM 插件执行 / 未声明能力拒绝 / 声明后放行 / 未知能力拒绝 / `fs.read`
+  目录穿越拒绝；Playbook 解析、变量替换、JSON 子集断言、mock 协议端到端
+  （connect → exec → list_dir → disconnect）与断言失败中止。
+
 ### 新增（会话层 W4）
 
 - **心跳**：新增 `heartbeat_sessions` 命令，对全部活跃会话轻量探活
