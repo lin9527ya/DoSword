@@ -198,6 +198,96 @@ echo json_encode(array('host' => $host, 'open' => $open, 'scanned' => count($por
     )
 }
 
+/// 非 PHP 运行时的端口扫描命令（POSIX sh 兼容）。
+///
+/// 为什么不能直接拼 `/dev/tcp`：目标机的 `/bin/sh` 在 Debian/Ubuntu 上是 **dash**，
+/// 而 `/dev/tcp` 是 **bash 专有特性** —— dash 下会报
+/// `cannot create /dev/tcp/...: Directory nonexistent`，于是每个端口都被判成 closed，
+/// 给出一个静默的错误结论。Windows 的 `cmd /c` 更是完全没有 `/dev/tcp`。
+///
+/// 这里改为**先探测目标上可用的探测方法，再逐端口探测**，输出供调用方解析：
+/// - `DSW_METHOD=<bash|nc|python3|python|perl|空>`：实际选用的方法
+/// - `DSW_OPEN <port>`：每个开放端口一行
+/// - `DSW_DONE`：扫描正常结束 —— 用于区分「扫完确实没有开放端口」与「脚本根本没跑起来」
+///
+/// 方法优先级：bash（需配 `timeout` 保证连接超时，否则被过滤的端口会长时间挂住）
+/// → nc → python3 → python → perl。都没有则输出 `DSW_NO_METHOD`。
+fn sh_port_scan_command(host: &str, ports: &[u32], timeout: u32) -> String {
+    let port_list: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
+    format!(
+        r#"H='{host}'
+T={timeout}
+M=''
+if command -v bash >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then M=bash
+elif command -v nc >/dev/null 2>&1; then M=nc
+elif command -v python3 >/dev/null 2>&1; then M=python3
+elif command -v python >/dev/null 2>&1; then M=python
+elif command -v perl >/dev/null 2>&1; then M=perl
+fi
+echo "DSW_METHOD=$M"
+if [ -z "$M" ]; then echo "DSW_NO_METHOD"; exit 0; fi
+for P in {ports}; do
+  case "$M" in
+    bash) timeout "$T" bash -c "exec 3<>/dev/tcp/$H/$P" 2>/dev/null && echo "DSW_OPEN $P" ;;
+    nc) nc -z -w "$T" "$H" "$P" >/dev/null 2>&1 && echo "DSW_OPEN $P" ;;
+    python3|python) "$M" -c "import socket,sys;s=socket.socket();s.settimeout($T);sys.exit(0 if s.connect_ex(('$H',$P))==0 else 1)" >/dev/null 2>&1 && echo "DSW_OPEN $P" ;;
+    perl) perl -MIO::Socket::INET -e "exit(IO::Socket::INET->new(PeerAddr=>'$H',PeerPort=>$P,Timeout=>$T)?0:1)" >/dev/null 2>&1 && echo "DSW_OPEN $P" ;;
+  esac
+done
+echo "DSW_DONE"
+"#,
+        host = host,
+        timeout = timeout,
+        ports = port_list.join(" "),
+    )
+}
+
+/// 解析 [`sh_port_scan_command`] 的输出，返回与 PHP 版一致的结构
+/// （`{host, open, scanned}`，另附 `method`）。
+///
+/// 未看到 `DSW_DONE` 即认为命令没在目标上跑起来（典型原因：目标 shell 不是 POSIX sh，
+/// 例如 Windows 的 `cmd.exe`）。**此时必须报错**，不能返回「0 个开放端口」——
+/// 那正是本次要修掉的静默错误结论。
+fn parse_sh_port_scan(
+    host: &str,
+    ports: &[u32],
+    stdout: &str,
+) -> Result<serde_json::Value, ProtocolError> {
+    if !stdout.contains("DSW_DONE") {
+        let preview: String = stdout.trim().chars().take(200).collect();
+        return Err(ProtocolError::NotSupported(format!(
+            "端口扫描命令未在目标上执行完（目标 shell 可能不是 POSIX sh，如 Windows cmd）。原始输出：{preview}"
+        )));
+    }
+    if stdout.contains("DSW_NO_METHOD") {
+        return Err(ProtocolError::NotSupported(
+            "目标上找不到可用的端口探测方法（bash+timeout / nc / python3 / python / perl 均不可用）"
+                .to_string(),
+        ));
+    }
+    let mut open: Vec<u32> = Vec::new();
+    let mut method = String::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("DSW_METHOD=") {
+            method = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("DSW_OPEN ")
+            && let Ok(port) = rest.trim().parse::<u32>()
+        {
+            open.push(port);
+        }
+    }
+    open.sort_unstable();
+    open.dedup();
+    Ok(serde_json::json!({
+        "ok": true,
+        "host": host,
+        "open": open,
+        "scanned": ports.len(),
+        "method": method,
+    }))
+}
+
 /// 端口扫描（通用：PHP 代码型载荷；JSP/ASP 待协议实现后补模板）。
 pub struct PortScanPlugin;
 
@@ -207,7 +297,7 @@ impl FeaturePlugin for PortScanPlugin {
             id: "port_scan".into(),
             name: "端口扫描".into(),
             version: "1.0.0".into(),
-            description: "扫描目标主机开放端口（基于目标语言的 socket 载荷）。".into(),
+            description: "扫描目标主机开放端口。PHP 走 socket 载荷；其它运行时走命令型探测（需目标为 POSIX shell，自动在 bash / nc / python / perl 中择一）。".into(),
             category: "general".into(),
             languages: vec![],
             params: vec![
@@ -263,20 +353,16 @@ impl FeaturePlugin for PortScanPlugin {
                 let code = php_port_scan_code(&host, &ports, timeout);
                 run_payload(protocol, session, &code, settings)
             }
-            // 非 PHP：命令型 /dev/tcp 扫描（Linux 环境）
+            // 非 PHP：命令型扫描（先探测目标可用方法，见 sh_port_scan_command）
             _other => {
                 validate_host_arg(&host).map_err(ProtocolError::NotSupported)?;
-                let ports: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
-                let checks: Vec<String> = ports
-                    .iter()
-                    .map(|p| {
-                        format!(
-                            "(echo >/dev/tcp/{host}/{p}) 2>/dev/null && echo '{p} open' || echo '{p} closed'"
-                        )
-                    })
-                    .collect();
-                let command = format!("for c in {}; do $c; done", checks.join("; "));
-                run_command(protocol, session, &command, settings)
+                let command = sh_port_scan_command(&host, &ports, timeout);
+                let result = run_command(protocol, session, &command, settings)?;
+                let stdout = result
+                    .get("stdout")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                parse_sh_port_scan(&host, &ports, stdout)
             }
         }
     }
@@ -546,6 +632,135 @@ mod tests {
         assert!(code.contains("fsockopen"));
         assert!(code.contains("80"));
         assert!(code.contains("127.0.0.1"));
+    }
+
+    /// 取一个「几乎肯定关闭」的端口：绑定后立即释放。
+    fn closed_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    /// 端到端：命令必须在真实 POSIX sh 下**跑得起来并扫对**。
+    ///
+    /// 这是回归测试的核心 —— 原实现拼出的 `for c in (echo >/dev/tcp/…) && …; do $c; done`
+    /// 在 bash 与 dash 下都是语法错误（`未预期的记号 "("`），从未工作过。
+    fn run_scan_command(shell: &str) -> Option<String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap().port();
+        let closed = closed_port();
+        let command = sh_port_scan_command("127.0.0.1", &[open as u32, closed as u32], 1);
+        let output = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if stdout.contains("DSW_NO_METHOD") {
+            return None; // 环境里没有任何可用探测方法，跳过
+        }
+        assert!(
+            stdout.contains("DSW_DONE"),
+            "{shell} 下应正常结束：{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("DSW_OPEN {open}")),
+            "{shell} 下开放端口 {open} 应被识别：{stdout}"
+        );
+        assert!(
+            !stdout.contains(&format!("DSW_OPEN {closed}")),
+            "{shell} 下关闭端口 {closed} 不应被识别为开放：{stdout}"
+        );
+        Some(stdout)
+    }
+
+    #[test]
+    fn port_scan_command_works_under_posix_sh() {
+        if run_scan_command("sh").is_none() {
+            eprintln!("跳过：环境无可用端口探测方法");
+        }
+    }
+
+    /// dash 是 Debian/Ubuntu 的 `/bin/sh` —— 正是原实现失败的那个环境。
+    /// 本机 `/bin/sh` 若指向 bash（如 Kali），上面的测试覆盖不到 dash，故单列一条。
+    #[test]
+    fn port_scan_command_works_under_dash() {
+        if std::process::Command::new("dash")
+            .arg("-c")
+            .arg(":")
+            .output()
+            .is_err()
+        {
+            eprintln!("跳过：未安装 dash");
+            return;
+        }
+        if run_scan_command("dash").is_none() {
+            eprintln!("跳过：环境无可用端口探测方法");
+        }
+    }
+
+    #[test]
+    fn port_scan_parser_collects_open_ports() {
+        let out = "DSW_METHOD=python3\nDSW_OPEN 443\nDSW_OPEN 80\nDSW_DONE\n";
+        let value = parse_sh_port_scan("10.0.0.1", &[80, 443, 3306], out).unwrap();
+        assert_eq!(value["host"], "10.0.0.1");
+        assert_eq!(value["scanned"], 3);
+        assert_eq!(value["method"], "python3");
+        let open: Vec<u64> = value["open"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        assert_eq!(open, vec![80, 443], "应去重并升序");
+    }
+
+    /// 命令没跑起来（如目标 shell 是 Windows cmd）必须报错，
+    /// 不能返回「0 个开放端口」—— 那正是本次修掉的静默错误结论。
+    #[test]
+    fn port_scan_parser_requires_completion_marker() {
+        let err = parse_sh_port_scan("127.0.0.1", &[80], "'M' 不是内部或外部命令").unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("未在目标上执行完"), "{text}");
+        assert!(
+            text.contains("不是内部或外部命令"),
+            "应带原始输出便于定位：{text}"
+        );
+    }
+
+    #[test]
+    fn port_scan_parser_reports_no_method() {
+        let out = "DSW_METHOD=\nDSW_NO_METHOD\nDSW_DONE\n";
+        let err = parse_sh_port_scan("127.0.0.1", &[80], out).unwrap_err();
+        assert!(
+            err.to_string().contains("找不到可用的端口探测方法"),
+            "{err}"
+        );
+    }
+
+    /// 生成的命令不得再依赖 bash 专有的 `/dev/tcp` 裸用法：
+    /// 只允许出现在 `bash -c` 分支里（dash 下该分支不会被选中）。
+    #[test]
+    fn port_scan_command_guards_dev_tcp_behind_bash() {
+        let command = sh_port_scan_command("127.0.0.1", &[80], 1);
+        let line = command
+            .lines()
+            .find(|l| l.contains("/dev/tcp"))
+            .expect("应存在 bash 分支");
+        assert!(
+            line.contains("bash -c"),
+            "dev/tcp 只能在 bash 分支使用：{line}"
+        );
+        assert!(
+            command.contains("command -v bash"),
+            "必须先探测 bash 是否存在：{command}"
+        );
+        assert!(
+            command.contains("command -v timeout"),
+            "bash 分支需配 timeout，否则被过滤端口会挂住：{command}"
+        );
+        assert!(command.contains("DSW_DONE"), "应有结束标记：{command}");
     }
 }
 
