@@ -580,7 +580,7 @@ function PluginResultView({ data, viewRaw }: { data: unknown; viewRaw: boolean }
         );
         return { kind: "table" as const, columns, rows };
       }
-      for (const key of ["entries", "matches", "webshells", "users", "processes", "databases", "tables"]) {
+      for (const key of ["entries", "matches", "webshells", "users", "processes", "databases", "tables", "findings"]) {
         const items = obj[key];
         if (Array.isArray(items) && items.length > 0 && typeof items[0] === "object") {
           const first = items[0] as Record<string, unknown>;

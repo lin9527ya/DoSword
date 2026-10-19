@@ -537,6 +537,7 @@ impl FeaturePluginRegistry {
         // （见 src-tauri/src/protocol/php.rs 的 real_php_godzilla_extended_plugins），
         // 但从未在此注册，导致界面完全取不到、快捷栏芯片静默消失。
         let _ = registry.register(Box::new(crate::feature_plugins::SysinfoPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::PrivEnumPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::TaskSchedulerPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::ServiceCtlPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::ProcessKillPlugin));
@@ -705,7 +706,7 @@ mod feature_tests {
                 "缺少未接线插件 {id}：{ids:?}"
             );
         }
-        assert_eq!(ids.len(), 37, "内置插件数量应为 37：{ids:?}");
+        assert_eq!(ids.len(), 38, "内置插件数量应为 38：{ids:?}");
         // 重复注册拒绝
         let mut r = FeaturePluginRegistry::new();
         assert!(

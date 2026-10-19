@@ -3035,6 +3035,416 @@ fn sysinfo_command(language: &str) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 提权信息收集（只读）。返回结构化 findings，由 Rust 侧判定，不把原始输出直接丢给用户。
+// 重 IO 的 find / getcap 由 deep_scan 控制（默认关闭，避免触发目标侧告警与卡顿）。
+// ---------------------------------------------------------------------------
+
+pub struct PrivEnumPlugin;
+
+impl FeaturePlugin for PrivEnumPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "priv_enum".into(),
+            name: "提权信息收集".into(),
+            version: "1.0.0".into(),
+            description: "只读采集提权相关配置并给出结论（SUID/sudo/capabilities/服务/令牌等）。\
+                          不包含任何利用动作；deep_scan 会执行 find / 与 getcap，可能触发目标侧告警。"
+                .into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![ParamSpec {
+                name: "deep_scan".into(),
+                label: "深度扫描（SUID / capabilities，较慢且可能触发告警）".into(),
+                param_type: "bool".into(),
+                default: Some(serde_json::json!(false)),
+                options: None,
+            }],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let deep = param_bool(params, "deep_scan", false);
+        let command = priv_enum_command(runtime, deep);
+        let result = run_command(protocol, session, &command, settings)?;
+        let stdout = result
+            .get("stdout")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        Ok(parse_priv_enum(stdout, deep))
+    }
+}
+
+fn priv_enum_command(language: &str, deep: bool) -> String {
+    if language == "aspnet" || language == "asp" {
+        return [
+            "echo ===WHOAMI===",
+            "whoami /priv 2>nul",
+            "echo ===GROUPS===",
+            "whoami /groups 2>nul",
+            "echo ===PATCH===",
+            "wmic qfe get HotFixID,InstalledOn 2>nul",
+            "echo ===SERVICE===",
+            "wmic service get name,pathname,startmode,state 2>nul",
+            "echo ===TASK===",
+            "schtasks /query /fo CSV /v 2>nul",
+            "echo ===REG===",
+            "reg query \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer\" /v AlwaysInstallElevated 2>nul",
+            "reg query \"HKCU\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer\" /v AlwaysInstallElevated 2>nul",
+            "echo ===ADMIN===",
+            "net localgroup administrators 2>nul",
+            "echo ===SYS===",
+            "systeminfo 2>nul",
+        ]
+        .join(" & ");
+    }
+    let mut parts = vec![
+        "echo ===ID===".to_string(),
+        "id 2>/dev/null".into(),
+        "echo ===SUDO===".into(),
+        "sudo -n -l 2>&1 | head -40".into(),
+        "echo ===GROUPS===".into(),
+        "id -Gn 2>/dev/null".into(),
+        "echo ===SENSITIVE===".into(),
+        "ls -la /etc/passwd /etc/shadow /etc/sudoers 2>/dev/null".into(),
+        "echo ===CRON===".into(),
+        "ls -la /etc/cron.d /etc/cron.daily /var/spool/cron 2>/dev/null | head -40".into(),
+        "echo ===KERNEL===".into(),
+        "uname -r 2>/dev/null".into(),
+        "echo ===MOUNT===".into(),
+        "findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS 2>/dev/null | head -40".into(),
+        "echo ===CONTAINER===".into(),
+        "ls -la /.dockerenv /var/run/docker.sock 2>/dev/null".into(),
+        "echo ===NFS===".into(),
+        "cat /etc/exports 2>/dev/null".into(),
+        "echo ===SYSTEMD===".into(),
+        "systemctl list-timers --no-pager 2>/dev/null | head -20".into(),
+        "ls -la /etc/systemd/system 2>/dev/null | head -30".into(),
+    ];
+    if deep {
+        parts.push("echo ===SUID===".into());
+        parts.push("find / -xdev -perm -4000 -type f 2>/dev/null | head -200".into());
+        parts.push("echo ===CAPS===".into());
+        parts.push("getcap -r / 2>/dev/null | head -100".into());
+    }
+    parts.join("; ")
+}
+
+fn split_sections(output: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let mut current = String::new();
+    let mut buffer = String::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.len() > 6 && trimmed.starts_with("===") && trimmed.ends_with("===") {
+            if !current.is_empty() {
+                map.insert(current.clone(), buffer.trim().to_string());
+            }
+            current = trimmed.trim_matches('=').to_string();
+            buffer.clear();
+        } else {
+            buffer.push_str(line);
+            buffer.push('\n');
+        }
+    }
+    if !current.is_empty() {
+        map.insert(current, buffer.trim().to_string());
+    }
+    map
+}
+
+fn push_finding(findings: &mut Vec<serde_json::Value>, level: &str, title: &str, detail: &str) {
+    findings.push(serde_json::json!({
+        "level": level,
+        "title": title,
+        "detail": detail,
+    }));
+}
+
+fn parse_priv_enum(output: &str, deep: bool) -> serde_json::Value {
+    let sections = split_sections(output);
+    let windows = sections.contains_key("WHOAMI") && sections.contains_key("SERVICE");
+    let mut findings: Vec<serde_json::Value> = Vec::new();
+
+    if windows {
+        if let Some(whoami) = sections.get("WHOAMI") {
+            for (privilege, level, title) in [
+                (
+                    "SeImpersonatePrivilege",
+                    "high",
+                    "SeImpersonatePrivilege（Potato 系列提权路径）",
+                ),
+                (
+                    "SeAssignPrimaryTokenPrivilege",
+                    "high",
+                    "SeAssignPrimaryTokenPrivilege",
+                ),
+                (
+                    "SeDebugPrivilege",
+                    "warn",
+                    "SeDebugPrivilege（可调试/注入进程）",
+                ),
+                (
+                    "SeBackupPrivilege",
+                    "warn",
+                    "SeBackupPrivilege（可备份读取任意文件）",
+                ),
+                (
+                    "SeRestorePrivilege",
+                    "warn",
+                    "SeRestorePrivilege（可恢复任意文件）",
+                ),
+                (
+                    "SeTakeOwnershipPrivilege",
+                    "warn",
+                    "SeTakeOwnershipPrivilege（可夺取文件所有权）",
+                ),
+            ] {
+                if whoami.contains(privilege) {
+                    push_finding(&mut findings, level, title, "whoami /priv 中已启用");
+                }
+            }
+        }
+        if let Some(reg) = sections.get("REG")
+            && reg.contains("0x1")
+        {
+            push_finding(
+                &mut findings,
+                "high",
+                "AlwaysInstallElevated 已启用",
+                "HKLM/HKCU 至少一处为 0x1，可安装 MSI 以 SYSTEM 权限执行",
+            );
+        }
+        if let Some(service) = sections.get("SERVICE") {
+            let mut hits = 0;
+            for line in service.lines() {
+                let line = line.trim();
+                // 未加引号且路径含空格：`C:\Program Files\...\svc.exe args`
+                if hits < 10
+                    && line.contains(":\\")
+                    && line.contains(".exe ")
+                    && !line.contains('"')
+                {
+                    push_finding(&mut findings, "warn", "服务路径未加引号", line);
+                    hits += 1;
+                }
+            }
+        }
+        if let Some(groups) = sections.get("GROUPS")
+            && groups.to_lowercase().contains("administrators")
+        {
+            push_finding(&mut findings, "info", "当前用户在 Administrators 组", "");
+        }
+    } else {
+        if let Some(id) = sections.get("ID")
+            && id.contains("uid=0(")
+        {
+            push_finding(
+                &mut findings,
+                "info",
+                "当前已是 root",
+                id.lines().next().unwrap_or(""),
+            );
+        }
+        if let Some(sudo) = sections.get("SUDO") {
+            if sudo.contains("NOPASSWD") {
+                push_finding(&mut findings, "high", "sudo 免密可执行", sudo);
+            } else if sudo.contains("(ALL") {
+                push_finding(&mut findings, "warn", "sudo 可执行任意命令", sudo);
+            }
+        }
+        if let Some(groups) = sections.get("GROUPS") {
+            let group_list: Vec<&str> = groups.split_whitespace().collect();
+            if group_list.contains(&"docker") || group_list.contains(&"lxd") {
+                push_finding(
+                    &mut findings,
+                    "high",
+                    "用户在 docker/lxd 组",
+                    "可直接挂载宿主文件系统，等同于 root",
+                );
+            }
+        }
+        if let Some(container) = sections.get("CONTAINER")
+            && container.contains("docker.sock")
+        {
+            push_finding(&mut findings, "high", "Docker socket 可见", container);
+        }
+        if let Some(nfs) = sections.get("NFS")
+            && nfs.contains("no_root_squash")
+        {
+            push_finding(&mut findings, "high", "NFS 存在 no_root_squash", nfs);
+        }
+        if let Some(sensitive) = sections.get("SENSITIVE") {
+            for line in sensitive.lines() {
+                if line.contains("/etc/passwd") && line.trim_start().starts_with("-rw-rw-rw") {
+                    push_finding(&mut findings, "high", "/etc/passwd 全局可写", line);
+                }
+            }
+        }
+        if let Some(suid) = sections.get("SUID") {
+            const GTFOBINS: &[&str] = &[
+                "python", "python3", "perl", "find", "vim", "less", "awk", "env", "bash", "sh",
+                "cp", "mv", "tar", "zip", "gcc", "nmap", "node", "ruby", "php", "tee", "dd",
+            ];
+            let mut hits = 0;
+            for line in suid.lines() {
+                let name = line.trim().rsplit('/').next().unwrap_or("");
+                if hits < 20 && GTFOBINS.contains(&name) {
+                    push_finding(
+                        &mut findings,
+                        "warn",
+                        "SUID 二进制可被滥用（GTFOBins）",
+                        line,
+                    );
+                    hits += 1;
+                }
+            }
+        }
+        if let Some(caps) = sections.get("CAPS") {
+            for line in caps.lines() {
+                if line.contains("cap_setuid")
+                    || line.contains("cap_sys_admin")
+                    || line.contains("cap_dac_read_search")
+                {
+                    push_finding(&mut findings, "warn", "危险 capability", line);
+                }
+            }
+        }
+        if let Some(kernel) = sections.get("KERNEL")
+            && !kernel.trim().is_empty()
+        {
+            push_finding(
+                &mut findings,
+                "info",
+                "内核版本",
+                &format!("{kernel}（需自行比对本地漏洞库）"),
+            );
+        }
+    }
+
+    if findings.is_empty() {
+        push_finding(
+            &mut findings,
+            "info",
+            "未发现明显提权线索",
+            "不代表目标不可提权，仅表示本次采集未命中已知模式",
+        );
+    }
+
+    serde_json::json!({
+        "ok": true,
+        "platform": if windows { "windows" } else { "linux" },
+        "deepScan": deep,
+        "findings": findings,
+        "raw": output,
+    })
+}
+
+#[cfg(test)]
+mod priv_enum_tests {
+    use super::*;
+
+    #[test]
+    fn linux_findings_detected() {
+        let output = r#"===ID===
+uid=1000(kali) gid=1000(kali) groups=1000(kali),999(docker)
+===SUDO===
+User kali may run the following commands on host:
+    (ALL : ALL) NOPASSWD: ALL
+===GROUPS===
+kali docker
+===SENSITIVE===
+-rw-rw-rw- 1 root root 1234 Jan  1 00:00 /etc/passwd
+===NFS===
+/srv *(rw,sync,no_root_squash)
+===KERNEL===
+5.10.0-1-amd64
+"#;
+        let value = parse_priv_enum(output, false);
+        let findings = value["findings"].as_array().unwrap();
+        let titles: Vec<&str> = findings
+            .iter()
+            .map(|f| f["title"].as_str().unwrap())
+            .collect();
+        assert!(titles.contains(&"sudo 免密可执行"));
+        assert!(titles.contains(&"用户在 docker/lxd 组"));
+        assert!(titles.contains(&"NFS 存在 no_root_squash"));
+        assert!(titles.contains(&"/etc/passwd 全局可写"));
+        assert_eq!(value["platform"], "linux");
+    }
+
+    #[test]
+    fn windows_findings_detected() {
+        let output = r#"===WHOAMI===
+SeImpersonatePrivilege        Impersonate a client after authentication Enabled
+SeDebugPrivilege              Debug programs Enabled
+===GROUPS===
+BUILTIN\Administrators
+===SERVICE===
+C:\Program Files\Vuln App\svc.exe -k run
+C:\Windows\system32\ok.exe
+===REG===
+    AlwaysInstallElevated    REG_DWORD    0x1
+"#;
+        let value = parse_priv_enum(output, false);
+        let findings = value["findings"].as_array().unwrap();
+        let titles: Vec<&str> = findings
+            .iter()
+            .map(|f| f["title"].as_str().unwrap())
+            .collect();
+        assert!(titles.iter().any(|t| t.contains("SeImpersonatePrivilege")));
+        assert!(titles.iter().any(|t| t.contains("AlwaysInstallElevated")));
+        assert!(titles.iter().any(|t| t.contains("服务路径未加引号")));
+        assert_eq!(value["platform"], "windows");
+    }
+
+    #[test]
+    fn deep_scan_controls_heavy_commands() {
+        let shallow = priv_enum_command("php", false);
+        assert!(!shallow.contains("find / -xdev"));
+        assert!(!shallow.contains("getcap -r"));
+        let deep = priv_enum_command("php", true);
+        assert!(deep.contains("===SUID==="));
+        assert!(deep.contains("getcap -r"));
+    }
+
+    /// 本地真实采集自检（env 门控，CI 默认跳过）：验证真实输出能被正确分段与解析。
+    #[test]
+    fn local_linux_collection_parses() {
+        if std::env::var("DSW_PRIV_SELFTEST").is_err() {
+            eprintln!("跳过：未设置 DSW_PRIV_SELFTEST");
+            return;
+        }
+        let command = priv_enum_command("php", false);
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .expect("sh 应可执行");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let value = parse_priv_enum(&text, false);
+        assert_eq!(value["platform"], "linux");
+        assert!(!value["findings"].as_array().unwrap().is_empty());
+        assert!(text.contains("===ID==="), "分段标记应存在");
+    }
+
+    #[test]
+    fn no_finding_still_returns_info() {
+        let value = parse_priv_enum("===ID===\nuid=1000(kali)\n", false);
+        let findings = value["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["level"], "info");
+    }
+}
+
 /// 系统信息（通用）：主机/CPU/内存/磁盘/负载/网络/用户。
 pub struct SysinfoPlugin;
 
