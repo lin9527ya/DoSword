@@ -1878,6 +1878,13 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             protocol.write_file(session.as_ref(), &test_file, b"hello py", &settings)?;
             let content = protocol.read_file(session.as_ref(), &test_file, &settings)?;
             assert_eq!(content, b"hello py");
+            // P2：分块读写（客户端已转发 stub 的 o/l）
+            protocol.write_file(session.as_ref(), &test_file, b"0123456789", &settings)?;
+            let chunk = protocol.read_chunk(session.as_ref(), &test_file, 3, 4, &settings)?;
+            assert_eq!(chunk, b"3456", "分块读应返回指定范围");
+            protocol.write_chunk(session.as_ref(), &test_file, b"XY", 2, &settings)?;
+            let patched = protocol.read_file(session.as_ref(), &test_file, &settings)?;
+            assert_eq!(patched, b"01XY456789", "分块写应覆盖指定偏移");
             eprintln!("[python] read/write ok");
             // DB：sqlite（目标进程内建库 + 建表 + 查询）
             let db_file = format!("{}/py_test.db", dir.display());
@@ -1986,6 +1993,13 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             protocol.write_file(session.as_ref(), &test_file, b"hello node", &settings)?;
             let content = protocol.read_file(session.as_ref(), &test_file, &settings)?;
             assert_eq!(content, b"hello node");
+            // P2：分块读写（客户端已转发 stub 的 o/l）
+            protocol.write_file(session.as_ref(), &test_file, b"0123456789", &settings)?;
+            let chunk = protocol.read_chunk(session.as_ref(), &test_file, 3, 4, &settings)?;
+            assert_eq!(chunk, b"3456", "分块读应返回指定范围");
+            protocol.write_chunk(session.as_ref(), &test_file, b"XY", 2, &settings)?;
+            let patched = protocol.read_file(session.as_ref(), &test_file, &settings)?;
+            assert_eq!(patched, b"01XY456789", "分块写应覆盖指定偏移");
             eprintln!("[node] read/write ok");
             // DB：sqlite（node:sqlite）
             let db_file = format!("{}/node_test.db", dir.display());
