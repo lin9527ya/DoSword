@@ -60,7 +60,7 @@ http.createServer((req, res) => {{
           arch: os.arch(),
           extensions: [],
           disable_functions: '',
-          info: {{ OsInfo: os.type() + ' ' + os.release() + ' ' + os.arch(), CurrentUser: os.userInfo().username, CurrentDir: process.cwd(), FileRoot: __dirname, Node: process.version, Platform: os.platform() }},
+          info: {{ ProtoVersion: '2', Capabilities: 'chunked,stream,db,plugin,exec', ShellType: 'file', OsInfo: os.type() + ' ' + os.release() + ' ' + os.arch(), CurrentUser: os.userInfo().username, CurrentDir: process.cwd(), FileRoot: __dirname, Node: process.version, Platform: os.platform() }},
         }};
       }} else if (hh === H.exec) {{
         const c = reqObj.c || ''; const w = reqObj.w || '';

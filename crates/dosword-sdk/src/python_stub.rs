@@ -67,6 +67,9 @@ try:
             'extensions': [],
             'disable_functions': '',
             'info': {{
+                'ProtoVersion': '2',
+                'Capabilities': 'chunked,stream,db,plugin,exec',
+                'ShellType': 'file',
                 'OsInfo': ' '.join(platform.uname()),
                 'CurrentUser': os.environ.get('USER', ''),
                 'CurrentDir': os.getcwd(),

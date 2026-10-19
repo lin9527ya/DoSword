@@ -2550,6 +2550,27 @@ mod tests {
         }
     }
 
+    /// 能力协商依赖 stub 上报 ProtoVersion/Capabilities/ShellType。
+    /// PHP 早已上报；本测试防止非 PHP stub 回退。
+    #[test]
+    fn all_language_stubs_report_capabilities() {
+        let encoder = NativeEncoder { crypto: "xor" };
+        for language in ["php", "jsp", "aspx", "asp", "python", "node"] {
+            let stub = encoder
+                .stub(language, "secret")
+                .unwrap_or_else(|error| panic!("{language} stub 生成失败：{error}"));
+            assert!(
+                stub.contains("ProtoVersion"),
+                "{language} stub 缺少 ProtoVersion"
+            );
+            assert!(
+                stub.contains("Capabilities"),
+                "{language} stub 缺少 Capabilities"
+            );
+            assert!(stub.contains("ShellType"), "{language} stub 缺少 ShellType");
+        }
+    }
+
     #[test]
     fn registry_lists_all_encoders() {
         let ids: Vec<String> = EncoderRegistry::builtin()
