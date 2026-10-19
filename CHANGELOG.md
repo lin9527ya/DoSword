@@ -184,6 +184,15 @@ PHP 侧此前是「三条通道、三套能力」：同一个目标换个编码�
 
 ### 安全
 
+- **NATIVE 落地 stub 去除高危明文特征**：命令执行降级链不再出现候选函数数组，
+  `__CMD__` 改为按 crc32b 符号表索引（0/20/21/22/23）探测与分发；
+  `@exec(`/`@popen(`/`@passthru(`、`@eval($c)`、明文 `base64_*`、
+  `@stat(`/`@touch(`/`@chdir(`、`is_dir(`、`stream_get_contents(`、`@pclose(`、
+  `gzdecode`/`gzencode` 全部改为符号表调用；内部辅助函数改为中性命名
+  （apply/index/load/save/clear/relocate/ensure/state/dsn/query/rule/bulk/dispatch）。
+  符号表索引 20-30 为新增槽位，旧 stub 不受影响。
+  回归：`native_stub_has_no_plain_sensitive_functions`（7 个变体逐一断言）+
+  `real_php_exec_fallback_when_shell_exec_disabled`（禁用 shell_exec 后仍能降级执行）。
 - 授权门补齐：`run_feature_plugin` 走 `session_ctx`（补到期与真实网络开关复查）、
   `pty_write/read/close` 校验归属会话存活、`get_session_probe` 补到期检查、
   自动重连前重跑授权检查、**关闭真实网络时强制断开全部会话并清理 PTY**

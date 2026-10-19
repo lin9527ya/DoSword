@@ -2691,6 +2691,45 @@ for($i=0;$i<strlen($raw);$i++){$code.=$raw[$i]^$key[$i%strlen($key)];}
         }
     }
 
+    /// 回归：命令降级链改为按符号表索引探测后，`shell_exec` 被禁用时
+    /// 必须自动降级到 exec/system/passthru/popen（而不是直接失败）。
+    #[test]
+    fn real_php_exec_fallback_when_shell_exec_disabled() {
+        let settings = settings();
+        let encoder = dosword_sdk::EncoderRegistry::global()
+            .get("native")
+            .expect("native 编码器");
+        let stub = encoder.stub("php", "secret").expect("生成 stub");
+        let Some((url, dir, mut child)) =
+            spawn_php_server_stub_args(&stub, "native", false, &["disable_functions=shell_exec"])
+        else {
+            eprintln!("跳过：未检测到 php 可执行文件");
+            return;
+        };
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, probe) = PhpProtocol.connect(&profile, &settings)?;
+            assert!(
+                probe.disable_functions.contains("shell_exec"),
+                "测试前提：shell_exec 应被禁用（{}）",
+                probe.disable_functions
+            );
+            let output =
+                PhpProtocol.execute_command(session.as_ref(), "printf fallback-ok", &settings)?;
+            assert_eq!(
+                output.stdout.trim(),
+                "fallback-ok",
+                "shell_exec 被禁用后应降级到其它命令函数"
+            );
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("命令降级链回归失败：{error}"));
+    }
+
     /// W4 心跳：三条通道都能轻量探活；目标下线后必须报错（stale 的依据）。
     #[test]
     fn real_php_heartbeat_round_trip() {
@@ -4763,6 +4802,16 @@ except Exception as e:
         encoder_id: &str,
         session: bool,
     ) -> Option<(String, std::path::PathBuf, std::process::Child)> {
+        spawn_php_server_stub_args(stub, encoder_id, session, &[])
+    }
+
+    /// 同上，但允许追加 `-d` 参数（如 `disable_functions=shell_exec`）。
+    fn spawn_php_server_stub_args(
+        stub: &str,
+        encoder_id: &str,
+        session: bool,
+        ini_overrides: &[&str],
+    ) -> Option<(String, std::path::PathBuf, std::process::Child)> {
         // 缺 php 时测试会静默跳过——CI 上这等于"假绿"。
         // 设置 DOSWORD_REQUIRE_PHP=1 可把跳过变成硬失败（CI 已启用）。
         let require_php = std::env::var("DOSWORD_REQUIRE_PHP").is_ok();
@@ -4795,6 +4844,9 @@ except Exception as e:
                 listener.local_addr().unwrap().port()
             };
             let mut command = std::process::Command::new("php");
+            for override_ in ini_overrides {
+                command.arg("-d").arg(override_);
+            }
             if encoder_id == "php_stream" {
                 // 仅 include 流方案需要 allow_url_include；xor_body 用 file_get_contents 无需
                 command.arg("-d").arg("allow_url_include=1");

