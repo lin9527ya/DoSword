@@ -930,12 +930,272 @@ impl super::DoswordMcp {
         .await;
         Ok(guard.run(async { result }).await)
     }
+    // ---- 内存马（P2：此前 agent 完全看不到这块能力） ----
+
+    #[rmcp::tool(description = "列出已注入的内存马（只读）。可按 workspace / shell 过滤")]
+    async fn dosword_memshell_list(
+        &self,
+        Parameters(args): Parameters<MemshellListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let summary = format!(
+            "workspace={} shell={}",
+            args.workspace_id.as_deref().unwrap_or("-"),
+            args.shell_id.as_deref().unwrap_or("-")
+        );
+        let guard =
+            match Guard::begin(&self.app, "dosword_memshell_list", Tier::Read, summary).await {
+                Ok(guard) => guard,
+                Err(denied) => return Ok(denied),
+            };
+        let app = self.app.clone();
+        let result = crate::commands::memshell_list(args.workspace_id, args.shell_id, app).await;
+        Ok(guard.run(async { result }).await)
+    }
+
+    #[rmcp::tool(description = "检查某内存马是否仍然存活（只读）")]
+    async fn dosword_memshell_check(
+        &self,
+        Parameters(args): Parameters<MemshellCheckArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let summary = format!("handle={}", args.handle_id);
+        let guard =
+            match Guard::begin(&self.app, "dosword_memshell_check", Tier::Read, summary).await {
+                Ok(guard) => guard,
+                Err(denied) => return Ok(denied),
+            };
+        let app = self.app.clone();
+        let result = crate::commands::memshell_check(args.handle_id, app).await;
+        Ok(guard.run(async { result }).await)
+    }
+
+    #[rmcp::tool(description = "查询目标支持哪些内存马注入形态（只读）")]
+    async fn dosword_memshell_capabilities(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let summary = format!("session={}", args.session_id);
+        let guard = match Guard::begin(
+            &self.app,
+            "dosword_memshell_capabilities",
+            Tier::Read,
+            summary,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(denied) => return Ok(denied),
+        };
+        let app = self.app.clone();
+        let result = crate::commands::memshell_capabilities(args.session_id, app).await;
+        Ok(guard.run(async { result }).await)
+    }
+
+    #[rmcp::tool(
+        description = "向目标注入内存马（执行级：会改变目标进程/站点配置，默认需人工确认）。可先用 dosword_memshell_capabilities 查形态"
+    )]
+    async fn dosword_memshell_install(
+        &self,
+        Parameters(args): Parameters<MemshellInstallArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let summary = format!(
+            "session={} kind={} dir={}",
+            args.session_id,
+            args.kind,
+            args.install_dir.as_deref().unwrap_or("-")
+        );
+        let guard =
+            match Guard::begin(&self.app, "dosword_memshell_install", Tier::Exec, summary).await {
+                Ok(guard) => guard,
+                Err(denied) => return Ok(denied),
+            };
+        let app = self.app.clone();
+        let result = crate::commands::memshell_install(
+            args.session_id,
+            args.kind,
+            args.install_dir,
+            args.trigger_url,
+            args.fpm_target,
+            args.script_filename,
+            app,
+        )
+        .await;
+        Ok(guard.run(async { result }).await)
+    }
+
+    #[rmcp::tool(
+        description = "卸载内存马并清理落地文件（执行级，默认需人工确认）。无卸载能力的形态不予实现"
+    )]
+    async fn dosword_memshell_uninstall(
+        &self,
+        Parameters(args): Parameters<MemshellCheckArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let summary = format!("handle={}", args.handle_id);
+        let guard = match Guard::begin(&self.app, "dosword_memshell_uninstall", Tier::Exec, summary)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(denied) => return Ok(denied),
+        };
+        let app = self.app.clone();
+        let result = crate::commands::memshell_uninstall(args.handle_id, app).await;
+        Ok(guard.run(async { result }).await)
+    }
+
+    // ---- 代理链 ----
+
+    #[rmcp::tool(description = "列出所有代理链及其状态（只读）")]
+    async fn dosword_proxy_chain_list(
+        &self,
+        Parameters(_args): Parameters<NoArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let guard = match Guard::begin(
+            &self.app,
+            "dosword_proxy_chain_list",
+            Tier::Read,
+            "list".into(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(denied) => return Ok(denied),
+        };
+        let app = self.app.clone();
+        let result = crate::commands::proxy_chain_list(app).await;
+        Ok(guard.run(async { result }).await)
+    }
+
+    #[rmcp::tool(description = "启动一条代理链（写入级：会占用本地端口并在目标侧建监听）")]
+    async fn dosword_proxy_chain_start(
+        &self,
+        Parameters(args): Parameters<ProxyChainStartArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let spec =
+            match serde_json::from_value::<crate::commands::ProxyChainSpec>(args.spec.clone()) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "代理链参数不合法：{error}"
+                    ))]));
+                }
+            };
+        let summary = format!("hops={} local_port={}", spec.hops.len(), spec.local_port);
+        let guard = match Guard::begin(&self.app, "dosword_proxy_chain_start", Tier::Write, summary)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(denied) => return Ok(denied),
+        };
+        let app = self.app.clone();
+        let result = crate::commands::proxy_chain_start(spec, app).await;
+        Ok(guard.run(async { result }).await)
+    }
+
+    #[rmcp::tool(description = "停止一条代理链（写入级）")]
+    async fn dosword_proxy_chain_stop(
+        &self,
+        Parameters(args): Parameters<ChainIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let summary = format!("chain={}", args.chain_id);
+        let guard =
+            match Guard::begin(&self.app, "dosword_proxy_chain_stop", Tier::Write, summary).await {
+                Ok(guard) => guard,
+                Err(denied) => return Ok(denied),
+            };
+        let app = self.app.clone();
+        let result = crate::commands::proxy_chain_stop(args.chain_id, app).await;
+        Ok(guard.run(async { result }).await)
+    }
+
+    // ---- 会话探活与剧本 ----
+
+    #[rmcp::tool(description = "对全部活跃会话做一次轻量探活，返回存活状态（只读）")]
+    async fn dosword_heartbeat_sessions(
+        &self,
+        Parameters(_args): Parameters<NoArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let guard = match Guard::begin(
+            &self.app,
+            "dosword_heartbeat_sessions",
+            Tier::Read,
+            "heartbeat".into(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(denied) => return Ok(denied),
+        };
+        let app = self.app.clone();
+        let result = crate::commands::heartbeat_sessions(app).await;
+        Ok(guard.run(async { result }).await)
+    }
+
+    #[rmcp::tool(description = "运行 YAML 剧本（执行级：剧本内可执行命令/插件，默认需人工确认）")]
+    async fn dosword_run_playbook(
+        &self,
+        Parameters(args): Parameters<PlaybookArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let preview: String = truncate_text(&args.yaml).0.chars().take(120).collect();
+        let summary = format!("yaml={preview}");
+        let guard = match Guard::begin(&self.app, "dosword_run_playbook", Tier::Exec, summary).await
+        {
+            Ok(guard) => guard,
+            Err(denied) => return Ok(denied),
+        };
+        let app = self.app.clone();
+        let result = crate::commands::run_playbook(args.yaml, app).await;
+        Ok(guard.run(async { result }).await)
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShellIdArgs {
     /// 已登记的 Shell id（见 `dosword_shells_list`）
     pub shell_id: String,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MemshellListArgs {
+    /// 只列出该 Workspace 的内存马
+    pub workspace_id: Option<String>,
+    /// 只列出该 Shell 的内存马
+    pub shell_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MemshellCheckArgs {
+    /// 内存马记录 id（见 dosword_memshell_list）
+    pub handle_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MemshellInstallArgs {
+    pub session_id: String,
+    /// 注入形态：user_ini / php_fcgi（可用 dosword_memshell_capabilities 查询目标支持哪些）
+    pub kind: String,
+    /// 落地目录（user_ini 形态需要可写目录）
+    pub install_dir: Option<String>,
+    /// 触发 URL（写入记录便于存活检查）
+    pub trigger_url: Option<String>,
+    /// php_fcgi 形态的 FPM 监听地址（host:port）
+    pub fpm_target: Option<String>,
+    /// php_fcgi 形态的脚本文件名
+    pub script_filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProxyChainStartArgs {
+    /// 代理链定义（与 ProxyChainSpec 同构：id / hops[] 等）
+    pub spec: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChainIdArgs {
+    pub chain_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PlaybookArgs {
+    /// 完整 YAML 文本
+    pub yaml: String,
 }
 
 #[cfg(test)]
@@ -977,6 +1237,16 @@ mod tests {
             "dosword_exec",
             "dosword_plugin_run",
             "dosword_generate_stub",
+            "dosword_memshell_list",
+            "dosword_memshell_check",
+            "dosword_memshell_capabilities",
+            "dosword_memshell_install",
+            "dosword_memshell_uninstall",
+            "dosword_proxy_chain_list",
+            "dosword_proxy_chain_start",
+            "dosword_proxy_chain_stop",
+            "dosword_heartbeat_sessions",
+            "dosword_run_playbook",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),

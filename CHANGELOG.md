@@ -67,6 +67,9 @@
     三个只读资源（经脱敏层、审计详情截断）与提示词 `dosword_guidance`
     （授权边界、三级权限、执行级确认流程、安全用法）；`get_info` 已宣告 resources/prompts 能力
   - 明确不暴露：Workspace/Shell 增删改、插件安装、改设置、本地文件读写、`http_send`、PTY
+  - MCP 工具面补全（P2）：工具数 23 → 33 —— 内存马 `memshell_list/check/capabilities`（只读）、
+    `memshell_install/uninstall`（执行级）、`proxy_chain_list`（只读）、`proxy_chain_start/stop`（写入级）、
+    `heartbeat_sessions`（只读）、`run_playbook`（执行级）；README 工具表同步更新
   - `cargo build --no-default-features` 可完全裁掉 MCP 模块与 rmcp/axum 依赖树
 
 ### 修复（PHP 通道对齐，2026-10-19）

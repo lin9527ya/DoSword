@@ -226,9 +226,9 @@ Claude Desktop / Cursor / 自研 agent。**默认关闭**，且只监听 `127.0.
 
 | 级别 | 默认 | 工具 |
 |---|---|---|
-| 只读 | **开** | `dosword_workspaces_list`、`dosword_shells_list`（**不含密码**，仅 `hasPassword`）、`dosword_sessions_list`、`dosword_probe_session`、`dosword_settings_get`（令牌已清空、代理已脱敏）、`dosword_protocols_list`、`dosword_plugins_list`、`dosword_encoders_list`、`dosword_audit_query`、`dosword_fs_list`、`dosword_fs_read`（偏移分块） |
-| 写入 | 关 | `dosword_shell_connect`/`_disconnect`、`dosword_fs_write`（支持追加偏移）、`dosword_fs_mkdir`/`_rename`/`_delete`/`_touch`、`dosword_db_probe`、`dosword_db_query`（`SELECT`/`SHOW`/`EXPLAIN` 自动按只读处理，其余按写入） |
-| 执行 | 关 | `dosword_exec`、`dosword_plugin_run`、`dosword_generate_stub` |
+| 只读 | **开** | `dosword_workspaces_list`、`dosword_shells_list`（**不含密码**，仅 `hasPassword`）、`dosword_sessions_list`、`dosword_probe_session`、`dosword_settings_get`（令牌已清空、代理已脱敏）、`dosword_protocols_list`、`dosword_plugins_list`、`dosword_encoders_list`、`dosword_audit_query`、`dosword_fs_list`、`dosword_fs_read`（偏移分块）、`dosword_memshell_list/check/capabilities`、`dosword_proxy_chain_list`、`dosword_heartbeat_sessions` |
+| 写入 | 关 | `dosword_shell_connect`/`_disconnect`、`dosword_fs_write`（支持追加偏移）、`dosword_fs_mkdir`/`_rename`/`_delete`/`_touch`、`dosword_db_probe`、`dosword_db_query`（`SELECT`/`SHOW`/`EXPLAIN` 自动按只读处理，其余按写入）、`dosword_proxy_chain_start/stop` |
+| 执行 | 关 | `dosword_exec`、`dosword_plugin_run`、`dosword_generate_stub`、`dosword_memshell_install/uninstall`、`dosword_run_playbook` |
 
 **不通过 MCP 暴露**：Workspace / Shell 的增删改、插件安装、修改设置、本地文件读写、
 `http_send` 原始请求、PTY。授权登记表只能由人在 GUI 里维护——agent 无法给自己扩权。
