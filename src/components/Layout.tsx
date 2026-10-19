@@ -7,6 +7,7 @@ import {
   ListChecks,
   Network,
   Settings,
+  ScrollText,
   ShieldCheck,
   TerminalSquare,
   X,
@@ -33,6 +34,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: "database", label: "数据库", icon: <Boxes size={17} />, view: { kind: "database" }, shortcut: "Ctrl+D" },
   { key: "orchestrate", label: "批量编排", icon: <ListChecks size={17} />, view: { kind: "orchestrate" }, shortcut: "Ctrl+B" },
   { key: "proxyChain", label: "代理链", icon: <Network size={17} />, view: { kind: "proxyChain" } },
+  { key: "playbook", label: "剧本编排", icon: <ScrollText size={17} />, view: { kind: "playbook" } },
 ];
 
 const BOTTOM_ITEMS: NavItem[] = [

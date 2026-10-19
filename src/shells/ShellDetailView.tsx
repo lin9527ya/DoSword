@@ -445,6 +445,28 @@ function InfoPanel({
               <span>工作根目录</span>
               <code>{info.currentDir} (分隔符: {info.separator})</code>
             </div>
+            <div className="info-card">
+              <span>目标能力（stub 自报）</span>
+              {info.capabilities ? (
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                  <code style={{ marginRight: 4 }}>v{info.capabilities.protoVersion}</code>
+                  <code style={{ marginRight: 4 }}>{info.capabilities.shellType}</code>
+                  {info.capabilities.capabilities.length === 0 && (
+                    <span style={{ fontSize: 12, color: "var(--muted)" }}>未声明能力位</span>
+                  )}
+                  {info.capabilities.capabilities.map((capability) => (
+                    <span key={capability} className="tag-badge">
+                      {capability}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                  旧 stub（协议 v1）：未上报能力。用当前版本重新生成并上传 stub 可获得
+                  分块读写、数据库与非只读 SQL 的精确门禁。
+                </span>
+              )}
+            </div>
           </>
         )}
       </div>

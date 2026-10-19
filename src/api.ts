@@ -30,6 +30,7 @@ import type {
   McpStatus,
   McpCallRecord,
   McpPendingApproval,
+  PlaybookReport,
   FeatureManifest,
   MemoryShell,
   MemshellCapability,
@@ -302,6 +303,7 @@ export const api = {
     invoke<McpCallRecord[]>("mcp_recent_calls", { limit: limit ?? null }),
   mcpClearLog: () => invoke<void>("mcp_clear_log"),
   mcpPendingApprovals: () => invoke<McpPendingApproval[]>("mcp_pending_approvals"),
+  runPlaybook: (yaml: string) => invoke<PlaybookReport>("run_playbook", { yaml }),
   mcpResolveApproval: (id: string, approve: boolean) =>
     invoke<McpPendingApproval>("mcp_resolve_approval", { id, approve }),
 };

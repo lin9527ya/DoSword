@@ -8,6 +8,7 @@ import { GlobalFilesView } from "./views/GlobalFilesView";
 import { GlobalDatabaseView } from "./views/GlobalDatabaseView";
 import { OrchestrationView } from "./views/OrchestrationView";
 import { ProxyChainView } from "./views/ProxyChainView";
+import { PlaybookView } from "./views/PlaybookView";
 import { SettingsView } from "./views/SettingsView";
 import { AuditView } from "./views/AuditView";
 import { ShellDetailView } from "./shells/ShellDetailView";
@@ -119,6 +120,8 @@ function App() {
             <OrchestrationView />
           ) : mainView.kind === "proxyChain" ? (
             <ProxyChainView />
+          ) : mainView.kind === "playbook" ? (
+            <PlaybookView />
           ) : mainView.kind === "audit" ? (
             <AuditView />
           ) : (

@@ -9,6 +9,7 @@ export type View =
   | { kind: "database" }
   | { kind: "orchestrate" }
   | { kind: "proxyChain" }
+  | { kind: "playbook" }
   | { kind: "audit" }
   | { kind: "settings" };
 
