@@ -48,6 +48,9 @@ base64 = "0.22"
 ts-rs = { version = "10", features = ["serde-compat"] }
 md-5 = "0.10"
 aes = "0.8"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
 des = "0.8"
 cbc = { version = "0.1", features = ["block-padding", "alloc"] }
 crc32fast = "1.4"

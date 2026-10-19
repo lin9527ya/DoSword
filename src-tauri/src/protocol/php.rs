@@ -78,6 +78,55 @@ fn encoder_for(protocol_params: &str) -> Result<&'static dyn PayloadEncoder, Pro
 
 /// 有效密码：协议参数里带 `salt` 时用 `salt:password` 派生密钥与令牌，
 /// 与 `generate_shell` 的加盐 stub 保持一致；未带盐时等于原密码。
+/// 按编码器建立 AEAD 会话状态（非 AEAD 编码器返回 None）。
+fn aead_state(
+    encoder: &dyn PayloadEncoder,
+    password: &str,
+) -> Option<std::sync::Mutex<dosword_sdk::aead::AeadSession>> {
+    if encoder.id() == "native_aead" {
+        Some(std::sync::Mutex::new(dosword_sdk::aead::AeadSession::new(
+            password,
+        )))
+    } else {
+        None
+    }
+}
+
+/// 统一编码入口：AEAD 走带序号的会话状态，其余走编码器本身。
+fn encode_payload(php: &PhpSession, plaintext: &str) -> Result<String, ProtocolError> {
+    match &php.aead {
+        Some(aead) => aead
+            .lock()
+            .map_err(|_| ProtocolError::ParseError("AEAD 状态锁异常".into()))?
+            .seal(plaintext.as_bytes())
+            .map_err(ProtocolError::ParseError),
+        None => Ok(php.encoder.encode(plaintext, &php.password)),
+    }
+}
+
+/// 统一解码入口（响应方向；AEAD 会校验 tag 与序号窗口）。
+fn decode_payload(php: &PhpSession, payload: &str) -> Result<Vec<u8>, ProtocolError> {
+    match &php.aead {
+        Some(aead) => aead
+            .lock()
+            .map_err(|_| ProtocolError::ParseError("AEAD 状态锁异常".into()))?
+            .open(payload)
+            .map_err(ProtocolError::ParseError),
+        None => php.encoder.decode(payload, &php.password),
+    }
+}
+
+/// 头鉴权令牌：AEAD 用密钥派生的令牌，其余沿用 md5(password)[..16]。
+fn auth_token(php: &PhpSession) -> String {
+    match &php.aead {
+        Some(aead) => aead
+            .lock()
+            .map(|session| session.token().to_string())
+            .unwrap_or_default(),
+        None => dosword_sdk::encoder::md5_hex(&php.password)[..16].to_string(),
+    }
+}
+
 fn effective_password(protocol_params: &str, password: &str) -> String {
     let salt = serde_json::from_str::<serde_json::Value>(protocol_params)
         .ok()
@@ -129,6 +178,8 @@ pub struct PhpSession {
     pub chunked: bool,
     /// 会话当前工作目录（cd 支持：每次命令前 stub 端 chdir）。
     pub cwd: std::sync::Mutex<String>,
+    /// AEAD 会话状态（仅 `native_aead`）：发送序号 + 接收滑动窗口。
+    pub aead: Option<std::sync::Mutex<dosword_sdk::aead::AeadSession>>,
 }
 
 impl PhpSession {
@@ -233,6 +284,10 @@ impl PhpProtocol {
                 session_mode: false,
                 chunked: false,
                 cwd: std::sync::Mutex::new(String::new()),
+                aead: aead_state(
+                    encoder,
+                    &effective_password(&profile.protocol_params, &profile.password),
+                ),
             };
             return self.session_probe(&php, settings);
         }
@@ -250,6 +305,10 @@ impl PhpProtocol {
                 session_mode: true,
                 chunked: false,
                 cwd: std::sync::Mutex::new(String::new()),
+                aead: aead_state(
+                    encoder,
+                    &effective_password(&profile.protocol_params, &profile.password),
+                ),
             };
             return self.session_probe(&php, settings);
         }
@@ -940,6 +999,10 @@ impl Protocol for PhpProtocol {
             session_mode: session_mode_for(&profile.protocol_params, encoder),
             chunked,
             cwd: std::sync::Mutex::new(result.current_dir.clone()),
+            aead: aead_state(
+                encoder,
+                &effective_password(&profile.protocol_params, &profile.password),
+            ),
         });
         Ok((session, result))
     }
@@ -1668,7 +1731,7 @@ fn session_post(
     // 响应为编码器密文（base64 文本），按编码器解密
     let text = String::from_utf8_lossy(&bytes);
     log_request(php, action, status.as_u16(), started, plaintext, &text);
-    php.encoder.decode(&text, &php.password)
+    decode_payload(php, &text)
 }
 
 /// 写一条请求调试记录（统一协议 id 与密码脱敏）。
@@ -1702,7 +1765,7 @@ fn ensure_session_init(php: &PhpSession, settings: &AppSettings) -> Result<(), P
         return Ok(());
     }
     let code = dosword_sdk::encoder::session_handler_code();
-    let payload = php.encoder.encode(code, &php.password);
+    let payload = encode_payload(php, code)?;
     let plain = session_post(php, "session_init", code, payload, settings)?;
     let text = String::from_utf8_lossy(&plain);
     if !text.contains("ok") {
@@ -1730,7 +1793,7 @@ fn session_call(
     request.push('}');
 
     // session 变体（分阶段载荷）暂不启用 gzip（响应为明文 JSON，结构不兼容压缩）
-    let payload = php.encoder.encode(&request, &php.password);
+    let payload = encode_payload(php, &request)?;
     let plain = session_post(php, action, &request, payload, settings)?;
     let text = String::from_utf8_lossy(&plain);
 
@@ -1772,18 +1835,18 @@ fn native_call(
     }
     request.push('}');
 
-    let payload = php.encoder.encode(&request, &php.password);
+    let payload = encode_payload(php, &request)?;
     let payload = crate::protocol::transport::gzip_payload(&payload, settings.gzip_enabled);
     // base64 载荷可能含 +/=，必须转义（否则 PHP 表单解析时 + 转空格损坏密文）；
     // P2：手动快速转义（仅 +、=、&），避免对整块载荷全量百分号编码
     let body = format!("formData={}", form_escape(&payload));
-    let token = &dosword_sdk::encoder::md5_hex(&php.password)[..16];
+    let token = auth_token(php);
     let started = std::time::Instant::now();
     let response = match php
         .client
         .post(&php.endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("X-Debug-Key", token)
+        .header("X-Debug-Key", &token)
         .body(body)
         .send()
     {
@@ -1820,7 +1883,7 @@ fn native_call(
         .ok_or_else(|| ProtocolError::ParseError("响应缺少 data 字段".to_string()))?;
     // gzip：响应若为 gzip 字节则解压后重新 base64（stub 端 gzencode 兜底）
     let data = crate::protocol::transport::gunzip_if_needed(data);
-    let plain = php.encoder.decode(&data, &php.password)?;
+    let plain = decode_payload(php, &data)?;
     let value: Value = serde_json::from_slice(&plain)
         .map_err(|_| ProtocolError::ParseError("响应内容不是合法 JSON".to_string()))?;
     if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -3060,6 +3123,117 @@ except Exception as e:
         // Redis 不走 PDO，必须显式拒绝而不是静默变成 pgsql
         assert!(build_dsn(&base("redis"), true).is_err());
         assert_eq!(build_dsn(&base("sqlite"), true).unwrap(), "sqlite:app");
+    }
+
+    /// AEAD：真实 PHP 往返（HKDF + AES-256-GCM + 序号递增 + 重放拒绝）。
+    #[test]
+    fn real_php_aead_round_trip() {
+        let Some((url, dir, mut child)) = spawn_php_server_with("native_aead", "secret", false)
+        else {
+            eprintln!("跳过：未检测到 php");
+            return;
+        };
+        let settings = settings();
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native_aead"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            // 多次操作：序号递增，stub 的防重放不应误拒
+            for _ in 0..3 {
+                let out =
+                    PhpProtocol.execute_command(session.as_ref(), "printf aead-ok", &settings)?;
+                assert_eq!(out.stdout, "aead-ok");
+            }
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("AEAD 真实往返应成功：{error}"));
+    }
+
+    /// AEAD 回归（真实 PHP）：
+    ///
+    /// 1. **重连必须可用** —— stub 的重放窗口存在目标机临时文件里、跨连接存活，
+    ///    而客户端每次连接的序号都从 1 开始。窗口若不按连接隔离，第二次连接起
+    ///    所有请求都会被判成重放，返回 `bad params`，会话**永久不可用**
+    ///    （修复前实测如此）。
+    /// 2. **连接内重放必须被拒** —— 同一帧原样重发第二次要失败。
+    #[test]
+    fn real_php_aead_reconnect_and_replay() {
+        let Some((url, dir, mut child)) = spawn_php_server_with("native_aead", "secret", false)
+        else {
+            eprintln!("跳过：未检测到 php");
+            return;
+        };
+        let settings = settings();
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native_aead"}"#.to_string();
+        let result = (|| -> Result<(String, String, String, String), ProtocolError> {
+            // 1) 两次独立连接（同一密码）：第二次是新 sid，必须照常工作
+            let (first, _) = PhpProtocol.connect(&profile, &settings)?;
+            let one = PhpProtocol
+                .execute_command(first.as_ref(), "printf conn-one", &settings)?
+                .stdout;
+            drop(first);
+            let (second, _) = PhpProtocol.connect(&profile, &settings)?;
+            let two = PhpProtocol
+                .execute_command(second.as_ref(), "printf conn-two", &settings)?
+                .stdout;
+            drop(second);
+
+            // 2) 手工构造一帧并原样重发：第二次必须被防重放拒绝
+            let key = dosword_sdk::aead::derive_key("secret");
+            let mut session = dosword_sdk::aead::AeadSession::new("secret");
+            let frame = session
+                .seal(br#"{"a":"exec","c":"printf replay-hit"}"#)
+                .expect("封装帧");
+            let token = session.token().to_string();
+            let body = format!("formData={}", form_escape(&frame));
+            let client = build_client(&settings);
+            let post = |body: &str| -> Result<String, ProtocolError> {
+                let response = client
+                    .post(&url)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .header("X-Debug-Key", &token)
+                    .body(body.to_string())
+                    .send()
+                    .map_err(|error| ProtocolError::Network(error.to_string()))?;
+                let text = response
+                    .text()
+                    .map_err(|error| ProtocolError::Network(error.to_string()))?;
+                let outer: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|_| ProtocolError::ParseError("响应不是合法 JSON".into()))?;
+                let data = outer
+                    .get("data")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| ProtocolError::ParseError("响应缺少 data".into()))?;
+                let data = crate::protocol::transport::gunzip_if_needed(data);
+                let (_, plain) =
+                    dosword_sdk::aead::open(&key, dosword_sdk::aead::DIR_RESPONSE, &data)
+                        .map_err(ProtocolError::ParseError)?;
+                Ok(String::from_utf8_lossy(&plain).to_string())
+            };
+            let accepted = post(&body)?;
+            let replayed = post(&body)?;
+            Ok((one, two, accepted, replayed))
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (one, two, accepted, replayed) =
+            result.unwrap_or_else(|error| panic!("AEAD 重连/重放测试失败：{error}"));
+        assert_eq!(one, "conn-one");
+        assert_eq!(two, "conn-two");
+        // exec 的 stdout 在响应里是 base64（cmVwbGF5LWhpdA== = replay-hit）
+        assert!(
+            accepted.contains("cmVwbGF5LWhpdA=="),
+            "首帧应被正常执行：{accepted}"
+        );
+        assert!(
+            replayed.contains("bad params"),
+            "原样重放必须被防重放拒绝：{replayed}"
+        );
     }
 
     /// 加盐派生：stub 用 `salt:password` 生成，客户端用「原密码 + 盐」连接。
