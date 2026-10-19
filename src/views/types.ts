@@ -7,6 +7,7 @@ export type View =
   | { kind: "debug" }
   | { kind: "files" }
   | { kind: "database" }
+  | { kind: "orchestrate" }
   | { kind: "audit" }
   | { kind: "settings" };
 

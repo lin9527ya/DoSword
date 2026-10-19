@@ -6,6 +6,7 @@ import { SessionsView } from "./views/SessionsView";
 import { RequestDebugView } from "./views/RequestDebugView";
 import { GlobalFilesView } from "./views/GlobalFilesView";
 import { GlobalDatabaseView } from "./views/GlobalDatabaseView";
+import { OrchestrationView } from "./views/OrchestrationView";
 import { SettingsView } from "./views/SettingsView";
 import { AuditView } from "./views/AuditView";
 import { ShellDetailView } from "./shells/ShellDetailView";
@@ -113,6 +114,8 @@ function App() {
             <GlobalFilesView onNavigate={navigate} />
           ) : mainView.kind === "database" ? (
             <GlobalDatabaseView onNavigate={navigate} />
+          ) : mainView.kind === "orchestrate" ? (
+            <OrchestrationView />
           ) : mainView.kind === "audit" ? (
             <AuditView />
           ) : (

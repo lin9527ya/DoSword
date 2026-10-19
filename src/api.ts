@@ -36,6 +36,24 @@ import type {
 
 export type * from "./generated/domain";
 
+/** 批量编排的单个目标结果。 */
+export type OrchestrationOutcome = {
+  shellId: string;
+  shellName: string;
+  ok: boolean;
+  elapsedMs: number;
+  output: string;
+  error: string;
+};
+
+/** 批量编排汇总。 */
+export type OrchestrationReport = {
+  total: number;
+  ok: number;
+  failed: number;
+  outcomes: OrchestrationOutcome[];
+};
+
 // --- invoke 封装 ---
 
 export const api = {
@@ -146,6 +164,16 @@ export const api = {
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   executeCommand: (sessionId: string, command: string) =>
     invoke<CommandOutput>("execute_command", { sessionId, command }),
+  // --- 批量与多目标编排 ---
+  orchestrateRun: (spec: {
+    shellIds: string[];
+    op: Record<string, unknown>;
+    concurrency: number;
+    stopOnError: boolean;
+    autoConnect: boolean;
+    disconnectAfter: boolean;
+  }) => invoke<OrchestrationReport>("orchestrate_run", { spec }),
+
   // --- 内存马（后渗透） ---
   memshellCapabilities: (sessionId: string) =>
     invoke<MemshellCapability[]>("memshell_capabilities", { sessionId }),

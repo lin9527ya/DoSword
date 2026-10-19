@@ -1306,13 +1306,45 @@ fn batch_update_shells_impl(
     tags: Option<Vec<String>>,
     password: Option<String>,
 ) -> Result<usize, String> {
-    let mut database = state
-        .database
-        .lock()
-        .map_err(|_| "数据库锁异常".to_string())?;
-    database
-        .batch_update_shells(ids, tags.as_ref(), password.as_deref())
-        .map_err(|e| e.to_string())
+    let updated = {
+        let mut database = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?;
+        database
+            .batch_update_shells(ids, tags.as_ref(), password.as_deref())
+            .map_err(|e| e.to_string())?
+    };
+    // P6：与单条 update_shell 一致 —— 更新后失效会话上下文缓存，否则已建会话仍用旧密码
+    if let Ok(mut sessions) = state.sessions.lock() {
+        for id in ids {
+            sessions.invalidate_context(id);
+        }
+    }
+    // 全量审计：批量改密码此前完全不留痕
+    if let Ok(database) = state.database.lock() {
+        let _ = database.record_audit(
+            None,
+            None,
+            "shell.batch_update",
+            "success",
+            &format!(
+                "批量更新 {} 个 Shell；标签：{}；密码：{}",
+                updated,
+                if tags.is_some() {
+                    "已更新"
+                } else {
+                    "未变更"
+                },
+                if password.is_some() {
+                    "已更新"
+                } else {
+                    "未变更"
+                }
+            ),
+        );
+    }
+    Ok(updated)
 }
 
 /// Repeater：手工构造并发送一次 HTTP 请求（不经协议，仅走传输层）。
@@ -1722,76 +1754,82 @@ pub async fn update_settings(input: AppSettings, app: AppHandle) -> Result<(), S
 #[tauri::command]
 pub async fn connect_shell(shell_id: String, app: AppHandle) -> Result<ConnectResult, String> {
     blocking(app, move |state| {
-        let (shell, settings) = load_shell_and_settings(state, &shell_id)?;
-        let _auth_reason = require_authorized_for(state, &shell, &settings)?;
-
-        let protocol = state
-            .protocols
-            .get(&shell.protocol_id)
-            .ok_or_else(|| format!("未知协议：{}", shell.protocol_id))?;
-
-        let (session_state, probe) = protocol
-            .connect(&shell, &settings)
-            .map_err(|error| audit_fail(state, &shell, "shell.connect", error))?;
-
-        let session_id = {
-            let mut sessions = state
-                .sessions
-                .lock()
-                .map_err(|_| "会话锁异常".to_string())?;
-            // S8：同 Shell 重连替换旧会话前，级联清理其 PTY 流
-            if let Some(old_session_id) = sessions.session_id_for_profile(&shell.id) {
-                state.ptys.close_for_session(&old_session_id);
-            }
-            let session_id = sessions.insert(
-                &shell.id,
-                &shell.workspace_id,
-                &shell.protocol_id,
-                Arc::from(session_state),
-                probe.clone(),
-            );
-            // P6：连接时缓存上下文（避免每命令重复查库）；P5：快照授权过期时间
-            let expires_snapshot = {
-                let database = state
-                    .database
-                    .lock()
-                    .map_err(|_| "数据库锁异常".to_string())?;
-                database
-                    .workspace(&shell.workspace_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|workspace| workspace.expires_at)
-            };
-            if let Ok(session) = sessions.get_mut(&session_id) {
-                session.profile = Some(shell.clone());
-                session.settings = Some(settings.clone());
-                session.workspace_expires_at = expires_snapshot;
-            }
-            session_id
-        };
-
-        // 连接成功刷新在线状态
-        let _ = state
-            .database
-            .lock()
-            .map_err(|_| "数据库锁异常".to_string())
-            .and_then(|mut database| {
-                database
-                    .record_probe(&shell, "online", "连接成功")
-                    .map_err(|error| error.to_string())
-            });
-        audit(
-            state,
-            &shell.workspace_id,
-            Some(&shell.id),
-            "shell.connect",
-            "success",
-            &format!("连接成功：{}", shell.endpoint),
-        );
-
-        Ok(ConnectResult::from_probe(session_id, probe))
+        connect_shell_impl(state, &shell_id).map(|(result, _)| result)
     })
     .await
+}
+
+/// 建立会话的内部实现，返回 `(探测结果, session_id)`。供命令层与批量编排复用。
+fn connect_shell_impl(state: &AppState, shell_id: &str) -> Result<(ConnectResult, String), String> {
+    let (shell, settings) = load_shell_and_settings(state, shell_id)?;
+    let _auth_reason = require_authorized_for(state, &shell, &settings)?;
+
+    let protocol = state
+        .protocols
+        .get(&shell.protocol_id)
+        .ok_or_else(|| format!("未知协议：{}", shell.protocol_id))?;
+
+    let (session_state, probe) = protocol
+        .connect(&shell, &settings)
+        .map_err(|error| audit_fail(state, &shell, "shell.connect", error))?;
+
+    let session_id = {
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?;
+        // S8：同 Shell 重连替换旧会话前，级联清理其 PTY 流
+        if let Some(old_session_id) = sessions.session_id_for_profile(&shell.id) {
+            state.ptys.close_for_session(&old_session_id);
+        }
+        let session_id = sessions.insert(
+            &shell.id,
+            &shell.workspace_id,
+            &shell.protocol_id,
+            Arc::from(session_state),
+            probe.clone(),
+        );
+        // P6：连接时缓存上下文（避免每命令重复查库）；P5：快照授权过期时间
+        let expires_snapshot = {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            database
+                .workspace(&shell.workspace_id)
+                .ok()
+                .flatten()
+                .and_then(|workspace| workspace.expires_at)
+        };
+        if let Ok(session) = sessions.get_mut(&session_id) {
+            session.profile = Some(shell.clone());
+            session.settings = Some(settings.clone());
+            session.workspace_expires_at = expires_snapshot;
+        }
+        session_id
+    };
+
+    // 连接成功刷新在线状态
+    let _ = state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())
+        .and_then(|mut database| {
+            database
+                .record_probe(&shell, "online", "连接成功")
+                .map_err(|error| error.to_string())
+        });
+    audit(
+        state,
+        &shell.workspace_id,
+        Some(&shell.id),
+        "shell.connect",
+        "success",
+        &format!("连接成功：{}", shell.endpoint),
+    );
+
+    let result = ConnectResult::from_probe(session_id.clone(), probe);
+    Ok((result, session_id))
 }
 
 /// 建立交互式 PTY 会话：目标反弹回连后返回 ptyId（失败则报错，前端降级为命令模式）。
@@ -3634,6 +3672,285 @@ pub async fn memshell_exec(
         Ok(output)
     })
     .await
+}
+
+// ---------------------------------------------------------------------------
+// 批量与多目标编排
+//
+// 设计取向：编排放在后端，以保证会话生命周期可控（只断开自己建立的会话）、
+// 并发受限、审计可汇总；每个目标的授权检查仍由 require_authorized_for 逐个完成。
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationSpec {
+    pub shell_ids: Vec<String>,
+    pub op: OrchestrationOp,
+    #[serde(default = "default_orchestration_concurrency")]
+    pub concurrency: u32,
+    #[serde(default)]
+    pub stop_on_error: bool,
+    #[serde(default = "default_true")]
+    pub auto_connect: bool,
+    #[serde(default)]
+    pub disconnect_after: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum OrchestrationOp {
+    Command {
+        command: String,
+    },
+    Plugin {
+        plugin_id: String,
+        #[serde(default)]
+        params: serde_json::Value,
+    },
+    ListDir {
+        path: String,
+    },
+}
+
+fn default_orchestration_concurrency() -> u32 {
+    4
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn orchestration_op_label(op: &OrchestrationOp) -> String {
+    match op {
+        OrchestrationOp::Command { command } => format!("命令：{}", truncate_chars(command, 80)),
+        OrchestrationOp::Plugin { plugin_id, .. } => format!("插件：{plugin_id}"),
+        OrchestrationOp::ListDir { path } => format!("列目录：{path}"),
+    }
+}
+
+fn execute_orchestration_op(
+    state: &AppState,
+    session_id: &str,
+    shell: &ShellProfile,
+    settings: &AppSettings,
+    op: &OrchestrationOp,
+) -> Result<String, String> {
+    let (session_state, protocol_id) = {
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?;
+        let session = sessions.get_mut(session_id)?;
+        (session.state.clone(), session.protocol_id.clone())
+    };
+    let protocol = state
+        .protocols
+        .get(&protocol_id)
+        .ok_or_else(|| format!("未知协议：{protocol_id}"))?;
+    match op {
+        OrchestrationOp::Command { command } => protocol
+            .execute_command(session_state.as_ref(), command, settings)
+            .map(|output| output.stdout)
+            .map_err(|error| error.to_string()),
+        OrchestrationOp::ListDir { path } => protocol
+            .list_dir(session_state.as_ref(), path, settings)
+            .map(|listing| serde_json::to_string(&listing).unwrap_or_default())
+            .map_err(|error| error.to_string()),
+        OrchestrationOp::Plugin { plugin_id, params } => {
+            let plugin = {
+                let registry = state
+                    .feature_plugins
+                    .lock()
+                    .map_err(|_| "插件注册表锁异常".to_string())?;
+                registry
+                    .get(plugin_id)
+                    .ok_or_else(|| format!("未知功能插件：{plugin_id}"))?
+                    .clone()
+            };
+            let runtime = if shell.runtime.is_empty() {
+                "php"
+            } else {
+                shell.runtime.as_str()
+            };
+            plugin
+                .execute(protocol, session_state.as_ref(), runtime, params, settings)
+                .map(|value| value.to_string())
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn run_orchestration_target(
+    state: &AppState,
+    shell_id: &str,
+    spec: &OrchestrationSpec,
+) -> serde_json::Value {
+    let started = std::time::Instant::now();
+    let mut created_session = false;
+    let mut session_id_opt: Option<String> = None;
+
+    let result = (|| -> Result<(String, String), String> {
+        let (shell, settings) = load_shell_and_settings(state, shell_id)?;
+        require_authorized_for(state, &shell, &settings)?;
+        let existing = {
+            let sessions = state
+                .sessions
+                .lock()
+                .map_err(|_| "会话锁异常".to_string())?;
+            sessions.session_id_for_profile(&shell.id)
+        };
+        let session_id = match existing {
+            Some(id) => id,
+            None => {
+                if !spec.auto_connect {
+                    return Err("目标未连接，且未开启自动连接".to_string());
+                }
+                let (_result, id) = connect_shell_impl(state, &shell.id)?;
+                created_session = true;
+                id
+            }
+        };
+        session_id_opt = Some(session_id.clone());
+        let output = execute_orchestration_op(state, &session_id, &shell, &settings, &spec.op)?;
+        Ok((shell.name.clone(), output))
+    })();
+
+    // 只断开本次任务自己建立的会话，绝不碰用户手动建立的会话
+    if created_session
+        && spec.disconnect_after
+        && let Some(session_id) = &session_id_opt
+        && let Ok(mut sessions) = state.sessions.lock()
+    {
+        sessions.remove(session_id);
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok((name, output)) => serde_json::json!({
+            "shellId": shell_id,
+            "shellName": name,
+            "ok": true,
+            "elapsedMs": elapsed_ms,
+            "output": truncate_chars(&output, 4000),
+            "error": "",
+        }),
+        Err(error) => serde_json::json!({
+            "shellId": shell_id,
+            "shellName": shell_id,
+            "ok": false,
+            "elapsedMs": elapsed_ms,
+            "output": "",
+            "error": error,
+        }),
+    }
+}
+
+fn orchestrate_run_impl(
+    state: &AppState,
+    spec: OrchestrationSpec,
+) -> Result<serde_json::Value, String> {
+    if spec.shell_ids.is_empty() {
+        return Err("请至少选择一个目标 Shell".to_string());
+    }
+    if spec.shell_ids.len() > 200 {
+        return Err("单次最多 200 个目标".to_string());
+    }
+    let workers = (spec.concurrency as usize)
+        .clamp(1, 8)
+        .min(spec.shell_ids.len());
+    let stop = std::sync::atomic::AtomicBool::new(false);
+
+    let outcomes: Vec<serde_json::Value> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for worker in 0..workers {
+            let ids = &spec.shell_ids;
+            let spec_ref = &spec;
+            let stop_ref = &stop;
+            handles.push(scope.spawn(move || {
+                let mut local = Vec::new();
+                let mut index = worker;
+                while index < ids.len() {
+                    if stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let outcome = run_orchestration_target(state, &ids[index], spec_ref);
+                    if spec_ref.stop_on_error && outcome["ok"] == false {
+                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    local.push(outcome);
+                    index += workers;
+                }
+                local
+            }));
+        }
+        let mut all = Vec::new();
+        for handle in handles {
+            if let Ok(items) = handle.join() {
+                all.extend(items);
+            }
+        }
+        all
+    });
+
+    // 按输入顺序输出，便于前端对齐
+    let mut ordered = Vec::with_capacity(spec.shell_ids.len());
+    for id in &spec.shell_ids {
+        if let Some(item) = outcomes.iter().find(|item| item["shellId"] == *id) {
+            ordered.push(item.clone());
+        }
+    }
+    let ok = ordered.iter().filter(|item| item["ok"] == true).count();
+    let failed = ordered.len() - ok;
+
+    if let Ok(database) = state.database.lock() {
+        let _ = database.record_audit(
+            None,
+            None,
+            "orchestrate.run",
+            if failed == 0 { "success" } else { "partial" },
+            &format!(
+                "{}；目标 {}，成功 {ok}，失败 {failed}",
+                orchestration_op_label(&spec.op),
+                spec.shell_ids.len()
+            ),
+        );
+        // 只为失败目标写明细，避免 N 个成功目标淹没审计表
+        for item in &ordered {
+            if item["ok"] == false {
+                let _ = database.record_audit(
+                    None,
+                    None,
+                    "orchestrate.target",
+                    "failed",
+                    &format!(
+                        "目标 {}：{}",
+                        item["shellId"].as_str().unwrap_or(""),
+                        item["error"].as_str().unwrap_or("")
+                    ),
+                );
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "total": ordered.len(),
+        "ok": ok,
+        "failed": failed,
+        "outcomes": ordered,
+    }))
+}
+
+/// 批量执行：命令 / 功能插件 / 列目录（多目标）。
+#[tauri::command]
+pub async fn orchestrate_run(
+    spec: OrchestrationSpec,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    blocking(app, move |state| orchestrate_run_impl(state, spec)).await
 }
 
 #[cfg(test)]

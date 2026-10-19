@@ -4,6 +4,7 @@ import {
   Boxes,
   FileCode2,
   LayoutDashboard,
+  ListChecks,
   Settings,
   ShieldCheck,
   TerminalSquare,
@@ -29,6 +30,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: "debug", label: "请求调试", icon: <ArrowLeftRight size={17} />, view: { kind: "debug" }, shortcut: "Ctrl+R" },
   { key: "files", label: "批量文件", icon: <FileCode2 size={17} />, view: { kind: "files" }, shortcut: "Ctrl+M" },
   { key: "database", label: "数据库", icon: <Boxes size={17} />, view: { kind: "database" }, shortcut: "Ctrl+D" },
+  { key: "orchestrate", label: "批量编排", icon: <ListChecks size={17} />, view: { kind: "orchestrate" }, shortcut: "Ctrl+B" },
 ];
 
 const BOTTOM_ITEMS: NavItem[] = [
@@ -86,6 +88,9 @@ export function Layout({
       } else if (mod && event.key.toLowerCase() === "d") {
         event.preventDefault();
         onNavigate({ kind: "database" });
+      } else if (mod && event.key.toLowerCase() === "b") {
+        event.preventDefault();
+        onNavigate({ kind: "orchestrate" });
       } else if (event.key === "F5") {
         event.preventDefault();
         onNavigate({ kind: "dashboard" });

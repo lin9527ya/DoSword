@@ -225,6 +225,7 @@ pub fn run() {
             commands::memshell_uninstall,
             commands::memshell_list,
             commands::memshell_exec,
+            commands::orchestrate_run,
             commands::read_file,
             commands::write_file,
             commands::upload_file,
