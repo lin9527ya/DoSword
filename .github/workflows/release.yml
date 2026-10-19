@@ -1,0 +1,69 @@
+name: Release
+
+# 仅在打 tag（v*）或手动触发时运行，不影响 main 的 CI。
+# 产物：三平台 dosword-cli 二进制（未签名）+ 校验和。
+# 说明：桌面安装包（msi/dmg/AppImage）需要各平台签名与打包依赖，
+# 目前只发布 CLI——它与桌面端同 crate、同服务层、同数据目录。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cli:
+    name: 构建 dosword-cli（${{ matrix.artifact }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            bin: dosword-cli
+            artifact: dosword-cli-linux-x64
+          - os: windows-latest
+            bin: dosword-cli.exe
+            artifact: dosword-cli-windows-x64
+          - os: macos-14
+            bin: dosword-cli
+            artifact: dosword-cli-macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Linux 系统依赖（Tauri 传递依赖）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: 安装 Rust 工具链（版本来自 rust-toolchain.toml）
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # --no-default-features：裁掉 mcp / wasm（CLI 不需要），显著加快构建
+      - name: 构建 CLI
+        run: cargo build --release --no-default-features --bin dosword-cli
+
+      - name: 生成校验和
+        shell: bash
+        run: |
+          cd target/release
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.bin }}" > "${{ matrix.bin }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.bin }}" > "${{ matrix.bin }}.sha256"
+          fi
+          cat "${{ matrix.bin }}.sha256"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/release/${{ matrix.bin }}
+            target/release/${{ matrix.bin }}.sha256
+          if-no-files-found: error

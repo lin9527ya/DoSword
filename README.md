@@ -265,6 +265,49 @@ Claude Desktop / Cursor / 自研 agent。**默认关闭**，且只监听 `127.0.
 cargo build -p dosword --no-default-features   # 去掉 mcp feature 与 rmcp/axum 依赖树
 ```
 
+## 剧本（Playbook）与内存马
+
+### 剧本：把一串操作写成 YAML
+
+「剧本编排」页可直接编辑并运行（Ctrl/Cmd+Enter），结果按步骤展示通过 / 跳过 / 失败与耗时。
+CLI 侧等价命令是 `dosword-cli playbook run <file>`。
+
+```yaml
+name: smoke
+continue_on_error: false
+steps:
+  - id: conn
+    action: connect
+    args: { shell_id: "shell-1" }
+  - id: whoami
+    action: exec
+    args: { session_id: "${conn.sessionId}", command: "id" }
+    expect: { contains: "uid=" }
+  - action: list_dir
+    when: { ref: "${conn.runtime}", equals: "php" }   # 条件为假 → skipped
+    args: { session_id: "${conn.sessionId}", path: "/" }
+  - action: disconnect
+    args: { session_id: "${conn.sessionId}" }
+```
+
+- 动作：`connect` / `disconnect` / `exec` / `list_dir` / `read_file` / `write_file` / `plugin`
+- 变量：`${步骤id.字段路径}`（如 `${conn.sessionId}`）、循环变量 `${item.字段}`
+- 断言：`expect.contains` / `expect.equals`；条件：`when`；循环：`repeat` / `foreach`
+- 每次运行写审计 `playbook.run`；失败步骤会带上后端错误原文
+
+### 内存马（PHP）
+
+支持两种形态，均带**卸载**与存活检测（无卸载能力的形态不予实现）：
+
+| 形态 | 机制 | 说明 |
+|---|---|---|
+| `user_ini` | `.user.ini` + `auto_prepend_file` | 需要可写目录；落地一个 PHP 文件并在同目录写 `.user.ini` |
+| `php_fcgi` | 直连 FPM（FastCGI） | 零落盘，需能直连 `host:port` 与目标脚本名 |
+
+- 入口：Shell 详情页「内存马」页签，或 MCP 的 `dosword_memshell_*`（执行级，默认需人工确认）
+- 先查形态：打开页签会自动探测（MCP 侧为 `dosword_memshell_capabilities`）
+- **卸载**会清理落地文件与 `.user.ini` 中的条目；注入/卸载都写审计
+
 ## 开发
 
 ```bash
