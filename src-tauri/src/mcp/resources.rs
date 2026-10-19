@@ -64,12 +64,14 @@ pub fn read_resource(app: &AppHandle, uri: &str) -> Result<Vec<ResourceContents>
                 Ok(sessions
                     .list()
                     .into_iter()
-                    .map(|(session_id, profile_id, server, last_used_at)| {
+                    .map(|session| {
                         serde_json::json!({
-                            "sessionId": session_id,
-                            "profileId": profile_id,
-                            "server": server,
-                            "lastUsedAt": last_used_at,
+                            "sessionId": session.session_id,
+                            "profileId": session.profile_id,
+                            "server": session.server,
+                            "lastUsedAt": session.last_used_at,
+                            "lastHeartbeatAt": session.last_heartbeat_at,
+                            "stale": session.stale,
                         })
                     })
                     .collect::<Vec<_>>())

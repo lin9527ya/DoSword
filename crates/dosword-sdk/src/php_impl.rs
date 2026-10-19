@@ -271,7 +271,7 @@ else{$affected=$__st->rowCount();$ok=true;}
 pub const PHP_INFO_IMPL: &str = r#"$info=array(
 'ChunkedTransfer'=>'1',
 'ProtoVersion'=>'2',
-'Capabilities'=>'chunked,stream,db,plugin,exec,gzip_plain',
+'Capabilities'=>'chunked,stream,db,plugin,exec,batch,gzip_plain',
 'ShellType'=>'file',
 'OsInfo'=>@php_uname('s').' '.@php_uname('r').' '.@php_uname('m'),
 'CurrentUser'=>''.@get_current_user(),

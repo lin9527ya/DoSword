@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dosword_sdk::SessionState;
-use dosword_sdk::domain::{AppSettings, ProbeResult, ShellProfile};
+use dosword_sdk::domain::{AppSettings, ProbeResult, SessionInfo, ShellProfile};
 
 /// 会话默认存活时长（秒）。
 pub const SESSION_TTL_SECS: u64 = 4 * 60 * 60;
@@ -23,6 +23,52 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 令牌桶（W4 背压）：同一会话的 PTY 轮询与文件分块**共享**一个桶，
+/// 避免 agent / 前端高频请求把目标打满。容量内突发不限制，持续速率受限。
+pub struct TokenBucket {
+    capacity: f64,
+    tokens: f64,
+    refill_per_sec: f64,
+    last: std::time::Instant,
+}
+
+impl TokenBucket {
+    pub fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_per_sec,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn refill(&mut self, now: std::time::Instant) {
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+            self.last = now;
+        }
+    }
+
+    /// 取 `count` 个令牌；在 `timeout` 内取不到返回 `false`。
+    pub fn acquire(&mut self, count: f64, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let now = std::time::Instant::now();
+            self.refill(now);
+            if self.tokens >= count {
+                self.tokens -= count;
+                return true;
+            }
+            if now >= deadline {
+                return false;
+            }
+            let wait = ((count - self.tokens) / self.refill_per_sec).clamp(0.001, 0.05);
+            std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+        }
+    }
+}
+
 /// 一个活跃会话：绑定到 Shell 配置，持有协议的连接状态。
 pub struct ShellSession {
     pub id: String,
@@ -34,6 +80,13 @@ pub struct ShellSession {
     /// 连接时的环境信息（服务器 / 目录 / 分隔符等）。
     pub info: ProbeResult,
     pub last_used_at: u64,
+    /// 最近一次心跳成功时间（W4）。心跳**不**刷新 `last_used_at`：
+    /// TTL 仍由用户交互决定，空闲会话照常过期。
+    pub last_heartbeat_at: u64,
+    /// 最近一次心跳是否失败（目标掉线 / 会话失效）。
+    pub stale: bool,
+    /// W4 背压：PTY 轮询与文件分块共享的令牌桶。
+    pub limiter: Arc<std::sync::Mutex<TokenBucket>>,
     /// 上下文缓存：连接时写入，update_shell / update_settings 时失效（避免每命令重复查库）。
     pub profile: Option<ShellProfile>,
     pub settings: Option<AppSettings>,
@@ -97,6 +150,9 @@ impl SessionManager {
                 state,
                 info,
                 last_used_at: now,
+                last_heartbeat_at: now,
+                stale: false,
+                limiter: Arc::new(std::sync::Mutex::new(TokenBucket::new(120.0, 40.0))),
                 profile: None,
                 settings: None,
                 workspace_expires_at: None,
@@ -172,19 +228,61 @@ impl SessionManager {
     }
 
     /// 列出全部活跃会话的元信息（不含协议状态）。
-    pub fn list(&mut self) -> Vec<(String, String, String, u64)> {
+    /// 会话列表快照（含心跳状态），按最近交互时间倒序。
+    pub fn list(&mut self) -> Vec<SessionInfo> {
+        self.purge_expired();
+        let mut items: Vec<SessionInfo> = self
+            .sessions
+            .values()
+            .map(|session| SessionInfo {
+                session_id: session.id.clone(),
+                profile_id: session.profile_id.clone(),
+                server: session.info.server.clone(),
+                last_used_at: session.last_used_at,
+                last_heartbeat_at: session.last_heartbeat_at,
+                stale: session.stale,
+            })
+            .collect();
+        items.sort_by_key(|item| std::cmp::Reverse(item.last_used_at));
+        items
+    }
+
+    /// 心跳目标：`(session_id, protocol_id, 连接状态)`。
+    /// 锁内只做克隆，探活在锁外执行。
+    pub fn heartbeat_targets(&mut self) -> Vec<(String, String, Arc<dyn SessionState>)> {
         self.purge_expired();
         self.sessions
             .values()
             .map(|session| {
                 (
                     session.id.clone(),
-                    session.profile_id.clone(),
-                    session.info.server.clone(),
-                    session.last_used_at,
+                    session.protocol_id.clone(),
+                    Arc::clone(&session.state),
                 )
             })
             .collect()
+    }
+
+    /// 会话共享令牌桶（W4 背压：PTY 与文件流共用）。
+    pub fn limiter(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Arc<std::sync::Mutex<TokenBucket>>, String> {
+        self.purge_expired();
+        self.sessions
+            .get(session_id)
+            .map(|session| Arc::clone(&session.limiter))
+            .ok_or_else(|| "会话不存在或已过期，请重新连接".to_string())
+    }
+
+    /// 记录一次心跳结果：成功刷新时间并清除 stale；失败只标记 stale。
+    pub fn mark_heartbeat(&mut self, session_id: &str, alive: bool) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.stale = !alive;
+            if alive {
+                session.last_heartbeat_at = now_secs();
+            }
+        }
     }
 
     /// 全部活跃会话 id（设置变更时批量失效用）。
@@ -247,6 +345,54 @@ mod tests {
             dummy_info(),
         );
         assert_eq!(manager.get_mut(&id).unwrap().profile_id, "p1");
+    }
+
+    /// W4：心跳失败标记 stale，成功清除；且**不**刷新用户交互时间（TTL 不变）。
+    #[test]
+    fn heartbeat_marks_stale_and_does_not_touch_last_used() {
+        let mut manager = SessionManager::new();
+        let id = manager.insert(
+            "p1",
+            "w1",
+            "builtin.mock.v1",
+            Arc::new(DummyState),
+            dummy_info(),
+        );
+        let before = manager.list();
+        assert!(!before[0].stale, "新会话不应是 stale");
+        let used_at = before[0].last_used_at;
+
+        manager.mark_heartbeat(&id, false);
+        let after_fail = manager.list();
+        assert!(after_fail[0].stale, "心跳失败应标记 stale");
+        assert_eq!(
+            after_fail[0].last_used_at, used_at,
+            "心跳不得刷新 last_used_at"
+        );
+
+        manager.mark_heartbeat(&id, true);
+        let after_ok = manager.list();
+        assert!(!after_ok[0].stale, "心跳成功应清除 stale");
+        assert_eq!(after_ok[0].last_used_at, used_at);
+        // 目标列表也用于探活
+        assert_eq!(manager.heartbeat_targets().len(), 1);
+    }
+
+    /// W4 背压：令牌桶按容量限制突发、按速率补充。
+    #[test]
+    fn token_bucket_throttles_and_refills() {
+        let mut bucket = TokenBucket::new(2.0, 100.0);
+        assert!(bucket.acquire(1.0, std::time::Duration::ZERO));
+        assert!(bucket.acquire(1.0, std::time::Duration::ZERO));
+        assert!(
+            !bucket.acquire(1.0, std::time::Duration::ZERO),
+            "桶空时应立即失败"
+        );
+        // 100/s → 约 10ms 补充一个令牌
+        assert!(
+            bucket.acquire(1.0, std::time::Duration::from_millis(200)),
+            "等待后应能取到令牌"
+        );
     }
 
     #[test]
@@ -312,6 +458,6 @@ mod tests {
         );
         let sessions = manager.list();
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].1, "p1");
+        assert_eq!(sessions[0].profile_id, "p1");
     }
 }

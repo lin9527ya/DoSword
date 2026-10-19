@@ -32,9 +32,20 @@ export function SessionsView({ onNavigate }: { onNavigate: (view: View) => void 
     }
   }, [toast]);
 
+  // W4 心跳：空闲时每 45s 探活一次，失败只更新 stale 状态（不打断页面）
+  const heartbeat = useCallback(async () => {
+    try {
+      setSessions(await api.heartbeatSessions());
+    } catch {
+      // 会话可能已被清理：保留现有列表，下次手动刷新
+    }
+  }, []);
+
   useEffect(() => {
     void load();
-  }, [load]);
+    const timer = window.setInterval(() => void heartbeat(), 45_000);
+    return () => window.clearInterval(timer);
+  }, [load, heartbeat]);
 
   async function disconnect(sessionId: string) {
     try {
@@ -102,12 +113,21 @@ export function SessionsView({ onNavigate }: { onNavigate: (view: View) => void 
           <div className="shell-list">
             {sessions.map((session) => (
               <article className="shell-row" key={session.sessionId} style={{ gridTemplateColumns: "10px minmax(220px, 1fr) 90px 140px 100px 76px" }}>
-                <div className="status-dot online" />
+                <div className={`status-dot ${session.stale ? "error" : "online"}`} />
                 <div className="shell-identity">
                   <strong>会话 #{session.sessionId}</strong>
                   <span>{session.server || "目标服务器已连接"}</span>
                 </div>
-                <span className="runtime-badge php">ACTIVE</span>
+                <span
+                  className={`runtime-badge ${session.stale ? "stale" : "php"}`}
+                  title={
+                    session.lastHeartbeatAt > 0
+                      ? `最后心跳：${shortTime(new Date(session.lastHeartbeatAt * 1000).toISOString())}`
+                      : "尚未心跳"
+                  }
+                >
+                  {session.stale ? "STALE" : "ACTIVE"}
+                </span>
                 <div className="last-seen">
                   <span>最后交互</span>
                   <small>{shortTime(new Date(session.lastUsedAt * 1000).toISOString())}</small>

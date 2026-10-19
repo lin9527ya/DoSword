@@ -26,6 +26,32 @@ pub struct AppState {
     dir_cache: Mutex<DirCache>,
     /// 多跳代理链（id → 本地监听器）
     proxy_chains: Mutex<std::collections::HashMap<String, proxy_chain::LocalChain>>,
+    /// W4 断点续传：上传检查点（会话 + 远端路径）
+    upload_checkpoints: Mutex<std::collections::HashMap<(String, String), UploadCheckpoint>>,
+    /// W4 断点续传：下载检查点（会话 + 远端路径 + 本地路径）
+    download_checkpoints:
+        Mutex<std::collections::HashMap<(String, String, String), DownloadCheckpoint>>,
+}
+
+/// W4 断点续传：上传检查点。
+///
+/// `size` / `last_modified` 用来识别「同一个源文件」——同名但内容不同的文件
+/// 不会误续传（远端被改动时也会重置）。
+#[derive(Debug, Clone)]
+pub struct UploadCheckpoint {
+    pub size: u64,
+    pub last_modified: i64,
+    /// 已成功写入远端的字节数（顺序追加语义）。
+    pub written: u64,
+}
+
+/// W4 断点续传：下载检查点。
+#[derive(Debug, Clone)]
+pub struct DownloadCheckpoint {
+    /// 开始下载时记录的远端大小；重试时不一致则不续传。
+    pub remote_size: u64,
+    /// 已写入本地 `.dswpart` 的字节数。
+    pub written: u64,
 }
 
 /// 目录列表缓存：`lru::LruCache` + TTL 5s + Arc 共享（O(1) 淘汰，免深拷贝）。
@@ -122,6 +148,8 @@ fn build_app_state(
         ptys: pty::PtyRegistry::new(),
         dir_cache: Mutex::new(DirCache::new()),
         proxy_chains: Mutex::new(std::collections::HashMap::new()),
+        upload_checkpoints: Mutex::new(std::collections::HashMap::new()),
+        download_checkpoints: Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -220,6 +248,7 @@ pub fn run() {
             commands::pty_read,
             commands::pty_close,
             commands::list_sessions,
+            commands::heartbeat_sessions,
             commands::execute_command,
             commands::list_dir,
             commands::batch_list_dir,
@@ -243,6 +272,8 @@ pub fn run() {
             commands::touch_path,
             commands::write_chunk,
             commands::read_chunk,
+            commands::upload_begin,
+            commands::upload_finish,
             commands::db_probe,
             commands::db_query,
             commands::list_request_log,

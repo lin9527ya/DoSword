@@ -527,6 +527,17 @@ impl ConnectResult {
     }
 }
 
+/// 文件传输结果（W4 断点续传）：本次字节数与续传起点。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferOutcome {
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// 0 = 从头开始；> 0 = 从该偏移续传。
+    #[ts(type = "number")]
+    pub resumed_from: u64,
+}
+
 /// 活跃会话元信息（供会话列表页展示）。
 #[derive(Debug, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -536,6 +547,12 @@ pub struct SessionInfo {
     pub server: String,
     #[ts(type = "number")]
     pub last_used_at: u64,
+    /// 最近一次心跳成功的时间（0 = 尚未心跳）。心跳**不**刷新 `last_used_at`，
+    /// 因此空闲会话仍会按 TTL 过期。
+    #[ts(type = "number")]
+    pub last_heartbeat_at: u64,
+    /// 最近一次心跳失败（目标掉线 / 会话失效）。
+    pub stale: bool,
 }
 
 // --- 数据库管理（V2.0） ---
@@ -692,6 +709,7 @@ mod ts_bindings {
             ("ProtocolMeta", ProtocolMeta::decl()),
             ("ConnectResult", ConnectResult::decl()),
             ("SessionInfo", SessionInfo::decl()),
+            ("TransferOutcome", TransferOutcome::decl()),
             ("DbConnection", DbConnection::decl()),
             ("DbProbeResult", DbProbeResult::decl()),
             ("DbQueryResult", DbQueryResult::decl()),

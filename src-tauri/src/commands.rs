@@ -9,14 +9,14 @@ use dosword_sdk::domain::{
     CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing, FileChunk,
     FileContent, GenerateShellResult, HttpSendResult, ImportResult, MemoryShell,
     MemshellCapability, ProbeResult, ProtocolMeta, ProxyTestResult, RequestRecord, SessionInfo,
-    ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
+    ShellProfile, TransferOutcome, UpdateShell, UpdateWorkspace, Workspace,
 };
 use dosword_sdk::encoder::{EncoderRegistry, STUB_LANGUAGES};
 use dosword_sdk::plugin::FeaturePlugin;
 use dosword_sdk::{PluginManifest, Protocol, ProtocolError, SessionState};
 
-use crate::AppState;
 use crate::auth;
+use crate::{AppState, DownloadCheckpoint, UploadCheckpoint};
 
 fn validate_text(value: &str, field: &str) -> Result<(), String> {
     if value.trim().is_empty() {
@@ -2081,7 +2081,8 @@ fn require_pty_owner_alive(state: &AppState, pty_id: &str) -> Result<String, Str
 #[tauri::command]
 pub async fn pty_write(pty_id: String, data_b64: String, app: AppHandle) -> Result<(), String> {
     blocking(app, move |state| {
-        require_pty_owner_alive(state, &pty_id)?;
+        let owner = require_pty_owner_alive(state, &pty_id)?;
+        acquire_token(state, &owner, 1.0, std::time::Duration::from_secs(2))?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data_b64)
             .map_err(|error| format!("PTY 输入解码失败：{error}"))?;
@@ -2094,11 +2095,22 @@ pub async fn pty_write(pty_id: String, data_b64: String, app: AppHandle) -> Resu
 #[tauri::command]
 pub async fn pty_read(pty_id: String, app: AppHandle) -> Result<serde_json::Value, String> {
     blocking(app, move |state| {
-        if let Err(error) = require_pty_owner_alive(state, &pty_id) {
+        let owner = match require_pty_owner_alive(state, &pty_id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Ok(serde_json::json!({
+                    "data": "",
+                    "closed": true,
+                    "error": error,
+                }));
+            }
+        };
+        // 背压：轮询过快时本次返回空（前端按固定节奏再轮询即可）
+        if acquire_token(state, &owner, 1.0, std::time::Duration::from_millis(100)).is_err() {
             return Ok(serde_json::json!({
                 "data": "",
-                "closed": true,
-                "error": error,
+                "closed": false,
+                "throttled": true,
             }));
         }
         match state.ptys.read(&pty_id) {
@@ -2176,18 +2188,54 @@ pub async fn list_sessions(app: AppHandle) -> Result<Vec<SessionInfo>, String> {
             .sessions
             .lock()
             .map_err(|_| "会话锁异常".to_string())?;
-        Ok(sessions
-            .list()
+        Ok(sessions.list())
+    })
+    .await
+}
+
+/// W4 心跳：对所有活跃会话做一次轻量探活，更新 `stale` 并返回最新会话列表。
+///
+/// 探活在会话锁外执行（先克隆 `Arc<dyn SessionState>`），单个目标的慢响应
+/// 不会阻塞其它会话或 UI；心跳**不**刷新 `last_used_at`（TTL 语义不变）。
+#[tauri::command]
+pub async fn heartbeat_sessions(app: AppHandle) -> Result<Vec<SessionInfo>, String> {
+    blocking(app, move |state| {
+        let targets = {
+            let mut sessions = state
+                .sessions
+                .lock()
+                .map_err(|_| "会话锁异常".to_string())?;
+            sessions.heartbeat_targets()
+        };
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let settings = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .get_settings()
+            .map_err(|error| error.to_string())?;
+        // 锁外逐个探活（请求轻量、会话之间串行即可）
+        let outcomes: Vec<(String, bool)> = targets
             .into_iter()
-            .map(
-                |(session_id, profile_id, server, last_used_at)| SessionInfo {
-                    session_id,
-                    profile_id,
-                    server,
-                    last_used_at,
-                },
-            )
-            .collect())
+            .map(|(session_id, protocol_id, session)| {
+                let alive = state
+                    .protocols
+                    .get(&protocol_id)
+                    .map(|protocol| protocol.heartbeat(session.as_ref(), &settings).is_ok())
+                    .unwrap_or(false);
+                (session_id, alive)
+            })
+            .collect();
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?;
+        for (session_id, alive) in outcomes {
+            sessions.mark_heartbeat(&session_id, alive);
+        }
+        Ok(sessions.list())
     })
     .await
 }
@@ -2261,6 +2309,30 @@ fn session_ctx<'a>(state: &'a AppState, session_id: &str) -> Result<SessionCtx<'
 
 /// 短锁取出会话的协议状态（`Arc` 克隆），在锁外执行 `f`。
 /// 网络调用不持有全局会话锁：单个慢请求不再阻塞其他会话。
+/// W4 背压：从会话共享令牌桶取 `count` 个令牌（PTY 与文件分块共用）。
+///
+/// 超时仍未取到 → 明确报错（调用方应提示"稍后重试"而不是自动重试风暴）。
+fn acquire_token(
+    state: &AppState,
+    session_id: &str,
+    count: f64,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let limiter = {
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?;
+        sessions.limiter(session_id)?
+    };
+    let mut bucket = limiter.lock().map_err(|_| "限流器锁异常".to_string())?;
+    if bucket.acquire(count, timeout) {
+        Ok(())
+    } else {
+        Err("请求过于频繁（会话令牌桶已耗尽）：请稍后重试".to_string())
+    }
+}
+
 fn with_session<T>(
     state: &AppState,
     session_id: &str,
@@ -2451,88 +2523,164 @@ pub async fn batch_list_dir(
 ) -> Result<serde_json::Value, String> {
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
-        // P4：并行拉取（上限 4 线程），避免 N 个目录串行网络往返
-        let workers = paths.len().clamp(1, 4);
-        let path_list = &paths;
-        let session_id_ref = &session_id;
-        let settings_ref = &ctx.settings;
-        let collected: Vec<(String, Result<serde_json::Value, String>)> =
-            std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(workers);
-                for worker in 0..workers {
-                    let session_id = session_id_ref;
-                    let settings = settings_ref;
-                    handles.push(scope.spawn(move || {
-                        let mut out = Vec::new();
-                        let mut index = worker;
-                        while index < path_list.len() {
-                            let path = &path_list[index];
-                            // 批量浏览同样命中目录缓存（避免重复网络往返）
-                            let cache_key = (session_id.clone(), path.clone());
-                            let listing = {
-                                let cache_hit =
-                                    state.dir_cache.lock().ok().and_then(|mut cache| {
-                                        cache.get(&cache_key, std::time::Duration::from_secs(5))
-                                    });
-                                match cache_hit {
-                                    Some(listing) => (*listing).clone(),
-                                    None => {
-                                        let listing = with_session(state, session_id, |session| {
-                                            ctx.protocol.list_dir(session, path, settings)
-                                        })
-                                        .map_err(|error| format!("浏览 {path} 失败：{error}"));
-                                        match listing {
-                                            Ok(listing) => {
-                                                let listing_arc = std::sync::Arc::new(listing);
-                                                if let Ok(mut cache) = state.dir_cache.lock() {
-                                                    cache.insert(
-                                                        cache_key,
-                                                        (
-                                                            std::time::Instant::now(),
-                                                            std::sync::Arc::clone(&listing_arc),
-                                                        ),
-                                                    );
-                                                }
-                                                (*listing_arc).clone()
-                                            }
-                                            Err(error) => {
-                                                out.push((path.clone(), Err(error)));
-                                                index += workers;
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                            };
-                            out.push((
-                                path.clone(),
-                                serde_json::to_value(listing).map_err(|error| error.to_string()),
-                            ));
-                            index += workers;
-                        }
-                        out
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .flat_map(|handle| handle.join().unwrap_or_default())
-                    .collect()
-            });
         let mut results = serde_json::Map::new();
-        for (path, value) in collected {
-            // 逐目录容错：不存在的目录很常见，不应让整批失败
-            match value {
-                Ok(listing) => {
-                    results.insert(path, listing);
+
+        // 1) 目录缓存命中直接返回（5s TTL）
+        let mut missing: Vec<String> = Vec::new();
+        for path in &paths {
+            let cache_key = (session_id.clone(), path.clone());
+            let hit = state
+                .dir_cache
+                .lock()
+                .ok()
+                .and_then(|mut cache| cache.get(&cache_key, std::time::Duration::from_secs(5)));
+            match hit.and_then(|listing| serde_json::to_value(&*listing).ok()) {
+                Some(value) => {
+                    results.insert(path.clone(), value);
                 }
-                Err(error) => {
-                    results.insert(path, serde_json::json!({ "ok": false, "error": error }));
-                }
+                None => missing.push(path.clone()),
             }
         }
+
+        // 2) 多路复用（W4）：一次往返取回全部未命中路径。
+        //    只有 NATIVE / 分阶段通道支持（服务端有统一分发器）；
+        //    不支持时回退到逐个并行拉取。
+        if !missing.is_empty() {
+            let session = {
+                let mut sessions = state
+                    .sessions
+                    .lock()
+                    .map_err(|_| "会话锁异常".to_string())?;
+                sessions.get_mut(&session_id)?.state.clone()
+            };
+            match ctx
+                .protocol
+                .batch_list_dir(session.as_ref(), &missing, &ctx.settings)
+            {
+                Ok(items) => {
+                    for (path, listing) in items {
+                        match listing {
+                            Ok(listing) => {
+                                let listing = std::sync::Arc::new(listing);
+                                if let Ok(mut cache) = state.dir_cache.lock() {
+                                    cache.insert(
+                                        (session_id.clone(), path.clone()),
+                                        (
+                                            std::time::Instant::now(),
+                                            std::sync::Arc::clone(&listing),
+                                        ),
+                                    );
+                                }
+                                match serde_json::to_value(&*listing) {
+                                    Ok(value) => {
+                                        results.insert(path, value);
+                                    }
+                                    Err(error) => {
+                                        results.insert(
+                                            path,
+                                            serde_json::json!({ "ok": false, "error": error.to_string() }),
+                                        );
+                                    }
+                                }
+                            }
+                            // 逐目录容错：不存在的目录很常见，不应让整批失败
+                            Err(error) => {
+                                results.insert(
+                                    path,
+                                    serde_json::json!({ "ok": false, "error": format!("浏览失败：{error}") }),
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(ProtocolError::NotSupported(_)) => {
+                    for (path, value) in fetch_dirs_parallel(state, &session_id, &missing, &ctx) {
+                        match value {
+                            Ok(listing) => {
+                                results.insert(path, listing);
+                            }
+                            Err(error) => {
+                                results.insert(
+                                    path,
+                                    serde_json::json!({ "ok": false, "error": error }),
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+
         Ok(serde_json::Value::Object(results))
     })
     .await
+}
+
+/// 逐个并行拉取目录（上限 4 线程）。供不支持多路复用的协议回退。
+fn fetch_dirs_parallel(
+    state: &AppState,
+    session_id: &str,
+    paths: &[String],
+    ctx: &SessionCtx<'_>,
+) -> Vec<(String, Result<serde_json::Value, String>)> {
+    let workers = paths.len().clamp(1, 4);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            handles.push(scope.spawn(move || {
+                let mut out = Vec::new();
+                let mut index = worker;
+                while index < paths.len() {
+                    let path = &paths[index];
+                    let cache_key = (session_id.to_string(), path.clone());
+                    let cache_hit = state.dir_cache.lock().ok().and_then(|mut cache| {
+                        cache.get(&cache_key, std::time::Duration::from_secs(5))
+                    });
+                    let listing = match cache_hit {
+                        Some(listing) => (*listing).clone(),
+                        None => {
+                            match with_session(state, session_id, |session| {
+                                ctx.protocol.list_dir(session, path, &ctx.settings)
+                            }) {
+                                Ok(listing) => {
+                                    let listing = std::sync::Arc::new(listing);
+                                    if let Ok(mut cache) = state.dir_cache.lock() {
+                                        cache.insert(
+                                            cache_key,
+                                            (
+                                                std::time::Instant::now(),
+                                                std::sync::Arc::clone(&listing),
+                                            ),
+                                        );
+                                    }
+                                    (*listing).clone()
+                                }
+                                Err(error) => {
+                                    out.push((
+                                        path.clone(),
+                                        Err(format!("浏览 {path} 失败：{error}")),
+                                    ));
+                                    index += workers;
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    out.push((
+                        path.clone(),
+                        serde_json::to_value(listing).map_err(|error| error.to_string()),
+                    ));
+                    index += workers;
+                }
+                out
+            }));
+        }
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    })
 }
 
 #[tauri::command]
@@ -2641,6 +2789,7 @@ pub async fn upload_file(
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(base64_slice(&content_b64, b64_offset, end)?)
                 .map_err(|_| "文件内容不是合法 Base64".to_string())?;
+            acquire_token(state, &session_id, 1.0, std::time::Duration::from_secs(2))?;
             with_session(state, &session_id, |session| {
                 ctx.protocol.write_chunk(
                     session,
@@ -2715,6 +2864,7 @@ pub async fn write_chunk(
             .decode(&content_b64)
             .map_err(|_| "文件内容不是合法 Base64".to_string())?;
         let ctx = session_ctx(state, &session_id)?;
+        acquire_token(state, &session_id, 1.0, std::time::Duration::from_secs(2))?;
         with_session(state, &session_id, |session| {
             ctx.protocol
                 .write_chunk(session, &path, &bytes, offset, &ctx.settings)
@@ -2730,6 +2880,12 @@ pub async fn write_chunk(
             )
         })?;
         invalidate_dir_cache(state, &session_id);
+        // W4：若本次上传由 `upload_begin` 建立了检查点，记录已写入偏移
+        if let Ok(mut checkpoints) = state.upload_checkpoints.lock()
+            && let Some(checkpoint) = checkpoints.get_mut(&(session_id.clone(), path.clone()))
+        {
+            checkpoint.written = checkpoint.written.max(offset + bytes.len() as u64);
+        }
         audit(
             state,
             &ctx.workspace_id,
@@ -2741,6 +2897,110 @@ pub async fn write_chunk(
         Ok(())
     })
     .await
+}
+
+/// W4 断点续传：开始一次上传，返回可续传的字节偏移（`None` = 从头开始）。
+///
+/// 只有「同一会话 + 同一远端路径 + 相同源文件大小/修改时间 + 远端文件长度
+/// 与检查点一致」时才续传；其余情况一律从头开始 —— 避免把同名但内容不同的
+/// 文件拼坏，也避免远端文件被外部改动后续传出错误内容。
+#[tauri::command]
+pub async fn upload_begin(
+    session_id: String,
+    remote_path: String,
+    size: u64,
+    last_modified: i64,
+    app: AppHandle,
+) -> Result<Option<u64>, String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        let remote_size = remote_file_size(state, &ctx, &session_id, &remote_path);
+        let key = (session_id.clone(), remote_path.clone());
+        let mut checkpoints = state
+            .upload_checkpoints
+            .lock()
+            .map_err(|_| "检查点锁异常".to_string())?;
+        match checkpoints.get_mut(&key) {
+            Some(checkpoint)
+                if checkpoint.size == size
+                    && checkpoint.last_modified == last_modified
+                    && checkpoint.written > 0 =>
+            {
+                if remote_size == Some(checkpoint.written) {
+                    Ok(Some(checkpoint.written))
+                } else {
+                    // 远端被改动/删除：从头开始
+                    checkpoint.written = 0;
+                    Ok(None)
+                }
+            }
+            _ => {
+                checkpoints.insert(
+                    key,
+                    UploadCheckpoint {
+                        size,
+                        last_modified,
+                        written: 0,
+                    },
+                );
+                Ok(None)
+            }
+        }
+    })
+    .await
+}
+
+/// W4：上传完成，清除检查点（失败时保留，供重试续传）。
+#[tauri::command]
+pub async fn upload_finish(
+    session_id: String,
+    remote_path: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    blocking(app, move |state| {
+        state
+            .upload_checkpoints
+            .lock()
+            .map_err(|_| "检查点锁异常".to_string())?
+            .remove(&(session_id, remote_path));
+        Ok(())
+    })
+    .await
+}
+
+/// 拆分远端路径为 `(父目录, 文件名)`，兼容 `/` 与 `\\`；无分隔符返回 `None`。
+fn split_parent(path: &str) -> Option<(&str, &str)> {
+    let index = path.rfind(['/', '\\'])?;
+    let parent = if index == 0 {
+        &path[..1]
+    } else {
+        &path[..index]
+    };
+    let name = &path[index + 1..];
+    if name.is_empty() {
+        None
+    } else {
+        Some((parent, name))
+    }
+}
+
+/// 取远端文件大小（通过父目录列表）。取不到时返回 `None`（调用方不续传）。
+fn remote_file_size(
+    state: &AppState,
+    ctx: &SessionCtx<'_>,
+    session_id: &str,
+    remote_path: &str,
+) -> Option<u64> {
+    let (parent, name) = split_parent(remote_path)?;
+    let listing = with_session(state, session_id, |session| {
+        ctx.protocol.list_dir(session, parent, &ctx.settings)
+    })
+    .ok()?;
+    listing
+        .entries
+        .into_iter()
+        .find(|entry| entry.name == name && !entry.is_dir)
+        .map(|entry| entry.size)
 }
 
 /// 分块读取远端文件（`length = 0` 表示读到文件尾）。
@@ -2760,6 +3020,7 @@ pub async fn read_chunk(
 ) -> Result<FileChunk, String> {
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
+        acquire_token(state, &session_id, 1.0, std::time::Duration::from_secs(2))?;
         let data = with_session(state, &session_id, |session| {
             ctx.protocol
                 .read_chunk(session, &path, offset, length, &ctx.settings)
@@ -2792,22 +3053,72 @@ pub async fn download_file(
     remote_path: String,
     local_path: String,
     app: AppHandle,
-) -> Result<u64, String> {
+) -> Result<TransferOutcome, String> {
     blocking(app, move |state| {
         let ctx = session_ctx(state, &session_id)?;
         // S4：下载目标必须是用户选定（save 对话框）的普通路径，拒绝敏感目录
         let safe = sanitize_local_path(state, &local_path, true)?;
-        // 分块拉取（块大小由设置配置，默认 4MB），避免大文件一次性占用内存与超时；
-        // P3：逐块流式写盘（不再整文件累积在内存后一次性写入）
+        // W4：先写 `<目标>.dswpart`，完成后原子改名 —— 中断重试时可从断点续传
+        let part_path = std::path::PathBuf::from(format!("{}.dswpart", safe.display()));
+        let key = (
+            session_id.clone(),
+            remote_path.clone(),
+            safe.display().to_string(),
+        );
         let chunk_size = ctx.settings.chunk_size_mb.max(1) * 1024 * 1024;
+
+        // 续传判定：远端大小与检查点一致、且本地临时文件长度等于检查点偏移
+        let remote_size = remote_file_size(state, &ctx, &session_id, &remote_path);
+        let resumed_from = {
+            let part_len = std::fs::metadata(&part_path).ok().map(|meta| meta.len());
+            let mut checkpoints = state
+                .download_checkpoints
+                .lock()
+                .map_err(|_| "检查点锁异常".to_string())?;
+            let resume = checkpoints
+                .get(&key)
+                .and_then(|checkpoint| match remote_size {
+                    Some(size)
+                        if checkpoint.written > 0
+                            && checkpoint.remote_size == size
+                            && part_len == Some(checkpoint.written)
+                            && checkpoint.written < size =>
+                    {
+                        Some(checkpoint.written)
+                    }
+                    _ => None,
+                });
+            let from = resume.unwrap_or(0);
+            checkpoints.insert(
+                key.clone(),
+                DownloadCheckpoint {
+                    remote_size: remote_size.unwrap_or(0),
+                    written: from,
+                },
+            );
+            from
+        };
+
+        let mut written = resumed_from;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
-            .open(&safe)
-            .map_err(|error| format!("创建本地文件失败：{error}"))?;
-        let mut written = 0u64;
+            .append(written > 0)
+            .truncate(written == 0)
+            .open(&part_path)
+            .map_err(|error| format!("创建本地临时文件失败：{error}"))?;
+        if resumed_from > 0 {
+            audit(
+                state,
+                &ctx.workspace_id,
+                Some(&ctx.shell.id),
+                "file.download",
+                "success",
+                &format!("续传下载：{remote_path} 自 {resumed_from} 字节处继续"),
+            );
+        }
         loop {
+            acquire_token(state, &session_id, 1.0, std::time::Duration::from_secs(2))?;
             let chunk = with_session(state, &session_id, |session| {
                 ctx.protocol
                     .read_chunk(session, &remote_path, written, chunk_size, &ctx.settings)
@@ -2835,23 +3146,44 @@ pub async fn download_file(
                 ));
             }
             file.write_all(&chunk)
-                .map_err(|error| format!("写入本地文件失败：{error}"))?;
+                .map_err(|error| format!("写入本地临时文件失败：{error}"))?;
             written += chunk.len() as u64;
+            // 每块更新检查点（进程内；应用重启后检查点失效，但 .dswpart 会从头覆盖）
+            if let Ok(mut checkpoints) = state.download_checkpoints.lock()
+                && let Some(checkpoint) = checkpoints.get_mut(&key)
+            {
+                checkpoint.written = written;
+            }
             if (chunk.len() as u64) < chunk_size {
                 break;
             }
         }
         file.flush()
             .map_err(|error| format!("刷新本地文件失败：{error}"))?;
+        drop(file);
+        // 完成后替换目标文件（Windows 上 rename 不能覆盖已有文件）
+        let _ = std::fs::remove_file(&safe);
+        std::fs::rename(&part_path, &safe).map_err(|error| format!("替换目标文件失败：{error}"))?;
+        if let Ok(mut checkpoints) = state.download_checkpoints.lock() {
+            checkpoints.remove(&key);
+        }
+        let resume_note = if resumed_from > 0 {
+            format!("，自 {resumed_from} 字节续传")
+        } else {
+            String::new()
+        };
         audit(
             state,
             &ctx.workspace_id,
             Some(&ctx.shell.id),
             "file.download",
             "success",
-            &format!("下载文件：{remote_path} → {local_path}（{written} 字节）"),
+            &format!("下载文件：{remote_path} → {local_path}（{written} 字节{resume_note}）"),
         );
-        Ok(written)
+        Ok(TransferOutcome {
+            bytes: written,
+            resumed_from,
+        })
     })
     .await
 }
@@ -4212,6 +4544,8 @@ mod tests {
             ptys: crate::pty::PtyRegistry::new(),
             dir_cache: Mutex::new(crate::DirCache::new()),
             proxy_chains: Mutex::new(std::collections::HashMap::new()),
+            upload_checkpoints: Mutex::new(std::collections::HashMap::new()),
+            download_checkpoints: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -4494,6 +4828,16 @@ mod tests {
             Arc::from(session),
             probe,
         )
+    }
+
+    /// W4 续传：远端路径拆分（POSIX + Windows 分隔符）。
+    #[test]
+    fn split_parent_handles_posix_and_windows_paths() {
+        assert_eq!(split_parent("/var/www/a.txt"), Some(("/var/www", "a.txt")));
+        assert_eq!(split_parent("/a.txt"), Some(("/", "a.txt")));
+        assert_eq!(split_parent("C:\\www\\a.txt"), Some(("C:\\www", "a.txt")));
+        assert_eq!(split_parent("a.txt"), None);
+        assert_eq!(split_parent("/var/www/"), None);
     }
 
     #[test]

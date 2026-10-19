@@ -414,8 +414,23 @@ export function FileManager({
       const target = join(file.name);
       try {
         const total = file.size;
-        let sent = 0;
-        setUploading({ name: file.name, sent: 0, total });
+        // W4 断点续传：后端按 (会话, 远端路径, 源大小, 修改时间) 判断上次中断点
+        const resumeFrom = (await api.uploadBegin(
+          sessionId,
+          target,
+          file.size,
+          file.lastModified,
+        )) ?? 0;
+        let sent = resumeFrom;
+        // 需要跳过的源字节数（续传时从断点继续读文件）
+        let skip = resumeFrom;
+        setUploading({ name: file.name, sent, total });
+        if (resumeFrom > 0) {
+          toast.info(
+            `从 ${(resumeFrom / 1024 / 1024).toFixed(2)} MB 处续传`,
+            `${file.name} 检测到未完成的上传`,
+          );
+        }
         const reader = file.stream().getReader();
         let buf = new Uint8Array(0);
         const flush = async (data: Uint8Array) => {
@@ -431,10 +446,19 @@ export function FileManager({
             if (buf.length > 0) await flush(buf);
             break;
           }
+          let chunk: Uint8Array = value;
+          if (skip > 0) {
+            if (chunk.length <= skip) {
+              skip -= chunk.length;
+              continue;
+            }
+            chunk = chunk.slice(skip);
+            skip = 0;
+          }
           // 聚合小块至 CHUNK
-          const next = new Uint8Array(buf.length + value.length);
+          const next = new Uint8Array(buf.length + chunk.length);
           next.set(buf, 0);
-          next.set(value, buf.length);
+          next.set(chunk, buf.length);
           buf = next;
           while (buf.length >= CHUNK) {
             const slice = buf.slice(0, CHUNK);
@@ -442,6 +466,7 @@ export function FileManager({
             buf = buf.slice(CHUNK);
           }
         }
+        await api.uploadFinish(sessionId, target);
         toast.success(`文件 ${file.name} 上传完成`);
       } catch (cause) {
         toast.error(`上传 ${file.name} 失败：${errorText(cause)}`);
@@ -456,8 +481,13 @@ export function FileManager({
     try {
       const savePath = await save({ defaultPath: entry.name });
       if (!savePath) return;
-      await api.downloadFile(sessionId, entry.path, String(savePath));
-      toast.success(`文件已下载至 ${savePath}`, "下载完成");
+      const outcome = await api.downloadFile(sessionId, entry.path, String(savePath));
+      toast.success(
+        outcome.resumedFrom > 0
+          ? `文件已下载至 ${savePath}（自 ${(outcome.resumedFrom / 1024 / 1024).toFixed(2)} MB 处续传）`
+          : `文件已下载至 ${savePath}`,
+        "下载完成",
+      );
     } catch (cause) {
       toast.error(`下载失败：${errorText(cause)}`);
     }

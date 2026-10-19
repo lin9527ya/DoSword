@@ -85,6 +85,28 @@ PHP 侧此前是「三条通道、三套能力」：同一个目标换个编码�
 - 分阶段载荷的 gzip 改为**明文层**压缩（`{"n":..,"z":1,"d":base64(gzip(请求))}`）：
   密文层压缩对高熵密文收益接近零，而 base64 载荷的 33% 膨胀可以被真正收回。
 
+### 新增（会话层 W4）
+
+- **心跳**：新增 `heartbeat_sessions` 命令，对全部活跃会话轻量探活
+  （PHP：NATIVE / 分阶段走 `probe`，legacy 走探测模板；其它协议执行无副作用命令）。
+  `SessionInfo` 增加 `lastHeartbeatAt` / `stale`；会话页每 45s 自动探活，
+  掉线显示 `STALE`。心跳**不**刷新 `last_used_at`（TTL 语义不变）。
+- **多路复用**：NATIVE stub 与分阶段处理器新增 `batch` 分发（单次调用与批量共用
+  `__RUN__` / `<prefix>once` 分发器）；批量目录浏览优先一次往返取回全部未缓存路径。
+  legacy 通道明确返回 `NotSupported`，命令层回退到原有的 4 线程并行拉取。
+  新能力位 `batch`（旧 stub 不上报 → 自动回退）。
+- **断点续传**：上传新增 `upload_begin` / `upload_finish` —— 按
+  「会话 + 远端路径 + 源文件大小/修改时间」记录检查点，并用远端文件长度校验断点；
+  下载改为写 `<目标>.dswpart` + 远端大小校验，完成后原子替换，
+  `download_file` 返回 `TransferOutcome { bytes, resumedFrom }`。
+- **背压**：每会话一个令牌桶（容量 120、每秒补充 40），PTY 读写与分块读写/
+  上传下载**共享**；PTY 读超限返回空轮询（前端按节奏重试），写与文件操作返回
+  明确错误，避免自动重试风暴。
+- 测试：`real_php_heartbeat_round_trip`（三通道探活 + 目标下线后失败）、
+  `real_php_batch_list_dir_round_trip`（逐项容错 + legacy 明确不支持）、
+  `heartbeat_marks_stale_and_does_not_touch_last_used`、
+  `token_bucket_throttles_and_refills`、`split_parent_handles_posix_and_windows_paths`。
+
 ### 新增（PHP）
 
 - **W2 传输形态可配（Transport Profile）**：每 Shell 可在 `protocol_params.transport`

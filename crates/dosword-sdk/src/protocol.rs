@@ -48,6 +48,9 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
+/// 批量目录列举结果：`(路径, 该路径的结果)`，单项失败不影响其余。
+pub type BatchDirResult = Vec<(String, Result<DirListing, String>)>;
+
 /// 一次成功连接后需要保留的会话状态。具体协议将其向下转型回自身类型。
 pub trait SessionState: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
@@ -87,6 +90,35 @@ pub trait Protocol: Send + Sync {
         path: &str,
         settings: &AppSettings,
     ) -> Result<DirListing, ProtocolError>;
+
+    /// 轻量探活（W4 心跳）：会话空闲时调用，失败即认为目标已掉线。
+    ///
+    /// 默认实现执行一条无副作用命令（所有协议都有命令通道）；
+    /// PHP 覆写为更轻的 probe / legacy 探测模板。心跳**不**更新
+    /// 会话的 `last_used_at`（TTL 仍由用户交互决定）。
+    fn heartbeat(
+        &self,
+        session: &dyn SessionState,
+        settings: &AppSettings,
+    ) -> Result<(), ProtocolError> {
+        self.execute_command(session, "true", settings).map(|_| ())
+    }
+
+    /// 多路复用：一次网络往返列举多个目录（W4）。
+    ///
+    /// 返回 `(path, Result<DirListing, String>)`：单项失败不影响其余。
+    /// 默认返回 `NotSupported`，调用方回退到逐个列举；支持批量分发的协议
+    /// （如 PHP 的 NATIVE / 分阶段通道）覆写本方法。
+    fn batch_list_dir(
+        &self,
+        _session: &dyn SessionState,
+        _paths: &[String],
+        _settings: &AppSettings,
+    ) -> Result<BatchDirResult, ProtocolError> {
+        Err(ProtocolError::NotSupported(
+            "该协议不支持多路复用（批量列举）".into(),
+        ))
+    }
 
     fn read_file(
         &self,

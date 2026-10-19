@@ -234,7 +234,21 @@ export type ConnectResult = { sessionId: string, server: string, webServer: stri
  * stub 自报的协议元数据（能力协商）。旧 stub 可能为 None。
  */
 capabilities: TargetCapabilities | null, };
-export type SessionInfo = { sessionId: string, profileId: string, server: string, lastUsedAt: number, };
+export type SessionInfo = { sessionId: string, profileId: string, server: string, lastUsedAt: number, 
+/**
+ * 最近一次心跳成功的时间（0 = 尚未心跳）。心跳**不**刷新 `last_used_at`，
+ * 因此空闲会话仍会按 TTL 过期。
+ */
+lastHeartbeatAt: number, 
+/**
+ * 最近一次心跳失败（目标掉线 / 会话失效）。
+ */
+stale: boolean, };
+export type TransferOutcome = { bytes: number, 
+/**
+ * 0 = 从头开始；> 0 = 从该偏移续传。
+ */
+resumedFrom: number, };
 export type DbConnection = { driver: string, host: string | null, port: number | null, username: string | null, password: string | null, dbname: string | null, };
 export type DbProbeResult = { driver: string, databases: Array<string>, message: string, };
 export type DbQueryResult = { columns: Array<string>, 
