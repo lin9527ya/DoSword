@@ -28,6 +28,22 @@ const DEFAULT_CONN: DbConnection = {
 
 const isRedis = (driver: string) => driver === "redis";
 
+/** 标识符引号：各驱动语法不同（MySQL 反引号 / 标准双引号 / MSSQL 方括号）。 */
+function quoteIdent(driver: string, name: string): string {
+  if (driver === "mysql") return `\`${name.replace(/`/g, "``")}\``;
+  if (driver === "mssql") return `[${name.replace(/]/g, "]]")}]`;
+  // pgsql / oracle / sqlite 用标准双引号
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+/** 预览语句：引号与分页语法都必须按驱动分派。 */
+function previewSqlFor(driver: string, table: string): string {
+  const target = quoteIdent(driver, table);
+  if (driver === "mssql") return `SELECT TOP 100 * FROM ${target};`;
+  if (driver === "oracle") return `SELECT * FROM ${target} FETCH FIRST 100 ROWS ONLY;`;
+  return `SELECT * FROM ${target} LIMIT 100;`;
+}
+
 const TABLE_SQL: Record<string, (db: string) => string> = {
   mysql: () => "SHOW TABLES",
   pgsql: () => "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
@@ -169,7 +185,9 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
     }
   }, [databases, connection.driver, selectedDb]);
 
-  const previewSql = (table: string) => `SELECT * FROM \`${table}\` LIMIT 100;`;
+  // 预览必须按驱动分派：反引号只在 MySQL 合法，MSSQL/Oracle 的 `LIMIT` 也不存在。
+  // 旧实现硬编码反引号 + LIMIT，pgsql / mssql / oracle 上点表名必然报错。
+  const previewSql = (table: string) => previewSqlFor(connection.driver, table);
 
   const cellCount = useMemo(() => result?.columns.length ?? 0, [result]);
 
