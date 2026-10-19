@@ -55,17 +55,20 @@ export function AuditView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [filter, setFilter] = useState<string>("");
+  // 按 Shell 过滤：定位「某个目标上做过什么」（后端 idx_audit_shell 支撑）
+  const [shellFilter, setShellFilter] = useState<string>("");
   const [outcome, setOutcome] = useState<string>("");
   const [page, setPage] = useState(0);
   const [selectedEvent, setSelectedEvent] = useState<AuditEvent | null>(null);
 
   const load = useCallback(
-    async (targetPage: number, action: string, result: string) => {
+    async (targetPage: number, action: string, result: string, shellId: string) => {
       setLoading(true);
       setError("");
       try {
         const data = await api.listAudit({
           workspaceId: null,
+          shellId: shellId.trim() || null,
           action: action || null,
           outcome: result || null,
           limit: PAGE_SIZE,
@@ -86,7 +89,10 @@ export function AuditView() {
   );
 
   useEffect(() => {
-    void load(0, filter, outcome);
+    void load(0, filter, outcome, shellFilter);
+    // shellFilter 故意不进依赖：它是「按 Enter / 点刷新才生效」的输入框，
+    // 逐字符触发全量审计查询既慢又抖。需要即时生效时把 shellFilter 加进来即可。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [load, filter, outcome]);
 
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -126,6 +132,16 @@ export function AuditView() {
           <h1>安全审计轨迹</h1>
         </div>
         <div className="top-actions">
+          <input
+            className="input"
+            style={{ width: 200 }}
+            placeholder="按 Shell ID 过滤（可选）"
+            value={shellFilter}
+            onChange={(event) => setShellFilter(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void load(0, filter, outcome, shellFilter);
+            }}
+          />
           <select
             className="select"
             value={outcome}
@@ -149,7 +165,7 @@ export function AuditView() {
           </select>
           <button
             className="button secondary"
-            onClick={() => void load(page, filter, outcome)}
+            onClick={() => void load(page, filter, outcome, shellFilter)}
             title="刷新日志"
           >
             <RefreshCw size={14} />
@@ -221,7 +237,7 @@ export function AuditView() {
               <button
                 className="button compact"
                 disabled={page === 0}
-                onClick={() => void load(page - 1, filter, outcome)}
+                onClick={() => void load(page - 1, filter, outcome, shellFilter)}
               >
                 上一页
               </button>
@@ -231,7 +247,7 @@ export function AuditView() {
               <button
                 className="button compact"
                 disabled={page + 1 >= pageCount}
-                onClick={() => void load(page + 1, filter, outcome)}
+                onClick={() => void load(page + 1, filter, outcome, shellFilter)}
               >
                 下一页
               </button>

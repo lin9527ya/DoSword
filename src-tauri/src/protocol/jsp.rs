@@ -488,7 +488,19 @@ impl Protocol for JvmLikeProtocol {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data)
             .map_err(|_| ProtocolError::ParseError("文件内容 Base64 解码失败".to_string()))?;
-        Ok(slice_chunk(bytes, offset, length))
+        // 双重切片 bug：stub 支持偏移读写（chunked 能力）时服务端已按 o/l 返回切片，
+        // 本端再从 offset 切一次 → offset>0 的第二次读取必然拿到空块。
+        // 只有旧 stub（无 chunked 能力、忽略 o/l 返回整文件）才需要本端切片。
+        let stub_seeks = ensure_info(jsp, settings)
+            .ok()
+            .and_then(|info| info.capabilities)
+            .map(|caps| caps.supports_chunked())
+            .unwrap_or(false);
+        if stub_seeks {
+            Ok(bytes)
+        } else {
+            Ok(slice_chunk(bytes, offset, length))
+        }
     }
 
     /// P1：分块写入（stub 支持 seek 时按 offset 定位覆盖写；否则整文件读改写）。

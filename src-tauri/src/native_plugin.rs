@@ -33,17 +33,21 @@ impl NativeFeaturePlugin {
         if abi_ptr.is_null() {
             return Err("插件 ABI 指针为空".to_string());
         }
-        // SAFETY: ABI 结构由导出宏按固定布局写入（按值复制函数指针）
-        let abi = unsafe { std::ptr::read(abi_ptr) };
-        if abi.magic != ABI_MAGIC {
-            return Err(format!("插件魔数不匹配（0x{:08x}）", abi.magic));
+        // SAFETY: ABI 结构由导出宏按固定布局写入。
+        // 两阶段校验：先只读前两个 u32（magic / version），通过后再整体复制。
+        // 若插件是旧/新布局，函数指针区可能错位；整块 `ptr::read` 会把野指针
+        // 当函数指针保存，直到调用时才炸（甚至调用到任意地址）。
+        let magic = unsafe { std::ptr::read(abi_ptr as *const u32) };
+        if magic != ABI_MAGIC {
+            return Err(format!("插件魔数不匹配（0x{magic:08x}）"));
         }
-        if abi.version != ABI_VERSION {
+        let version = unsafe { std::ptr::read((abi_ptr as *const u32).add(1)) };
+        if version != ABI_VERSION {
             return Err(format!(
-                "插件 ABI 版本不兼容（{}，当前 {ABI_VERSION}）",
-                abi.version
+                "插件 ABI 版本不兼容（{version}，当前 {ABI_VERSION}）"
             ));
         }
+        let abi = unsafe { std::ptr::read(abi_ptr) };
         Ok(Self {
             _lib: Arc::new(lib),
             abi,
@@ -70,8 +74,16 @@ impl NativeFeaturePlugin {
     ) -> Result<serde_json::Value, String> {
         let runtime_c = CString::new(runtime).map_err(|_| "runtime 含 NUL".to_string())?;
         let params_c = CString::new(params.to_string()).map_err(|_| "参数含 NUL".to_string())?;
-        // 插件 ABI 已校验；函数指针在 Library 存活期内有效（指针本身为安全 extern fn）
-        let out = (self.abi.execute_json)(runtime_c.as_ptr(), params_c.as_ptr());
+        // 插件 ABI 已校验；函数指针在 Library 存活期内有效（指针本身为安全 extern fn）。
+        // catch_unwind：插件在 FFI 边界内 panic 会变成 UB（跨 C ABI 展开未定义），
+        // 这里把它拦成普通错误，且 release 的 panic=abort 构建下不会走到该分支。
+        let call = std::panic::AssertUnwindSafe(|| {
+            (self.abi.execute_json)(runtime_c.as_ptr(), params_c.as_ptr())
+        });
+        let out = match std::panic::catch_unwind(call) {
+            Ok(pointer) => pointer,
+            Err(_) => return Err("插件执行时 panic（已拦截，未影响宿主）".to_string()),
+        };
         if out.is_null() {
             return Err("插件执行返回空".to_string());
         }

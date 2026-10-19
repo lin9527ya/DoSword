@@ -12,7 +12,11 @@ protocolParams: string, authorizationAck: boolean, status: string, lastConnected
  */
 tags: Array<string>, };
 export type AuditEvent = { id: number, workspaceId: string, shellId: string | null, action: string, outcome: string, detail: string, createdAt: string, };
-export type AuditFilter = { workspaceId: string | null, action: string | null, outcome: string | null, limit: number | null, offset: number | null, };
+export type AuditFilter = { workspaceId: string | null, 
+/**
+ * 按目标 Shell 过滤（审计页与 MCP 排查「这个目标上做过什么」）
+ */
+shellId: string | null, action: string | null, outcome: string | null, limit: number | null, offset: number | null, };
 export type AuditPage = { total: number, events: Array<AuditEvent>, };
 export type Dashboard = { workspaces: Array<Workspace>, shells: Array<ShellProfile>, auditEvents: Array<AuditEvent>, };
 export type CreateWorkspace = { name: string, authorizationScope: string, expiresAt: string | null, };

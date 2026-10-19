@@ -1,5 +1,6 @@
 mod auth;
 pub mod commands;
+mod instance_lock;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod memshell;
@@ -21,6 +22,7 @@ use protocol::ProtocolRegistry;
 use session::SessionManager;
 use storage::Database;
 use tauri::Manager;
+use tauri_plugin_dialog::DialogExt;
 
 pub struct AppState {
     database: Mutex<Database>,
@@ -283,6 +285,23 @@ pub fn run() {
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data)?;
+            // 单实例锁：两个桌面实例会各有一套会话表与重复审计。
+            // 锁由操作系统在进程退出/崩溃时自动释放，不会留下脏锁。
+            // 已被占用时给出可读提示并退出（不静默开第二个窗口）。
+            let instance_lock = match instance_lock::InstanceLock::acquire(&app_data) {
+                Ok(lock) => lock,
+                Err(message) => {
+                    eprintln!("[startup] {message}");
+                    app.dialog()
+                        .message(message)
+                        .title("DoSword 已在运行")
+                        .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+                        .blocking_show();
+                    std::process::exit(0);
+                }
+            };
+            // 交给 Tauri 管理，保证锁持有到进程退出
+            app.manage(instance_lock);
             let database = Database::open(app_data.join("dosword.sqlite3"))?;
             // P5：启动时按保留期清理过期审计（设置 0 表示不清理）
             if let Ok(settings) = database.get_settings()

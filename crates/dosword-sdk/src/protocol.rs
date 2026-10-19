@@ -196,12 +196,7 @@ pub trait Protocol: Send + Sync {
         settings: &AppSettings,
     ) -> Result<Vec<u8>, ProtocolError> {
         let whole = self.read_file(session, path, settings)?;
-        let start = (offset as usize).min(whole.len());
-        let end = if length == 0 {
-            whole.len()
-        } else {
-            (start + (length as usize)).min(whole.len())
-        };
+        let (start, end) = chunk_range(whole.len(), offset, length);
         Ok(whole[start..end].to_vec())
     }
 
@@ -215,12 +210,25 @@ pub trait Protocol: Send + Sync {
         offset: u64,
         settings: &AppSettings,
     ) -> Result<(), ProtocolError> {
-        let mut whole = self.read_file(session, path, settings).unwrap_or_default();
-        let start = offset as usize;
-        if start + content.len() > whole.len() {
-            whole.resize(start + content.len(), 0);
+        // 读失败必须区分对待：原实现对**任何**读失败都 `unwrap_or_default()`，
+        // 把「读不到」当成空文件，随后只写入新块 —— 远端文件被零填充 + 单块覆盖。
+        // 规则：
+        //   offset == 0 → 调用方本就要从头写，读不到即按新建文件处理（无数据可丢）；
+        //   offset  > 0 → 必须读到原内容才能拼接，读失败一律上抛（绝不零填充）。
+        let mut whole = if tolerate_missing_on_write(offset) {
+            self.read_file(session, path, settings).unwrap_or_default()
+        } else {
+            self.read_file(session, path, settings)?
+        };
+        let start = usize::try_from(offset)
+            .map_err(|_| ProtocolError::NotSupported("写入偏移超出本机寻址范围".into()))?;
+        let end = start
+            .checked_add(content.len())
+            .ok_or_else(|| ProtocolError::NotSupported("写入区间溢出".into()))?;
+        if end > whole.len() {
+            whole.resize(end, 0);
         }
-        whole[start..start + content.len()].copy_from_slice(content);
+        whole[start..end].copy_from_slice(content);
         self.write_file(session, path, &whole, settings)
     }
 
@@ -247,5 +255,59 @@ pub trait Protocol: Send + Sync {
         Err(ProtocolError::NotSupported(
             "当前协议不支持数据库操作".into(),
         ))
+    }
+}
+
+/// 计算分块读取的字节区间（字符安全、无溢出）。
+///
+/// 独立成函数以便单测：`offset + length` 在极端值下会回绕，
+/// 直接切片会 panic 或读到错误区间。
+fn chunk_range(total_len: usize, offset: u64, length: u64) -> (usize, usize) {
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total_len);
+    let end = if length == 0 {
+        total_len
+    } else {
+        usize::try_from(length)
+            .ok()
+            .and_then(|length| start.checked_add(length))
+            .unwrap_or(usize::MAX)
+            .min(total_len)
+    };
+    (start, end)
+}
+
+/// 写入时若读不到原文件，是否可以按「新建文件」处理。
+///
+/// 只有 `offset == 0`（从头写）可以容忍——此时没有任何既有内容会被丢弃；
+/// `offset > 0` 必须读到原内容才能拼接，容忍就会把远端文件零填充后覆盖。
+fn tolerate_missing_on_write(offset: u64) -> bool {
+    offset == 0
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    #[test]
+    fn chunk_range_handles_overflow_and_bounds() {
+        // 常规区间
+        assert_eq!(chunk_range(100, 10, 20), (10, 30));
+        // length = 0 表示读到尾
+        assert_eq!(chunk_range(100, 10, 0), (10, 100));
+        // 偏移越界 → 空区间，不 panic
+        assert_eq!(chunk_range(100, 500, 10), (100, 100));
+        // u64::MAX 偏移不得回绕
+        assert_eq!(chunk_range(100, u64::MAX, 10), (100, 100));
+        // 偏移 + 长度溢出 → 截到文件尾
+        assert_eq!(chunk_range(100, 90, u64::MAX), (90, 100));
+        // 空文件
+        assert_eq!(chunk_range(0, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn only_zero_offset_tolerates_missing_source() {
+        assert!(tolerate_missing_on_write(0), "offset=0 可视为新建文件");
+        assert!(!tolerate_missing_on_write(1), "offset>0 必须读到原内容");
+        assert!(!tolerate_missing_on_write(u64::MAX));
     }
 }

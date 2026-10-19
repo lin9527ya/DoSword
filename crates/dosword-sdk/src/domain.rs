@@ -48,6 +48,8 @@ pub struct AuditEvent {
 #[serde(rename_all = "camelCase")]
 pub struct AuditFilter {
     pub workspace_id: Option<String>,
+    /// 按目标 Shell 过滤（审计页与 MCP 排查「这个目标上做过什么」）
+    pub shell_id: Option<String>,
     pub action: Option<String>,
     pub outcome: Option<String>,
     #[ts(type = "number | null")]

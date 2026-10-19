@@ -404,6 +404,8 @@ pub struct StubArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AuditArgs {
     pub workspace_id: Option<String>,
+    /// 只返回该 Shell 的审计（排查单个目标时用）
+    pub shell_id: Option<String>,
     pub action: Option<String>,
     /// success / error / denied / override / pending
     pub outcome: Option<String>,
@@ -615,6 +617,7 @@ impl super::DoswordMcp {
     ) -> Result<CallToolResult, McpError> {
         let filter = AuditFilter {
             workspace_id: args.workspace_id,
+            shell_id: args.shell_id,
             action: args.action,
             outcome: args.outcome,
             limit: Some(args.limit.unwrap_or(50).clamp(1, 200)),

@@ -115,6 +115,9 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX idx_memshell_workspace ON memory_shells(workspace_id);
      CREATE INDEX idx_memshell_shell ON memory_shells(shell_id);
      CREATE INDEX idx_memshell_status ON memory_shells(status);",
+    // v7：审计按 Shell 过滤（"这个目标上做过什么"是最常用的排查方式）。
+    // 既有 idx_audit_* 覆盖 workspace/action/outcome/created_at，缺 shell_id。
+    "CREATE INDEX IF NOT EXISTS idx_audit_shell ON audit_events(shell_id);",
 ];
 
 const SETTINGS_KEY: &str = "app";
@@ -144,9 +147,15 @@ pub struct Database {
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let mut connection = Connection::open(path)?;
+        // busy_timeout：桌面端与 dosword-cli 共用同一数据目录 / 同一 SQLite 文件，
+        // 并发写（CLI 跑 playbook 时 GUI 记审计）会瞬时拿到 SQLITE_BUSY。
+        // 不设超时 → 直接报 "database is locked"；设 5s → 等对方事务提交后重试。
+        // synchronous=NORMAL 在 WAL 下已是安全档（断电只丢最后一个事务，不损坏库）。
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = WAL;",
+             PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA synchronous = NORMAL;",
         )?;
         migrate(&mut connection)?;
         Ok(Self { connection })
@@ -659,6 +668,11 @@ impl Database {
         if let Some(workspace_id) = &filter.workspace_id {
             clauses.push("workspace_id = ?".into());
             params.push(Box::new(workspace_id.clone()));
+        }
+        // 按 Shell 过滤：排查「某个目标上做过什么」是审计最常见的用法
+        if let Some(shell_id) = &filter.shell_id {
+            clauses.push("shell_id = ?".into());
+            params.push(Box::new(shell_id.clone()));
         }
         if let Some(action) = &filter.action {
             clauses.push("action = ?".into());

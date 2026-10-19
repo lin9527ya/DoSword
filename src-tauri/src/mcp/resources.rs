@@ -87,6 +87,7 @@ pub fn read_resource(app: &AppHandle, uri: &str) -> Result<Vec<ResourceContents>
                 database
                     .query_audit(&AuditFilter {
                         workspace_id: None,
+                        shell_id: None,
                         action: None,
                         outcome: None,
                         limit: Some(20),
