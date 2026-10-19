@@ -533,6 +533,18 @@ impl FeaturePluginRegistry {
         let _ = registry.register(Box::new(crate::feature_plugins::UserListPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::CryptoToolPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::CodeLoaderPlugin));
+        // 哥斯拉风格工具插件。此前已实现且有真实 PHP 往返测试覆盖
+        // （见 src-tauri/src/protocol/php.rs 的 real_php_godzilla_extended_plugins），
+        // 但从未在此注册，导致界面完全取不到、快捷栏芯片静默消失。
+        let _ = registry.register(Box::new(crate::feature_plugins::SysinfoPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::TaskSchedulerPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::ServiceCtlPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::ProcessKillPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::CredScanPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::RemoteDownloadPlugin));
+        let _ = registry.register(Box::new(
+            crate::feature_plugins::BypassDisableFunctionsPlugin,
+        ));
         registry
     }
 }
@@ -678,6 +690,22 @@ mod feature_tests {
         assert!(ids.contains(&"network_proxy".to_string()), "{ids:?}");
         assert!(ids.contains(&"http_proxy".to_string()), "{ids:?}");
         assert!(ids.contains(&"p_eval_code".to_string()), "{ids:?}");
+        // 2026-10 接线：此前已实现但从未注册，界面上取不到
+        for id in [
+            "sysinfo",
+            "task_scheduler",
+            "service_ctl",
+            "process_kill",
+            "cred_scan",
+            "remote_download",
+            "bypass_disable_functions",
+        ] {
+            assert!(
+                ids.contains(&id.to_string()),
+                "缺少未接线插件 {id}：{ids:?}"
+            );
+        }
+        assert_eq!(ids.len(), 37, "内置插件数量应为 37：{ids:?}");
         // 重复注册拒绝
         let mut r = FeaturePluginRegistry::new();
         assert!(

@@ -416,6 +416,18 @@ impl EncoderRegistry {
                 Box::new(NativeEncoder { crypto: "chacha20" }),
                 Box::new(NativeEncoder { crypto: "rabbit" }),
                 Box::new(CustomEncoder),
+                // 以下编码器早已实现并有单测，但从未注册 → 生成器与连接端都选不到。
+                // 已核实 id 与上面 6 个 NATIVE 变体无冲突（`des` ≠ `native_des`）。
+                Box::new(Base64Encoder),
+                Box::new(XorBase64Encoder),
+                Box::new(DesEcbEncoder),
+                Box::new(CharEncoder),
+                Box::new(PhpObfuscateEncoder),
+                Box::new(PhpStreamEncoder),
+                Box::new(XorBodyEncoder),
+                // 哥斯拉式分阶段载荷：客户端通道与 session_mode_for 均已实现，
+                // 注册后这条路径才真正可达。
+                Box::new(XorSessionEncoder),
             ],
         }
     }
@@ -2548,16 +2560,25 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "base64",
+                "char",
                 "custom",
+                "des",
                 "native",
                 "native_aes_cbc",
                 "native_aes_ecb",
                 "native_chacha20",
                 "native_des",
                 "native_rabbit",
+                "php_obfuscate",
+                "php_stream",
+                "xor_base64",
+                "xor_body",
+                "xor_session",
             ],
-            "注册表应暴露 NATIVE 系列 + 自加密编码器 + 自定义（Custom）"
+            "注册表应暴露全部 15 个编码器（NATIVE 系列 + 经典形态 + 自定义）"
         );
+        assert_eq!(ids.len(), 15, "编码器数量应与注册表一致");
     }
 
     // --- PHP_STREAM：零敏感函数 stub ---

@@ -52,8 +52,13 @@ fn session_enabled(protocol_params: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 从 `protocol_params`（JSON）解析编码器 id，缺省 base64（兼容旧配置与旧 stub）。
-fn encoder_for(protocol_params: &str) -> &'static dyn PayloadEncoder {
+/// 从 `protocol_params`（JSON）解析编码器 id。
+///
+/// - 未配置 `encoder`：用 NATIVE_XOR（与历史行为一致）。
+/// - 配置了但未注册：**报错**。旧实现会静默回退 NATIVE_XOR —— 那会把「拼错的 id」
+///   变成「用一个不相干的编码器发请求」，表现为莫名其妙的解密失败；且与
+///   `generate_shell` 的严格校验（未知 id 直接拒绝）不一致。
+fn encoder_for(protocol_params: &str) -> Result<&'static dyn PayloadEncoder, ProtocolError> {
     let encoder_id: Option<String> = serde_json::from_str::<serde_json::Value>(protocol_params)
         .ok()
         .and_then(|value| {
@@ -62,10 +67,12 @@ fn encoder_for(protocol_params: &str) -> &'static dyn PayloadEncoder {
                 .and_then(|item| item.as_str().map(str::to_string))
         });
     match encoder_id.as_deref() {
-        Some(id) => EncoderRegistry::global()
-            .get(id)
-            .unwrap_or(&dosword_sdk::encoder::NATIVE_XOR),
-        None => &dosword_sdk::encoder::NATIVE_XOR,
+        Some(id) => EncoderRegistry::global().get(id).ok_or_else(|| {
+            ProtocolError::NotSupported(format!(
+                "未注册的编码器 {id}：请重新生成 Shell，或修正 Shell 配置中的 encoder"
+            ))
+        }),
+        None => Ok(&dosword_sdk::encoder::NATIVE_XOR),
     }
 }
 
@@ -193,7 +200,7 @@ impl PhpProtocol {
         reused_client: Option<&reqwest::blocking::Client>,
     ) -> Result<ProbeResult, ProtocolError> {
         // 环境信息探测：不产生任何文件系统副作用
-        let encoder = encoder_for(&profile.protocol_params);
+        let encoder = encoder_for(&profile.protocol_params)?;
         if encoder.id().starts_with("native") {
             // NATIVE 与自加密编码器恒走分阶段会话通道
             let client = match reused_client {
@@ -900,7 +907,7 @@ impl Protocol for PhpProtocol {
         // 先探测验证密码与连通性，再建立会话（探测与会话复用同一连接池）
         let client = build_client(settings);
         let result = self.probe_impl(profile, settings, Some(&client))?;
-        let encoder = encoder_for(&profile.protocol_params);
+        let encoder = encoder_for(&profile.protocol_params)?;
         // 分块能力：由 stub 的 probe 上报（NATIVE `__ENV__` / 分阶段 probe 的 info 表）
         let chunked = result
             .info
@@ -2955,6 +2962,28 @@ except Exception as e:
     with open(outfile, "w") as f:
         f.write("ERR: " + str(e))
 "#;
+
+    /// 未知编码器必须显式报错，而不是静默回退 NATIVE_XOR ——
+    /// 后者会把「拼错的 id」变成「用不相干的编码器发请求」，表现为莫名的解密失败。
+    #[test]
+    fn unknown_encoder_id_is_rejected() {
+        let err = match encoder_for(r#"{"encoder":"does_not_exist"}"#) {
+            Ok(encoder) => panic!("应拒绝未知编码器，实际解析为 {}", encoder.id()),
+            Err(error) => error,
+        };
+        assert!(err.to_string().contains("未注册的编码器"), "{err}");
+        // 未配置 encoder 时仍回退 NATIVE_XOR（兼容旧配置与旧 stub）
+        assert_eq!(encoder_for("{}").unwrap().id(), "native");
+        // 新注册的编码器可正常解析
+        assert_eq!(
+            encoder_for(r#"{"encoder":"base64"}"#).unwrap().id(),
+            "base64"
+        );
+        assert_eq!(
+            encoder_for(r#"{"encoder":"xor_session"}"#).unwrap().id(),
+            "xor_session"
+        );
+    }
 
     #[test]
     fn run_code_disabled_gate() {

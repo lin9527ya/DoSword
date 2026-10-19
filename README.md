@@ -293,12 +293,22 @@ impl Protocol for MyProtocol { /* ... */ }
 - v1 约定：execute 为纯逻辑（runtime + 参数 JSON → JSON），
   需要命令/代码通道的插件请用脚本型 .plugin
 
-## 功能插件清单（内置 12 个 + 外部 .plugin）
+## 功能插件清单（内置 37 个 + 外部 .plugin）
 
-**功能（feature）**：进程详情、端口扫描、ZIP 压缩、WebShell 扫描、
-Socks 代理、HTTP 代理、文件搜索、网络信息、用户枚举、PHP 环境检测、
-代码执行（P_Eval_Code）、ByPassOpenBasedir（symlink+glob）、
-Bypass 向量库（9 个独立向量，手动选择测试）
+**功能（feature）**：进程详情、系统信息、端口扫描、ZIP 压缩、WebShell 扫描、
+文件搜索、网络信息、用户枚举、PHP 环境检测、凭据枚举（仅检查存在性、不读内容）、
+代码执行（P_Eval_Code）、ByPassOpenBasedir（symlink+glob）、Bypass 环境检测
+
+**系统运维（feature）**：计划任务（Linux crontab / Windows schtasks）、
+服务管理（systemctl / service / sc）、结束进程（kill -9 / taskkill）、
+远程下载（URL 落盘，curl 降级）
+
+**网络代理（feature）**：Socks5（RFC1929 认证 + pcntl 常驻）、端口转发、
+端口映射（LCX 反向桥接）、HTTP 代理、综合调度壳
+
+**Bypass 向量库（loader，10 个独立向量，手动选择测试）**：
+直接系统调用 / FFI / pcntl_exec / LD_PRELOAD / COM(Windows) / 老版本 eval /
+dl 动态加载 / FPM 未授权 / GCONV_PATH / pcntl 反弹
 
 **加载器（loader）**：
 - 虚拟终端（反弹 Shell）：fsockopen + proc_open 反弹 /bin/bash 到攻击机

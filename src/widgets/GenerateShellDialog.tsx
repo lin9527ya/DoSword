@@ -25,6 +25,9 @@ export function GenerateShellDialog({
   const [encoders, setEncoders] = useState<[string, string][]>([]);
   const [encoderId, setEncoderId] = useState("native");
   const [password, setPassword] = useState("pass123");
+  // 分阶段载荷（Godzilla session 模式）：处理器只注入一次，后续只传参数。
+  // 必须与连接端的 session 配置一致，故显式暴露而不是写死。
+  const [sessionMode, setSessionMode] = useState(false);
   const [result, setResult] = useState<GenerateShellResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -52,7 +55,7 @@ export function GenerateShellDialog({
     setError("");
     setCopied(false);
     try {
-      const res = await api.generateShell(language, encoderId, password, false);
+      const res = await api.generateShell(language, encoderId, password, sessionMode);
       setResult(res);
       toast.success(`Webshell 代码生成完毕 (${res.filename})`, "生成成功");
     } catch (cause) {
@@ -135,6 +138,20 @@ export function GenerateShellDialog({
             </button>
           </div>
         </label>
+
+        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={sessionMode}
+            onChange={(event) => setSessionMode(event.target.checked)}
+            style={{ width: "auto", margin: 0 }}
+          />
+          生成分阶段载荷（session 模式）
+        </label>
+        <p className="form-note" style={{ marginTop: -4 }}>
+          Godzilla 风格：处理器只注入一次，后续请求只传参数。需与连接端保持一致的
+          session 配置；普通 stub 请保持关闭。
+        </p>
 
         <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 4 }}>
           <button className="button primary" onClick={() => void generate()} disabled={busy}>
