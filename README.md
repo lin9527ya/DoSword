@@ -56,8 +56,33 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
   字符串不存在），且 eval 经业务函数包裹 + 局部变量中转（防语义级查杀如 D盾
   的「内藏 Eval 后门」）；file_get_contents / php://input / 解码函数全部经
   crc32b 符号表查表调用与字符串拆分，stub 无明文敏感特征；参数为业务语义
-  token/data；密钥由连接密码运行时派生；兼容 PHP 5.3+（自加密编码器需
-  openssl 扩展）
+  token/data；密钥由连接密码运行时派生
+  > PHP 依赖分档：NATIVE 系列兼容 **PHP 5.3+**（`native_aes_*` / `native_des` 需 openssl 扩展）；
+  > `native_chacha20` / `native_rabbit` 需 **64 位 PHP**（纯 PHP 实现，32 位位运算不可靠）；
+  > `native_aead` 需 **PHP 7.1+ / 64 位 / openssl 支持 aes-256-gcm**
+  > （`hash_hkdf` + `openssl_encrypt`）；gzip 传输压缩需目标有 zlib
+- **编码方式：16 种**（生成 Webshell 与登记 Shell 都从这里选，两处必须一致）
+  - NATIVE 内置分发系列（7）：`native`（XOR，默认）、`native_aes_ecb`、`native_aes_cbc`、
+    `native_des`、`native_chacha20`、`native_rabbit`、`native_aead`
+  - 经典/兼容形态（8）：`base64`、`xor_base64`、`char`、`php_obfuscate`、`php_stream`、
+    `xor_body`、`des`、`xor_session`（哥斯拉式分阶段载荷）
+  - `custom`：用户上传 stub 模板（须按契约实现：表单参数 `k` = 密码、`x` = `base64(XOR(代码, md5(密码)))`）
+- **三条通道功能对齐**（同一个 Shell 换编码方式不再少功能）
+  - NATIVE 内置分发：stub 落地，命令/文件/数据库等 12 项功能内置，敏感函数经 crc32b 符号表调用
+  - 分阶段载荷（session）：处理器一次注入、后续只传参数；**由客户端每次连接注入**，
+    因此能力始终与客户端同版本
+  - legacy 逐请求：代码逐请求下发，兼容既有 stub
+  - 三者共用同一份 PHP 实现（`crates/dosword-sdk/src/php_impl.rs`）：
+    命令函数降级链（`shell_exec` → `exec` → `system`/`passthru` → `popen`，全部被禁用时给出明确错误）、
+    6 个数据库驱动（mysql / pgsql / sqlite / mssql / oracle / redis）、
+    目录列举单次 `stat()` 合并
+  - gzip 传输压缩：NATIVE 通道（密文层，需 stub 上报 `gzip` 能力）与
+    分阶段载荷通道（明文层，由每次注入的处理器解压）启用；
+    **legacy 通道不压缩** —— 那条通道的请求由目标上已部署的 stub 解包，
+    而旧 stub 不会 gunzip，无法安全启用
+- **能力协商**：stub 上报 `ProtoVersion` / `Capabilities` / `ShellType`；
+  客户端**只在 stub 明确上报且缺项时**拒绝（旧 stub 不上报 → 保持旧行为），
+  错误提示「请用当前版本重新生成并上传 stub」而不是发出去必然失败
 - **生成 Webshell**：PHP / ASP / ASPX / JSP / Python / Node 六种语言 × 编码器生成服务端 stub
   > 语言可用性（实测口径）：PHP 全功能；Python（CGI）与 Node 可用；
   > **JSP / ASPX / ASP 当前无法端到端使用**——生成的 stub 未经真实容器验证，
@@ -96,13 +121,15 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
 ### 3. 登记 Shell
 
 总览 → 登记 Shell：选择「标准 PHP WebShell（类蚁剑）」，填写 Endpoint 与连接密码，
-**编码方式选择与 stub 一致**（XOR_BASE64 或 BASE64），勾选授权确认。
+并选择与 stub 一致的**编码方式 / 密钥盐 / 分阶段载荷（session）开关**——这三项在
+「编辑 Shell」里同样可改（改完请重连，已建立的会话仍用旧通道）。勾选授权确认。
 
 ### 4. 连接与操作
 
 连接后可在详情页进行文件管理与命令执行。所有操作都会写入审计日志。
 
-> ASP / ASPX / JSP 的客户端连接协议规划中，当前仅生成 stub。
+> JSP / ASP.NET / 经典 ASP 的**客户端协议已实现**（`builtin.jsp.v1` / `builtin.aspnet.v1` /
+> `builtin.asp.v1`），但生成的 stub 尚未在真实容器（Tomcat / IIS）上验证，勿用于真实评估。
 
 ## 无 PHP 环境联调
 

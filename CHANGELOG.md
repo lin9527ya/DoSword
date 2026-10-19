@@ -34,6 +34,59 @@
   - 明确不暴露：Workspace/Shell 增删改、插件安装、改设置、本地文件读写、`http_send`、PTY
   - `cargo build --no-default-features` 可完全裁掉 MCP 模块与 rmcp/axum 依赖树
 
+### 修复（PHP 通道对齐，2026-10-19）
+
+PHP 侧此前是「三条通道、三套能力」：同一个目标换个编码方式就少一半功能。
+本轮把三条通道对齐到同一份实现，并把每个编码器纳入真实 `php -S` 往返测试
+（测试随即暴露出下列**实际缺陷**，不是理论风险）：
+
+- **8 个 legacy 编码器（`base64` / `xor_base64` / `char` / `php_obfuscate` /
+  `php_stream` / `xor_body` / `des` / `xor_session`）全部不可用**：
+  `business_php_stub` 与 `xor_body` 模板各有一段「执行器降级」覆盖 `$_g[0]`，
+  而该槽位属于调用方传入的第一个符号（`base64_decode` / `openssl_decrypt`）——
+  解包时去调用 `shell_exec(密文)`，响应恒为 `{"code":200,"rule_size":0}`，
+  客户端报「响应中未找到协议帧」。（session 模板此前修过同一个坑，这两处漏了。）
+- **legacy 通道没有分块能力**：legacy 的 probe 不返回 `info` 表 → `ChunkedTransfer`
+  取不到 → 分块上传/下载一律被拒（旧 stub 上的大文件传输等于不可用）。
+- **数据库能力三条通道不一致**：legacy 只列 mysql/pgsql 的库且**显式拒绝 redis**，
+  分阶段通道只有 mysql/pgsql/sqlite（无 mssql/oracle/redis）。现统一 6 驱动，
+  由 stub 端实现（`php_impl::PHP_DB_PROBE_IMPL` / `PHP_DB_QUERY_IMPL`）。
+- **命令降级链只有 NATIVE 有**：session / legacy 硬用 `@shell_exec`，
+  目标禁用 `shell_exec` 时命令通道直接死。现三条通道共用 `PHP_EXEC_IMPL`
+  （`shell_exec` → `exec` → `system`/`passthru` → `popen`；全部被禁用时返回
+  明确错误而不是静默空输出）。legacy 通道同时补上 `cd` 前缀与 cwd 跟踪。
+- **能力协商只上报不使用**：`session_probe` 的 `capabilities` 恒为 `None`，
+  客户端只看 `ChunkedTransfer` 一个标志。现 `db` / `exec` / `gzip` / `chunked`
+  统一走 `require_capability()`：旧 stub（未上报）保持 v1 行为，
+  明确上报但缺项时精确拒绝并提示重新生成 stub。
+- **登记/编辑 Shell 无法设置 `session:true`**：生成器有「分阶段载荷」开关且提示
+  "需与连接端一致"，登记表单却没有该字段，`update_shell` 也不接受协议参数 ——
+  生成 session stub 后按 UI 登记必然连不上（只有 `xor_session` 编码器能进该通道）。
+  现表单可改编码方式 / 盐 / session，`update_shell` 支持协议参数，
+  并在保存时校验未注册的 encoder id。
+- **前端数据库「预览」硬编码反引号 + `LIMIT`**：pgsql / mssql / oracle 上点表名必报错。
+  现按驱动分派标识符引号与分页语法（MSSQL `TOP 100` / Oracle `FETCH FIRST 100 ROWS ONLY`）。
+- **P1 的目录列表 `stat` 合并只在 legacy 模板生效**：默认 NATIVE 与 session 仍是每项
+  `is_dir` + `filesize` + `filemtime` + `fileperms` 四次调用。现三条通道统一单次
+  `stat()`（`is_dir` 由 `mode` 判定），顺带消除 stub 里明文的 `fileperms(`。
+- 分阶段载荷的 gzip 改为**明文层**压缩（`{"n":..,"z":1,"d":base64(gzip(请求))}`）：
+  密文层压缩对高熵密文收益接近零，而 base64 载荷的 33% 膨胀可以被真正收回。
+
+### 新增（PHP）
+
+- `crates/dosword-sdk/src/php_impl.rs`：三条通道共用的 PHP 实现片段
+  （命令 / 目录列举 / 数据库探测与查询 / redis RESP 辅助 / 环境信息表），
+  由 `session_handler_matches_native_capabilities` 测试守住与 NATIVE stub 的一致性。
+- 分阶段载荷与 legacy 通道的 probe 现返回完整 `info` 表：能力协商之外，
+  内存马前置判定（`PHP_SAPI` / `user_ini_filename` / `DOCUMENT_ROOT`）在
+  session / legacy 通道上此前也拿不到数据。
+- 测试：`real_php_all_encoders_round_trip` 改为遍历注册表全部编码器并跑
+  命令/目录/整文件读写/偏移分块；`real_php_session_variants_round_trip` 补上
+  `xor_session`（原数组里没有它，判断分支是死代码）；新增
+  `real_php_db_round_trip_on_all_channels`（三条通道 × redis mock）、
+  `session_handler_is_valid_php`（`php -l`）、
+  `legacy_stubs_do_not_clobber_symbol_slot_zero`（回归守卫）。
+
 ### 修复（阻断级）
 
 - **分块上传/下载对全部可选编码器均不可用**：`read_chunk`/`write_chunk` 缺少
@@ -81,6 +134,11 @@
 
 ### 变更
 
+- `update_shell` 支持更新协议参数（编码方式 / 密钥盐 / session 开关）：
+  此前 `protocol_params` 只能在创建时写入，用户重新生成 stub 换了编码器后
+  只能删掉重建 Shell。变更写审计。
+- 前端新增 `src/shells/encoders.ts`：编码方式 → 通道能力（是否支持 session）的
+  单一来源，生成器与登记表单共用，消除「生成器能勾 session、登记表单没这个字段」。
 - 前端质量门禁：新增 ESLint（含 `react-hooks` 规则）与 `pnpm check:ipc`
   （前端 `invoke` 名 ↔ 后端 `generate_handler!` 双向核对），均接入 CI
 - CI：`cargo test` 增加 `DOSWORD_REQUIRE_PHP=1`，缺 php 时失败而非静默跳过（消除假绿）
@@ -91,6 +149,13 @@
 
 ### 文档
 
+- README：编码方式清单更新为 16 个（原写"XOR_BASE64 或 BASE64"）、补三条通道能力对齐
+  与能力协商说明、PHP 依赖按编码器分档（5.3+ / 64 位 / PHP 7.1+ 与 openssl-gcm）、
+  登记 Shell 一节补「编码方式/盐/session 可编辑」、订正「JSP/ASPX/ASP 客户端协议规划中」
+  （客户端协议已实现，缺的是真实容器验证）。
+- `docs/优化拓展方案.md`：新增「2026-10-19 本轮已修复」一节（含 8 项实际缺陷），
+  并订正此前高估/过期的条目（编码器注册、请求调试、批量 API 接线、Rabbit 差分测试）。
+- `docs/现代化方案.md`：W1/W3/W5 标记为已完成，W2/W4/W6 仍待做。
 - README 订正与实现不符的声明：NATIVE stub 实际含明文 `@eval($c)` 与命令函数数组，
   XOR 密钥直接内嵌（不构成抗提取混淆），AES 为 256 位；分块传输需重新生成 stub；
   JSP/ASPX/ASP 当前不可端到端使用（**勿用于真实评估**）
