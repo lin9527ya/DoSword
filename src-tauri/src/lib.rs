@@ -36,6 +36,9 @@ pub struct AppState {
     /// W4 断点续传：下载检查点（会话 + 远端路径 + 本地路径）
     download_checkpoints:
         Mutex<std::collections::HashMap<(String, String, String), DownloadCheckpoint>>,
+    /// 运行期设置覆盖（CLI 的 --proxy / --timeout / --tls-verify）。
+    /// 只影响本次进程，不写回数据库。
+    settings_override: Mutex<Option<dosword_sdk::domain::AppSettings>>,
 }
 
 /// W4 断点续传：上传检查点。
@@ -145,6 +148,25 @@ impl AppState {
     pub fn database(&self) -> &Mutex<Database> {
         &self.database
     }
+
+    /// 设置运行期覆盖的全局设置（CLI 使用；不写回数据库）。
+    pub fn set_settings_override(&self, settings: dosword_sdk::domain::AppSettings) {
+        if let Ok(mut guard) = self.settings_override.lock() {
+            *guard = Some(settings);
+        }
+    }
+
+    /// 应用运行期覆盖（无覆盖时返回原值）。
+    pub(crate) fn effective_settings(
+        &self,
+        base: dosword_sdk::domain::AppSettings,
+    ) -> dosword_sdk::domain::AppSettings {
+        self.settings_override
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or(base)
+    }
 }
 
 /// 加载功能插件：内置 + 插件目录中的脚本（`.plugin`）/
@@ -249,6 +271,7 @@ pub fn build_app_state(
         proxy_chains: Mutex::new(std::collections::HashMap::new()),
         upload_checkpoints: Mutex::new(std::collections::HashMap::new()),
         download_checkpoints: Mutex::new(std::collections::HashMap::new()),
+        settings_override: Mutex::new(None),
     }
 }
 
@@ -303,6 +326,8 @@ pub fn run() {
             commands::install_plugin,
             commands::install_native_plugin,
             commands::uninstall_plugin,
+            #[cfg(feature = "wasm")]
+            commands::install_wasm_plugin,
             commands::list_encoders,
             commands::register_custom_encoder,
             commands::generate_shell,

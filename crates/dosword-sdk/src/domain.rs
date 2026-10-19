@@ -546,6 +546,8 @@ pub struct PlaybookStepReport {
     pub id: Option<String>,
     pub action: String,
     pub ok: bool,
+    /// 条件（`when`）为假而跳过。
+    pub skipped: bool,
     #[ts(type = "number")]
     pub duration_ms: u64,
     pub error: Option<String>,

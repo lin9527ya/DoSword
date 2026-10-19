@@ -250,7 +250,11 @@ export type TransferOutcome = { bytes: number,
  */
 resumedFrom: number, };
 export type PlaybookReport = { name: string, ok: boolean, durationMs: number, steps: Array<PlaybookStepReport>, };
-export type PlaybookStepReport = { index: number, id: string | null, action: string, ok: boolean, durationMs: number, error: string | null, 
+export type PlaybookStepReport = { index: number, id: string | null, action: string, ok: boolean, 
+/**
+ * 条件（`when`）为假而跳过。
+ */
+skipped: boolean, durationMs: number, error: string | null, 
 /**
  * 动作返回的 JSON（结构随动作而异）。
  */

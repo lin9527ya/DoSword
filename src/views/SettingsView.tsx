@@ -254,7 +254,10 @@ export function SettingsView() {
       const localPath = await open({
         multiple: false,
         filters: [
-          { name: "DoSword 插件包", extensions: ["plugin", "json", "so", "dll", "dylib"] },
+          {
+            name: "DoSword 插件包",
+            extensions: ["plugin", "json", "so", "dll", "dylib", "wasm"],
+          },
         ],
       });
       if (!localPath || Array.isArray(localPath)) return;
@@ -262,6 +265,9 @@ export function SettingsView() {
       if (ext === "so" || ext === "dll" || ext === "dylib") {
         // 二进制插件（Rust cdylib，dlopen 加载）
         await api.installNativePlugin(String(localPath));
+      } else if (ext === "wasm") {
+        // WASM 沙箱插件（同目录下需有 <name>.wasm.json 清单）
+        await api.installWasmPlugin(String(localPath));
       } else {
         // 脚本型插件（JSON 清单）
         const contentB64 = await api.readLocalFile(String(localPath));
@@ -1161,7 +1167,7 @@ export function SettingsView() {
               </button>
               <button className="button compact primary" onClick={() => void installPlugin()}>
                 <PackageOpen size={14} />
-                安装插件包 (.plugin / .so / .dll)
+                安装插件包 (.plugin / .so / .dll / .wasm)
               </button>
             </div>
           }

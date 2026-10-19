@@ -38,6 +38,15 @@ struct Cli {
     /// 输出 JSON（便于脚本 / agent 调度）
     #[arg(long, global = true)]
     json: bool,
+    /// 本次运行强制使用代理（覆盖设置，不写回数据库）
+    #[arg(long, global = true)]
+    proxy: Option<String>,
+    /// 本次运行覆盖请求超时（秒，1-300）
+    #[arg(long, global = true)]
+    timeout: Option<u64>,
+    /// 本次运行强制校验 TLS 证书（默认沿用设置）
+    #[arg(long, global = true)]
+    tls_verify: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -161,6 +170,9 @@ enum StubCommand {
         /// Transport Profile：鉴权头名
         #[arg(long)]
         header: Option<String>,
+        /// 写入文件（默认打印到标准输出）
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -185,8 +197,23 @@ fn run(cli: Cli) -> Result<(), String> {
     std::fs::create_dir_all(&data_dir).map_err(|error| format!("创建数据目录失败：{error}"))?;
     let database = Database::open(data_dir.join("dosword.sqlite3"))
         .map_err(|error| format!("打开数据库失败：{error}"))?;
+    // 运行期设置覆盖（不写回数据库）：--proxy / --timeout / --tls-verify
+    let mut settings = database
+        .get_settings()
+        .map_err(|error| format!("读取设置失败：{error}"))?;
+    if let Some(proxy) = cli.proxy.as_deref() {
+        reqwest::Proxy::all(proxy).map_err(|error| format!("代理地址无效：{error}"))?;
+        settings.proxy = Some(proxy.to_string());
+    }
+    if let Some(timeout) = cli.timeout {
+        settings.default_timeout_secs = timeout.clamp(1, 300);
+    }
+    if cli.tls_verify {
+        settings.tls_verify = true;
+    }
     let plugins = load_feature_plugins(&data_dir.join("plugins"));
     let state = build_app_state(database, plugins);
+    state.set_settings_override(settings);
 
     match &cli.command {
         Command::Shells => {
@@ -457,6 +484,7 @@ fn stub(command: &StubCommand, json_mode: bool) -> Result<(), String> {
         salted,
         param,
         header,
+        out,
     } = command;
     let encoder = dosword_sdk::EncoderRegistry::global()
         .get(encoder)
@@ -480,9 +508,31 @@ fn stub(command: &StubCommand, json_mode: bool) -> Result<(), String> {
             .stub_with(language, &effective, &opts)
             .map_err(|error| error.to_string())?
     };
+    let written = match out {
+        Some(path) => {
+            std::fs::write(path, &content).map_err(|error| format!("写入文件失败：{error}"))?;
+            Some(path.display().to_string())
+        }
+        None => None,
+    };
     if json_mode {
-        let value = json!({ "language": language, "encoder": encoder.id(), "salt": salt, "content": content });
-        println!("{}", value);
+        let mut value = json!({
+            "language": language,
+            "encoder": encoder.id(),
+            "salt": salt,
+            "bytes": content.len(),
+        });
+        if let Some(written) = &written {
+            value["path"] = json!(written);
+        } else {
+            value["content"] = json!(content);
+        }
+        println!("{value}");
+    } else if let Some(path) = &written {
+        if let Some(salt) = &salt {
+            eprintln!("盐（登记 Shell 时填写）：{salt}");
+        }
+        println!("已写入 {path}（{} 字节）", content.len());
     } else {
         if let Some(salt) = &salt {
             eprintln!("盐（登记 Shell 时填写）：{salt}");

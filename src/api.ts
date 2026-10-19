@@ -112,6 +112,9 @@ export const api = {
   installPlugin: (content: string) => invoke<void>("install_plugin", { content }),
   installNativePlugin: (sourcePath: string) =>
     invoke<void>("install_native_plugin", { sourcePath }),
+  /** 安装 WASM 沙箱插件（需同目录下有 `<name>.wasm.json` 清单）。 */
+  installWasmPlugin: (sourcePath: string) =>
+    invoke<void>("install_wasm_plugin", { sourcePath }),
   uninstallPlugin: (pluginId: string) => invoke<void>("uninstall_plugin", { pluginId }),
   exportShells: () => invoke<string>("export_shells"),
   backupShells: (backupDir: string) => invoke<string>("backup_shells", { backupDir }),

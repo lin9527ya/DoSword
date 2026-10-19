@@ -85,6 +85,23 @@ PHP 侧此前是「三条通道、三套能力」：同一个目标换个编码�
 - 分阶段载荷的 gzip 改为**明文层**压缩（`{"n":..,"z":1,"d":base64(gzip(请求))}`）：
   密文层压缩对高熵密文收益接近零，而 base64 载荷的 33% 膨胀可以被真正收回。
 
+### 新增（扩展与自动化 W6 · 延伸）
+
+- **WASM 插件 UI 安装入口**：设置页「插件」可选择 `.wasm` 安装（要求同目录下有
+  同名 `.wasm.json` 清单），安装前完成 id / 能力白名单 / 模块解析校验；
+  卸载时同时清理 `<id>.wasm` 与 `<id>.wasm.json`；安装写审计 `plugin.install`。
+- **Playbook 条件与循环**：
+  - `when: { ref, equals?, not_equals? }`（`ref` 支持 `!` 取反）为假时跳过该步骤，
+    报告新增 `skipped` 字段；
+  - `repeat: N` 与 `foreach: { source, as }`（source 可为 `${...}` 或内联数组），
+    结果聚合为 `{"iterations":[...]}`，断言逐轮检查；上限 1000；
+  - 变量替换支持内嵌插值（`echo ${item.name}`）与无点引用（`${item}`）。
+- **CLI 高级参数**：`--proxy <url>` / `--timeout <secs>` / `--tls-verify` 通过
+  运行期设置覆盖生效（不写回数据库，AppState 新增 `settings_override`）；
+  `stub generate --out <file>`；`--json` 输出补充 `bytes` / `path`。
+- 测试：`when` 跳过/真值/取反、`repeat` 聚合、`foreach` 绑定循环变量与非法 source、
+  设置覆盖只影响 `effective_settings` 不写库。
+
 ### 新增（扩展与自动化 W6）
 
 - **WASM 沙箱插件**（cargo feature `wasm`，默认开启）：插件目录下的

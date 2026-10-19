@@ -94,6 +94,8 @@ fn load_shell_and_settings(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Shell 不存在".to_string())?;
     let settings = database.get_settings().map_err(|error| error.to_string())?;
+    // CLI 运行期覆盖（--proxy/--timeout/--tls-verify）只在本次进程生效
+    let settings = state.effective_settings(settings);
     Ok((shell, settings))
 }
 
@@ -1133,6 +1135,51 @@ pub async fn install_native_plugin(source_path: String, app: AppHandle) -> Resul
     .await
 }
 
+/// 安装 WASM 沙箱插件：`<name>.wasm` + 同名 `.wasm.json` 清单。
+///
+/// 先加载校验（id、能力白名单、模块可解析），再复制到数据目录并注册。
+#[cfg(feature = "wasm")]
+#[tauri::command]
+pub async fn install_wasm_plugin(source_path: String, app: AppHandle) -> Result<(), String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let plugins_dir = data_dir.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).map_err(|error| error.to_string())?;
+    let plugin = crate::wasm_plugin::WasmFeaturePlugin::load(std::path::Path::new(&source_path))?;
+    let id = plugin.manifest().id.clone();
+    dosword_sdk::validate_plugin_id(&id).map_err(|error| format!("插件 id 非法：{error}"))?;
+    let manifest_source = format!("{source_path}.json");
+    std::fs::copy(&source_path, plugins_dir.join(format!("{id}.wasm")))
+        .map_err(|error| format!("插件文件复制失败：{error}"))?;
+    std::fs::copy(
+        &manifest_source,
+        plugins_dir.join(format!("{id}.wasm.json")),
+    )
+    .map_err(|error| format!("插件清单复制失败：{error}"))?;
+    blocking(app, move |state| {
+        let mut registry = state
+            .feature_plugins
+            .lock()
+            .map_err(|_| "插件注册表锁异常".to_string())?;
+        registry
+            .register(Box::new(plugin))
+            .map_err(|error| format!("注册失败：{error}"))?;
+        registry.installed.insert(id.clone());
+        audit(
+            state,
+            "system",
+            None,
+            "plugin.install",
+            "success",
+            &format!("安装 WASM 插件：{id}"),
+        );
+        Ok(())
+    })
+    .await
+}
+
 /// 安装外部 .plugin 插件（JSON 清单 + 执行定义），持久化到数据目录。
 #[tauri::command]
 pub async fn install_plugin(content: String, app: AppHandle) -> Result<(), String> {
@@ -1176,6 +1223,8 @@ pub async fn uninstall_plugin(plugin_id: String, app: AppHandle) -> Result<(), S
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if name == format!("{plugin_id}.plugin")
                     || name.starts_with(&format!("{plugin_id}.native."))
+                    || name == format!("{plugin_id}.wasm")
+                    || name == format!("{plugin_id}.wasm.json")
                 {
                     let _ = std::fs::remove_file(entry.path());
                 }
@@ -2323,6 +2372,7 @@ pub fn session_ctx<'a>(state: &'a AppState, session_id: &str) -> Result<SessionC
         Some(settings) => settings,
         None => database.get_settings().map_err(|error| error.to_string())?,
     };
+    let settings = state.effective_settings(settings);
     drop(database);
 
     let protocol = state
@@ -4577,6 +4627,7 @@ mod tests {
             proxy_chains: Mutex::new(std::collections::HashMap::new()),
             upload_checkpoints: Mutex::new(std::collections::HashMap::new()),
             download_checkpoints: Mutex::new(std::collections::HashMap::new()),
+            settings_override: Mutex::new(None),
         }
     }
 
@@ -4859,6 +4910,35 @@ mod tests {
             Arc::from(session),
             probe,
         )
+    }
+
+    /// W6 CLI：运行期设置覆盖只影响 effective_settings，不写回数据库。
+    #[test]
+    fn settings_override_replaces_effective_settings_only() {
+        let state = app_state();
+        let base = state.database.lock().unwrap().get_settings().unwrap();
+        assert_eq!(
+            state.effective_settings(base.clone()).default_timeout_secs,
+            base.default_timeout_secs
+        );
+        let mut overridden = base.clone();
+        overridden.default_timeout_secs = 7;
+        overridden.tls_verify = true;
+        state.set_settings_override(overridden);
+        let effective = state.effective_settings(base.clone());
+        assert_eq!(effective.default_timeout_secs, 7);
+        assert!(effective.tls_verify);
+        // 数据库里的设置保持不变
+        assert_eq!(
+            state
+                .database
+                .lock()
+                .unwrap()
+                .get_settings()
+                .unwrap()
+                .default_timeout_secs,
+            base.default_timeout_secs
+        );
     }
 
     /// W4 续传：远端路径拆分（POSIX + Windows 分隔符）。
