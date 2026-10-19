@@ -20,9 +20,11 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
     客户端按操作名 md5 哈希分发调用（stub 仅含哈希数字比较）
   - 敏感函数（file_get_contents/scandir/openssl_decrypt 等）**尽量**经
     crc32b 符号表查表调用（哥斯拉式符号表，运行时从 get_defined_functions() 解析）
-    > ⚠️ **诚实声明（勿轻信"零检出"）**：stub 中仍存在明文特征——命令执行降级链
-    > 的候选函数数组（`shell_exec`/`exec`/`system`/`passthru`/`popen`）、
+    > ⚠️ **诚实声明（勿轻信"零检出"）**：NATIVE **落地 stub** 中仍存在明文特征——
+    > 命令执行降级链的候选函数数组（`shell_exec`/`exec`/`system`/`passthru`/`popen`）、
     > `@exec(`、`@popen(`、`@eval($c)`（run_code 通道）与 `$_POST['formData']`。
+    > （session 处理器与 legacy 逐请求代码已改用运行时符号表、不含上述明文名；
+    > 但 NATIVE stub 为兼容存量未改。）
     > 且 `__DEC__('密文','密钥')` 的第二参就把 XOR 密钥写在文件里，
     > 所谓"XOR 加密嵌入"不具备抗提取能力（一条 `php -r` 即可还原全部字符串）。
     > 另：stub 内嵌 `md5(密码)` 与其前 16 位令牌——**拿到 stub 即等于拿到会话密钥**，
@@ -76,6 +78,14 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
     命令函数降级链（`shell_exec` → `exec` → `system`/`passthru` → `popen`，全部被禁用时给出明确错误）、
     6 个数据库驱动（mysql / pgsql / sqlite / mssql / oracle / redis）、
     目录列举单次 `stat()` 合并
+  - **OPSEC 对齐**：session 处理器与 legacy 逐请求代码里的敏感函数名
+    （命令执行五函数、`base64_*`、`file_get_contents`/`file_put_contents`、
+    `scandir`、`unlink`/`rmdir`/`rename`/`mkdir`/`touch`、`fopen`/`fseek`/`fread`/`fwrite`/`fclose`、
+    `stream_socket_client`、`preg_split`、`gzdecode`/`gzencode`、`eval`）
+    全部改经**随代码自带**的 crc32b 运行时符号表调用（运行时从
+    `get_defined_functions()` 反查），代码里只出现哈希与索引；
+    `eval` 用大小写混合 + 随机注释分隔。符号表内嵌在处理器/载荷里，
+    不依赖目标上已部署 stub 的版本。
   - gzip 传输压缩：NATIVE 通道（密文层，需 stub 上报 `gzip` 能力）与
     分阶段载荷通道（明文层，由每次注入的处理器解压）启用；
     **legacy 通道不压缩** —— 那条通道的请求由目标上已部署的 stub 解包，

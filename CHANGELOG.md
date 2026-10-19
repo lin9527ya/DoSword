@@ -69,6 +69,14 @@ PHP 侧此前是「三条通道、三套能力」：同一个目标换个编码�
 - **P1 的目录列表 `stat` 合并只在 legacy 模板生效**：默认 NATIVE 与 session 仍是每项
   `is_dir` + `filesize` + `filemtime` + `fileperms` 四次调用。现三条通道统一单次
   `stat()`（`is_dir` 由 `mode` 判定），顺带消除 stub 里明文的 `fileperms(`。
+- **session / legacy 通道的敏感函数名全部改经运行时符号表**：命令执行五函数、
+  `base64_*`、文件读写/列举/删除/重命名/建目录/改时间戳、`fopen`/`fseek`/`fread`/
+  `fwrite`/`fclose`、`stream_socket_client`、`preg_split`、`gzdecode`/`gzencode`
+  以及 `eval` —— 代码里只出现 crc32b 哈希与索引，运行时从 `get_defined_functions()`
+  反查；符号表随处理器/载荷自带，不依赖目标上已部署 stub 的版本（旧 stub 也没有新索引）。
+  回归测试：`session_handler_and_shared_impl_have_no_plain_sensitive_names`、
+  `legacy_channel_payloads_have_no_plain_sensitive_names`（后者从请求调试环缓冲
+  取真实载荷断言）。
 - 分阶段载荷的 gzip 改为**明文层**压缩（`{"n":..,"z":1,"d":base64(gzip(请求))}`）：
   密文层压缩对高熵密文收益接近零，而 base64 载荷的 33% 膨胀可以被真正收回。
 
