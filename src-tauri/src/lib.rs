@@ -5,6 +5,7 @@ mod mcp;
 mod memshell;
 mod native_plugin;
 mod protocol;
+mod proxy_chain;
 mod pty;
 mod session;
 mod storage;
@@ -23,6 +24,8 @@ pub struct AppState {
     feature_plugins: std::sync::Mutex<dosword_sdk::FeaturePluginRegistry>,
     ptys: pty::PtyRegistry,
     dir_cache: Mutex<DirCache>,
+    /// 多跳代理链（id → 本地监听器）
+    proxy_chains: Mutex<std::collections::HashMap<String, proxy_chain::LocalChain>>,
 }
 
 /// 目录列表缓存：`lru::LruCache` + TTL 5s + Arc 共享（O(1) 淘汰，免深拷贝）。
@@ -118,6 +121,7 @@ fn build_app_state(
         feature_plugins: Mutex::new(feature_plugins),
         ptys: pty::PtyRegistry::new(),
         dir_cache: Mutex::new(DirCache::new()),
+        proxy_chains: Mutex::new(std::collections::HashMap::new()),
     }
 }
 
@@ -226,6 +230,9 @@ pub fn run() {
             commands::memshell_list,
             commands::memshell_exec,
             commands::orchestrate_run,
+            commands::proxy_chain_start,
+            commands::proxy_chain_stop,
+            commands::proxy_chain_list,
             commands::read_file,
             commands::write_file,
             commands::upload_file,

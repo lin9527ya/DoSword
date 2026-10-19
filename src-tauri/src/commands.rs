@@ -1713,7 +1713,19 @@ pub async fn update_settings(input: AppSettings, app: AppHandle) -> Result<(), S
             for session_id in &removed {
                 state.ptys.close_for_session(session_id);
             }
-            if !removed.is_empty() {
+            // 关闭真实网络 = 同时关闭全部多跳代理链（否则链会继续转发流量）
+            let chain_count = {
+                let mut chains = state
+                    .proxy_chains
+                    .lock()
+                    .map_err(|_| "代理链注册表锁异常".to_string())?;
+                let count = chains.len();
+                for (_, chain) in chains.drain() {
+                    chain.stop();
+                }
+                count
+            };
+            if !removed.is_empty() || chain_count > 0 {
                 audit(
                     state,
                     "system",
@@ -1721,8 +1733,9 @@ pub async fn update_settings(input: AppSettings, app: AppHandle) -> Result<(), S
                     "settings.update",
                     "success",
                     &format!(
-                        "已关闭真实网络：强制断开 {} 个活跃会话及其 PTY",
-                        removed.len()
+                        "已关闭真实网络：强制断开 {} 个活跃会话及其 PTY，关闭 {} 条代理链",
+                        removed.len(),
+                        chain_count
                     ),
                 );
             }
@@ -3953,6 +3966,148 @@ pub async fn orchestrate_run(
     blocking(app, move |state| orchestrate_run_impl(state, spec)).await
 }
 
+// ---------------------------------------------------------------------------
+// 多跳代理链
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyHopSpec {
+    /// 该跳对应的 Shell（用于逐个做授权复查与审计）。
+    pub shell_id: String,
+    /// 从前一跳看该 SOCKS5 的地址（第一跳是从操作机看）。
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyChainSpec {
+    pub hops: Vec<ProxyHopSpec>,
+    /// 本地监听端口，0 = 随机。
+    #[serde(default)]
+    pub local_port: u16,
+    /// 固定转发目标；留空则为动态 SOCKS5（客户端自行指定目标）。
+    pub target_host: Option<String>,
+    pub target_port: Option<u16>,
+}
+
+/// 启动多跳代理链，返回本地 SOCKS5 地址。
+#[tauri::command]
+pub async fn proxy_chain_start(
+    spec: ProxyChainSpec,
+    app: AppHandle,
+) -> Result<serde_json::Value, String> {
+    blocking(app, move |state| {
+        if spec.hops.is_empty() {
+            return Err("请至少配置一跳".to_string());
+        }
+        if spec.hops.len() > 8 {
+            return Err("代理链最多 8 跳".to_string());
+        }
+        let settings = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .get_settings()
+            .map_err(|error| error.to_string())?;
+        if !settings.http_enabled {
+            return Err("真实网络协议未开启".to_string());
+        }
+
+        // 每一跳都必须通过授权复查（与其它目标操作同一把尺子）
+        let mut hops = Vec::with_capacity(spec.hops.len());
+        for hop in &spec.hops {
+            let (shell, settings) = load_shell_and_settings(state, &hop.shell_id)?;
+            require_authorized_for(state, &shell, &settings)?;
+            hops.push(crate::proxy_chain::ChainHop {
+                host: hop.host.clone(),
+                port: hop.port,
+                auth: match (&hop.username, &hop.password) {
+                    (Some(user), Some(pass)) if !user.is_empty() => {
+                        Some((user.clone(), pass.clone()))
+                    }
+                    _ => None,
+                },
+            });
+        }
+
+        let fixed = match (&spec.target_host, spec.target_port) {
+            (Some(host), Some(port)) if !host.trim().is_empty() => {
+                Some((host.trim().to_string(), port))
+            }
+            _ => None,
+        };
+        let timeout = std::time::Duration::from_secs(settings.default_timeout_secs.clamp(1, 300));
+        let chain =
+            crate::proxy_chain::start_local_listener(hops, fixed, spec.local_port, timeout)?;
+        let chain_id = uuid::Uuid::new_v4().to_string();
+        let local_addr = chain.addr();
+        state
+            .proxy_chains
+            .lock()
+            .map_err(|_| "代理链注册表锁异常".to_string())?
+            .insert(chain_id.clone(), chain);
+
+        if let Ok(database) = state.database.lock() {
+            let _ = database.record_audit(
+                None,
+                None,
+                "proxy.chain.start",
+                "success",
+                &format!("链路：{chain_id}；{local_addr}；{} 跳", spec.hops.len()),
+            );
+        }
+        Ok(serde_json::json!({
+            "chainId": chain_id,
+            "localAddr": local_addr,
+            "hops": spec.hops.len(),
+        }))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn proxy_chain_stop(chain_id: String, app: AppHandle) -> Result<(), String> {
+    blocking(app, move |state| {
+        let chain = state
+            .proxy_chains
+            .lock()
+            .map_err(|_| "代理链注册表锁异常".to_string())?
+            .remove(&chain_id)
+            .ok_or_else(|| format!("代理链不存在：{chain_id}"))?;
+        chain.stop();
+        if let Ok(database) = state.database.lock() {
+            let _ = database.record_audit(
+                None,
+                None,
+                "proxy.chain.stop",
+                "success",
+                &format!("链路：{chain_id}"),
+            );
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn proxy_chain_list(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    blocking(app, move |state| {
+        let chains = state
+            .proxy_chains
+            .lock()
+            .map_err(|_| "代理链注册表锁异常".to_string())?;
+        Ok(chains
+            .iter()
+            .map(|(id, chain)| serde_json::json!({ "chainId": id, "localAddr": chain.addr() }))
+            .collect())
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3970,6 +4125,7 @@ mod tests {
             feature_plugins: std::sync::Mutex::new(dosword_sdk::FeaturePluginRegistry::builtin()),
             ptys: crate::pty::PtyRegistry::new(),
             dir_cache: Mutex::new(crate::DirCache::new()),
+            proxy_chains: Mutex::new(std::collections::HashMap::new()),
         }
     }
 

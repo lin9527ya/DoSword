@@ -7,6 +7,7 @@ import { RequestDebugView } from "./views/RequestDebugView";
 import { GlobalFilesView } from "./views/GlobalFilesView";
 import { GlobalDatabaseView } from "./views/GlobalDatabaseView";
 import { OrchestrationView } from "./views/OrchestrationView";
+import { ProxyChainView } from "./views/ProxyChainView";
 import { SettingsView } from "./views/SettingsView";
 import { AuditView } from "./views/AuditView";
 import { ShellDetailView } from "./shells/ShellDetailView";
@@ -116,6 +117,8 @@ function App() {
             <GlobalDatabaseView onNavigate={navigate} />
           ) : mainView.kind === "orchestrate" ? (
             <OrchestrationView />
+          ) : mainView.kind === "proxyChain" ? (
+            <ProxyChainView />
           ) : mainView.kind === "audit" ? (
             <AuditView />
           ) : (

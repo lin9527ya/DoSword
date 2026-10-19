@@ -54,6 +54,13 @@ export type OrchestrationReport = {
   outcomes: OrchestrationOutcome[];
 };
 
+/** 已启动的代理链。 */
+export type ProxyChainInfo = {
+  chainId: string;
+  localAddr: string;
+  hops?: number;
+};
+
 // --- invoke 封装 ---
 
 export const api = {
@@ -164,6 +171,22 @@ export const api = {
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   executeCommand: (sessionId: string, command: string) =>
     invoke<CommandOutput>("execute_command", { sessionId, command }),
+  // --- 多跳代理链 ---
+  proxyChainStart: (spec: {
+    hops: Array<{
+      shellId: string;
+      host: string;
+      port: number;
+      username?: string;
+      password?: string;
+    }>;
+    localPort: number;
+    targetHost?: string | null;
+    targetPort?: number | null;
+  }) => invoke<ProxyChainInfo>("proxy_chain_start", { spec }),
+  proxyChainStop: (chainId: string) => invoke<void>("proxy_chain_stop", { chainId }),
+  proxyChainList: () => invoke<ProxyChainInfo[]>("proxy_chain_list"),
+
   // --- 批量与多目标编排 ---
   orchestrateRun: (spec: {
     shellIds: string[];

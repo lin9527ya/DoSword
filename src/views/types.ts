@@ -8,6 +8,7 @@ export type View =
   | { kind: "files" }
   | { kind: "database" }
   | { kind: "orchestrate" }
+  | { kind: "proxyChain" }
   | { kind: "audit" }
   | { kind: "settings" };
 

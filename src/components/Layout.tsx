@@ -5,6 +5,7 @@ import {
   FileCode2,
   LayoutDashboard,
   ListChecks,
+  Network,
   Settings,
   ShieldCheck,
   TerminalSquare,
@@ -31,6 +32,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: "files", label: "批量文件", icon: <FileCode2 size={17} />, view: { kind: "files" }, shortcut: "Ctrl+M" },
   { key: "database", label: "数据库", icon: <Boxes size={17} />, view: { kind: "database" }, shortcut: "Ctrl+D" },
   { key: "orchestrate", label: "批量编排", icon: <ListChecks size={17} />, view: { kind: "orchestrate" }, shortcut: "Ctrl+B" },
+  { key: "proxyChain", label: "代理链", icon: <Network size={17} />, view: { kind: "proxyChain" } },
 ];
 
 const BOTTOM_ITEMS: NavItem[] = [
