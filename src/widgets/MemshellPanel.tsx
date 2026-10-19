@@ -52,8 +52,11 @@ export function MemshellPanel({
   const toast = useToast();
   const [capabilities, setCapabilities] = useState<MemshellCapability[]>([]);
   const [handles, setHandles] = useState<MemoryShell[]>([]);
+  const [selectedKind, setSelectedKind] = useState("php_user_ini");
   const [installDir, setInstallDir] = useState(documentRoot ?? "");
   const [triggerUrl, setTriggerUrl] = useState(endpoint);
+  const [fpmTarget, setFpmTarget] = useState("127.0.0.1:9000");
+  const [scriptFilename, setScriptFilename] = useState("");
   const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -90,7 +93,7 @@ export function MemshellPanel({
       .catch((cause) => setError(errorText(cause)));
   }, [sessionId]);
 
-  const feasible = capabilities.find((item) => item.feasible);
+  const installable = capabilities.filter((item) => item.feasible);
   const live = handles.filter((item) => item.status === "active" || item.status === "pending");
   const orphans = handles.filter((item) => item.status === "orphaned");
 
@@ -103,14 +106,25 @@ export function MemshellPanel({
       toast.warning("请先勾选授权确认");
       return;
     }
-    if (!installDir.trim() || !triggerUrl.trim()) {
+    if (selectedKind === "php_fcgi") {
+      if (!fpmTarget.trim() || !scriptFilename.trim()) {
+        toast.warning("请填写 FPM 地址与 SCRIPT_FILENAME");
+        return;
+      }
+    } else if (!installDir.trim() || !triggerUrl.trim()) {
       toast.warning("请填写安装目录与触发 URL");
       return;
     }
     setBusy(true);
     setError("");
     try {
-      const handle = await api.memshellInstall(sessionId, installDir.trim(), triggerUrl.trim());
+      const handle = await api.memshellInstall(
+        sessionId,
+        selectedKind,
+        selectedKind === "php_fcgi"
+          ? { fpmTarget: fpmTarget.trim(), scriptFilename: scriptFilename.trim() }
+          : { installDir: installDir.trim(), triggerUrl: triggerUrl.trim() },
+      );
       await refresh();
       if (handle.status === "active") {
         toast.success(`内存马已生效：${handle.installPath}`, "注入成功");
@@ -228,7 +242,7 @@ export function MemshellPanel({
         )}
       </div>
 
-      {feasible && !orphans.length && (
+      {installable.length > 0 && !orphans.length && (
         <div
           style={{
             border: "1px solid var(--border)",
@@ -238,23 +252,66 @@ export function MemshellPanel({
             gap: 8,
           }}
         >
-          <strong style={{ fontSize: 12.5 }}>注入 {feasible.kind}</strong>
-          <label>
-            安装目录（.user.ini 所在目录，须是触发 URL 的所在目录）
-            <input
-              value={installDir}
-              onChange={(event) => setInstallDir(event.target.value)}
-              placeholder="/var/www/html"
-            />
-          </label>
-          <label>
-            触发 URL（该目录下已存在的 PHP 页面）
-            <input
-              value={triggerUrl}
-              onChange={(event) => setTriggerUrl(event.target.value)}
-              placeholder="http://target/index.php"
-            />
-          </label>
+          <strong style={{ fontSize: 12.5 }}>注入内存马</strong>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {capabilities.map((item) => (
+              <button
+                key={item.kind}
+                className={`button compact ${selectedKind === item.kind ? "primary" : "secondary"}`}
+                disabled={!item.feasible}
+                title={item.feasible ? "" : (item.reason ?? "")}
+                onClick={() => setSelectedKind(item.kind)}
+              >
+                {item.feasible ? "" : "不可用 · "}
+                {item.kind}
+              </button>
+            ))}
+          </div>
+          {selectedKind === "php_fcgi" ? (
+            <>
+              <label>
+                FPM 地址（客户端需能直连）
+                <input
+                  value={fpmTarget}
+                  onChange={(event) => setFpmTarget(event.target.value)}
+                  placeholder="127.0.0.1:9000"
+                />
+              </label>
+              <label>
+                SCRIPT_FILENAME（目标上已存在的 PHP 文件绝对路径）
+                <input
+                  value={scriptFilename}
+                  onChange={(event) => setScriptFilename(event.target.value)}
+                  placeholder="/var/www/html/index.php"
+                />
+              </label>
+              <div className="form-note">
+                零落盘：请求体即载荷，目标不留文件、无缓存延迟；前提是 FPM 端口可达。
+              </div>
+            </>
+          ) : (
+            <>
+              <label>
+                安装目录（.user.ini 所在目录，须是触发 URL 的所在目录）
+                <input
+                  value={installDir}
+                  onChange={(event) => setInstallDir(event.target.value)}
+                  placeholder="/var/www/html"
+                />
+              </label>
+              <label>
+                触发 URL（该目录下已存在的 PHP 页面）
+                <input
+                  value={triggerUrl}
+                  onChange={(event) => setTriggerUrl(event.target.value)}
+                  placeholder="http://target/index.php"
+                />
+              </label>
+              <div className="form-note">
+                生效可能延迟：目标 PHP 缓存 .user.ini 默认 300 秒，首次检测可能为「待生效」。
+              </div>
+            </>
+          )}
           <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <input
               type="checkbox"
@@ -264,9 +321,6 @@ export function MemshellPanel({
             />
             我确认该目标在授权范围内，并了解注入会改变目标状态、需在结束后中和
           </label>
-          <div className="form-note">
-            生效可能延迟：目标 PHP 缓存 .user.ini 默认 300 秒，首次检测可能为「待生效」。
-          </div>
           <div>
             <button className="button primary" onClick={() => void install()} disabled={busy}>
               {busy ? <LoaderCircle className="spin" size={14} /> : <ShieldOff size={14} />}

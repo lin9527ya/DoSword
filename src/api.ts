@@ -149,8 +149,24 @@ export const api = {
   // --- 内存马（后渗透） ---
   memshellCapabilities: (sessionId: string) =>
     invoke<MemshellCapability[]>("memshell_capabilities", { sessionId }),
-  memshellInstall: (sessionId: string, installDir: string, triggerUrl: string) =>
-    invoke<MemoryShell>("memshell_install", { sessionId, installDir, triggerUrl }),
+  memshellInstall: (
+    sessionId: string,
+    kind: string,
+    options: {
+      installDir?: string;
+      triggerUrl?: string;
+      fpmTarget?: string;
+      scriptFilename?: string;
+    },
+  ) =>
+    invoke<MemoryShell>("memshell_install", {
+      sessionId,
+      kind,
+      installDir: options.installDir ?? null,
+      triggerUrl: options.triggerUrl ?? null,
+      fpmTarget: options.fpmTarget ?? null,
+      scriptFilename: options.scriptFilename ?? null,
+    }),
   memshellCheck: (handleId: string) => invoke<boolean>("memshell_check", { handleId }),
   memshellUninstall: (handleId: string) => invoke<string>("memshell_uninstall", { handleId }),
   memshellList: (workspaceId?: string, shellId?: string) =>

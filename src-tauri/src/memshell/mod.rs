@@ -11,6 +11,7 @@
 //! Java 内存马需要先给 JSP 协议补 `run_code` 通道（当前 stub 是固定分发），
 //! 且存在 classloader 回收陷阱，另行排期。
 
+pub mod fcgi;
 pub mod php;
 
 use dosword_sdk::domain::ProbeResult;
@@ -23,6 +24,7 @@ pub const TOKEN_HEADER: &str = "X-DSW-TOKEN";
 pub const CMD_HEADER: &str = "X-DSW-CMD";
 
 pub const KIND_PHP_USER_INI: &str = "php_user_ini";
+pub const KIND_PHP_FCGI: &str = "php_fcgi";
 
 /// 判定 `php_user_ini` 在当前目标上是否可行。纯本地计算，不发网络请求。
 ///
