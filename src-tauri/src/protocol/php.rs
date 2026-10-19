@@ -4785,45 +4785,58 @@ except Exception as e:
         std::fs::create_dir_all(dir.join("www")).ok()?;
         std::fs::write(dir.join("www/hello.txt"), b"hello dosword").ok()?;
 
-        let port = {
-            // 取一个空闲端口
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let mut command = std::process::Command::new("php");
-        if encoder_id == "php_stream" {
-            // 仅 include 流方案需要 allow_url_include；xor_body 用 file_get_contents 无需
-            command.arg("-d").arg("allow_url_include=1");
-        }
-        if session || encoder_id == "xor_session" {
-            // 分阶段载荷依赖 session：显式指定可写目录
-            command
-                .arg("-d")
-                .arg(format!("session.save_path={}", dir.display()))
-                .arg("-d")
-                .arg("session.use_cookies=1");
-        }
-        let child = command
-            .arg("-S")
-            .arg(format!("127.0.0.1:{port}"))
-            .arg("-t")
-            .arg(&dir)
-            .current_dir(&dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::from(
-                std::fs::File::create(std::env::temp_dir().join("srv.log")).ok()?,
-            ))
-            .spawn()
-            .ok()?;
-        // 等待服务器就绪
-        let url = format!("http://127.0.0.1:{port}/shell.php");
-        for _ in 0..50 {
-            if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-                break;
+        // 端口是「先 bind 取号、再释放、再交给 php」的，并行测试下可能被其它
+        // 用例抢走；此时 php -S 绑定失败会立刻退出。重试最多 3 次，并以
+        // 「子进程仍存活 + TCP 可连」作为就绪判据 —— 只看 TCP 会把别的用例的
+        // 服务器误认成自己的，表现为随机「鉴权失败/协议帧缺失」的假失败。
+        for _ in 0..3 {
+            let port = {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let mut command = std::process::Command::new("php");
+            if encoder_id == "php_stream" {
+                // 仅 include 流方案需要 allow_url_include；xor_body 用 file_get_contents 无需
+                command.arg("-d").arg("allow_url_include=1");
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            if session || encoder_id == "xor_session" {
+                // 分阶段载荷依赖 session：显式指定可写目录
+                command
+                    .arg("-d")
+                    .arg(format!("session.save_path={}", dir.display()))
+                    .arg("-d")
+                    .arg("session.use_cookies=1");
+            }
+            let mut child = command
+                .arg("-S")
+                .arg(format!("127.0.0.1:{port}"))
+                .arg("-t")
+                .arg(&dir)
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::from(
+                    std::fs::File::create(dir.join("server.log")).ok()?,
+                ))
+                .spawn()
+                .ok()?;
+            let url = format!("http://127.0.0.1:{port}/shell.php");
+            for _ in 0..50 {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    break; // 启动失败（端口被占等）：换一个端口重试
+                }
+                if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+                    return Some((url, dir, child));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        Some((url, dir, child))
+        if std::env::var("DOSWORD_REQUIRE_PHP").is_ok() {
+            panic!("php -S 连续 3 次未能启动（端口竞态或环境异常）");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        None
     }
 
     #[allow(dead_code)] // 测试基础设施，保留供新增协议用例复用
