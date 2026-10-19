@@ -141,6 +141,9 @@ export const api = {
     password: string,
     session: boolean,
     salted: boolean,
+    /** 传输形态（W2）：请求参数名 / 鉴权头名（仅 NATIVE 系列烘焙进 stub） */
+    param?: string,
+    header?: string,
   ) =>
     invoke<GenerateShellResult>("generate_shell", {
       language,
@@ -148,6 +151,8 @@ export const api = {
       password,
       session,
       salted,
+      param,
+      header,
     }),
   listAudit: (filter: AuditFilter) => invoke<AuditPage>("list_audit", { filter }),
   writeLocalFile: (path: string, contentB64: string) =>

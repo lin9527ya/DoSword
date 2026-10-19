@@ -362,6 +362,10 @@ fn validate_protocol_params(params: &str) -> Result<(), String> {
     {
         return Err("协议参数 session 必须是布尔值".to_string());
     }
+    // 传输形态（W2）：参数名 / 头名 / 查询串 / 填充长度在保存时就校验，
+    // 避免把「连不上的配置」留到连接时才暴露（头名同时防 CRLF 注入）
+    crate::protocol::php::TransportProfile::from_protocol_params(params)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -646,12 +650,16 @@ pub async fn probe_shell(shell_id: String, app: AppHandle) -> Result<ProbeResult
 /// 生成服务端 Webshell stub（本地生成，不产生网络流量）。
 /// `language` 白名单：php / asp / aspx / jsp；`encoder_id`：xor_base64 / base64。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri IPC 参数是扁平命名参数，无法收进结构体
 pub async fn generate_shell(
     language: String,
     encoder_id: String,
     password: String,
     session: bool,
     salted: bool,
+    // W2 传输形态：请求参数名 / 鉴权头名（仅 NATIVE 系列烘焙进 stub；None = 历史默认）
+    param: Option<String>,
+    header: Option<String>,
     app: AppHandle,
 ) -> Result<GenerateShellResult, String> {
     blocking(app, move |state| {
@@ -675,13 +683,19 @@ pub async fn generate_shell(
             Some(salt) => format!("{salt}:{password}"),
             None => password.clone(),
         };
+        let opts = dosword_sdk::encoder::StubOptions {
+            param: param.unwrap_or_else(|| "formData".to_string()),
+            header: header.unwrap_or_else(|| "X-Debug-Key".to_string()),
+        };
+        opts.validate().map_err(|error| error.to_string())?;
         let content = if session {
+            // 分阶段载荷读请求体，参数名/头名不生效
             encoder
                 .stub_session(&language, &effective)
                 .map_err(|error| error.to_string())?
         } else {
             encoder
-                .stub(&language, &effective)
+                .stub_with(&language, &effective, &opts)
                 .map_err(|error| error.to_string())?
         };
         let filename = format!("shell_{}_{}.{}", language, encoder_id, language);

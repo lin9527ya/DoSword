@@ -21,7 +21,9 @@ import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import { api, b64, errorText, shortTime } from "../api";
 import {
   buildProtocolParams,
+  headerLines,
   isNativeEncoder,
+  parseHeaderLines,
   parseProtocolParams,
   supportsSessionMode,
 } from "../shells/encoders";
@@ -1002,6 +1004,23 @@ function ShellDialog({
   const [encoderId, setEncoderId] = useState(saved.encoder ?? "native");
   const [salt, setSalt] = useState(saved.salt ?? "");
   const [sessionMode, setSessionMode] = useState(saved.session === true);
+  // 传输形态（W2）：参数名/头名需与 stub 一致；查询串/填充/额外头只改变请求形态
+  const [transportParam, setTransportParam] = useState(saved.transport?.param ?? "");
+  const [transportHeader, setTransportHeader] = useState(saved.transport?.header ?? "");
+  const [transportSuffix, setTransportSuffix] = useState(saved.transport?.pathSuffix ?? "");
+  const [transportPadding, setTransportPadding] = useState(
+    saved.transport?.padding ? String(saved.transport.padding) : "",
+  );
+  const [transportHeaders, setTransportHeaders] = useState(
+    headerLines(saved.transport?.extraHeaders),
+  );
+  const transportProfile = () => ({
+    param: transportParam,
+    header: transportHeader,
+    pathSuffix: transportSuffix,
+    padding: Number(transportPadding) || 0,
+    extraHeaders: parseHeaderLines(transportHeaders),
+  });
   const [settings, setSettings] = useState<{ httpEnabled: boolean }>({ httpEnabled: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -1028,7 +1047,7 @@ function ShellDialog({
         String(form.get("password") ?? ""),
         protocolId,
         protocolId === "builtin.php.v1"
-          ? buildProtocolParams(encoderId, salt, sessionMode)
+          ? buildProtocolParams(encoderId, salt, sessionMode, transportProfile())
           : undefined,
         String(form.get("runtime") ?? "php"),
         allowUnscoped,
@@ -1067,7 +1086,7 @@ function ShellDialog({
           tags: parseTags(String(form.get("tags") ?? "")),
           protocolParams:
             protocolId === "builtin.php.v1"
-              ? buildProtocolParams(encoderId, salt, sessionMode)
+              ? buildProtocolParams(encoderId, salt, sessionMode, transportProfile())
               : undefined,
         });
         toast.success(`Shell「${form.get("name")}」已更新`, "保存成功");
@@ -1083,7 +1102,7 @@ function ShellDialog({
           tags: parseTags(String(form.get("tags") ?? "")),
           protocolParams:
             protocolId === "builtin.php.v1"
-              ? buildProtocolParams(encoderId, salt, sessionMode)
+              ? buildProtocolParams(encoderId, salt, sessionMode, transportProfile())
               : undefined,
         });
         toast.success(`Shell「${form.get("name")}」登记完成`, "登记成功");
@@ -1229,6 +1248,73 @@ function ShellDialog({
                     : `${encoderId} 不使用分阶段载荷${isNativeEncoder(encoderId) ? "（NATIVE 自带内置分发）" : ""}，该开关不生效。`}
                 </span>
               </label>
+            )}
+            {protocolId === "builtin.php.v1" && (
+              <fieldset
+                style={{
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  padding: "10px 12px",
+                  display: "grid",
+                  gap: 10,
+                }}
+              >
+                <legend style={{ padding: "0 6px", fontSize: 12, color: "var(--text-faint)" }}>
+                  传输形态（可选；与 stub 不一致会连不上）
+                </legend>
+                {isNativeEncoder(encoderId) && (
+                  <>
+                    <label>
+                      请求参数名
+                      <input
+                        value={transportParam}
+                        onChange={(event) => setTransportParam(event.target.value)}
+                        placeholder="formData"
+                      />
+                    </label>
+                    <label>
+                      鉴权头名
+                      <input
+                        value={transportHeader}
+                        onChange={(event) => setTransportHeader(event.target.value)}
+                        placeholder="X-Debug-Key"
+                      />
+                    </label>
+                  </>
+                )}
+                <label>
+                  附加查询串
+                  <input
+                    value={transportSuffix}
+                    onChange={(event) => setTransportSuffix(event.target.value)}
+                    placeholder="?v=1"
+                  />
+                </label>
+                <label>
+                  请求填充字节（0-4096）
+                  <input
+                    type="number"
+                    min={0}
+                    max={4096}
+                    value={transportPadding}
+                    onChange={(event) => setTransportPadding(event.target.value)}
+                    placeholder="0"
+                  />
+                </label>
+                <label>
+                  额外请求头（每行 Name: Value）
+                  <textarea
+                    rows={2}
+                    value={transportHeaders}
+                    onChange={(event) => setTransportHeaders(event.target.value)}
+                    placeholder="X-Requested-With: XMLHttpRequest"
+                  />
+                </label>
+                <span className="field-hint">
+                  参数名/头名由「生成 Webshell」时填写，必须一致；查询串、额外头与填充只改变
+                  客户端请求形态（随机填充会附带随机表单字段）。
+                </span>
+              </fieldset>
             )}
 
             {!editing && settings.httpEnabled && (

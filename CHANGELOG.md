@@ -87,6 +87,18 @@ PHP 侧此前是「三条通道、三套能力」：同一个目标换个编码�
 
 ### 新增（PHP）
 
+- **W2 传输形态可配（Transport Profile）**：每 Shell 可在 `protocol_params.transport`
+  配置请求参数名 / 鉴权头名（NATIVE 系列，须与 stub 一致）、附加查询串、
+  额外请求头、表单体随机填充字节。
+  - SDK 新增 `StubOptions` + `PayloadEncoder::stub_with`（默认转调 `stub`）：
+    `native*` / `native_aead` 把参数名与头名烘焙进 stub；默认值即历史行为
+  - 客户端三条通道统一应用查询串与额外头；NATIVE/legacy 表单体支持随机填充
+  - 严格校验：参数名须为 PHP 标识符、头名须为 HTTP token（拒绝 CRLF 注入）、
+    查询串须以 `?`/`&` 开头且不含空白与 `#`、填充 ≤ 4096；保存时就报错
+  - 生成器与登记/编辑表单都暴露这些字段；MCP `dosword_generate_stub` 同步支持
+  - 测试：`stub_with_custom_param_and_header`、`stub_options_validate_rejects_bad_values`、
+    `transport_profile_validation`、`real_php_transport_profile_round_trip`
+    （自定义参数名/头名连通；不匹配时必须连不上）
 - `crates/dosword-sdk/src/php_impl.rs`：三条通道共用的 PHP 实现片段
   （命令 / 目录列举 / 数据库探测与查询 / redis RESP 辅助 / 环境信息表），
   由 `session_handler_matches_native_capabilities` 测试守住与 NATIVE stub 的一致性。

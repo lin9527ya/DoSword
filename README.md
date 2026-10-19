@@ -95,6 +95,11 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
 - **能力协商**：stub 上报 `ProtoVersion` / `Capabilities` / `ShellType`；
   客户端**只在 stub 明确上报且缺项时**拒绝（旧 stub 不上报 → 保持旧行为），
   错误提示「请用当前版本重新生成并上传 stub」而不是发出去必然失败
+- **传输形态可配（Transport Profile）**：每 Shell 可在 `protocol_params.transport` 指定
+  请求参数名 / 鉴权头名（NATIVE 系列；须与 stub 一致，生成 stub 时同样可配）、
+  附加查询串（如 `?v=1`）、额外请求头、以及表单体随机填充字节。
+  参数名/头名严格校验（拒绝 CRLF/头注入），非法配置在保存 Shell 时就拒绝；
+  未配置时行为与历史版本完全一致。
 - **生成 Webshell**：PHP / ASP / ASPX / JSP / Python / Node 六种语言 × 编码器生成服务端 stub
   > 语言可用性（实测口径）：PHP 全功能；Python（CGI）与 Node 可用；
   > **JSP / ASPX / ASP 当前无法端到端使用**——生成的 stub 未经真实容器验证，

@@ -395,6 +395,10 @@ pub struct StubArgs {
     pub password: String,
     /// 是否生成分阶段（session）载荷
     pub session: Option<bool>,
+    /// 请求参数名（Transport Profile；默认 formData，仅 NATIVE 系列生效）
+    pub param: Option<String>,
+    /// 鉴权头名（Transport Profile；默认 X-Debug-Key，仅 NATIVE 系列生效）
+    pub header: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -916,6 +920,8 @@ impl super::DoswordMcp {
             args.session.unwrap_or(false),
             // MCP 生成不启用加盐（盐需人工带入 Shell 配置，交给 GUI 更合适）
             false,
+            args.param,
+            args.header,
             app,
         )
         .await;
