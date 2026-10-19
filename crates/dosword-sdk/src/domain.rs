@@ -605,6 +605,51 @@ pub struct RequestRecord {
     pub response: String,
 }
 
+/// 内存马句柄。
+///
+/// 设计约束：**仅凭本记录（endpoint + token + artifact）就应能在一个全新的
+/// DoSword 实例上完成卸载**。做不到的形态不允许实现 —— 否则等于给目标留后门。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryShell {
+    pub id: String,
+    pub workspace_id: String,
+    /// 关联的 Shell（可为空：Shell 被删除后句柄仍需保留以便卸载）。
+    pub shell_id: Option<String>,
+    /// 目标运行时：php / jsp。
+    pub runtime: String,
+    /// 形态：php_fcgi / php_user_ini / java_filter。
+    pub kind: String,
+    /// 载荷自报的标识（用于存活检测与卸载时精确匹配）。
+    pub name: String,
+    /// 存活检测与自毁鉴权令牌。**等同密码**，UI 需掩码显示。
+    pub token: String,
+    /// 注入时的目标端点（全新实例可据此重连并卸载）。
+    pub endpoint: String,
+    pub install_path: String,
+    /// 卸载所需的产物清单（JSON：files[] / previous_content / cleanup[]）。
+    pub artifact: String,
+    /// active / stale / orphaned / uninstalled
+    pub status: String,
+    pub installed_at: String,
+    pub last_check_at: Option<String>,
+    pub last_check_ok: bool,
+    #[ts(type = "number")]
+    pub uninstall_attempts: i64,
+    pub notes: String,
+}
+
+/// 某个内存马形态在当前目标上的可行性（由客户端根据 probe 的环境信息本地判定）。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct MemshellCapability {
+    pub kind: String,
+    pub runtime: String,
+    pub feasible: bool,
+    /// 不可行时的原因（供 UI 直接展示）。
+    pub reason: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // TS 类型生成：将全部 DTO 导出为 src/generated/domain.ts，前端 api.ts 复用，
 // 避免前后端类型手工重复维护导致的漂移。
@@ -630,6 +675,8 @@ mod ts_bindings {
             ("UpdateShell", UpdateShell::decl()),
             ("ProbeResult", ProbeResult::decl()),
             ("TargetCapabilities", TargetCapabilities::decl()),
+            ("MemoryShell", MemoryShell::decl()),
+            ("MemshellCapability", MemshellCapability::decl()),
             ("AppSettings", AppSettings::decl()),
             ("CommandOutput", CommandOutput::decl()),
             ("DirListing", DirListing::decl()),

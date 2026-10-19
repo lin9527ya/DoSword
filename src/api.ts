@@ -30,6 +30,8 @@ import type {
   McpCallRecord,
   McpPendingApproval,
   FeatureManifest,
+  MemoryShell,
+  MemshellCapability,
 } from "./generated/domain";
 
 export type * from "./generated/domain";
@@ -144,6 +146,17 @@ export const api = {
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   executeCommand: (sessionId: string, command: string) =>
     invoke<CommandOutput>("execute_command", { sessionId, command }),
+  // --- 内存马（后渗透） ---
+  memshellCapabilities: (sessionId: string) =>
+    invoke<MemshellCapability[]>("memshell_capabilities", { sessionId }),
+  memshellInstall: (sessionId: string, installDir: string, triggerUrl: string) =>
+    invoke<MemoryShell>("memshell_install", { sessionId, installDir, triggerUrl }),
+  memshellCheck: (handleId: string) => invoke<boolean>("memshell_check", { handleId }),
+  memshellUninstall: (handleId: string) => invoke<string>("memshell_uninstall", { handleId }),
+  memshellList: (workspaceId?: string, shellId?: string) =>
+    invoke<MemoryShell[]>("memshell_list", { workspaceId, shellId }),
+  memshellExec: (handleId: string, command: string) =>
+    invoke<string>("memshell_exec", { handleId, command }),
   batchListDir: (sessionId: string, paths: string[]) =>
     invoke<Record<string, DirListing>>("batch_list_dir", { sessionId, paths }),
   listDir: (sessionId: string, path: string) =>

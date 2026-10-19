@@ -69,6 +69,44 @@ capabilities: Array<string>,
  * 载荷形态：file（落地文件）/ memory（内存马）
  */
 shellType: string, };
+export type MemoryShell = { id: string, workspaceId: string, 
+/**
+ * 关联的 Shell（可为空：Shell 被删除后句柄仍需保留以便卸载）。
+ */
+shellId: string | null, 
+/**
+ * 目标运行时：php / jsp。
+ */
+runtime: string, 
+/**
+ * 形态：php_fcgi / php_user_ini / java_filter。
+ */
+kind: string, 
+/**
+ * 载荷自报的标识（用于存活检测与卸载时精确匹配）。
+ */
+name: string, 
+/**
+ * 存活检测与自毁鉴权令牌。**等同密码**，UI 需掩码显示。
+ */
+token: string, 
+/**
+ * 注入时的目标端点（全新实例可据此重连并卸载）。
+ */
+endpoint: string, installPath: string, 
+/**
+ * 卸载所需的产物清单（JSON：files[] / previous_content / cleanup[]）。
+ */
+artifact: string, 
+/**
+ * active / stale / orphaned / uninstalled
+ */
+status: string, installedAt: string, lastCheckAt: string | null, lastCheckOk: boolean, uninstallAttempts: number, notes: string, };
+export type MemshellCapability = { kind: string, runtime: string, feasible: boolean, 
+/**
+ * 不可行时的原因（供 UI 直接展示）。
+ */
+reason: string | null, };
 export type AppSettings = { 
 /**
  * 是否允许发起真实网络请求（安全门总开关，默认关闭）。

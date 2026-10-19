@@ -5,9 +5,30 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use dosword_sdk::domain::{
-    AppSettings, AuditEvent, AuditFilter, CreateShell, CreateWorkspace, Dashboard, ShellProfile,
-    UpdateShell, UpdateWorkspace, Workspace,
+    AppSettings, AuditEvent, AuditFilter, CreateShell, CreateWorkspace, Dashboard, MemoryShell,
+    ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
 };
+
+fn memory_shell_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryShell> {
+    Ok(MemoryShell {
+        id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        shell_id: row.get(2)?,
+        runtime: row.get(3)?,
+        kind: row.get(4)?,
+        name: row.get(5)?,
+        token: row.get(6)?,
+        endpoint: row.get(7)?,
+        install_path: row.get(8)?,
+        artifact: row.get(9)?,
+        status: row.get(10)?,
+        installed_at: row.get(11)?,
+        last_check_at: row.get(12)?,
+        last_check_ok: row.get::<_, i64>(13)? != 0,
+        uninstall_attempts: row.get(14)?,
+        notes: row.get(15)?,
+    })
+}
 
 /// 迁移脚本：`MIGRATIONS[i]` 把数据库从 user_version i 升级到 i+1。
 /// 新增迁移时**追加**到数组末尾，不要修改已发布的条目。
@@ -71,6 +92,29 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX idx_audit_outcome ON audit_events(outcome);
      CREATE INDEX idx_audit_created ON audit_events(created_at);
      CREATE INDEX idx_shell_workspace ON shell_profiles(workspace_id);",
+    // v6: 内存马句柄。句柄必须自足 —— 仅凭本表内容（endpoint + token + artifact）
+    //     就应能在一个全新的 DoSword 实例上完成卸载；句柄丢失等于留下后门。
+    "CREATE TABLE memory_shells (
+       id TEXT PRIMARY KEY,
+       workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+       shell_id TEXT REFERENCES shell_profiles(id) ON DELETE SET NULL,
+       runtime TEXT NOT NULL,
+       kind TEXT NOT NULL,
+       name TEXT NOT NULL,
+       token TEXT NOT NULL,
+       endpoint TEXT NOT NULL,
+       install_path TEXT NOT NULL DEFAULT '',
+       artifact TEXT NOT NULL DEFAULT '{}',
+       status TEXT NOT NULL,
+       installed_at TEXT NOT NULL,
+       last_check_at TEXT,
+       last_check_ok INTEGER NOT NULL DEFAULT 0,
+       uninstall_attempts INTEGER NOT NULL DEFAULT 0,
+       notes TEXT NOT NULL DEFAULT ''
+     );
+     CREATE INDEX idx_memshell_workspace ON memory_shells(workspace_id);
+     CREATE INDEX idx_memshell_shell ON memory_shells(shell_id);
+     CREATE INDEX idx_memshell_status ON memory_shells(status);",
 ];
 
 const SETTINGS_KEY: &str = "app";
@@ -446,6 +490,112 @@ impl Database {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![SETTINGS_KEY, json],
         )?;
+        Ok(())
+    }
+
+    // ---- 内存马句柄 ----
+
+    pub fn insert_memory_shell(&self, shell: &MemoryShell) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "INSERT INTO memory_shells
+               (id, workspace_id, shell_id, runtime, kind, name, token, endpoint,
+                install_path, artifact, status, installed_at, last_check_at,
+                last_check_ok, uninstall_attempts, notes)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                shell.id,
+                shell.workspace_id,
+                shell.shell_id,
+                shell.runtime,
+                shell.kind,
+                shell.name,
+                shell.token,
+                shell.endpoint,
+                shell.install_path,
+                shell.artifact,
+                shell.status,
+                shell.installed_at,
+                shell.last_check_at,
+                shell.last_check_ok as i64,
+                shell.uninstall_attempts,
+                shell.notes,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 列出句柄。两个过滤条件均可选（None = 不过滤）。
+    pub fn list_memory_shells(
+        &self,
+        workspace_id: Option<&str>,
+        shell_id: Option<&str>,
+    ) -> rusqlite::Result<Vec<MemoryShell>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, workspace_id, shell_id, runtime, kind, name, token, endpoint,
+                    install_path, artifact, status, installed_at, last_check_at,
+                    last_check_ok, uninstall_attempts, notes
+             FROM memory_shells
+             WHERE (?1 IS NULL OR workspace_id = ?1)
+               AND (?2 IS NULL OR shell_id = ?2)
+             ORDER BY installed_at DESC",
+        )?;
+        let rows = statement.query_map(params![workspace_id, shell_id], memory_shell_from_row)?;
+        rows.collect()
+    }
+
+    pub fn memory_shell(&self, id: &str) -> rusqlite::Result<Option<MemoryShell>> {
+        self.connection
+            .query_row(
+                "SELECT id, workspace_id, shell_id, runtime, kind, name, token, endpoint,
+                        install_path, artifact, status, installed_at, last_check_at,
+                        last_check_ok, uninstall_attempts, notes
+                 FROM memory_shells WHERE id = ?1",
+                [id],
+                memory_shell_from_row,
+            )
+            .optional()
+    }
+
+    /// 更新存活检测结果。
+    pub fn update_memory_shell_check(
+        &self,
+        id: &str,
+        status: &str,
+        alive: bool,
+    ) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE memory_shells
+             SET status = ?2, last_check_ok = ?3, last_check_at = ?4
+             WHERE id = ?1",
+            params![id, status, alive as i64, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// 卸载失败时累加尝试次数并置为指定状态（通常是 orphaned）。
+    pub fn mark_memory_shell_uninstall_failed(
+        &self,
+        id: &str,
+        status: &str,
+        note: &str,
+    ) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "UPDATE memory_shells
+             SET status = ?2,
+                 uninstall_attempts = uninstall_attempts + 1,
+                 notes = ?3
+             WHERE id = ?1",
+            params![id, status, note],
+        )?;
+        Ok(())
+    }
+
+    /// 删除句柄记录。**只应在载荷已中和且 TTL 已过（文件已清理）后调用**；
+    /// 待接：UI 的「完成清理」入口。
+    #[allow(dead_code)]
+    pub fn delete_memory_shell(&self, id: &str) -> rusqlite::Result<()> {
+        self.connection
+            .execute("DELETE FROM memory_shells WHERE id = ?1", [id])?;
         Ok(())
     }
 

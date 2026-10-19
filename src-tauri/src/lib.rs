@@ -2,6 +2,7 @@ mod auth;
 mod commands;
 #[cfg(feature = "mcp")]
 mod mcp;
+mod memshell;
 mod native_plugin;
 mod protocol;
 mod pty;
@@ -218,6 +219,12 @@ pub fn run() {
             commands::execute_command,
             commands::list_dir,
             commands::batch_list_dir,
+            commands::memshell_capabilities,
+            commands::memshell_install,
+            commands::memshell_check,
+            commands::memshell_uninstall,
+            commands::memshell_list,
+            commands::memshell_exec,
             commands::read_file,
             commands::write_file,
             commands::upload_file,
