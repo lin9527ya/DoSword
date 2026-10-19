@@ -68,6 +68,10 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
   > `native_chacha20` / `native_rabbit` 需 **64 位 PHP**（纯 PHP 实现，32 位位运算不可靠）；
   > `native_aead` 需 **PHP 7.1+ / 64 位 / openssl 支持 aes-256-gcm**
   > （`hash_hkdf` + `openssl_encrypt`）；gzip 传输压缩需目标有 zlib
+  > `native_aead` 的**非 PHP** 依赖：JSP 需 JDK 8+（`javax.crypto` GCM）；
+  > ASPX 需 .NET Framework 4.5+ 或 .NET 6+（纯托管 GCM 实现，不依赖 Windows 专有 API）；
+  > Python 需 `cryptography`；Node 需 12+（`hkdfSync` / `aes-256-gcm`）；
+  > **经典 ASP（VBScript）无内置 AES-GCM，`native_aead` 不支持**
 - **编码方式：16 种**（生成 Webshell 与登记 Shell 都从这里选，两处必须一致）
   - NATIVE 内置分发系列（7）：`native`（XOR，默认）、`native_aes_ecb`、`native_aes_cbc`、
     `native_des`、`native_chacha20`、`native_rabbit`、`native_aead`
@@ -133,8 +137,10 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
     不写回设置）与 `stub generate --out <file>`。
 - **生成 Webshell**：PHP / ASP / ASPX / JSP / Python / Node 六种语言 × 编码器生成服务端 stub
   > 语言可用性（实测口径）：PHP 全功能；Python（CGI）与 Node 可用；
-  > **JSP / ASPX / ASP 当前无法端到端使用**——生成的 stub 未经真实容器验证，
-  > 详见 `docs/优化拓展方案.md` 的「已知缺口」一节，勿用于真实评估。
+  > JSP / ASPX 的 stub 已通过**编译与密码学互操作验证**（javac / dotnet 实机编译运行，
+  > 覆盖 native 与 native_aead 两种编码），但**页面级集成未在真实容器（Tomcat / IIS）
+  > 中验证**，勿用于真实评估；经典 ASP 未验证且 `native_aead` 不支持。
+  > 详见 `docs/优化拓展方案.md` 的「已知缺口」一节。
 - 分块上传下载（块大小可配，默认 4MB；`read/write` 走偏移读取 + 顺序追加写），上传带进度条
   > 需要**用当前版本重新生成并上传 stub**：旧 stub 未上报 `ChunkedTransfer` 能力，
   > 客户端会明确报错而不是退化为"整文件返回/从头覆写"
@@ -177,7 +183,8 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
 连接后可在详情页进行文件管理与命令执行。所有操作都会写入审计日志。
 
 > JSP / ASP.NET / 经典 ASP 的**客户端协议已实现**（`builtin.jsp.v1` / `builtin.aspnet.v1` /
-> `builtin.asp.v1`），但生成的 stub 尚未在真实容器（Tomcat / IIS）上验证，勿用于真实评估。
+> `builtin.asp.v1`）。JSP / ASPX 的 stub 现在有编译与密码学互操作测试兜底（见「生成 Webshell」
+> 一节），但页面级集成仍未在真实容器（Tomcat / IIS）上验证，勿用于真实评估。
 
 ## 无 PHP 环境联调
 

@@ -7,6 +7,41 @@
 
 ## [未发布]
 
+### 新增（AEAD 多语言，2026-10-20）
+
+- **JSP / ASP.NET / Python / Node 的 AEAD stub**（编码器 `native_aead` 不再只有 PHP）。
+  四者与 PHP 版逐字节互操作：HKDF-SHA256（盐 `dosword/aead/v2`、info `dsw2`）派生密钥、
+  AES-256-GCM、帧 `base64(nonce[12] ‖ seq[8] ‖ ct ‖ tag[16])`、
+  AAD `"dsw2" ‖ 方向 ‖ seq`、连接 sid = nonce 前 8 字节，按 sid 维护防重放窗口。
+  - JSP：`javax.crypto` GCM（`GCMParameterSpec`，128 位 tag），`DSW_SEEN` 按 sid 记序号
+  - ASPX：**纯托管**实现（ECB 原语 + CTR + GHASH + GCM tag），.NET Framework 与 .NET 6+
+    均可运行——不使用 `AesCryptoServiceProvider` / `RNGCryptoServiceProvider`
+    （在 .NET Core / Linux 上抛 PlatformNotSupported）
+  - Python：`cryptography` 的 `AESGCM`（缺失时给出明确错误），防重放状态按 sid 落临时目录；
+    解码失败返回**可解密的错误帧**，不再 404 / 空响应（此前表现为客户端 JSON 解析失败）
+  - Node：原生 `crypto` 的 `hkdfSync` + `aes-256-gcm`
+  - IKM（`SHA256(密码)` 的十六进制）与 PHP 一致以 **XOR 形式嵌入**，stub 中不出现明文
+  - 经典 ASP（VBScript）无内置 AES-GCM：`native_aead` 明确拒绝并说明原因
+- 客户端：`src-tauri/src/protocol/jsp.rs` 按编码器选择载荷编码器
+  （`native` → XOR、`native_aead` → `AeadSession`），AEAD 会话状态随连接建立。
+- 测试：
+  - Node / Python：真实服务端到端往返（连接 / 命令 / 文件 / 分块）+ 重放拒绝
+  - JSP / ASPX：**密码学互操作**测试——把 stub 的 `<%! %>` / `<script runat="server">`
+    声明块与页面脚本片段抽出，用 `javac` / `dotnet` 编译成普通程序运行，验证
+    「Java/C# 解 Rust 帧、Rust 解 Java/C# 帧、重放被拒」，无需 servlet 容器 / IIS
+  - JSP / ASPX 的 NATIVE（XOR）变体做编译期校验（与 AEAD 变体共用同一模板）
+  - SDK：AEAD 语言矩阵测试（四种语言可生成、经典 ASP 拒绝、IKM 不明文）
+
+### 修复（AEAD 多语言，2026-10-20）
+
+同批工作中暴露的 JSP / ASPX 模板缺陷——此前**没有任何测试能发现**（无容器、无编译检查）：
+
+- JSP 声明块反斜杠被双重转义（生成的 Java 根本无法编译）、
+  `String out` 遮蔽 JSP 隐式 `out` 对象、声明块末尾多一个右花括号
+- ASPX 声明块反斜杠双重转义；NATIVE 变体的 `\n` 未转义为真实换行（语句挤在一行）
+- JSP / ASPX 的 `separator` 字段转义错误，产出**非法 JSON**（探针响应解析失败）
+- ASPX 的 GCM 计数器从 0 起算（应为 J0+1），导致 tag 校验通过但明文是乱码
+
 ### 新增
 
 - **MCP 服务端**（`src-tauri/src/mcp/`，cargo feature `mcp` 默认开启）：把 DoSword 能力
