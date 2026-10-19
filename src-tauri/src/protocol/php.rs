@@ -327,7 +327,7 @@ impl PhpProtocol {
         // 不会 gunzip（stub 版本在客户端不可知）——客户端在这条通道上也确实不压缩。
         // 分阶段载荷的 gzip 由每次注入的处理器解压，那条通道才报 gzip。
         let info = dosword_sdk::php_impl::PHP_INFO_IMPL.replace(
-            "chunked,stream,db,plugin,exec,gzip",
+            "chunked,stream,db,plugin,exec,gzip_plain",
             "chunked,stream,db,plugin,exec",
         );
         let code = format!(
@@ -1763,7 +1763,7 @@ fn session_call(
     let gzip_ok = php
         .capabilities
         .as_ref()
-        .map(|caps| caps.supports("gzip"))
+        .map(|caps| caps.supports("gzip_plain"))
         .unwrap_or(true);
     let mut sent = request.clone();
     if settings.gzip_enabled && gzip_ok && request.len() >= 1024 {
@@ -1804,6 +1804,19 @@ fn session_call(
     Ok(value)
 }
 
+/// 构造明文层 gzip 信封：`{"z":1,"d":"<base64(gzip(原请求 JSON))>"}`。
+///
+/// 压缩在**加密之前**发生，才能收回 base64 的 33% 膨胀；压缩无收益
+/// （小载荷 / 高熵内容）时返回 `None`，调用方按原样发送。
+fn gzip_plain_envelope(request: &str) -> Option<String> {
+    let encoded = B64.encode(request.as_bytes());
+    let packed = crate::protocol::transport::gzip_payload(&encoded, true);
+    if packed == encoded {
+        return None;
+    }
+    Some(format!("{{\"z\":1,\"d\":\"{packed}\"}}"))
+}
+
 /// NATIVE 编码器通道：POST formData（编码器加密的参数 JSON）+ 自定义头鉴权，
 /// 响应为 JSON{data: 编码器密文}，解密后得到结果 JSON。
 fn native_call(
@@ -1818,16 +1831,31 @@ fn native_call(
     }
     request.push('}');
 
-    let payload = encode_payload(php, &request)?;
-    // gzip：stub 明确上报了能力清单但**不含** gzip 时不压缩（新 stub 会带上 gzip；
-    // 旧 stub 未上报 → None → 保持既有行为，避免把"没这个字段"当成"不支持"）
-    let gzip_ok = php
+    // 传输压缩（gzip）：新 stub 走**明文层**信封 —— 压缩发生在加密之前，
+    // 才能真正收回 base64 的 33% 膨胀；密文是高频熵数据，密文层压缩收益接近零。
+    // 旧 stub（未上报 gzip_plain）保持既有行为：密文层压缩（v0.1.0 起的 stub 都会解压）。
+    let gzip_plain = php
+        .capabilities
+        .as_ref()
+        .map(|caps| caps.supports("gzip_plain"))
+        .unwrap_or(false);
+    let mut sent = request.clone();
+    if settings.gzip_enabled
+        && gzip_plain
+        && let Some(envelope) = gzip_plain_envelope(&request)
+    {
+        sent = envelope;
+    }
+    let payload = encode_payload(php, &sent)?;
+    // 密文层压缩只对旧 stub 有意义（新 stub 不上报 gzip，此项自然为 false）；
+    // None（更旧的 stub 未上报）→ 保持 v1 行为，继续压缩
+    let gzip_legacy_ok = php
         .capabilities
         .as_ref()
         .map(|caps| caps.supports("gzip"))
         .unwrap_or(true);
     let payload =
-        crate::protocol::transport::gzip_payload(&payload, settings.gzip_enabled && gzip_ok);
+        crate::protocol::transport::gzip_payload(&payload, settings.gzip_enabled && gzip_legacy_ok);
     // base64 载荷可能含 +/=，必须转义（否则 PHP 表单解析时 + 转空格损坏密文）；
     // P2：手动快速转义（仅 +、=、&），避免对整块载荷全量百分号编码
     let body = format!("formData={}", form_escape(&payload));
@@ -1873,8 +1901,10 @@ fn native_call(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ProtocolError::ParseError("响应缺少 data 字段".to_string()))?;
     // gzip：响应若为 gzip 字节则解压后重新 base64（stub 端 gzencode 兜底）
+    // 旧 stub：密文层压缩（先解压再解密）；新 stub：明文层压缩（先解密再解压）
     let data = crate::protocol::transport::gunzip_if_needed(data);
     let plain = decode_payload(php, &data)?;
+    let plain = crate::protocol::transport::gunzip_bytes_if_needed(plain);
     let value: Value = serde_json::from_slice(&plain)
         .map_err(|_| ProtocolError::ParseError("响应内容不是合法 JSON".to_string()))?;
     if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -2441,6 +2471,75 @@ for($i=0;$i<strlen($raw);$i++){$code.=$raw[$i]^$key[$i%strlen($key)];}
                     record.payload
                 );
             }
+        }
+    }
+
+    /// gzip：NATIVE 通道的**明文层**信封构造与还原。
+    ///
+    /// 大载荷应压缩成 `{"z":1,"d":...}`，小载荷不压缩（避免"压缩后更大"）。
+    #[test]
+    fn gzip_plain_envelope_round_trips() {
+        let request = format!(r#"{{"a":"write","d":"{}"}}"#, "A".repeat(4096));
+        let envelope = gzip_plain_envelope(&request).expect("大载荷应压缩");
+        assert!(
+            envelope.starts_with(r#"{"z":1,"d":""#),
+            "信封格式不符：{envelope}"
+        );
+        let value: Value = serde_json::from_str(&envelope).expect("信封应是合法 JSON");
+        let packed = value.get("d").and_then(|v| v.as_str()).expect("d 字段");
+        let inflated = crate::protocol::transport::gunzip_if_needed(packed);
+        let bytes = B64.decode(inflated).expect("解压后应是 base64");
+        assert_eq!(String::from_utf8(bytes).unwrap(), request);
+        // 小载荷 / 高熵内容不压缩
+        assert!(gzip_plain_envelope(r#"{"a":"probe"}"#).is_none());
+    }
+
+    /// gzip 在**明文层**（NATIVE）：写入 8KB 可压缩内容后原样读回。
+    ///
+    /// 请求走 `{"z":1,"d":...}` 信封；响应由 stub 在加密前压缩，客户端按 gzip
+    /// 魔数识别。开关关闭时走普通路径，两条路径都必须正确。
+    #[test]
+    fn real_php_native_gzip_plain_round_trip() {
+        for gzip_enabled in [true, false] {
+            let mut settings = settings();
+            settings.gzip_enabled = gzip_enabled;
+            let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false)
+            else {
+                eprintln!("跳过：未检测到 php 可执行文件");
+                return;
+            };
+            let mut profile = profile(&url);
+            profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+            let result = (|| -> Result<(), ProtocolError> {
+                let (session, probe) = PhpProtocol.connect(&profile, &settings)?;
+                // 新 stub 必须上报 gzip_plain —— 客户端据此才走明文层信封
+                assert!(
+                    probe
+                        .capabilities
+                        .as_ref()
+                        .is_some_and(|caps| caps.supports("gzip_plain")),
+                    "新 NATIVE stub 应上报 gzip_plain：{:?}",
+                    probe.capabilities
+                );
+                let payload = "B".repeat(8 * 1024).into_bytes();
+                let target = format!("{}/gzip-plain-{gzip_enabled}.bin", dir.display());
+                PhpProtocol.write_chunk(session.as_ref(), &target, &payload, 0, &settings)?;
+                let read = PhpProtocol.read_chunk(
+                    session.as_ref(),
+                    &target,
+                    0,
+                    payload.len() as u64,
+                    &settings,
+                )?;
+                assert_eq!(read, payload, "gzip_plain={gzip_enabled} 往返不一致");
+                Ok(())
+            })();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            result.unwrap_or_else(|error| {
+                panic!("NATIVE 明文层 gzip={gzip_enabled} 往返失败：{error}")
+            });
         }
     }
 

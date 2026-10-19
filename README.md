@@ -86,10 +86,12 @@ DoSword 是一个面向授权安全测试环境的现代化 WebShell 管理客�
     `get_defined_functions()` 反查），代码里只出现哈希与索引；
     `eval` 用大小写混合 + 随机注释分隔。符号表内嵌在处理器/载荷里，
     不依赖目标上已部署 stub 的版本。
-  - gzip 传输压缩：NATIVE 通道（密文层，需 stub 上报 `gzip` 能力）与
-    分阶段载荷通道（明文层，由每次注入的处理器解压）启用；
-    **legacy 通道不压缩** —— 那条通道的请求由目标上已部署的 stub 解包，
-    而旧 stub 不会 gunzip，无法安全启用
+  - gzip 传输压缩：NATIVE 与分阶段载荷通道都在**明文层**（加密之前）压缩，
+    能真正收回 base64 的 33% 膨胀；NATIVE 需新 stub 上报 `gzip_plain`，
+    请求为 `{"z":1,"d":"base64(gzip(内层 JSON))"}`、响应在加密前 gzip
+    （客户端按魔数识别，无需额外标记）。旧 stub（未上报 `gzip_plain`）
+    继续走原有的密文层压缩路径，行为不变。
+    **legacy 通道不压缩** —— 请求由目标上已部署的 stub 解包，旧 stub 不会 gunzip
 - **能力协商**：stub 上报 `ProtoVersion` / `Capabilities` / `ShellType`；
   客户端**只在 stub 明确上报且缺项时**拒绝（旧 stub 不上报 → 保持旧行为），
   错误提示「请用当前版本重新生成并上传 stub」而不是发出去必然失败

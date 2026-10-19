@@ -66,6 +66,11 @@ PHP 侧此前是「三条通道、三套能力」：同一个目标换个编码�
   并在保存时校验未注册的 encoder id。
 - **前端数据库「预览」硬编码反引号 + `LIMIT`**：pgsql / mssql / oracle 上点表名必报错。
   现按驱动分派标识符引号与分页语法（MSSQL `TOP 100` / Oracle `FETCH FIRST 100 ROWS ONLY`）。
+- **gzip 压缩位置修正**：NATIVE 通道原先把 gzip 放在**加密之后** —— 密文是高频熵
+  数据，只有 XOR 变体因周期性偶有收益，AES / ChaCha20 / Rabbit 下几乎压不动，
+  「gzip 传输压缩」设置形同虚设。现改为**加密前**压缩：请求走
+  `{"z":1,"d":"base64(gzip(内层 JSON))"}` 信封、响应在加密前 gzip（客户端按魔数识别）。
+  新增能力位 `gzip_plain` 区分新语义；旧 stub 继续走原密文层压缩路径，行为不变。
 - **P1 的目录列表 `stat` 合并只在 legacy 模板生效**：默认 NATIVE 与 session 仍是每项
   `is_dir` + `filesize` + `filemtime` + `fileperms` 四次调用。现三条通道统一单次
   `stat()`（`is_dir` 由 `mode` 判定），顺带消除 stub 里明文的 `fileperms(`。
@@ -88,7 +93,9 @@ PHP 侧此前是「三条通道、三套能力」：同一个目标换个编码�
 - 分阶段载荷与 legacy 通道的 probe 现返回完整 `info` 表：能力协商之外，
   内存马前置判定（`PHP_SAPI` / `user_ini_filename` / `DOCUMENT_ROOT`）在
   session / legacy 通道上此前也拿不到数据。
-- 测试：`real_php_all_encoders_round_trip` 改为遍历注册表全部编码器并跑
+- 测试：`real_php_native_gzip_plain_round_trip`（NATIVE 明文层 gzip，开/关）、
+  `gzip_plain_envelope_round_trips`（信封构造与还原）；
+  `real_php_all_encoders_round_trip` 改为遍历注册表全部编码器并跑
   命令/目录/整文件读写/偏移分块；`real_php_session_variants_round_trip` 补上
   `xor_session`（原数组里没有它，判断分支是死代码）；新增
   `real_php_db_round_trip_on_all_channels`（三条通道 × redis mock）、
