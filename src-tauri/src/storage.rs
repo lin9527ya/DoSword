@@ -274,31 +274,36 @@ impl Database {
     }
 
     pub fn update_shell(&self, input: &UpdateShell) -> rusqlite::Result<ShellProfile> {
-        if let Some(tags) = &input.tags {
-            self.connection.execute(
-                "UPDATE shell_profiles SET name = ?1, endpoint = ?2, password = ?3, tags = ?4
-                 WHERE id = ?5",
-                params![
-                    input.name,
-                    input.endpoint,
-                    input.password.clone().unwrap_or_default(),
-                    serde_json::to_string(tags).unwrap_or_else(|_| "[]".into()),
-                    input.id
-                ],
-            )?;
-        } else {
-            self.connection.execute(
-                "UPDATE shell_profiles SET name = ?1, endpoint = ?2, password = ?3 WHERE id = ?4",
-                params![
-                    input.name,
-                    input.endpoint,
-                    input.password.clone().unwrap_or_default(),
-                    input.id
-                ],
-            )?;
-        }
+        // 合并式更新：`None` 表示「保持原值」。协议参数（编码方式 / session 开关）
+        // 也在这里更新 —— 此前 protocol_params 只能在创建时写入，
+        // 用户重新生成 stub 换了编码器后无法改，只能删了重建 Shell。
+        let current = self
+            .shell(&input.id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let password = input
+            .password
+            .clone()
+            .unwrap_or_else(|| current.password.clone());
+        let tags = serde_json::to_string(input.tags.as_ref().unwrap_or(&current.tags))
+            .unwrap_or_else(|_| "[]".into());
+        let protocol_params = input
+            .protocol_params
+            .clone()
+            .unwrap_or_else(|| current.protocol_params.clone());
+        self.connection.execute(
+            "UPDATE shell_profiles SET name = ?1, endpoint = ?2, password = ?3, tags = ?4,
+             protocol_params = ?5 WHERE id = ?6",
+            params![
+                input.name,
+                input.endpoint,
+                password,
+                tags,
+                protocol_params,
+                input.id
+            ],
+        )?;
         self.shell(&input.id)?
-            .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)
     }
 
     /// 批量更新 Shell 标签/密码（单事务，批量场景 fsync 一次）。

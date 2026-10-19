@@ -112,6 +112,10 @@ pub struct UpdateShell {
     pub endpoint: String,
     pub password: Option<String>,
     pub tags: Option<Vec<String>>,
+    /// 协议参数（JSON 字符串，如 `{"encoder":"native","session":true}`）。
+    /// `None` = 保持不变；显式给出则整体替换（编码方式 / session 开关都在这里）。
+    #[serde(default)]
+    pub protocol_params: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

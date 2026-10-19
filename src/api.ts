@@ -95,6 +95,8 @@ export const api = {
     endpoint: string;
     password?: string;
     tags?: string[];
+    /** 协议参数（编码方式 / 盐 / session 开关）；省略 = 保持不变。 */
+    protocolParams?: string;
   }) => invoke<ShellProfile>("update_shell", { input }),
   deleteShell: (shellId: string) => invoke<void>("delete_shell", { shellId }),
   listProtocols: () => invoke<ProtocolMeta[]>("list_protocols"),

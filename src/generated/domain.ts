@@ -22,7 +22,12 @@ export type CreateShell = { workspaceId: string, name: string, endpoint: string,
  */
 confirmNetwork: boolean, tags: Array<string> | null, };
 export type UpdateWorkspace = { id: string, name: string, authorizationScope: string, expiresAt: string | null, };
-export type UpdateShell = { id: string, name: string, endpoint: string, password: string | null, tags: Array<string> | null, };
+export type UpdateShell = { id: string, name: string, endpoint: string, password: string | null, tags: Array<string> | null, 
+/**
+ * 协议参数（JSON 字符串，如 `{"encoder":"native","session":true}`）。
+ * `None` = 保持不变；显式给出则整体替换（编码方式 / session 开关都在这里）。
+ */
+protocolParams: string | null, };
 export type ProbeResult = { status: string, server: string, webServer: string, runtime: string, 
 /**
  * 连接时的当前工作目录。

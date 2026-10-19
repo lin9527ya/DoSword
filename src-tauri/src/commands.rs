@@ -196,6 +196,9 @@ pub async fn create_shell(input: CreateShell, app: AppHandle) -> Result<ShellPro
     blocking(app, move |state| {
         validate_text(&input.name, "名称")?;
         validate_text(&input.workspace_id, "Workspace")?;
+        if let Some(params) = input.protocol_params.as_deref() {
+            validate_protocol_params(params)?;
+        }
         let endpoint = parse_endpoint(&input.endpoint)?;
 
         let protocol = state
@@ -338,10 +341,37 @@ pub async fn delete_workspace(workspace_id: String, app: AppHandle) -> Result<()
     .await
 }
 
+/// 校验协议参数 JSON（编码方式 / session 开关都在这里）。
+///
+/// 关键点：**未注册的 encoder id 在保存时就拒绝**。`encoder_for` 在连接时也会报错，
+/// 但那时用户已经在「连接失败」上排查，而且错误发生在一次网络往返之后；
+/// 与 `generate_shell` 的严格校验保持一致（它同样拒绝未知 id）。
+fn validate_protocol_params(params: &str) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(params).map_err(|error| format!("协议参数不是合法 JSON：{error}"))?;
+    let Some(object) = value.as_object() else {
+        return Err("协议参数必须是 JSON 对象".to_string());
+    };
+    if let Some(encoder) = object.get("encoder").and_then(|item| item.as_str())
+        && EncoderRegistry::global().get(encoder).is_none()
+    {
+        return Err(format!("未注册的编码方式：{encoder}"));
+    }
+    if let Some(session) = object.get("session")
+        && !session.is_boolean()
+    {
+        return Err("协议参数 session 必须是布尔值".to_string());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn update_shell(input: UpdateShell, app: AppHandle) -> Result<ShellProfile, String> {
     blocking(app, move |state| {
         validate_text(&input.name, "名称")?;
+        if let Some(params) = input.protocol_params.as_deref() {
+            validate_protocol_params(params)?;
+        }
         let previous = state
             .database
             .lock()
@@ -385,13 +415,28 @@ pub async fn update_shell(input: UpdateShell, app: AppHandle) -> Result<ShellPro
             .map_err(|_| "数据库锁异常".to_string())?
             .update_shell(&input)
             .map_err(|error| error.to_string())?;
+        // 协议参数变化要显式记审计：编码方式/session 开关决定用哪条通道，
+        // 改错会让 Shell 直接连不上（且生成器里的 stub 必须与之一致）
+        let params_changed = previous.protocol_params != profile.protocol_params;
         audit(
             state,
             &profile.workspace_id,
             Some(&profile.id),
             "shell.update",
             "success",
-            &format!("更新 Shell：{} → {}", previous.endpoint, profile.endpoint),
+            &format!(
+                "更新 Shell：{} → {}{}",
+                previous.endpoint,
+                profile.endpoint,
+                if params_changed {
+                    format!(
+                        "（协议参数 {} → {}）",
+                        previous.protocol_params, profile.protocol_params
+                    )
+                } else {
+                    String::new()
+                }
+            ),
         );
         // P6：更新后失效会话上下文缓存（下次使用重查）
         if let Ok(mut sessions) = state.sessions.lock() {
@@ -492,6 +537,9 @@ fn test_connection_impl(
     }
     parse_endpoint(endpoint)?;
     validate_text(password, "连接密码")?;
+    if let Some(params) = protocol_params {
+        validate_protocol_params(params)?;
+    }
     if protocol.requires_network() {
         let scope_result = {
             let database = state

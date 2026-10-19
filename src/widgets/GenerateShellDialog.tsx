@@ -5,6 +5,7 @@ import { api, b64, errorText } from "../api";
 import type { GenerateShellResult } from "../api";
 import { Dialog } from "../components/Dialog";
 import { useToast } from "../components/Toast";
+import { isNativeEncoder, supportsSessionMode } from "../shells/encoders";
 
 const LANGUAGES: { value: string; label: string }[] = [
   { value: "php", label: "PHP (.php)" },
@@ -144,15 +145,17 @@ export function GenerateShellDialog({
         <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <input
             type="checkbox"
-            checked={sessionMode}
+            checked={sessionMode && supportsSessionMode(encoderId)}
+            disabled={!supportsSessionMode(encoderId)}
             onChange={(event) => setSessionMode(event.target.checked)}
             style={{ width: "auto", margin: 0 }}
           />
           生成分阶段载荷（session 模式）
         </label>
         <p className="form-note" style={{ marginTop: -4 }}>
-          Godzilla 风格：处理器只注入一次，后续请求只传参数。需与连接端保持一致的
-          session 配置；普通 stub 请保持关闭。
+          {supportsSessionMode(encoderId)
+            ? "Godzilla 风格：处理器只注入一次，后续请求只传参数。登记 Shell 时需在表单里勾选同名开关；普通 stub 请保持关闭。"
+            : `${encoderId} 不使用分阶段载荷${isNativeEncoder(encoderId) ? "（NATIVE 自带内置分发）" : "（请求体直传）"}，生成的始终是普通 stub。`}
         </p>
 
         <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -166,7 +169,7 @@ export function GenerateShellDialog({
         </label>
         <p className="form-note" style={{ marginTop: -4 }}>
           开启后每次生成的 stub 使用随机盐派生密钥与鉴权令牌，能抵抗针对 stub 的弱口令爆破；
-          但登记 Shell 时**必须把生成的盐填入协议参数**，否则无法连接。
+          但登记 Shell 时**必须把生成的盐填进「密钥盐」字段**，否则无法连接。
         </p>
 
         <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 4 }}>

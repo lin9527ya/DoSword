@@ -19,6 +19,12 @@ import {
 } from "lucide-react";
 import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import { api, b64, errorText, shortTime } from "../api";
+import {
+  buildProtocolParams,
+  isNativeEncoder,
+  parseProtocolParams,
+  supportsSessionMode,
+} from "../shells/encoders";
 import type { Dashboard, ProtocolMeta, ShellProfile, Workspace } from "../api";
 import { Dialog } from "../components/Dialog";
 import { Empty, ErrorBanner, Metric, Panel } from "../components/common";
@@ -989,8 +995,13 @@ function ShellDialog({
   const [protocols, setProtocols] = useState<ProtocolMeta[]>([]);
   const [protocolId, setProtocolId] = useState(initial?.protocolId ?? "builtin.mock.v1");
   const [encoders, setEncoders] = useState<[string, string][]>([]);
-  const [encoderId, setEncoderId] = useState("native");
-  const [salt, setSalt] = useState("");
+  // 编辑既有 Shell 时按已保存的协议参数回填：编码方式 / 盐 / session 开关
+  // 必须与目标上的 stub 一致，否则连接必然失败。此前这三项只在「新建」时可见，
+  // 用户重新生成 stub 换了编码器后无法改，只能删掉重建 Shell。
+  const saved = parseProtocolParams(initial?.protocolParams);
+  const [encoderId, setEncoderId] = useState(saved.encoder ?? "native");
+  const [salt, setSalt] = useState(saved.salt ?? "");
+  const [sessionMode, setSessionMode] = useState(saved.session === true);
   const [settings, setSettings] = useState<{ httpEnabled: boolean }>({ httpEnabled: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -1017,7 +1028,7 @@ function ShellDialog({
         String(form.get("password") ?? ""),
         protocolId,
         protocolId === "builtin.php.v1"
-          ? JSON.stringify({ encoder: encoderId, ...(salt.trim() ? { salt: salt.trim() } : {}) })
+          ? buildProtocolParams(encoderId, salt, sessionMode)
           : undefined,
         String(form.get("runtime") ?? "php"),
         allowUnscoped,
@@ -1054,6 +1065,10 @@ function ShellDialog({
           endpoint: String(form.get("endpoint")),
           password: form.get("password") ? String(form.get("password")) : initial.password,
           tags: parseTags(String(form.get("tags") ?? "")),
+          protocolParams:
+            protocolId === "builtin.php.v1"
+              ? buildProtocolParams(encoderId, salt, sessionMode)
+              : undefined,
         });
         toast.success(`Shell「${form.get("name")}」已更新`, "保存成功");
       } else {
@@ -1068,10 +1083,7 @@ function ShellDialog({
           tags: parseTags(String(form.get("tags") ?? "")),
           protocolParams:
             protocolId === "builtin.php.v1"
-              ? JSON.stringify({
-                  encoder: encoderId,
-                  ...(salt.trim() ? { salt: salt.trim() } : {}),
-                })
+              ? buildProtocolParams(encoderId, salt, sessionMode)
               : undefined,
         });
         toast.success(`Shell「${form.get("name")}」登记完成`, "登记成功");
@@ -1174,7 +1186,7 @@ function ShellDialog({
                 placeholder={editing ? "留空保持原密码" : "WebShell 鉴权密钥"}
               />
             </label>
-            {!editing && protocolId === "builtin.php.v1" && (
+            {protocolId === "builtin.php.v1" && (
               <label>
                 编码方式
                 <select value={encoderId} onChange={(event) => setEncoderId(event.target.value)}>
@@ -1189,7 +1201,7 @@ function ShellDialog({
                 </span>
               </label>
             )}
-            {!editing && protocolId === "builtin.php.v1" && (
+            {protocolId === "builtin.php.v1" && (
               <label>
                 密钥盐（加盐 stub 必填）
                 <input
@@ -1199,6 +1211,22 @@ function ShellDialog({
                 />
                 <span className="field-hint">
                   生成 stub 时若勾选了「加盐密钥派生」，此处必须填入同一个盐，否则无法连接。
+                </span>
+              </label>
+            )}
+            {protocolId === "builtin.php.v1" && (
+              <label className="confirm-row">
+                <input
+                  type="checkbox"
+                  checked={sessionMode}
+                  disabled={!supportsSessionMode(encoderId)}
+                  onChange={(event) => setSessionMode(event.target.checked)}
+                />
+                <span>分阶段载荷（session 模式）</span>
+                <span className="field-hint">
+                  {supportsSessionMode(encoderId)
+                    ? "仅在生成 stub 时勾选过「分阶段载荷」的情况下开启；处理器只注入一次，后续请求只传参数。"
+                    : `${encoderId} 不使用分阶段载荷${isNativeEncoder(encoderId) ? "（NATIVE 自带内置分发）" : ""}，该开关不生效。`}
                 </span>
               </label>
             )}
