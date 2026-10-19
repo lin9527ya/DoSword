@@ -21,6 +21,8 @@ import { DatabaseManager } from "../widgets/DatabaseManager";
 import { PluginPanel } from "../widgets/PluginPanel";
 import { NotesPanel } from "../widgets/NotesPanel";
 import { MemshellPanel } from "../widgets/MemshellPanel";
+import { ForwardTerminal } from "../widgets/ForwardTerminal";
+import { NativePtyTerminal } from "../widgets/NativePtyTerminal";
 import { useToast } from "../components/Toast";
 import type { View } from "../views/types";
 
@@ -40,6 +42,7 @@ export function ShellDetailView({
   const [shell, setShell] = useState<ShellProfile | null>(null);
   const [capabilities, setCapabilities] = useState<string[] | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(initialSessionId ?? null);
+  const [terminalMode, setTerminalMode] = useState<"command" | "forward" | "native">("command");
   const [info, setInfo] = useState<ConnectResult | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState("");
@@ -271,6 +274,26 @@ export function ShellDetailView({
             <PluginPanel sessionId={sessionId} />
           </div>
           <div className={`detail-tabpane ${tab === "terminal" ? "" : "hidden"}`}>
+            <div style={{ display: "flex", gap: 6, padding: "0 0 8px", flexWrap: "wrap" }}>
+              {[
+                { key: "command", label: "命令终端" },
+                { key: "forward", label: "交互式（HTTP 隧道）" },
+                { key: "native", label: "本地 PTY（反弹接收）" },
+              ].map((item) => (
+                <button
+                  key={item.key}
+                  className={`button compact ${terminalMode === item.key ? "primary" : "secondary"}`}
+                  onClick={() => setTerminalMode(item.key as typeof terminalMode)}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+            {terminalMode === "forward" ? (
+              <ForwardTerminal sessionId={sessionId} active={tab === "terminal"} />
+            ) : terminalMode === "native" ? (
+              <NativePtyTerminal sessionId={sessionId} active={tab === "terminal"} />
+            ) : (
             <div className="panel detail-panel terminal-panel">
               <div className="terminal-tabs">
                 {terminals.map((terminal) => (
@@ -315,6 +338,7 @@ export function ShellDetailView({
                 </div>
               ))}
             </div>
+            )}
           </div>
         </>
       ) : tab !== "info" ? (

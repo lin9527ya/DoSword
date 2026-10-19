@@ -25,6 +25,11 @@ export function GlobalFilesView({ onNavigate }: { onNavigate?: (view: View) => v
   const [loading, setLoading] = useState(true);
   const [connecting, setConnecting] = useState<string | null>(null);
   const [error, setError] = useState("");
+  // 多目录概览（batch_list_dir：单会话多目录一次拉取）
+  const [overview, setOverview] = useState<
+    Array<{ path: string; count: number | null; error?: string }> | null
+  >(null);
+  const [overviewLoading, setOverviewLoading] = useState(false);
 
   // 批量分发/上传状态
   const [batchModal, setBatchModal] = useState(false);
@@ -65,6 +70,30 @@ export function GlobalFilesView({ onNavigate }: { onNavigate?: (view: View) => v
       setLoading(false);
     }
   }, [toast]);
+
+  async function loadOverview() {
+    if (!selectedSessionId) return;
+    const windows = separator === "\\" || /^[A-Za-z]:/.test(currentDir);
+    const paths = windows
+      ? ["C:\\inetpub\\wwwroot", "C:\\Windows\\Temp", "C:\\Users", "C:\\"]
+      : ["/var/www/html", "/tmp", "/etc", "/home", "/root", "/var/log"];
+    setOverviewLoading(true);
+    try {
+      const result = await api.batchListDir(selectedSessionId, paths);
+      setOverview(
+        paths.map((path) => {
+          const item = result[path] as { entries?: unknown[]; error?: string } | undefined;
+          if (!item) return { path, count: null, error: "无返回" };
+          if (item.error) return { path, count: null, error: item.error };
+          return { path, count: item.entries?.length ?? 0 };
+        }),
+      );
+    } catch (cause) {
+      toast.error(errorText(cause), "多目录概览失败");
+    } finally {
+      setOverviewLoading(false);
+    }
+  }
 
   useEffect(() => {
     void load();
@@ -244,11 +273,51 @@ export function GlobalFilesView({ onNavigate }: { onNavigate?: (view: View) => v
                 </button>
               );
             })}
+            <button
+              className="button compact secondary"
+              style={{ marginLeft: "auto", flexShrink: 0 }}
+              onClick={() => void loadOverview()}
+              disabled={overviewLoading || !selectedSessionId}
+              title="一次拉取多个常用目录（batch_list_dir）"
+            >
+              {overviewLoading ? (
+                <LoaderCircle className="spin" size={12} />
+              ) : (
+                <FileCode2 size={12} />
+              )}
+              多目录概览
+            </button>
           </div>
+
+          {overview && (
+            <div
+              style={{
+                display: "flex",
+                gap: 6,
+                flexWrap: "wrap",
+                padding: "8px 16px",
+                borderBottom: "1px solid var(--border)",
+              }}
+            >
+              {overview.map((item) => (
+                <button
+                  key={item.path}
+                  className="file-bookmark-chip"
+                  title={item.error ?? `${item.count ?? 0} 项`}
+                  onClick={() => setCurrentDir(item.path)}
+                >
+                  <code style={{ fontSize: 11 }}>{item.path}</code>
+                  <span style={{ marginLeft: 6, opacity: 0.7 }}>
+                    {item.error ? "×" : (item.count ?? 0)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
 
           {selectedSessionId && (
             <FileManager
-              key={selectedSessionId}
+              key={`${selectedSessionId}:${currentDir}`}
               sessionId={selectedSessionId}
               startDir={currentDir}
               separator={separator}

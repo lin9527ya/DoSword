@@ -2442,7 +2442,15 @@ pub async fn batch_list_dir(
             });
         let mut results = serde_json::Map::new();
         for (path, value) in collected {
-            results.insert(path, value?);
+            // 逐目录容错：不存在的目录很常见，不应让整批失败
+            match value {
+                Ok(listing) => {
+                    results.insert(path, listing);
+                }
+                Err(error) => {
+                    results.insert(path, serde_json::json!({ "ok": false, "error": error }));
+                }
+            }
         }
         Ok(serde_json::Value::Object(results))
     })

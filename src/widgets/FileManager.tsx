@@ -75,7 +75,9 @@ export function FileManager({
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [editing, setEditing] = useState<(FileEntry & { contentB64?: string }) | null>(null);
+  const [editing, setEditing] = useState<
+    (FileEntry & { contentB64?: string; truncated?: boolean; totalSize?: number }) | null
+  >(null);
   const [createName, setCreateName] = useState<string | null>(null);
   const [createKind, setCreateKind] = useState<"file" | "dir" | null>(null);
   const [uploading, setUploading] = useState<{ name: string; sent: number; total: number } | null>(null);
@@ -359,8 +361,25 @@ export function FileManager({
       navigateTo(entry.path);
     } else {
       try {
-        const content = await api.readFile(sessionId, entry.path);
-        setEditing({ ...entry, contentB64: content.contentB64 });
+        // 大文件只拉前 512KB 做只读预览，避免整文件进内存 / 撑爆网络
+        const LARGE_FILE_THRESHOLD = 1024 * 1024;
+        const PREVIEW_BYTES = 512 * 1024;
+        if (entry.size > LARGE_FILE_THRESHOLD) {
+          const chunk = await api.readChunk(sessionId, entry.path, 0, PREVIEW_BYTES);
+          setEditing({
+            ...entry,
+            contentB64: chunk.dataB64,
+            truncated: !chunk.eof,
+            totalSize: entry.size,
+          });
+          toast.info(
+            `文件较大（${formatSize(entry.size)}），已切换为只读预览`,
+            "分块读取",
+          );
+        } else {
+          const content = await api.readFile(sessionId, entry.path);
+          setEditing({ ...entry, contentB64: content.contentB64 });
+        }
       } catch (cause) {
         toast.error(`读取文件失败：${errorText(cause)}`);
       }

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Copy, Save, X } from "lucide-react";
-import { api, b64, errorText } from "../api";
+import { api, b64, errorText, formatSize } from "../api";
 import type { FileEntry } from "../api";
 import { useToast } from "../components/Toast";
 
@@ -27,7 +27,7 @@ export function FileEditor({
   onSaved,
 }: {
   sessionId: string;
-  entry: FileEntry & { contentB64?: string };
+  entry: FileEntry & { contentB64?: string; truncated?: boolean; totalSize?: number };
   onClose: () => void;
   onSaved: () => Promise<void>;
 }) {
@@ -37,6 +37,8 @@ export function FileEditor({
     entry.contentB64 ? decodeByEncoding(entry.contentB64, "utf-8") : "",
   );
   const [busy, setBusy] = useState(false);
+  // 大文件分块预览：只读，禁止保存（否则会把整个文件截断成预览段）
+  const truncated = entry.truncated === true;
   const [error, setError] = useState("");
 
   const gutterRef = useRef<HTMLDivElement>(null);
@@ -64,6 +66,10 @@ export function FileEditor({
   };
 
   async function saveFile() {
+    if (truncated) {
+      toast.warning("大文件为只读预览，请下载到本地编辑后再上传");
+      return;
+    }
     setBusy(true);
     setError("");
     try {
@@ -138,8 +144,8 @@ export function FileEditor({
             <button
               className="button compact primary"
               onClick={() => void saveFile()}
-              disabled={busy}
-              title="保存修改 (Ctrl+S)"
+              disabled={busy || truncated}
+              title={truncated ? "只读预览，不可保存" : "保存修改 (Ctrl+S)"}
             >
               <Save size={13} />
               {busy ? "保存中…" : "保存 (Ctrl+S)"}
@@ -160,10 +166,24 @@ export function FileEditor({
               ))}
             </div>
           )}
+          {truncated && (
+            <div
+              className="form-note"
+              style={{
+                padding: "6px 10px",
+                borderBottom: "1px solid var(--border)",
+                background: "var(--panel-2)",
+              }}
+            >
+              文件较大（{formatSize(entry.totalSize ?? entry.size)}），当前仅显示前 512KB 的
+              <strong> 只读预览 </strong>；完整内容请先下载到本地再编辑。
+            </div>
+          )}
           <textarea
             ref={textareaRef}
             className="editor-body"
             value={content}
+            readOnly={truncated}
             onChange={(event) => setContent(event.target.value)}
             onScroll={handleScroll}
             spellCheck={false}
