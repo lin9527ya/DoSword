@@ -580,6 +580,8 @@ pub struct GenerateShellResult {
     pub filename: String,
     /// 脚本内容。
     pub content: String,
+    /// 加盐密钥派生的盐（未启用时为 None）。登记 Shell 时需一并填入协议参数。
+    pub salt: Option<String>,
 }
 
 /// 一条协议请求记录（内存环缓冲，仅调试用途，不落盘）。

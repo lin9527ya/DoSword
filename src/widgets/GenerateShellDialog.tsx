@@ -28,6 +28,8 @@ export function GenerateShellDialog({
   // 分阶段载荷（Godzilla session 模式）：处理器只注入一次，后续只传参数。
   // 必须与连接端的 session 配置一致，故显式暴露而不是写死。
   const [sessionMode, setSessionMode] = useState(false);
+  // 加盐派生：stub 用 salt:password 派生密钥与令牌，登记 Shell 时需填入同一个盐
+  const [salted, setSalted] = useState(false);
   const [result, setResult] = useState<GenerateShellResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -55,7 +57,7 @@ export function GenerateShellDialog({
     setError("");
     setCopied(false);
     try {
-      const res = await api.generateShell(language, encoderId, password, sessionMode);
+      const res = await api.generateShell(language, encoderId, password, sessionMode, salted);
       setResult(res);
       toast.success(`Webshell 代码生成完毕 (${res.filename})`, "生成成功");
     } catch (cause) {
@@ -153,6 +155,20 @@ export function GenerateShellDialog({
           session 配置；普通 stub 请保持关闭。
         </p>
 
+        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={salted}
+            onChange={(event) => setSalted(event.target.checked)}
+            style={{ width: "auto", margin: 0 }}
+          />
+          加盐密钥派生（salt:password）
+        </label>
+        <p className="form-note" style={{ marginTop: -4 }}>
+          开启后每次生成的 stub 使用随机盐派生密钥与鉴权令牌，能抵抗针对 stub 的弱口令爆破；
+          但登记 Shell 时**必须把生成的盐填入协议参数**，否则无法连接。
+        </p>
+
         <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 4 }}>
           <button className="button primary" onClick={() => void generate()} disabled={busy}>
             {busy ? <LoaderCircle className="spin" size={14} /> : <Sparkles size={14} />}
@@ -175,6 +191,36 @@ export function GenerateShellDialog({
                 </button>
               </div>
             </div>
+
+            {result.salt && (
+              <div
+                style={{
+                  padding: "8px 12px",
+                  border: "1px solid var(--warning, #d29922)",
+                  borderRadius: "var(--radius-md)",
+                  background: "color-mix(in srgb, var(--warning, #d29922) 10%, transparent)",
+                  fontSize: 12,
+                }}
+              >
+                <strong>密钥盐：</strong>
+                <code className="mono">{result.salt}</code>
+                <button
+                  className="button compact secondary"
+                  style={{ marginLeft: 8 }}
+                  onClick={() => {
+                    void navigator.clipboard.writeText(result.salt ?? "");
+                    toast.info("盐已复制");
+                  }}
+                >
+                  复制
+                </button>
+                <div className="form-note" style={{ marginTop: 4 }}>
+                  登记该 Shell 时，把此盐填入「密钥盐」字段（或协议参数
+                  <code>{" "}{`{"encoder":"..." ,"salt":"${result.salt}"}`} </code>）。
+                  盐丢失后该 stub 无法再连接。
+                </div>
+              </div>
+            )}
 
             <pre>{result.content}</pre>
 

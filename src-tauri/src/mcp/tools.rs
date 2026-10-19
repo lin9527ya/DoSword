@@ -914,6 +914,8 @@ impl super::DoswordMcp {
             args.encoder_id,
             args.password,
             args.session.unwrap_or(false),
+            // MCP 生成不启用加盐（盐需人工带入 Shell 配置，交给 GUI 更合适）
+            false,
             app,
         )
         .await;

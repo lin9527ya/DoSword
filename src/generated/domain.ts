@@ -270,7 +270,11 @@ filename: string,
 /**
  * 脚本内容。
  */
-content: string, };
+content: string, 
+/**
+ * 加盐密钥派生的盐（未启用时为 None）。登记 Shell 时需一并填入协议参数。
+ */
+salt: string | null, };
 export type HttpSendResult = { status: number, statusText: string, headers: Array<[string, string]>, body: string, durationMs: number, };
 export type ImportResult = { imported: number, skipped: number, };
 export type ProxyTestResult = { ok: boolean, latencyMs: number, message: string, exitIp: string | null, };

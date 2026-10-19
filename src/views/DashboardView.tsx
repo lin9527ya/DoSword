@@ -990,6 +990,7 @@ function ShellDialog({
   const [protocolId, setProtocolId] = useState(initial?.protocolId ?? "builtin.mock.v1");
   const [encoders, setEncoders] = useState<[string, string][]>([]);
   const [encoderId, setEncoderId] = useState("native");
+  const [salt, setSalt] = useState("");
   const [settings, setSettings] = useState<{ httpEnabled: boolean }>({ httpEnabled: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -1016,7 +1017,7 @@ function ShellDialog({
         String(form.get("password") ?? ""),
         protocolId,
         protocolId === "builtin.php.v1"
-          ? JSON.stringify({ encoder: encoderId })
+          ? JSON.stringify({ encoder: encoderId, ...(salt.trim() ? { salt: salt.trim() } : {}) })
           : undefined,
         String(form.get("runtime") ?? "php"),
         allowUnscoped,
@@ -1067,7 +1068,10 @@ function ShellDialog({
           tags: parseTags(String(form.get("tags") ?? "")),
           protocolParams:
             protocolId === "builtin.php.v1"
-              ? JSON.stringify({ encoder: encoderId })
+              ? JSON.stringify({
+                  encoder: encoderId,
+                  ...(salt.trim() ? { salt: salt.trim() } : {}),
+                })
               : undefined,
         });
         toast.success(`Shell「${form.get("name")}」登记完成`, "登记成功");
@@ -1182,6 +1186,19 @@ function ShellDialog({
                 </select>
                 <span className="field-hint">
                   需与目标 stub 的解码方式一致；可在「生成 Webshell」中生成配套代码。
+                </span>
+              </label>
+            )}
+            {!editing && protocolId === "builtin.php.v1" && (
+              <label>
+                密钥盐（加盐 stub 必填）
+                <input
+                  value={salt}
+                  onChange={(event) => setSalt(event.target.value)}
+                  placeholder="留空 = 不加盐（普通 stub）"
+                />
+                <span className="field-hint">
+                  生成 stub 时若勾选了「加盐密钥派生」，此处必须填入同一个盐，否则无法连接。
                 </span>
               </label>
             )}

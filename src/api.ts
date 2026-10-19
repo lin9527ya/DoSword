@@ -133,8 +133,20 @@ export const api = {
   ) => invoke<HttpSendResult>("http_send", { ...request, allowUnscoped: allowUnscoped ?? false }),
   listEncoders: () => invoke<[string, string][]>("list_encoders"),
   registerCustomEncoder: (stub: string) => invoke<void>("register_custom_encoder", { stub }),
-  generateShell: (language: string, encoderId: string, password: string, session: boolean) =>
-    invoke<GenerateShellResult>("generate_shell", { language, encoderId, password, session }),
+  generateShell: (
+    language: string,
+    encoderId: string,
+    password: string,
+    session: boolean,
+    salted: boolean,
+  ) =>
+    invoke<GenerateShellResult>("generate_shell", {
+      language,
+      encoderId,
+      password,
+      session,
+      salted,
+    }),
   listAudit: (filter: AuditFilter) => invoke<AuditPage>("list_audit", { filter }),
   writeLocalFile: (path: string, contentB64: string) =>
     invoke<void>("write_local_file", { path, contentB64 }),
