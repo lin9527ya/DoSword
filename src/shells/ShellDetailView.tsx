@@ -8,6 +8,7 @@ import {
   LoaderCircle,
   Puzzle,
   Search,
+  ShieldOff,
   TerminalSquare,
   Unplug,
 } from "lucide-react";
@@ -19,10 +20,11 @@ import { FileManager } from "../widgets/FileManager";
 import { DatabaseManager } from "../widgets/DatabaseManager";
 import { PluginPanel } from "../widgets/PluginPanel";
 import { NotesPanel } from "../widgets/NotesPanel";
+import { MemshellPanel } from "../widgets/MemshellPanel";
 import { useToast } from "../components/Toast";
 import type { View } from "../views/types";
 
-type Tab = "info" | "files" | "terminal" | "database" | "notes" | "plugins";
+type Tab = "info" | "files" | "terminal" | "database" | "notes" | "plugins" | "memshell";
 type TerminalTab = { id: number; dir: string };
 
 export function ShellDetailView({
@@ -165,6 +167,10 @@ export function ShellDetailView({
       ? [{ key: "terminal" as Tab, label: "终端执行", icon: <TerminalSquare size={15} /> }]
       : []),
     { key: "notes", label: "操作笔记", icon: <BookOpen size={15} /> },
+    // 内存马目前仅实现 PHP（Java 需先给 JSP 协议补 run_code 通道）
+    ...(!shell.runtime || shell.runtime === "php"
+      ? [{ key: "memshell" as Tab, label: "内存马", icon: <ShieldOff size={15} /> }]
+      : []),
     { key: "plugins", label: "功能插件", icon: <Puzzle size={15} /> },
   ];
 
@@ -233,6 +239,15 @@ export function ShellDetailView({
           sessionId={sessionId ?? undefined}
           shellId={shell.id}
           shellName={shell.name}
+        />
+      </div>
+
+      <div className={`detail-tabpane ${tab === "memshell" ? "" : "hidden"}`}>
+        <MemshellPanel
+          sessionId={sessionId}
+          shellId={shell.id}
+          endpoint={shell.endpoint}
+          documentRoot={info?.info?.DOCUMENT_ROOT ?? info?.info?.FileRoot}
         />
       </div>
 
