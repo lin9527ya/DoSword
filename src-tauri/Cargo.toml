@@ -1,5 +1,6 @@
 [package]
 name = "dosword"
+license = "MIT"
 version.workspace = true
 description = "面向授权安全测试的 WebShell 管理客户端（Tauri 桌面应用）"
 authors.workspace = true

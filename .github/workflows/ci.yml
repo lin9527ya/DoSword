@@ -63,6 +63,9 @@ jobs:
       - name: 类型检查
         run: pnpm check
 
+      - name: 版本一致性（package.json / Cargo.toml / tauri.conf.json / tag）
+        run: pnpm check:version
+
       - name: IPC 契约检查（前端 invoke ↔ 后端命令注册）
         run: pnpm check:ipc
 
@@ -111,3 +114,8 @@ jobs:
       - name: Rust 依赖漏洞扫描
         # 只对 vulnerability 失败；unmaintained / unsound / yanked 属 warning，不阻塞
         run: cargo audit
+
+      - name: 依赖策略（cargo-deny：许可 / 来源 / 重复版本 / yanked）
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

@@ -1,5 +1,6 @@
 [package]
 name = "dosword-plugin-echo"
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

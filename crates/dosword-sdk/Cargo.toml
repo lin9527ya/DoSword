@@ -1,5 +1,6 @@
 [package]
 name = "dosword-sdk"
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

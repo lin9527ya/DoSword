@@ -956,8 +956,9 @@ pub async fn read_local_file(path: String, app: AppHandle) -> Result<String, Str
 
 /// 导出全部 Shell 配置（JSON 数组，含密码——请妥善保管导出文件）。
 #[tauri::command]
-pub fn export_shells(state: State<'_, AppState>) -> Result<String, String> {
-    export_shells_impl(&state)
+pub async fn export_shells(app: AppHandle) -> Result<String, String> {
+    // 异步化：原先同步命令在主线程取库锁，Shell 多时导出会卡 UI
+    blocking(app, export_shells_impl).await
 }
 
 fn export_shells_impl(state: &AppState) -> Result<String, String> {
@@ -1796,13 +1797,17 @@ fn test_proxy_upstream_impl(
 
 /// P16：高频微操作改同步 command（免 spawn_blocking 调度开销）。
 #[tauri::command]
-pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
-    state
-        .database
-        .lock()
-        .map_err(|_| "数据库锁异常".to_string())?
-        .get_settings()
-        .map_err(|error| error.to_string())
+pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
+    // 异步化：原先同步命令在主线程取库锁，设置页刷新会阻塞 UI
+    blocking(app, move |state| {
+        state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .get_settings()
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 /// 设置保存后按最新设置同步 MCP 服务（启用→重启，关闭→停止）。
