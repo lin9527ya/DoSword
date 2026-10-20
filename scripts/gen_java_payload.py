@@ -96,7 +96,8 @@ if not data.startswith(b"\xca\xfe\xba\xbe"):
     sys.exit(1)
 
 encoded = base64.b64encode(data).decode("ascii")
-source_hash = hashlib.sha256((ROOT / "TokenFilter.java").read_bytes()).hexdigest()
+source_bytes = bytes(byte for byte in (ROOT / "TokenFilter.java").read_bytes() if byte != 13)
+source_hash = hashlib.md5(source_bytes).hexdigest()
 # 每行 100 字符，便于 code review 时肉眼比对，也让 git diff 更可读
 lines = [encoded[i : i + 100] for i in range(0, len(encoded), 100)]
 body = "\n".join(f'    "{line}",' for line in lines)
@@ -143,7 +144,13 @@ mod drift_tests {{
     /// 源码改动后必须重新生成字节码，否则这里失败。
     #[test]
     fn embedded_bytes_match_source_revision() {{
-        let digest = dosword_sdk::encoder::md5_hex(super::FILTER_SOURCE);
+        // 过滤 CR：checkout 行尾随平台而变，不归一化会让本地与 CI 的哈希不同。
+        // 用 char::from(13) 而不是字符字面量，避免模板生成时的转义问题。
+        let normalized: String = super::FILTER_SOURCE
+            .chars()
+            .filter(|ch| *ch != char::from(13))
+            .collect();
+        let digest = dosword_sdk::encoder::md5_hex(&normalized);
         assert_eq!(
             digest,
             super::FILTER_SOURCE_MD5,

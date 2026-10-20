@@ -14,8 +14,7 @@
 
 /// 生成本常量时 `payload/TokenFilter.java` 的 MD5。用于防止
 /// 「改了 Java 源码却忘记重新生成字节码」——这类漂移在发布里最难发现。
-pub const FILTER_SOURCE_MD5: &str =
-    "6ec6221c3dcf906f4f6cf0cb1b7aad87140161c42e605e2f9489a74cccff3a14";
+pub const FILTER_SOURCE_MD5: &str = "164e07b102d8f5691e7770e7ae03ead0";
 
 /// 载荷类名（注册 FilterDef 时需要）。
 pub const FILTER_CLASS_NAME: &str = "dsw.TokenFilter";
@@ -100,7 +99,13 @@ mod drift_tests {
     /// 源码改动后必须重新生成字节码，否则这里失败。
     #[test]
     fn embedded_bytes_match_source_revision() {
-        let digest = dosword_sdk::encoder::md5_hex(super::FILTER_SOURCE);
+        // 过滤 CR：checkout 行尾随平台而变，不归一化会让本地与 CI 的哈希不同。
+        // 用 char::from(13) 而不是字符字面量，避免模板生成时的转义问题。
+        let normalized: String = super::FILTER_SOURCE
+            .chars()
+            .filter(|ch| *ch != char::from(13))
+            .collect();
+        let digest = dosword_sdk::encoder::md5_hex(&normalized);
         assert_eq!(
             digest,
             super::FILTER_SOURCE_MD5,
