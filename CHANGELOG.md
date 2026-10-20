@@ -112,7 +112,14 @@
     三个只读资源（经脱敏层、审计详情截断）与提示词 `dosword_guidance`
     （授权边界、三级权限、执行级确认流程、安全用法）；`get_info` 已宣告 resources/prompts 能力
   - 明确不暴露：Workspace/Shell 增删改、插件安装、改设置、本地文件读写、`http_send`、PTY
-  - Java 内存马前置通道（S4 第一步）：新增 `memshell/java.rs` —— 一次性页面模板
+  - Java 内存马载荷（S4 第二步）：真实编译的 `dsw.TokenFilter`
+  （`payload/TokenFilter.java`，javac 21 以 `-source/-target 8` 编译，4453 字节）——
+  只认 `X-DSW-TOKEN`（逐字符异或比较）、令牌不符**必须** `chain.doFilter` 放行、
+  支持 `ping` 与 `exec`（命令走 `X-DSW-CMD` base64，不落盘）；字节码 base64 内嵌于
+  `memshell/java_payload.rs`，由 `scripts/gen_java_payload.py` 生成（编译期用最小
+  servlet stub，stub 不入库）。`cargo test` 有两条护栏：源码 MD5 与内嵌常量不一致即失败
+  （防「改了 Java 忘了重新生成」）、字节码必须是合法 `CAFEBABE` 且类名可检索。
+  注册/卸载（`StandardContext` 反射）仍未实现，故不进 `memshell_capabilities`- Java 内存马前置通道（S4 第一步）：新增 `memshell/java.rs` —— 一次性页面模板
   （只认 `X-DSW-TOKEN`，逐字符异或比较防时序/前缀泄露，`op=ping` 与 `op=remove` 自删除）、
   由 token 派生的不可预测页面名、路径拼接；4 个单测覆盖令牌门禁、自删除、占位符替换
   与字面量转义。**刻意不含注入逻辑**：Filter 注入需要构建期内嵌已编译字节码 +

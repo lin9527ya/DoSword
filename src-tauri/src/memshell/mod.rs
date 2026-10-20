@@ -13,6 +13,7 @@
 
 pub mod fcgi;
 pub mod java;
+mod java_payload;
 pub mod php;
 
 use dosword_sdk::domain::ProbeResult;
