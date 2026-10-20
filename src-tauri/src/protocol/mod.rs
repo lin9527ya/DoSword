@@ -6,6 +6,7 @@
 pub mod jsp;
 pub mod mock;
 pub mod php;
+pub mod recorder;
 pub mod reqlog;
 pub mod transport;
 

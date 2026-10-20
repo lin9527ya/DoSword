@@ -1810,6 +1810,38 @@ pub async fn get_settings(app: AppHandle) -> Result<AppSettings, String> {
     .await
 }
 
+// ---------------- 会话录制 / 离线回放（S2） ----------------
+
+/// 开始录制：`key` 为 `protocol_id|endpoint`（见 `recorder::key`），
+/// 未开启时协议层的录制埋点会直接返回，无额外开销。
+#[tauri::command]
+pub fn recording_start(key: String, path: String, protocol_id: String) -> Result<String, String> {
+    crate::protocol::recorder::start(&key, std::path::Path::new(&path), &protocol_id)?;
+
+    Ok(path)
+}
+
+/// 停止录制并返回落盘路径。
+#[tauri::command]
+pub fn recording_stop(key: String) -> Result<Option<String>, String> {
+    let stopped = crate::protocol::recorder::stop(&key).map(|path| path.display().to_string());
+
+    Ok(stopped)
+}
+
+/// 当前正在录制的键列表。
+#[tauri::command]
+pub fn recording_status() -> Vec<String> {
+    crate::protocol::recorder::active_keys()
+}
+
+/// 离线回放：不联网，只重跑「外层 JSON → data → gunzip」并比对长度。
+#[tauri::command]
+pub fn recording_replay(path: String) -> Result<serde_json::Value, String> {
+    let report = crate::protocol::recorder::replay(std::path::Path::new(&path))?;
+    serde_json::to_value(report).map_err(|error| error.to_string())
+}
+
 /// 设置保存后按最新设置同步 MCP 服务（启用→重启，关闭→停止）。
 #[cfg(feature = "mcp")]
 fn schedule_mcp_sync(app: AppHandle, settings: AppSettings) {

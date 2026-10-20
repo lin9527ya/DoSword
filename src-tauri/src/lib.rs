@@ -340,6 +340,11 @@ pub fn run() {
             commands::dashboard,
             // Shell 库：分页查询 + 单取 + 精简列表（看板不再返回全量 Shell）
             commands::query_shells,
+            // 会话录制 / 离线回放
+            commands::recording_start,
+            commands::recording_stop,
+            commands::recording_status,
+            commands::recording_replay,
             commands::get_shell,
             commands::list_shell_summaries,
             commands::create_workspace,

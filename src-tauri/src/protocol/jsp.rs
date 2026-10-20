@@ -199,6 +199,24 @@ fn form_call(
     let plain = decode_payload(session, &data)?;
     let value: serde_json::Value = serde_json::from_slice(&plain)
         .map_err(|_| ProtocolError::ParseError("响应内容不是合法 JSON".to_string()))?;
+    // 录制（旁路，未开启时 recorder::append 直接返回）：只记录脱敏后的请求明文与响应原文，
+    // 不落密钥；回放靠 data 长度比对发现传输层漂移。
+    let record_key = crate::protocol::recorder::key(&session.protocol_id, &session.endpoint);
+    crate::protocol::recorder::append(
+        &record_key,
+        &crate::protocol::recorder::Frame {
+            ts_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or_default(),
+            protocol_id: session.protocol_id.clone(),
+            action: action.to_string(),
+            request: crate::protocol::recorder::redact_text(&request, &session.password),
+            response: text.to_string(),
+            data_len: data.len(),
+            ok: value.get("ok").and_then(|v| v.as_bool()) == Some(true),
+        },
+    );
     if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         let message = value
             .get("error")

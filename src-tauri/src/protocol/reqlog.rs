@@ -56,7 +56,7 @@ pub fn record_request(
 }
 
 /// 需要脱敏的密文变体（长串优先，避免短变体先命中留下残片）。
-fn secret_variants(password: &str) -> Vec<String> {
+pub(crate) fn secret_variants(password: &str) -> Vec<String> {
     if password.is_empty() {
         return Vec::new();
     }
@@ -75,7 +75,7 @@ fn secret_variants(password: &str) -> Vec<String> {
     variants
 }
 
-fn redact(value: &str, secrets: &[String]) -> String {
+pub(crate) fn redact(value: &str, secrets: &[String]) -> String {
     let mut out = value.to_string();
     for secret in secrets {
         out = out.replace(secret.as_str(), "***");

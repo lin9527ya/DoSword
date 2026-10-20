@@ -112,7 +112,12 @@
     三个只读资源（经脱敏层、审计详情截断）与提示词 `dosword_guidance`
     （授权边界、三级权限、执行级确认流程、安全用法）；`get_info` 已宣告 resources/prompts 能力
   - 明确不暴露：Workspace/Shell 增删改、插件安装、改设置、本地文件读写、`http_send`、PTY
-  - 发布（S3）：`release.yml` 增 `desktop` job（tauri-action，三平台安装包，未签名可直接产出；
+  - 会话录制与离线回放（S2，核心闭环）：新增 `protocol/recorder.rs` —— 按
+  `protocol_id|endpoint` 归档、JSONL 一行一帧、密码经 `reqlog` 同一套规则脱敏、
+  **不落任何密钥**；JSP `form_call` 埋点（未开启时零开销）；命令
+  `recording_start/stop/status/replay` + 前端 api 封装。回放只重跑
+  「外层 JSON → data → gunzip」并比对长度，用于发现传输层漂移；明文解密兼容性
+  仍由既有单测与真实往返覆盖。PHP `native_call`/会话通道的埋点与调试页入口留待下一步- 发布（S3）：`release.yml` 增 `desktop` job（tauri-action，三平台安装包，未签名可直接产出；
   配置 `TAURI_SIGNING_PRIVATE_KEY` 后自动签名）+ `guard` job（tag 与版本不一致时后续
   job 全部不跑），CLI job 改为 `needs: guard`。手动触发只产 artifact、不碰 Release，
   tag 触发创建草稿 Release- 工程化（P4 续）：新增 `deny.toml` 与 CI `cargo-deny`（许可白名单 / 来源限制 / 重复版本 /

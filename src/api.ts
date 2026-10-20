@@ -313,6 +313,12 @@ export const api = {
   mcpClearLog: () => invoke<void>("mcp_clear_log"),
   mcpPendingApprovals: () => invoke<McpPendingApproval[]>("mcp_pending_approvals"),
   runPlaybook: (yaml: string) => invoke<PlaybookReport>("run_playbook", { yaml }),
+  // 会话录制 / 离线回放（S2）：key = `${protocolId}|${endpoint}`
+  recordingStart: (key: string, path: string, protocolId: string) =>
+    invoke<string>("recording_start", { key, path, protocolId }),
+  recordingStop: (key: string) => invoke<string | null>("recording_stop", { key }),
+  recordingStatus: () => invoke<string[]>("recording_status"),
+  recordingReplay: (path: string) => invoke<unknown>("recording_replay", { path }),
   mcpResolveApproval: (id: string, approve: boolean) =>
     invoke<McpPendingApproval>("mcp_resolve_approval", { id, approve }),
 };
