@@ -4191,6 +4191,83 @@ except Exception as e:
         assert_eq!(attempts.load(Ordering::SeqCst), 2, "就绪后不应再次注入");
     }
 
+    /// 压缩/解压插件端到端（真实 PHP）：ZipArchive 打包 → 解压 → 校验内容，
+    /// 并断言**正常归档不产生跳过条目**（跳过意味着被判成路径穿越）。
+    #[test]
+    fn real_php_zip_and_unzip_plugins() {
+        if !php_supports_zip() {
+            eprintln!("跳过压缩/解压端到端：本机 php 未启用 ZipArchive 扩展");
+            return;
+        }
+        let settings = settings();
+        let Some((url, dir, mut child)) = spawn_php_server_with("native", "secret", false) else {
+            eprintln!("跳过：未检测到 php");
+            return;
+        };
+        let mut profile = profile(&url);
+        profile.protocol_params = r#"{"encoder":"native"}"#.to_string();
+        let result = (|| -> Result<(), ProtocolError> {
+            let (session, _) = PhpProtocol.connect(&profile, &settings)?;
+            let php = session
+                .as_any()
+                .downcast_ref::<PhpSession>()
+                .expect("会话类型不匹配");
+            let protocol = PhpProtocol;
+
+            // 准备：一个带内容的源目录
+            let source = dir.join("archive-src");
+            std::fs::create_dir_all(&source).expect("建源目录");
+            std::fs::write(source.join("payload.txt"), b"dosword-archive").expect("写源文件");
+
+            let archive = dir.join("bundle.zip");
+            let packed = dosword_sdk::feature_plugins::ZipPlugin.execute(
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({
+                    "source": source.to_string_lossy(),
+                    "target": archive.to_string_lossy(),
+                }),
+                &settings,
+            )?;
+            assert_eq!(
+                packed["ok"],
+                serde_json::json!(true),
+                "压缩应成功：{packed:?}"
+            );
+            assert!(archive.exists(), "应生成 zip 文件：{packed:?}");
+
+            let dest = dir.join("archive-out");
+            let unpacked = dosword_sdk::feature_plugins::UnzipPlugin.execute(
+                &protocol,
+                php,
+                "php",
+                &serde_json::json!({
+                    "source": archive.to_string_lossy(),
+                    "target": dest.to_string_lossy(),
+                }),
+                &settings,
+            )?;
+            assert_eq!(
+                unpacked["ok"],
+                serde_json::json!(true),
+                "解压应成功：{unpacked:?}"
+            );
+            assert_eq!(
+                unpacked["skipped"].as_u64().unwrap_or(999),
+                0,
+                "正常归档不应有被跳过的条目：{unpacked:?}"
+            );
+            let restored = std::fs::read(dest.join("payload.txt")).expect("解压后应还原该文件");
+            assert_eq!(restored, b"dosword-archive");
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap_or_else(|error| panic!("压缩/解压端到端应成功：{error}"));
+    }
+
     /// AEAD：真实 PHP 往返（HKDF + AES-256-GCM + 序号递增 + 重放拒绝）。
     #[test]
     fn real_php_aead_round_trip() {
@@ -4970,6 +5047,16 @@ except Exception as e:
     /// PHP / OpenSSL 的构建与配置（本项目 CI 的 php8.3 实测支持；某些发行版或
     /// 自编译环境不支持）。环境不支持时跳过 native_des 用例并打印原因，
     /// 而不是报一个与代码逻辑无关的假失败。
+    /// 目标 PHP 是否带 ZipArchive（压缩/解压插件依赖；缺失时跳过而非误报失败）。
+    fn php_supports_zip() -> bool {
+        std::process::Command::new("php")
+            .arg("-r")
+            .arg("echo class_exists('ZipArchive') ? '1' : '0';")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "1")
+            .unwrap_or(false)
+    }
+
     fn php_supports_des_ecb() -> bool {
         let probe = "$r = @openssl_encrypt('12345678', 'DES-ECB', '12345678', OPENSSL_RAW_DATA); \
                      echo ($r === false || strlen($r) === 0) ? '0' : '1';";

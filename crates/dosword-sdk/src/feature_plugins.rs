@@ -528,6 +528,106 @@ impl FeaturePlugin for ZipPlugin {
 }
 
 // ---------------------------------------------------------------------------
+// ZIP 解压（通用：PHP ZipArchive 载荷 + zip-slip 防护）
+// ---------------------------------------------------------------------------
+
+/// ZIP 解压（PHP）。逐条目校验后再解，**拒绝路径穿越条目**：
+/// 条目名里出现绝对路径或 `..` 一律跳过 —— 否则一个精心构造的 zip 能把文件写到
+/// 目标目录之外（zip-slip）。跳过数会回传，便于发现异常归档。
+fn php_unzip_code(source: &str, target: &str) -> String {
+    format!(
+        r#"<?php
+error_reporting(0);
+$src = {source};
+$dst = {target};
+if (!class_exists('ZipArchive')) {{ echo json_encode(array('ok' => false, 'error' => 'no ZipArchive')); exit; }}
+$zip = new ZipArchive();
+if ($zip->open($src) !== true) {{ echo json_encode(array('ok' => false, 'error' => 'open failed')); exit; }}
+if (!is_dir($dst) && !@mkdir($dst, 0755, true)) {{ echo json_encode(array('ok' => false, 'error' => 'mkdir failed')); exit; }}
+$extracted = 0;
+$skipped = 0;
+$total = $zip->numFiles;
+for ($i = 0; $i < $total; $i++) {{
+    $name = $zip->getNameIndex($i);
+    if ($name === false) {{ $skipped++; continue; }}
+    $normalized = str_replace('\\', '/', $name);
+    $absolute = substr($normalized, 0, 1) === '/' || preg_match('#^[A-Za-z]:#', $normalized) === 1;
+    $traversal = preg_match('#(^|/)\.\.(/|$)#', $normalized) === 1;
+    if ($absolute || $traversal) {{ $skipped++; continue; }}
+    if (@$zip->extractTo($dst, array($name))) {{ $extracted++; }} else {{ $skipped++; }}
+}}
+$zip->close();
+echo json_encode(array('ok' => true, 'target' => $dst, 'extracted' => $extracted, 'skipped' => $skipped, 'total' => $total));
+"#,
+        source = php_json_str(source),
+        target = php_json_str(target),
+    )
+}
+
+/// ZIP 解压（通用）。与 [`ZipPlugin`] 配对：压缩/解压都走同一套插件机制。
+pub struct UnzipPlugin;
+
+impl FeaturePlugin for UnzipPlugin {
+    fn manifest(&self) -> FeatureManifest {
+        FeatureManifest {
+            id: "unzip".into(),
+            name: "ZIP 解压".into(),
+            version: "1.0.0".into(),
+            description: "解压 ZIP 到目标目录（PHP ZipArchive 载荷，拒绝路径穿越条目）。".into(),
+            category: "general".into(),
+            languages: vec![],
+            params: vec![
+                ParamSpec {
+                    name: "source".into(),
+                    label: "ZIP 路径".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!("/tmp/backup.zip")),
+                    options: None,
+                },
+                ParamSpec {
+                    name: "target".into(),
+                    label: "解压到".into(),
+                    param_type: "string".into(),
+                    default: Some(serde_json::json!(".")),
+                    options: None,
+                },
+            ],
+            kind: "feature".into(),
+        }
+    }
+
+    fn execute(
+        &self,
+        protocol: &dyn Protocol,
+        session: &dyn SessionState,
+        runtime: &str,
+        params: &serde_json::Value,
+        settings: &AppSettings,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let source = param_str(params, "source", "/tmp/backup.zip");
+        let target = param_str(params, "target", ".");
+        match runtime {
+            "php" => {
+                let code = php_unzip_code(&source, &target);
+                run_payload(protocol, session, &code, settings)
+            }
+            // 非 PHP：系统 unzip 命令（可用时）
+            _other => {
+                validate_path_arg(&source).map_err(ProtocolError::NotSupported)?;
+                validate_path_arg(&target).map_err(ProtocolError::NotSupported)?;
+                let command = format!(
+                    "cd {} && unzip -o {} -d {} 2>&1 || echo 'unzip unavailable'",
+                    dirname_cmd(&source),
+                    basename_cmd(&source),
+                    target,
+                );
+                run_command(protocol, session, &command, settings)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 远程下载（通用，PHP 代码型：URL 拉取写入目标路径）
 // ---------------------------------------------------------------------------
 
@@ -616,6 +716,43 @@ impl FeaturePlugin for RemoteDownloadPlugin {
 mod tests {
     use super::*;
     use crate::plugin::FeaturePluginRegistry;
+
+    /// 解压载荷必须带 zip-slip 防护：绝对路径与 `..` 条目一律跳过。
+    #[test]
+    fn unzip_payload_guards_against_path_traversal() {
+        let code = php_unzip_code("/tmp/a.zip", "/tmp/out");
+        assert!(code.contains("extractTo"), "应逐条目解压：{code}");
+        // 两类穿越条目都要判：绝对路径（含 Windows 盘符）与 `..`
+        assert!(
+            code.contains("preg_match('#^[A-Za-z]:#'"),
+            "应拦 Windows 绝对路径"
+        );
+        assert!(
+            code.contains("substr($normalized, 0, 1) === '/'"),
+            "应拦 POSIX 绝对路径"
+        );
+        assert!(code.contains(r"#(^|/)\.\.(/|$)#"), "应拦 `..` 穿越");
+        // 跳过数要回传，便于发现异常归档
+        assert!(code.contains("'skipped' => $skipped"), "{code}");
+        // 两个路径参数都必须转义成 PHP 字符串字面量（防注入）
+        assert!(
+            code.contains(r#""/tmp/a.zip""#) && code.contains(r#""/tmp/out""#),
+            "{code}"
+        );
+    }
+
+    /// 非 PHP 走系统 unzip；参数里的 shell 元字符必须被拒（否则是命令注入）。
+    #[test]
+    fn unzip_non_php_command_validates_paths() {
+        let plugin = UnzipPlugin;
+        let manifest = plugin.manifest();
+        assert_eq!(manifest.id, "unzip");
+        assert_eq!(manifest.params.len(), 2);
+        assert!(validate_path_arg("/tmp/a.zip").is_ok());
+        assert!(validate_path_arg("/tmp/a.zip; rm -rf /").is_err());
+        assert!(validate_path_arg("/tmp/a.zip && curl evil").is_err());
+        assert!(validate_path_arg("/tmp/$(id).zip").is_err());
+    }
 
     #[test]
     fn builtin_manifests_valid() {

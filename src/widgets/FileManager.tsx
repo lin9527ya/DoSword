@@ -21,6 +21,7 @@ import {
   FileVideo,
   Folder,
   FolderPlus,
+  PackageOpen,
   Image,
   KeyRound,
   LoaderCircle,
@@ -482,6 +483,53 @@ export function FileManager({
   }
 
   // 隐藏 / 取消隐藏文件
+  /** 压缩为 ZIP：产物与源同目录（`<名字>.zip`）。走 zip 插件（PHP ZipArchive / 系统 zip）。 */
+  async function compressEntry(entry: FileEntry) {
+    const target = join(`${entry.name}.zip`);
+    try {
+      const result = await api.runFeaturePlugin(sessionId, "zip", {
+        source: entry.path,
+        target,
+      });
+      if (result.ok === false) {
+        toast.error(String(result.error ?? "压缩失败"), "压缩失败");
+        return;
+      }
+      toast.success(`已压缩到 ${target}`, "压缩完成");
+      await load(path);
+    } catch (cause) {
+      toast.error(`压缩失败：${errorText(cause)}`);
+    }
+  }
+
+  /** 解压 ZIP 到同名子目录。载荷侧会拒绝绝对路径 / `..` 条目（zip-slip），
+   *  有跳过时明确提示，避免「看着成功但少文件」。 */
+  async function extractEntry(entry: FileEntry) {
+    const target = join(entry.name.replace(/\.zip$/i, ""));
+    try {
+      const result = await api.runFeaturePlugin(sessionId, "unzip", {
+        source: entry.path,
+        target,
+      });
+      if (result.ok === false) {
+        toast.error(String(result.error ?? "解压失败"), "解压失败");
+        return;
+      }
+      const skipped = Number(result.skipped ?? 0);
+      if (skipped > 0) {
+        toast.warning(
+          `已解压到 ${target}，另有 ${skipped} 个条目因路径异常被跳过`,
+          "解压完成（有跳过）",
+        );
+      } else {
+        toast.success(`已解压到 ${target}`, "解压完成");
+      }
+      await load(path);
+    } catch (cause) {
+      toast.error(`解压失败：${errorText(cause)}`);
+    }
+  }
+
   async function toggleHideItem(entry: FileEntry, hide: boolean) {
     try {
       if (isWindows) {
@@ -1038,6 +1086,26 @@ export function FileManager({
                   }}
                 >
                   <Download size={14} /> 下载文件
+                </button>
+              )}
+              <button
+                className="file-context-item"
+                onClick={() => {
+                  setContextMenu(null);
+                  void compressEntry(contextMenu.entry!);
+                }}
+              >
+                <FileArchive size={14} /> 压缩为 ZIP
+              </button>
+              {/\.zip$/i.test(contextMenu.entry.name) && (
+                <button
+                  className="file-context-item"
+                  onClick={() => {
+                    setContextMenu(null);
+                    void extractEntry(contextMenu.entry!);
+                  }}
+                >
+                  <PackageOpen size={14} /> 解压到此处
                 </button>
               )}
               <button

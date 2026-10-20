@@ -507,6 +507,7 @@ impl FeaturePluginRegistry {
         let _ = registry.register(Box::new(crate::feature_plugins::PortScanPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::PhpEnvPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::ZipPlugin));
+        let _ = registry.register(Box::new(crate::feature_plugins::UnzipPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::WebShellScanPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::SuperTerminalPlugin));
         let _ = registry.register(Box::new(crate::feature_plugins::EvalCodePlugin));
@@ -677,6 +678,7 @@ mod feature_tests {
         assert!(ids.contains(&"port_scan".to_string()), "{ids:?}");
         assert!(ids.contains(&"php_env".to_string()), "{ids:?}");
         assert!(ids.contains(&"zip".to_string()), "{ids:?}");
+        assert!(ids.contains(&"unzip".to_string()), "{ids:?}");
         assert!(ids.contains(&"webshell_scan".to_string()), "{ids:?}");
         assert!(ids.contains(&"bypass_scan".to_string()), "{ids:?}");
         assert!(ids.contains(&"bypass_syscall".to_string()), "{ids:?}");
@@ -706,7 +708,7 @@ mod feature_tests {
                 "缺少未接线插件 {id}：{ids:?}"
             );
         }
-        assert_eq!(ids.len(), 38, "内置插件数量应为 38：{ids:?}");
+        assert_eq!(ids.len(), 39, "内置插件数量应为 39：{ids:?}");
         // 重复注册拒绝
         let mut r = FeaturePluginRegistry::new();
         assert!(

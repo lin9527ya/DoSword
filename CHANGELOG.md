@@ -42,6 +42,19 @@
 - JSP / ASPX 的 `separator` 字段转义错误，产出**非法 JSON**（探针响应解析失败）
 - ASPX 的 GCM 计数器从 0 起算（应为 J0+1），导致 tag 校验通过但明文是乱码
 
+### 新增（2026-10-20）
+
+- **文件管理器压缩 / 解压入口**：右键菜单新增「压缩为 ZIP」与「解压到此处」
+  （仅 .zip 条目显示），走既有的插件机制：
+  - 压缩复用内置 `zip` 插件（PHP ZipArchive / 非 PHP 系统 `zip`）
+  - 新增内置 `unzip` 插件：PHP 侧逐条目校验后解压，**拒绝绝对路径与 `..` 条目**
+    （zip-slip），跳过数回传并在前端明确提示「有 N 个条目被跳过」，避免
+    「看着成功但少文件」；非 PHP 走系统 `unzip`，路径参数照旧过 `validate_path_arg`
+  - 测试：`unzip_payload_guards_against_path_traversal`（载荷含两类穿越判定与转义）、
+    `unzip_non_php_command_validates_paths`（shell 元字符被拒）、
+    `real_php_zip_and_unzip_plugins`（真实 PHP：打包 → 解压 → 内容校验，且断言正常
+    归档的跳过数为 0）；本机 php 无 ZipArchive 时显式跳过而非误报失败
+
 ### 性能与规模化（2026-10-20）
 
 - **Shell 库改为服务端分页 + 过滤**（此前每次打开看板/详情都拉全量 Shell，含明文密码）：

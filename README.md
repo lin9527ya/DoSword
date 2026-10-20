@@ -419,9 +419,9 @@ impl Protocol for MyProtocol { /* ... */ }
 - v1 约定：execute 为纯逻辑（runtime + 参数 JSON → JSON），
   需要命令/代码通道的插件请用脚本型 .plugin
 
-## 功能插件清单（内置 37 个 + 外部 .plugin）
+## 功能插件清单（内置 39 个 + 外部 .plugin）
 
-**功能（feature）**：进程详情、系统信息、端口扫描、ZIP 压缩、WebShell 扫描、
+**功能（feature）**：进程详情、系统信息、端口扫描、ZIP 压缩 / 解压、WebShell 扫描、
 文件搜索、网络信息、用户枚举、PHP 环境检测、凭据枚举（仅检查存在性、不读内容）、
 代码执行（P_Eval_Code）、ByPassOpenBasedir（symlink+glob）、Bypass 环境检测
 
