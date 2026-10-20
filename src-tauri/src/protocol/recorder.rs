@@ -274,6 +274,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// 提交进仓库的 fixture 必须能稳定回放：这条用例让录制/回放逻辑在 CI 里
+    /// 每天都真跑一遍，而不是"写完就没人碰"。fixture 里的 data_len 与
+    /// gunzip_if_needed(data).len() 一旦不一致，这里立刻失败。
+    #[test]
+    fn committed_fixture_replays_clean() {
+        let text = include_str!("../../tests/fixtures/recording.jsonl");
+        let path = temp_path("fixture");
+        std::fs::write(&path, text).expect("写 fixture");
+        let report = replay(&path).expect("replay");
+        assert!(
+            report.total >= 3,
+            "fixture 至少 3 帧，实际 {}",
+            report.total
+        );
+        assert_eq!(
+            report.passed, report.total,
+            "fixture 回放有漂移帧：{:?}",
+            report.failures
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn append_without_start_is_noop() {
         let key = key("builtin.jsp.v1", "http://nowhere.invalid/x");
