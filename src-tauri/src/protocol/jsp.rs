@@ -215,6 +215,13 @@ fn form_call(
 /// - 不支持 seek 的 stub 忽略参数、返回整文件（长度 > length）→ 按 offset 切片。
 ///
 /// 旧实现无条件二次切片，导致 offset > 0 时 `offset >= total` 直接读空。
+/// 按 `offset`/`length` 取本块。**关键在第一个分支**：响应不比请求长时原样返回 ——
+/// 这条规则同时兜住「stub 已按偏移切好」（再切一次就是空块）与「stub 返回整文件」两种
+/// 情形，因此**不依赖能力位**，能力探测失败也安全。
+///
+/// 为什么不能只按能力位判「旧 stub 一律本地切片」：JSP stub 的偏移支持（2026-08-14，
+/// `c1957ad`）比能力上报（2026-10-19，`e76a3f5`）早两个月，这中间的 stub 会 seek 却
+/// 不上报能力 —— 本地再切一刀就会让 `offset>0` 读到空块。
 fn slice_chunk(bytes: Vec<u8>, offset: u64, length: u64) -> Vec<u8> {
     let total = bytes.len() as u64;
     if total <= length {
@@ -1761,6 +1768,60 @@ mod tests {
         }
     }
 
+    /// 端到端：**能力未知但会 seek 的 stub**（2026-08-14..10-19 之间生成的那批）
+    /// 必须被信任 —— 否则已切好的响应会被再切一刀，`offset>0` 读到空块。
+    #[test]
+    fn chunk_read_trusts_seeking_stub_with_unknown_capability() {
+        let script = std::env::temp_dir().join("dosword_jsp_mock_seek.py");
+        let _ = std::fs::write(&script, JSP_MOCK);
+        let port: u16 = {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let child = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(port.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            eprintln!("跳过分块读未知能力往返：未检测到 python3（mock server 需要）");
+            return;
+        };
+        if !crate::protocol::wait_http_ready(port, 10_000) {
+            eprintln!("跳过分块读未知能力往返：mock server 未就绪");
+            let _ = child.kill();
+            return;
+        }
+        let url = format!("http://127.0.0.1:{port}/shell.jsp");
+        let settings = settings();
+        let p = profile(&url);
+        let protocol = JspProtocol;
+        // (中段, 头部, 整文件) 三块结果
+        type Chunks = (Vec<u8>, Vec<u8>, Vec<u8>);
+        let result = (|| -> Result<Chunks, ProtocolError> {
+            let (session, probe) = protocol.connect(&p, &settings)?;
+            // mock 的 probe 不上报 info 表 → 能力未知，正是「中间批次 stub」的样子
+            assert!(
+                probe.capabilities.is_none(),
+                "mock 应模拟不上报能力的旧 stub：{:?}",
+                probe.capabilities
+            );
+            let middle = protocol.read_chunk(session.as_ref(), "/tmp/f", 3, 4, &settings)?;
+            let head = protocol.read_chunk(session.as_ref(), "/tmp/f", 0, 4, &settings)?;
+            let whole = protocol.read_chunk(session.as_ref(), "/tmp/f", 0, 10, &settings)?;
+            Ok((middle, head, whole))
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let (middle, head, whole) = result.expect("分块读往返应成功");
+        // 旧行为（能力未知一律本地切片）这里会得到空块
+        assert_eq!(middle, b"3456", "已按偏移切好的响应不应再被切一刀");
+        assert_eq!(head, b"0123");
+        assert_eq!(whole, b"0123456789");
+    }
+
     /// 偏移写：stub **明确**上报了能力清单且不含 chunked 时必须拒绝 ——
     /// 否则忽略 o 的 stub 会逐块从 0 覆写，分块上传只剩最后一块。
     #[test]
@@ -1845,6 +1906,15 @@ class Hd(BaseHTTPRequestHandler):
             out = {"ok": True, "data": {"entries": [
                    {"name": "a.txt", "path": "/tmp/a.txt", "is_dir": False,
                     "size": 3, "mtime": 0}]}}
+        elif h == H["read"]:
+            # 虚拟文件 b"0123456789"：**按 o/l 切片**（模拟 08-14 之后会 seek 的 stub）
+            data = b"0123456789"
+            off = int(req.get("o") or 0)
+            ln = int(req.get("l") or 0)
+            chunk = data[off:off + ln] if ln > 0 else data[off:]
+            out = {"ok": True, "data": base64.b64encode(chunk).decode()}
+        elif h == H["write"]:
+            out = {"ok": True, "data": None}
         else:
             out = {"ok": True, "data": None}
         resp = json.dumps(out).encode()
