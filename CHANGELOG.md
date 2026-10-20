@@ -42,6 +42,21 @@
 - JSP / ASPX 的 `separator` 字段转义错误，产出**非法 JSON**（探针响应解析失败）
 - ASPX 的 GCM 计数器从 0 起算（应为 J0+1），导致 tag 校验通过但明文是乱码
 
+### 工程化（2026-10-20）
+
+- **前端接入 vitest**（此前零测试）：`vitest.config.ts`（jsdom 环境，与生产构建配置分离）+
+  `pnpm test` / `pnpm test:watch`，CI 前端 job 增加「前端单测」步骤。
+  首批 3 个文件 36 个用例：
+  - `src/shells/encoders.test.ts` —— 编码方式分类（与后端 `session_mode_for` 同义）、
+    `protocol_params` 的容错解析与生成（默认值不写入、参数名/头名只对 NATIVE 生效、
+    额外请求头去空白与 CRLF 处理）、build↔parse 往返
+  - `src/theme.test.ts` —— 主题读取/回落/`data-theme` 写入
+  - `src/components/common.test.tsx` —— 错误边界（捕获后不白屏、重试恢复）、
+    Metric 数字补零、ErrorBanner 空消息不渲染、向上展开的每页条数选择器交互
+- **发布流程工具链钉版本**：`release.yml` 原用浮动的 `dtolnay/rust-toolchain@stable`
+  （注释还写着「版本来自 rust-toolchain.toml」，但 `@stable` 会绕过它），现与 ci.yml /
+  `rust-toolchain.toml` 统一为 `1.98.1`；三处一起升级的约定已写进 `rust-toolchain.toml`。
+
 ### 新增
 
 - **MCP 服务端**（`src-tauri/src/mcp/`，cargo feature `mcp` 默认开启）：把 DoSword 能力
@@ -356,7 +371,8 @@ PHP 侧此前是「三条通道、三套能力」：同一个目标换个编码�
 
 - Shell 连接密码以明文存储于本地 SQLite（工具惯例，keyring 加密待后续版本），
   导出的 Shell JSON 与备份文件同样含明文密码
-- 前端尚无自动化测试
+- 前端测试覆盖有限：vitest 已接入，当前覆盖编码器/协议参数、主题、共享组件；
+  各视图与 `FileManager` / `Terminal` 等大组件仍无测试
 
 [未发布]: https://github.com/lin9527ya/DoSword/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/lin9527ya/DoSword/releases/tag/v0.1.0

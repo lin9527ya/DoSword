@@ -328,6 +328,7 @@ sudo apt-get install librsvg2-dev libayatana-appindicator3-dev patchelf
 pnpm check          # TypeScript 类型检查
 pnpm check:ipc      # IPC 契约：前端 invoke 名 ↔ 后端 generate_handler! 注册
 pnpm lint           # ESLint（含 react-hooks 规则）
+pnpm test           # 前端单测（vitest + jsdom）
 pnpm build          # 前端构建
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
