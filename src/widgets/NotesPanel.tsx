@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { ask } from "@tauri-apps/plugin-dialog";
 import {
   BookOpen,
   Clock,
@@ -225,11 +226,18 @@ export function NotesPanel({ shellId, shellName }: NotesPanelProps) {
     toast.success("笔记已导出为 Markdown 文件");
   }
 
-  function clearNotes() {
-    if (confirm("确定要清空当前 Shell 的操作笔记吗？")) {
-      setContent(`# 渗透操作记录 — ${shellName}\n\n`);
-      toast.info("笔记已重置");
-    }
+  async function clearNotes() {
+    // 用应用内确认框而不是原生 confirm：原生框在 Tauri webview 里样式不可控，
+    // 且与其他确认（删除 Shell / Workspace）交互不一致
+    const confirmed = await ask("确定要清空当前 Shell 的操作笔记吗？", {
+      title: "清空笔记",
+      kind: "warning",
+      okLabel: "清空",
+      cancelLabel: "取消",
+    });
+    if (!confirmed) return;
+    setContent(`# 渗透操作记录 — ${shellName}\n\n`);
+    toast.info("笔记已重置");
   }
 
   const filteredSnippets = useMemo(() => {
@@ -313,7 +321,7 @@ export function NotesPanel({ shellId, shellName }: NotesPanelProps) {
           <button className="icon-button" onClick={exportMarkdown} title="导出为 .md 文件">
             <Download size={14} />
           </button>
-          <button className="icon-button danger" onClick={clearNotes} title="清空笔记">
+          <button className="icon-button danger" onClick={() => void clearNotes()} title="清空笔记">
             <Trash2 size={14} />
           </button>
         </div>

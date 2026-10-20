@@ -18,6 +18,18 @@ import { UpwardPageSizeSelect } from "../components/common";
 import { ForwardTerminal } from "./ForwardTerminal";
 import { useToast } from "../components/Toast";
 
+/** 需要多行输入框的参数名（代码 / 命令 / SQL / 载荷…）。
+ *
+ *  此前判据是「参数名含 code/commands **且当前值已含换行**」——首次编辑时值里没有换行，
+ *  于是渲染成单行 `<input>`，用户根本敲不出换行，永远进不到多行模式。
+ */
+function isMultilineParam(name: string): boolean {
+  const lower = name.toLowerCase();
+  return ["code", "command", "commands", "script", "sql", "query", "payload", "body"].some(
+    (key) => lower.includes(key),
+  );
+}
+
 export function PluginPanel({ sessionId }: { sessionId: string }) {
   const toast = useToast();
   const [plugins, setPlugins] = useState<FeatureManifest[]>([]);
@@ -412,8 +424,7 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
                                 </option>
                               ))}
                             </select>
-                          ) : (param.name.includes("code") || param.name.includes("commands")) &&
-                            String(values[param.name] ?? "").includes("\n") ? (
+                          ) : isMultilineParam(param.name) ? (
                             <textarea
                               rows={6}
                               value={String(values[param.name] ?? "")}

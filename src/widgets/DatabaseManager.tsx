@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  ChevronsLeft,
-  ChevronsRight,
   Database,
   Download,
   LoaderCircle,
@@ -10,10 +8,12 @@ import {
   Sparkles,
   Table2,
 } from "lucide-react";
-import { save } from "@tauri-apps/plugin-dialog";
-import { api, b64, errorText } from "../api";
+import { api, errorText } from "../api";
+import { Pager } from "../components/Pager";
+import { buildCsv } from "../lib/csv";
+import { saveTextFile } from "../lib/exportFile";
 import type { DbConnection, DbQueryResult } from "../api";
-import { Empty, ErrorBanner, UpwardPageSizeSelect } from "../components/common";
+import { Empty, ErrorBanner } from "../components/common";
 import { useToast } from "../components/Toast";
 
 const CONN_KEY = "dosword:db-conn";
@@ -99,7 +99,6 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
   const [result, setResult] = useState<DbQueryResult | null>(null);
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(100);
-  const [jumpPageInput, setJumpPageInput] = useState("");
   const [busy, setBusy] = useState<"probe" | "tables" | "query" | null>(null);
   const [error, setError] = useState("");
 
@@ -191,27 +190,16 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
 
   const cellCount = useMemo(() => result?.columns.length ?? 0, [result]);
 
-  function csvCell(value: unknown): string {
-    if (value === null || value === undefined) return "";
-    const text = String(value);
-    return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-  }
-
   async function exportResult(format: "csv" | "json") {
     if (!result) return;
     const stamp = new Date().toISOString().slice(0, 19).replace(/:/g, "-");
-    const localPath = await save({
-      defaultPath: `dosword-db-${selectedDb || "query"}-${stamp}.${format}`,
-      filters: [{ name: format.toUpperCase(), extensions: [format] }],
-    });
-    if (!localPath) return;
     let content: string;
     if (format === "csv") {
       const rows = [
         result.columns,
-        ...result.rows.map((row) => result.columns.map((_, i) => csvCell(row[i]))),
+        ...result.rows.map((row) => result.columns.map((_, i) => row[i])),
       ];
-      content = "\uFEFF" + rows.map((row) => row.join(",")).join("\r\n");
+      content = buildCsv(rows);
     } else {
       const items = result.rows.map((row) =>
         Object.fromEntries(result.columns.map((column, i) => [column, row[i]])),
@@ -219,8 +207,13 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
       content = JSON.stringify(items, null, 2);
     }
     try {
-      await api.writeLocalFile(localPath, b64.encodeBytes(new TextEncoder().encode(content)));
-      toast.success(`查询结果已导出至 ${localPath}`, "导出成功");
+      const saved = await saveTextFile({
+        defaultPath: `dosword-db-${selectedDb || "query"}-${stamp}.${format}`,
+        filters: [{ name: format.toUpperCase(), extensions: [format] }],
+        text: content,
+      });
+      if (!saved) return;
+      toast.success(`查询结果已导出`, "导出成功");
     } catch (cause) {
       toast.error(`导出失败：${errorText(cause)}`);
     }
@@ -507,92 +500,32 @@ export function DatabaseManager({ sessionId }: { sessionId: string }) {
                 })()}
 
                 {result.rows.length > 0 && (
-                  <div className="file-pager" style={{ borderTop: "1px solid var(--border)", margin: 0, borderRadius: "0 0 var(--radius-md) var(--radius-md)" }}>
-                    {(() => {
-                      const effectiveSize = pageSize === 0 ? result.rows.length : pageSize;
-                      const pageCount = pageSize === 0 ? 1 : Math.max(1, Math.ceil(result.rows.length / effectiveSize));
-
-                      const handleJump = () => {
-                        const p = parseInt(jumpPageInput.trim(), 10);
-                        if (!Number.isNaN(p) && p >= 1 && p <= pageCount) {
-                          setPage(p - 1);
-                          setJumpPageInput("");
-                        } else {
-                          toast.warning(`请输入 1 到 ${pageCount} 之间的有效页码`);
-                        }
-                      };
-
-                      return (
-                        <>
-                          <div className="file-pager-info">
-                            共 <strong>{result.rows.length}</strong> 行记录
-                          </div>
-
-                          <div className="file-pager-controls">
-                            <button
-                              className="button compact secondary"
-                              disabled={page === 0}
-                              onClick={() => setPage(0)}
-                              title="第一页"
-                            >
-                              <ChevronsLeft size={13} />
-                            </button>
-                            <button
-                              className="button compact secondary"
-                              disabled={page === 0}
-                              onClick={() => setPage((p) => Math.max(0, p - 1))}
-                            >
-                              上一页
-                            </button>
-                            <span className="pagination-info" style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>
-                              第 <strong>{page + 1}</strong> / {pageCount} 页
-                            </span>
-                            <button
-                              className="button compact secondary"
-                              disabled={page + 1 >= pageCount}
-                              onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
-                            >
-                              下一页
-                            </button>
-                            <button
-                              className="button compact secondary"
-                              disabled={page + 1 >= pageCount}
-                              onClick={() => setPage(pageCount - 1)}
-                              title="最后一页"
-                            >
-                              <ChevronsRight size={13} />
-                            </button>
-                          </div>
-
-                          <div className="file-pager-jump">
-                            <span style={{ fontSize: 11, color: "var(--text-faint)" }}>每页:</span>
-                            <UpwardPageSizeSelect
-                              value={pageSize}
-                              onChange={(val) => {
-                                setPageSize(val);
-                                setPage(0);
-                              }}
-                              unit="行"
-                            />
-
-                            <span style={{ fontSize: 11, color: "var(--text-faint)", marginLeft: 6 }}>跳至:</span>
-                            <input
-                              className="file-pager-input"
-                              value={jumpPageInput}
-                              onChange={(e) => setJumpPageInput(e.target.value)}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") handleJump();
-                              }}
-                              placeholder={String(page + 1)}
-                            />
-                            <button className="button compact secondary" onClick={handleJump}>
-                              跳转
-                            </button>
-                          </div>
-                        </>
-                      );
-                    })()}
-                  </div>
+                  <Pager
+                    className="file-pager"
+                    style={{
+                      borderTop: "1px solid var(--border)",
+                      margin: 0,
+                      borderRadius: "0 0 var(--radius-md) var(--radius-md)",
+                    }}
+                    page={page}
+                    pageCount={
+                      pageSize === 0
+                        ? 1
+                        : Math.max(1, Math.ceil(result.rows.length / pageSize))
+                    }
+                    pageSize={pageSize}
+                    onPage={setPage}
+                    onPageSize={(size) => {
+                      setPageSize(size);
+                      setPage(0);
+                    }}
+                    unit="行"
+                    info={
+                      <>
+                        共 <strong>{result.rows.length}</strong> 行记录
+                      </>
+                    }
+                  />
                 )}
               </>
             )}

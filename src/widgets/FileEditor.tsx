@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { Copy, Save, X } from "lucide-react";
 import { api, b64, errorText, formatSize } from "../api";
 import type { FileEntry } from "../api";
@@ -51,6 +52,42 @@ export function FileEditor({
   }, [entry.contentB64, encoding]);
 
   const lineCount = useMemo(() => Math.max(1, content.split("\n").length), [content]);
+
+  // 未保存改动判定：截断预览是只读的，不算改动
+  const originalContent = entry.contentB64 ? decodeByEncoding(entry.contentB64, encoding) : "";
+  const dirty = !truncated && content !== originalContent;
+
+  /** 关闭前确认（ESC / 点背景 / 点关闭按钮都走这里，避免手滑丢改动）。 */
+  const askingRef = useRef(false);
+  const closeWithConfirm = useCallback(async () => {
+    if (askingRef.current) return;
+    if (dirty) {
+      askingRef.current = true;
+      try {
+        const confirmed = await ask("文件有未保存的改动，确定放弃并关闭？", {
+          title: "放弃改动",
+          kind: "warning",
+          okLabel: "放弃并关闭",
+          cancelLabel: "继续编辑",
+        });
+        if (!confirmed) return;
+      } finally {
+        askingRef.current = false;
+      }
+    }
+    onClose();
+  }, [dirty, onClose]);
+
+  // Esc 关闭（与按钮同一条确认路径）
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      void closeWithConfirm();
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [closeWithConfirm]);
 
   function switchEncoding(next: Encoding) {
     if (!entry.contentB64) return;
@@ -105,7 +142,7 @@ export function FileEditor({
   }
 
   return (
-    <div className="dialog-backdrop" onMouseDown={onClose}>
+    <div className="dialog-backdrop" onMouseDown={() => void closeWithConfirm()}>
       <section className="editor" onMouseDown={(event) => event.stopPropagation()}>
         <div className="editor-head">
           <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
@@ -150,7 +187,7 @@ export function FileEditor({
               <Save size={13} />
               {busy ? "保存中…" : "保存 (Ctrl+S)"}
             </button>
-            <button className="icon-button" onClick={onClose} title="关闭编辑器 (Esc)">
+            <button className="icon-button" onClick={() => void closeWithConfirm()} title="关闭编辑器 (Esc)">
               <X size={15} />
             </button>
           </div>

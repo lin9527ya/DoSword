@@ -6,8 +6,6 @@ import {
   Bookmark,
   Calendar,
   CheckSquare,
-  ChevronsLeft,
-  ChevronsRight,
   Clipboard,
   ClipboardPaste,
   Copy,
@@ -38,8 +36,9 @@ import { ask, save } from "@tauri-apps/plugin-dialog";
 import { api, b64, errorText, formatSize } from "../api";
 import type { FileEntry } from "../api";
 import { Dialog } from "../components/Dialog";
-import { Empty, UpwardPageSizeSelect } from "../components/common";
+import { Empty } from "../components/common";
 import { FileEditor } from "./FileEditor";
+import { Pager } from "../components/Pager";
 import { useToast } from "../components/Toast";
 
 const LINUX_BOOKMARKS = [
@@ -109,7 +108,6 @@ export function FileManager({
   // 分页状态
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(100);
-  const [jumpPageInput, setJumpPageInput] = useState("");
   const uploadRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -218,16 +216,6 @@ export function FileManager({
 
   const pageCount = pageSize === 0 ? 1 : Math.max(1, Math.ceil(visible.length / pageSize));
   const pageEntries = pageSize === 0 ? visible : visible.slice(page * pageSize, (page + 1) * pageSize);
-
-  function handleJumpPage() {
-    const target = parseInt(jumpPageInput.trim(), 10);
-    if (!Number.isNaN(target) && target >= 1 && target <= pageCount) {
-      setPage(target - 1);
-      setJumpPageInput("");
-    } else {
-      toast.warning(`请输入 1 到 ${pageCount} 之间的有效页码`);
-    }
-  }
 
   function toggleSelect(name: string, event?: React.MouseEvent) {
     if (event?.shiftKey) {
@@ -898,75 +886,23 @@ export function FileManager({
             ))}
           </div>
 
-          {/* 分页与跳转栏 */}
-          <div className="file-pager">
-            <div className="file-pager-info">
-              共 <strong>{visible.length}</strong> 项
-              {selected.size > 0 && <span>（已选 {selected.size} 项）</span>}
-            </div>
-
-            <div className="file-pager-controls">
-              <button
-                className="button compact secondary"
-                disabled={page === 0}
-                onClick={() => setPage(0)}
-                title="第一页"
-              >
-                <ChevronsLeft size={13} />
-              </button>
-              <button
-                className="button compact secondary"
-                disabled={page === 0}
-                onClick={() => setPage((p) => Math.max(0, p - 1))}
-              >
-                上一页
-              </button>
-              <span className="pagination-info" style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>
-                第 <strong>{page + 1}</strong> / {pageCount} 页
-              </span>
-              <button
-                className="button compact secondary"
-                disabled={page + 1 >= pageCount}
-                onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
-              >
-                下一页
-              </button>
-              <button
-                className="button compact secondary"
-                disabled={page + 1 >= pageCount}
-                onClick={() => setPage(pageCount - 1)}
-                title="最后一页"
-              >
-                <ChevronsRight size={13} />
-              </button>
-            </div>
-
-            <div className="file-pager-jump">
-              <span style={{ fontSize: 11, color: "var(--text-faint)" }}>每页:</span>
-              <UpwardPageSizeSelect
-                value={pageSize}
-                onChange={(val) => {
-                  setPageSize(val);
-                  setPage(0);
-                }}
-                unit="条"
-              />
-
-              <span style={{ fontSize: 11, color: "var(--text-faint)", marginLeft: 6 }}>跳至:</span>
-              <input
-                className="file-pager-input"
-                value={jumpPageInput}
-                onChange={(e) => setJumpPageInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleJumpPage();
-                }}
-                placeholder={String(page + 1)}
-              />
-              <button className="button compact secondary" onClick={handleJumpPage}>
-                跳转
-              </button>
-            </div>
-          </div>
+          {/* 分页与跳转栏（共享组件） */}
+          <Pager
+            page={page}
+            pageCount={pageCount}
+            pageSize={pageSize}
+            onPage={setPage}
+            onPageSize={(size) => {
+              setPageSize(size);
+              setPage(0);
+            }}
+            info={
+              <>
+                共 <strong>{visible.length}</strong> 项
+                {selected.size > 0 && <span>（已选 {selected.size} 项）</span>}
+              </>
+            }
+          />
         </div>
       )}
 

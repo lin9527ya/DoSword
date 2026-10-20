@@ -7,8 +7,9 @@ import {
   RefreshCw,
   XCircle,
 } from "lucide-react";
-import { save } from "@tauri-apps/plugin-dialog";
-import { api, b64, errorText, shortTime } from "../api";
+import { api, errorText, shortTime } from "../api";
+import { buildCsv } from "../lib/csv";
+import { saveTextFile } from "../lib/exportFile";
 import type { AuditEvent } from "../api";
 import { Empty, ErrorBanner, Panel } from "../components/common";
 import { useToast } from "../components/Toast";
@@ -42,10 +43,6 @@ const ACTION_LABELS: Record<string, string> = {
 
 export function actionLabel(action: string): string {
   return ACTION_LABELS[action] ?? action;
-}
-
-function csvCell(value: string): string {
-  return `"${value.replace(/"/g, '""')}"`;
 }
 
 export function AuditView() {
@@ -99,11 +96,6 @@ export function AuditView() {
 
   async function exportCsv() {
     try {
-      const localPath = await save({
-        defaultPath: `dosword-audit-${new Date().toISOString().slice(0, 10)}.csv`,
-        filters: [{ name: "CSV 表格文件", extensions: ["csv"] }],
-      });
-      if (!localPath) return;
       const rows = [
         ["时间", "操作类型", "执行结果", "详细轨迹", "Workspace ID", "Shell ID"],
         ...events.map((event) => [
@@ -115,9 +107,12 @@ export function AuditView() {
           event.shellId ?? "",
         ]),
       ];
-      const csv = "\uFEFF" + rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
-      const bytes = new TextEncoder().encode(csv);
-      await api.writeLocalFile(localPath, b64.encodeBytes(bytes));
+      const saved = await saveTextFile({
+        defaultPath: `dosword-audit-${new Date().toISOString().slice(0, 10)}.csv`,
+        filters: [{ name: "CSV 表格文件", extensions: ["csv"] }],
+        text: buildCsv(rows),
+      });
+      if (!saved) return;
       toast.success(`已成功导出 ${events.length} 条审计日志`, "导出完成");
     } catch (cause) {
       toast.error(errorText(cause), "导出失败");

@@ -18,6 +18,8 @@ import {
 import { api, errorText } from "../api";
 import type { FeatureManifest, ParamSpec, SessionInfo } from "../api";
 import { Dialog } from "./Dialog";
+import { ask } from "@tauri-apps/plugin-dialog";
+
 import { useToast } from "./Toast";
 
 export interface ScriptPluginParam {
@@ -863,8 +865,19 @@ ${paramAssoc}
         options: p.options ? p.options.split(",").map((x) => x.trim()).filter(Boolean) : null,
       }));
 
-      // 如果是新编写的自定义脚本插件，先尝试热装载到注册表
+      // 如果是新编写的自定义脚本插件，先尝试热装载到注册表。
+      // 装载会写入本地插件目录（有副作用），此前是**静默安装** —— 先确认再装。
       if (!initialPlugin) {
+        const confirmed = await ask(
+          "联调测试需要先把该插件热装载到注册表（会写入本地插件目录，测试后仍然保留）。是否继续？",
+          {
+            title: "联调测试",
+            kind: "warning",
+            okLabel: "装载并测试",
+            cancelLabel: "取消",
+          },
+        );
+        if (!confirmed) return;
         const execution = execType === "code" ? { type: "code", codes: Object.fromEntries(languages.map((lang) => [lang, codeBody])) } : { type: "command", commands: Object.fromEntries(languages.map((lang) => [lang, codeBody])) };
         const manifestPayload = { id: cleanId, name: name.trim(), version: version.trim() || "1.0.0", description: description.trim(), category, kind, languages, params: paramSpecs, execution };
         await api.installPlugin(JSON.stringify(manifestPayload, null, 2));
