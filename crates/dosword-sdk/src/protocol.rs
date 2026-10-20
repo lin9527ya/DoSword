@@ -12,7 +12,10 @@ use crate::domain::{
 };
 
 /// 协议层错误。`Display` 输出面向用户的中文消息，命令层直接 `to_string()`。
-#[derive(Debug)]
+///
+/// `Clone`：会话初始化的并发等待者需要复用**同一次**失败结论（见
+/// `PhpSession.init`），不能各自重发一次往返。
+#[derive(Debug, Clone)]
 pub enum ProtocolError {
     /// 连接失败、超时、DNS 等传输层问题。
     Network(String),

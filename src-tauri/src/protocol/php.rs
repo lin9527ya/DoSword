@@ -308,6 +308,72 @@ fn append_padding(body: &mut String, bytes: usize) {
     body.push_str(&value);
 }
 
+/// 分阶段载荷的注入状态机（`Mutex` + 条件变量）。
+///
+/// 为什么不是一个 `Mutex<bool>`：注入本身要发**一次网络往返**。旧实现把锁
+/// held across I/O，于是：
+///
+/// - 注入失败时，每个并发调用者都会**依次**再试一次（N 个调用者 = N 次串行失败往返，
+///   每次都等到 HTTP 超时），批量编排下放大成几十秒；
+/// - 网络卡住期间其他调用者全部被挡在锁上；
+/// - 锁一旦中毒（注入路径 panic），整个会话永久报「会话状态锁异常」。
+///
+/// 现在的语义：
+///
+/// - 只有第一个调用者去注入，**注入期间不持锁**；
+/// - 其余调用者在条件变量上等，并与该次尝试**共享结论**（一起成功 / 一起失败），
+///   不会各自重发一次往返；
+/// - 失败的尝试把状态复位，**下一个新调用者**仍可重试（保留「瞬时故障下次可用」）；
+/// - 锁中毒不再致命（注入失败不该让会话永久不可用）。
+#[derive(Debug, Default)]
+struct SessionInit {
+    /// 处理器已注入且可用
+    ready: bool,
+    /// 有调用者正在注入（注入期间不持锁，只靠这个标志互斥）
+    in_flight: bool,
+    /// 每次注入尝试递增；等待者据此判断「我等的那一次」是否已经结束
+    attempt: u64,
+    /// 最近一次尝试的失败原因，供**同一批**等待者复用
+    failure: Option<ProtocolError>,
+}
+
+/// `SessionInit` 的锁 + 条件变量（见类型文档）。
+pub struct SessionInitState {
+    state: std::sync::Mutex<SessionInit>,
+    done: std::sync::Condvar,
+}
+
+impl Default for SessionInitState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionInitState {
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(SessionInit::default()),
+            done: std::sync::Condvar::new(),
+        }
+    }
+
+    /// 取锁：**中毒不致命** —— 注入失败不该让整个会话永久不可用。
+    fn lock(&self) -> std::sync::MutexGuard<'_, SessionInit> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait<'a>(
+        &self,
+        guard: std::sync::MutexGuard<'a, SessionInit>,
+    ) -> std::sync::MutexGuard<'a, SessionInit> {
+        self.done
+            .wait(guard)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// PHP 协议的会话状态：持有专用 HTTP 客户端（每会话独立，避免跨会话并发干扰）。
 pub struct PhpSession {
     pub endpoint: String,
@@ -315,8 +381,8 @@ pub struct PhpSession {
     pub client: reqwest::blocking::Client,
     /// 载荷编码器（连接时由 protocol_params 决定）。
     pub encoder: &'static dyn PayloadEncoder,
-    /// Godzilla 分阶段载荷：处理器代码是否已注入服务端 session。
-    pub initialized: std::sync::Mutex<bool>,
+    /// Godzilla 分阶段载荷：处理器代码是否已注入服务端 session（并发语义见 `SessionInitState`）。
+    pub init: SessionInitState,
     /// 分阶段载荷模式（protocol_params 中 session: true 且编码器支持）。
     pub session_mode: bool,
     /// stub 是否上报 `ChunkedTransfer` 能力（read/write 支持 o/l 偏移）。
@@ -435,7 +501,7 @@ impl PhpProtocol {
                 password: effective_password(&profile.protocol_params, &profile.password),
                 client,
                 encoder,
-                initialized: std::sync::Mutex::new(false),
+                init: SessionInitState::new(),
                 session_mode: false,
                 chunked: false,
                 cwd: std::sync::Mutex::new(String::new()),
@@ -459,7 +525,7 @@ impl PhpProtocol {
                 password: effective_password(&profile.protocol_params, &profile.password),
                 client,
                 encoder,
-                initialized: std::sync::Mutex::new(false),
+                init: SessionInitState::new(),
                 session_mode: true,
                 chunked: false,
                 cwd: std::sync::Mutex::new(String::new()),
@@ -490,7 +556,7 @@ impl PhpProtocol {
             password: effective,
             client,
             encoder,
-            initialized: std::sync::Mutex::new(false),
+            init: SessionInitState::new(),
             session_mode: false,
             chunked: false,
             cwd: std::sync::Mutex::new(String::new()),
@@ -1192,7 +1258,7 @@ impl Protocol for PhpProtocol {
             password: effective_password(&profile.protocol_params, &profile.password),
             client,
             encoder,
-            initialized: std::sync::Mutex::new(false),
+            init: SessionInitState::new(),
             session_mode: session_mode_for(&profile.protocol_params, encoder),
             chunked,
             cwd: std::sync::Mutex::new(result.current_dir.clone()),
@@ -1829,13 +1895,11 @@ fn log_request(
 
 /// 确保处理器代码已注入服务端 session（幂等：已初始化则跳过）。
 fn ensure_session_init(php: &PhpSession, settings: &AppSettings) -> Result<(), ProtocolError> {
-    let mut initialized = php
-        .initialized
-        .lock()
-        .map_err(|_| ProtocolError::ParseError("会话状态锁异常".to_string()))?;
-    if *initialized {
-        return Ok(());
-    }
+    ensure_init_with(&php.init, || inject_session_handler(php, settings))
+}
+
+/// 真正做注入的那次网络往返。**调用者必须不持锁**（见 `SessionInitState`）。
+fn inject_session_handler(php: &PhpSession, settings: &AppSettings) -> Result<(), ProtocolError> {
     let code = dosword_sdk::encoder::session_handler_code();
     let payload = encode_payload(php, code)?;
     let plain = session_post(php, "session_init", code, payload, settings)?;
@@ -1845,8 +1909,55 @@ fn ensure_session_init(php: &PhpSession, settings: &AppSettings) -> Result<(), P
             "分阶段载荷初始化失败：{text}"
         )));
     }
-    *initialized = true;
     Ok(())
+}
+
+/// 驱动注入状态机（与网络无关，便于单测）：并发语义见 `SessionInitState`。
+fn ensure_init_with<F>(state: &SessionInitState, inject: F) -> Result<(), ProtocolError>
+where
+    F: FnOnce() -> Result<(), ProtocolError>,
+{
+    let mut guard = state.lock();
+    loop {
+        if guard.ready {
+            return Ok(());
+        }
+        if !guard.in_flight {
+            // 由我来注入：**先把锁放掉**，网络往返期间不持锁
+            guard.in_flight = true;
+            guard.attempt = guard.attempt.wrapping_add(1);
+            guard.failure = None;
+            let attempt = guard.attempt;
+            drop(guard);
+            let result = inject();
+            let mut guard = state.lock();
+            // 只有注入者会改 `in_flight`，故此处 attempt 必然仍是自己那次
+            debug_assert_eq!(guard.attempt, attempt, "注入期间不应出现新一轮尝试");
+            guard.in_flight = false;
+            match &result {
+                Ok(()) => guard.ready = true,
+                Err(error) => guard.failure = Some(error.clone()),
+            }
+            drop(guard);
+            state.done.notify_all();
+            return result;
+        }
+        // 已有注入在飞：等它结束，并与它共享结论（不各自重发一次往返）
+        let waiting_for = guard.attempt;
+        while guard.in_flight && guard.attempt == waiting_for {
+            guard = state.wait(guard);
+        }
+        if guard.ready {
+            return Ok(());
+        }
+        if guard.attempt == waiting_for {
+            // 我等的那次失败了：复用它的结论，不自己再发一次往返
+            return Err(guard.failure.clone().unwrap_or_else(|| {
+                ProtocolError::ServerError("分阶段载荷初始化失败".to_string())
+            }));
+        }
+        // 期间已开始新一轮注入 → 回到循环顶部重新判断
+    }
 }
 
 /// 调用一次处理器操作：参数 JSON（XOR 加密）-> 解密响应 -> nonce 帧解析。
@@ -3983,6 +4094,101 @@ except Exception as e:
         // 现在三条通道都由 stub 端裸 RESP 实现，不再拒绝
         assert!(check_driver("redis").is_ok(), "redis 应在白名单内");
         assert!(check_driver("mongodb").is_err(), "未知驱动必须拒绝");
+    }
+
+    /// 注入失败时，并发等待者**共享**这一次失败的结论：
+    /// 只发生一次网络往返，其余调用者直接拿到同一个错误，不各自重试。
+    ///
+    /// 旧实现（`Mutex<bool>` held across I/O）在这里会得到 `CALLERS` 次串行往返。
+    #[test]
+    fn concurrent_session_init_failure_is_shared() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const CALLERS: usize = 6;
+        let state = SessionInitState::new();
+        let attempts = AtomicUsize::new(0);
+        let started = AtomicUsize::new(0);
+        let outcomes = std::sync::Mutex::new(Vec::new());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let state = &state;
+            let attempts = &attempts;
+            // 注入者：进入闭包（此时 in_flight 已为真）后卡住，等其余调用者就位
+            scope.spawn(move || {
+                let _ = ensure_init_with(state, || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                    Err(ProtocolError::ServerError("注入失败".into()))
+                });
+            });
+            // 确认注入已在飞（闭包只可能在 in_flight 置位后运行）——这一步保证
+            // 后面启动的调用者必然走等待分支，不会自己抢到「初始者」角色
+            entered_rx.recv().expect("注入者应已进入闭包");
+            for _ in 0..CALLERS {
+                let started_ref = &started;
+                let outcomes_ref = &outcomes;
+                scope.spawn(move || {
+                    started_ref.fetch_add(1, Ordering::SeqCst);
+                    let result = ensure_init_with(state, || {
+                        // 若这里被调用，说明等待者错误地各自重试了一次往返
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    });
+                    outcomes_ref
+                        .lock()
+                        .unwrap()
+                        .push(result.map_err(|error| error.to_string()));
+                });
+            }
+            // 所有调用者都已到达调用点；留出落到条件变量上的时间（测试侧同步）
+            while started.load(Ordering::SeqCst) < CALLERS {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = release_tx.send(());
+        });
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "同一次注入尝试只应发生一次往返（旧实现会重试 {CALLERS} 次）"
+        );
+        let outcomes = outcomes.lock().unwrap();
+        assert_eq!(outcomes.len(), CALLERS);
+        for outcome in outcomes.iter() {
+            let error = outcome.as_ref().expect_err("等待者应共享失败结论");
+            assert!(error.contains("注入失败"), "应复用注入者的错误：{error}");
+        }
+    }
+
+    /// 失败的尝试必须复位状态：**下一个新调用者**可以重试；就绪后不再注入。
+    #[test]
+    fn session_init_retries_after_failure_then_short_circuits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let state = SessionInitState::new();
+        let attempts = AtomicUsize::new(0);
+        let first = ensure_init_with(&state, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ProtocolError::ServerError("第一次失败".into()))
+        });
+        assert!(first.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        // 新调用者（不是等待者）可以重试 —— 保留「瞬时故障下次可用」
+        let second = ensure_init_with(&state, || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(second.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        // 已就绪：闭包不应再被调用
+        assert!(
+            ensure_init_with(&state, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_ok()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "就绪后不应再次注入");
     }
 
     /// AEAD：真实 PHP 往返（HKDF + AES-256-GCM + 序号递增 + 重放拒绝）。
