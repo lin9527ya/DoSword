@@ -2159,6 +2159,24 @@ fn native_call_json(
     let plain = crate::protocol::transport::gunzip_bytes_if_needed(plain);
     let value: Value = serde_json::from_slice(&plain)
         .map_err(|_| ProtocolError::ParseError("响应内容不是合法 JSON".to_string()))?;
+    // 录制（旁路，未开启时直接返回）：与 JSP 侧同一套脱敏与 data 长度口径，
+    // 回放只校验「外层 JSON → data → gunzip」这一段不需要密钥的管线。
+    let record_key = crate::protocol::recorder::key(PHP_PROTOCOL_ID, &php.endpoint);
+    crate::protocol::recorder::append(
+        &record_key,
+        &crate::protocol::recorder::Frame {
+            ts_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or_default(),
+            protocol_id: PHP_PROTOCOL_ID.to_string(),
+            action: action.to_string(),
+            request: crate::protocol::recorder::redact_text(request, &php.password),
+            response: text.to_string(),
+            data_len: data.len(),
+            ok: true,
+        },
+    );
     if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         let message = value
             .get("error")
