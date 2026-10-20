@@ -85,6 +85,15 @@ export function RequestDebugView() {
   const [templateName, setTemplateName] = useState("");
   const [toolInput, setToolInput] = useState("");
   const [toolOutput, setToolOutput] = useState("");
+  // 会话录制（S2）：key = `${protocolId}|${endpoint}`，与后端 recorder::key 一致
+  const [recEndpoint, setRecEndpoint] = useState("");
+  const [recPath, setRecPath] = useState("");
+  const [activeKeys, setActiveKeys] = useState<string[]>([]);
+  const [replayReport, setReplayReport] = useState<{
+    total: number;
+    passed: number;
+    failures: { index: number; reason: string }[];
+  } | null>(null);
 
   useEffect(() => {
     try {
@@ -113,6 +122,71 @@ export function RequestDebugView() {
     const sum = records.reduce((acc, r) => acc + (r.durationMs || 0), 0);
     return `${Math.round(sum / records.length)} ms`;
   }, [records]);
+
+  const recKey = useMemo(() => {
+    if (!recEndpoint) return "";
+    const record = records.find((item) => item.endpoint === recEndpoint);
+    return record ? `${record.protocolId}|${record.endpoint}` : "";
+  }, [records, recEndpoint]);
+
+  // 挂载时同步一次「正在录制」状态（页面刷新后按钮状态不丢）
+  useEffect(() => {
+    void api
+      .recordingStatus()
+      .then(setActiveKeys)
+      .catch(() => setActiveKeys([]));
+  }, []);
+
+  async function refreshRecording() {
+    try {
+      setActiveKeys(await api.recordingStatus());
+    } catch {
+      setActiveKeys([]);
+    }
+  }
+
+  async function startRecording() {
+    if (!recKey || !recPath.trim()) return;
+    try {
+      const protocolId = recKey.split("|")[0];
+      await api.recordingStart(recKey, recPath.trim(), protocolId);
+      await refreshRecording();
+      toast.success(`已开始录制：${recPath.trim()}`, "录制已开启");
+    } catch (cause) {
+      toast.error(errorText(cause), "开始录制失败");
+    }
+  }
+
+  async function stopRecording() {
+    if (!recKey) return;
+    try {
+      const stopped = await api.recordingStop(recKey);
+      await refreshRecording();
+      toast.info(stopped ? `已保存到 ${stopped}` : "该目标未在录制", "录制已停止");
+    } catch (cause) {
+      toast.error(errorText(cause), "停止录制失败");
+    }
+  }
+
+  async function replayRecording() {
+    if (!recPath.trim()) return;
+    try {
+      const report = (await api.recordingReplay(recPath.trim())) as {
+        total: number;
+        passed: number;
+        failures: { index: number; reason: string }[];
+      };
+      setReplayReport(report);
+      if (report.failures.length === 0) {
+        toast.success(`回放通过：${report.passed}/${report.total} 帧`, "回放完成");
+      } else {
+        toast.error(`${report.failures.length} 帧漂移，见下方明细`, "回放发现问题");
+      }
+    } catch (cause) {
+      setReplayReport(null);
+      toast.error(errorText(cause), "回放失败");
+    }
+  }
 
   async function clear() {
     try {
@@ -640,6 +714,68 @@ export function RequestDebugView() {
             />
           ) : (
             <div className="debug-list">
+              <div
+                style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", padding: "0 0 10px" }}
+              >
+                <span className="eyebrow" style={{ margin: 0 }}>会话录制</span>
+                <select
+                  className="select"
+                  value={recEndpoint}
+                  onChange={(event) => setRecEndpoint(event.target.value)}
+                >
+                  <option value="">选择目标 endpoint</option>
+                  {endpoints.map((endpoint) => (
+                    <option key={endpoint} value={endpoint}>
+                      {endpoint}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  className="input"
+                  style={{ minWidth: 260 }}
+                  placeholder="录制文件路径（.jsonl）"
+                  value={recPath}
+                  onChange={(event) => setRecPath(event.target.value)}
+                />
+                <button
+                  className="button primary compact"
+                  disabled={!recKey || !recPath.trim() || activeKeys.includes(recKey)}
+                  onClick={() => void startRecording()}
+                >
+                  开始
+                </button>
+                <button
+                  className="button secondary compact"
+                  disabled={!recKey || !activeKeys.includes(recKey)}
+                  onClick={() => void stopRecording()}
+                >
+                  停止
+                </button>
+                <button
+                  className="button secondary compact"
+                  disabled={!recPath.trim()}
+                  onClick={() => void replayRecording()}
+                >
+                  回放
+                </button>
+                <span className="mono" style={{ fontSize: 12, color: "var(--muted)" }}>
+                  {activeKeys.length > 0 ? `录制中：${activeKeys.length}` : "未录制"}
+                </span>
+              </div>
+              {replayReport && (
+                <div className="debug-item" style={{ padding: 10, marginBottom: 8 }}>
+                  <div style={{ fontSize: 12 }}>
+                    回放 {replayReport.total} 帧，通过 {replayReport.passed} 帧
+                    {replayReport.failures.length > 0 ? `，${replayReport.failures.length} 帧漂移` : "，全部一致"}
+                  </div>
+                  {replayReport.failures.slice(0, 5).map((failure) => (
+                    <div key={failure.index} style={{ fontSize: 12, color: "var(--danger, #d9534f)" }}>
+                      第 {failure.index} 帧：{failure.reason}
+                    </div>
+                  ))}
+                </div>
+              )}
+
               {filtered.map((record) => (
                 <article
                   className={`debug-item ${expanded === record.id ? "open" : ""}`}
