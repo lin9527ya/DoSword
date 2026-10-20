@@ -166,7 +166,7 @@ mod drift_tests {{
             bytes.starts_with(&[0xca, 0xfe, 0xba, 0xbe]),
             "不是 JVM class 文件"
         );
-        let needle = super::FILTER_CLASS_NAME.as_bytes();
+        // class 文件常量池里是 JVM 内部名（dsw/TokenFilter），不是点号形式\n        let needle = super::FILTER_CLASS_NAME.replace('.', "/").into_bytes();
         assert!(
             bytes.windows(needle.len()).any(|window| window == needle),
             "class 里找不到 {{}}",
