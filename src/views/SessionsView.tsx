@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect } from "react";
 import {
   ExternalLink,
   LoaderCircle,
@@ -10,27 +10,26 @@ import { api, errorText, shortTime } from "../api";
 import type { SessionInfo } from "../api";
 import { Empty, ErrorBanner, Panel } from "../components/common";
 import { useToast } from "../components/Toast";
+import { useAsync } from "../hooks/useAsync";
 import type { View } from "./types";
+
+/** 空列表常量：保持引用稳定，避免每次渲染都造新数组 */
+const EMPTY_SESSIONS: SessionInfo[] = [];
 
 export function SessionsView({ onNavigate }: { onNavigate: (view: View) => void }) {
   const toast = useToast();
-  const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError("");
-    try {
-      setSessions(await api.listSessions());
-    } catch (cause) {
-      const msg = errorText(cause);
-      setError(msg);
-      toast.error(msg, "读取会话失败");
-    } finally {
-      setLoading(false);
-    }
-  }, [toast]);
+  // loading / error / 乱序响应交给 useAsync（加载器是「取一份数据 → 设一个主状态」）；
+  // 心跳会改这份数据，故把 setData 取出来复用
+  const {
+    data,
+    setData: setSessions,
+    loading,
+    error,
+    reload: load,
+  } = useAsync(() => api.listSessions(), {
+    onError: (message) => toast.error(message, "读取会话失败"),
+  });
+  const sessions = data ?? EMPTY_SESSIONS;
 
   // W4 心跳：空闲时每 45s 探活一次，失败只更新 stale 状态（不打断页面）
   const heartbeat = useCallback(async () => {
@@ -39,13 +38,12 @@ export function SessionsView({ onNavigate }: { onNavigate: (view: View) => void 
     } catch {
       // 会话可能已被清理：保留现有列表，下次手动刷新
     }
-  }, []);
+  }, [setSessions]);
 
   useEffect(() => {
-    void load();
     const timer = window.setInterval(() => void heartbeat(), 45_000);
     return () => window.clearInterval(timer);
-  }, [load, heartbeat]);
+  }, [heartbeat]);
 
   async function disconnect(sessionId: string) {
     try {

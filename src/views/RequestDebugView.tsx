@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeftRight,
   CheckCircle2,
@@ -20,6 +20,7 @@ import { api, errorText, shortTime } from "../api";
 import type { HttpSendResult, RequestRecord } from "../api";
 import { Empty, ErrorBanner, Metric, Panel } from "../components/common";
 import { useToast } from "../components/Toast";
+import { useAsync } from "../hooks/useAsync";
 
 const ACTION_LABELS: Record<string, string> = {
   probe: "探测握手",
@@ -61,11 +62,16 @@ function emptyRequest(): RepeaterState {
   };
 }
 
+/** 空列表常量：保持引用稳定，避免每次渲染都造新数组 */
+const EMPTY_RECORDS: RequestRecord[] = [];
+
 export function RequestDebugView() {
   const toast = useToast();
-  const [records, setRecords] = useState<RequestRecord[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  // loading / error / 乱序响应交给 useAsync（加载器是「取一份数据 → 设一个主状态」）
+  const { data, loading, error, setError, reload: load } = useAsync(() => api.listRequestLog(), {
+    onError: (message) => toast.error(message, "加载请求日志失败"),
+  });
+  const records = data ?? EMPTY_RECORDS;
   const [activeTab, setActiveTab] = useState<"repeater" | "logs" | "tools">("repeater");
   const [expanded, setExpanded] = useState<number | null>(null);
   const [endpointFilter, setEndpointFilter] = useState("");
@@ -80,28 +86,13 @@ export function RequestDebugView() {
   const [toolInput, setToolInput] = useState("");
   const [toolOutput, setToolOutput] = useState("");
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError("");
-    try {
-      setRecords(await api.listRequestLog());
-    } catch (cause) {
-      const msg = errorText(cause);
-      setError(msg);
-      toast.error(msg, "加载请求日志失败");
-    } finally {
-      setLoading(false);
-    }
-  }, [toast]);
-
   useEffect(() => {
-    void load();
     try {
       setTemplates(JSON.parse(localStorage.getItem(TEMPLATE_KEY) ?? "[]"));
     } catch {
       setTemplates([]);
     }
-  }, [load]);
+  }, []);
 
   const endpoints = useMemo(() => [...new Set(records.map((record) => record.endpoint))], [records]);
 
