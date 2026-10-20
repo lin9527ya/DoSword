@@ -491,6 +491,10 @@ impl Protocol for JvmLikeProtocol {
         // 双重切片 bug：stub 支持偏移读写（chunked 能力）时服务端已按 o/l 返回切片，
         // 本端再从 offset 切一次 → offset>0 的第二次读取必然拿到空块。
         // 只有旧 stub（无 chunked 能力、忽略 o/l 返回整文件）才需要本端切片。
+        //
+        // 能力探测**失败**不影响正确性：能力位只是快路径，真正的判据在 `slice_chunk`
+        // 的长度守卫（响应不比请求长 → 信任 stub 已按偏移切好）。所以这里不把探测失败
+        // 升级成错误 —— 那会把一次本来能成功的读取变成失败。
         let stub_seeks = ensure_info(jsp, settings)
             .ok()
             .and_then(|info| info.capabilities)
@@ -516,6 +520,29 @@ impl Protocol for JvmLikeProtocol {
             .as_any()
             .downcast_ref::<JspSession>()
             .ok_or_else(|| ProtocolError::SessionInvalid("会话类型不匹配".into()))?;
+        // 偏移写只在 stub 真的会 seek 时才安全：**忽略 o 的 stub 会从 0 覆写**，
+        // 而分块上传每块偏移递增 → 远端最后只剩最后一块（静默数据损坏，
+        // `upload_file` 按 chunk_size_mb 分块递增偏移，见 commands.rs）。
+        //
+        // 判据有意偏保守，只拦「有证据不能用」的情况：
+        // - stub **明确上报**了能力清单且不含 chunked → 拒绝 offset>0；
+        // - 能力未知（旧 stub 未上报 / 探测失败）→ 放行，保持兼容。JSP 侧没有 PHP 的
+        //   `ChunkedTransfer` 折算位（stub 的 info 表只有 ProtoVersion/Capabilities/
+        //   ShellType），而**偏移支持（2026-08-14）比能力上报（2026-10-19）早两个月**
+        //   —— 这中间的 stub 会 seek 却不上报能力，一律拒绝会把它们现在能用的上传打断；
+        // - offset == 0 不涉及 seek，永远放行。
+        if offset > 0
+            && let Ok(info) = ensure_info(jsp, settings)
+            && let Some(capabilities) = info.capabilities.as_ref()
+            && !capabilities.supports_chunked()
+        {
+            return Err(ProtocolError::NotSupported(
+                "目标 stub 明确不支持分块偏移（能力清单里没有 chunked），\n\
+                 拒绝按偏移写入 —— 否则远端文件会被逐块从 0 覆写、只剩最后一块。\n\
+                 请用当前版本重新生成并上传 stub，或改用一次性整文件写入"
+                    .to_string(),
+            ));
+        }
         let b64 = base64::engine::general_purpose::STANDARD.encode(content);
         form_call(
             jsp,
@@ -1695,6 +1722,91 @@ mod tests {
     use super::*;
     use dosword_sdk::domain::AppSettings;
     use dosword_sdk::encoder::NativeEncoder;
+
+    /// 构造一份最小探测结果：`current_dir` 非空才会命中 `ensure_info` 的缓存。
+    fn probe_with(capabilities: Option<&str>) -> ProbeResult {
+        ProbeResult {
+            status: "online".into(),
+            server: String::new(),
+            web_server: String::new(),
+            runtime: String::new(),
+            current_dir: "/tmp".into(),
+            separator: "/".into(),
+            message: String::new(),
+            php_sapi: String::new(),
+            arch: String::new(),
+            extensions: Vec::new(),
+            disable_functions: String::new(),
+            info: std::collections::HashMap::new(),
+            capabilities: capabilities.map(|list| TargetCapabilities {
+                proto_version: 2,
+                capabilities: list.split(',').map(str::to_string).collect(),
+                shell_type: "file".into(),
+            }),
+        }
+    }
+
+    fn session_with_info(info: Option<ProbeResult>) -> JspSession {
+        JspSession {
+            protocol_id: "builtin.jsp.v1".into(),
+            // 不可达端口：任何真正的网络调用都会失败 —— 用来区分「被门禁拦下」
+            // 与「放行后走到网络才失败」
+            endpoint: "http://127.0.0.1:1/shell.jsp".into(),
+            password: "secret".into(),
+            client: crate::protocol::transport::build_client(&settings()),
+            encoder: &NativeEncoder { crypto: "xor" },
+            aead: None,
+            info: Mutex::new(info),
+            cwd: Mutex::new(String::new()),
+        }
+    }
+
+    /// 偏移写：stub **明确**上报了能力清单且不含 chunked 时必须拒绝 ——
+    /// 否则忽略 o 的 stub 会逐块从 0 覆写，分块上传只剩最后一块。
+    #[test]
+    fn write_chunk_at_offset_is_rejected_when_stub_reports_no_chunked() {
+        // 明确上报了能力，但清单里没有 chunked
+        let session = session_with_info(Some(probe_with(Some("stream,db,exec"))));
+        let error = JspProtocol
+            .write_chunk(&session, "/tmp/x", b"0123456789", 4, &settings())
+            .expect_err("明确不支持偏移时必须拒绝，而不是让远端被逐块覆写");
+        assert!(
+            error.to_string().contains("不支持分块偏移"),
+            "错误应说明是能力门禁：{error}"
+        );
+        // offset == 0 不涉及 seek：必须放行（走到网络才失败，而不是被门禁拦下）
+        let error = JspProtocol
+            .write_chunk(&session, "/tmp/x", b"0123456789", 0, &settings())
+            .expect_err("不可达端点必然失败");
+        assert!(
+            !error.to_string().contains("不支持分块偏移"),
+            "offset=0 不应被能力门禁拦下：{error}"
+        );
+    }
+
+    /// 偏移写：能力**未知**时放行（保持兼容）—— 旧 stub 里存在
+    /// 「实现了 o 但不上报 Capabilities」的情况，一律拒绝会打断现在能用的上传。
+    #[test]
+    fn write_chunk_at_offset_is_allowed_when_capability_is_unknown() {
+        // 1) 旧 stub：探测结果里没有 capabilities
+        let session = session_with_info(Some(probe_with(None)));
+        let error = JspProtocol
+            .write_chunk(&session, "/tmp/x", b"0123456789", 4, &settings())
+            .expect_err("不可达端点必然失败");
+        assert!(
+            !error.to_string().contains("不支持分块偏移"),
+            "能力未知时应放行（兼容旧 stub）：{error}"
+        );
+        // 2) 探测失败（缓存为空 + 端点不可达）同样放行
+        let session = session_with_info(None);
+        let error = JspProtocol
+            .write_chunk(&session, "/tmp/x", b"0123456789", 4, &settings())
+            .expect_err("不可达端点必然失败");
+        assert!(
+            !error.to_string().contains("不支持分块偏移"),
+            "探测失败时应放行：{error}"
+        );
+    }
 
     /// Python 模拟 JSP stub（同协议：XOR + hash 分发 + formData + X-Debug-Key）。
     const JSP_MOCK: &str = r#"
