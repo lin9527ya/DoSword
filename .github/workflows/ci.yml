@@ -113,7 +113,13 @@ jobs:
 
       - name: Rust 依赖漏洞扫描
         # 只对 vulnerability 失败；unmaintained / unsound / yanked 属 warning，不阻塞
-        run: cargo audit
+        # 忽略项与 deny.toml 的 advisories.ignore 保持一致：
+        # wasmtime 49.0.3 的两条公告（crates.io 尚无 49.0.4/48.0.7 稳定版）。
+        # 上游发布修复版本后：cargo update -p wasmtime，并同时删除此处的 --ignore 与 deny.toml 条目。
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0378
+          --ignore RUSTSEC-2026-0379
 
       - name: 依赖策略（cargo-deny：许可 / 来源 / 重复版本 / yanked）
         uses: EmbarkStudios/cargo-deny-action@v2
