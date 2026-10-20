@@ -112,7 +112,12 @@
     三个只读资源（经脱敏层、审计详情截断）与提示词 `dosword_guidance`
     （授权边界、三级权限、执行级确认流程、安全用法）；`get_info` 已宣告 resources/prompts 能力
   - 明确不暴露：Workspace/Shell 增删改、插件安装、改设置、本地文件读写、`http_send`、PTY
-  - 录制入口（S2 续）：请求调试页「底层交互日志」顶部新增录制工具条——按 endpoint 选目标、
+  - Java 内存马前置通道（S4 第一步）：新增 `memshell/java.rs` —— 一次性页面模板
+  （只认 `X-DSW-TOKEN`，逐字符异或比较防时序/前缀泄露，`op=ping` 与 `op=remove` 自删除）、
+  由 token 派生的不可预测页面名、路径拼接；4 个单测覆盖令牌门禁、自删除、占位符替换
+  与字面量转义。**刻意不含注入逻辑**：Filter 注入需要构建期内嵌已编译字节码 +
+  全新实例可卸载 + 容器 E2E，且模板里连 `addFilterMap`/`defineClass` 都断言不出现，
+  避免留下"看着能用实际没验证"的踏脚石。该形态不进 `memshell_capabilities`- 录制入口（S2 续）：请求调试页「底层交互日志」顶部新增录制工具条——按 endpoint 选目标、
   填 `.jsonl` 路径、开始/停止/回放，回放结果就地展示帧数与漂移明细；页面挂载时同步
   一次「正在录制」状态，刷新后按钮状态不丢- 会话录制与离线回放（S2，核心闭环）：新增 `protocol/recorder.rs` —— 按
   `protocol_id|endpoint` 归档、JSONL 一行一帧、密码经 `reqlog` 同一套规则脱敏、

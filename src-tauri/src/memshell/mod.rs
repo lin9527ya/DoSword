@@ -12,6 +12,7 @@
 //! 且存在 classloader 回收陷阱，另行排期。
 
 pub mod fcgi;
+pub mod java;
 pub mod php;
 
 use dosword_sdk::domain::ProbeResult;
