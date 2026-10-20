@@ -2,7 +2,7 @@
 # 钉死具体版本，不用 "stable"：
 # CI 的 clippy 门禁是 -D warnings，stable 每次发布若引入新 lint，CI 会突然变红、
 # 且与本地工具链不一致（本项目已被 rust 1.98 的 chunks_exact_to_as_chunks 命中过一次）。
-# 升级工具链请显式改这里 + .github/workflows/ci.yml 的 action ref，作为一次独立提交。
+# 升级工具链请显式改这里 + ci.yml / release.yml 的 action ref（共三处），作为一次独立提交。
 # 注：edition 2024 要求 >= 1.85。
 channel = "1.98.1"
 components = ["clippy", "rustfmt"]

@@ -39,8 +39,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: 安装 Rust 工具链（版本来自 rust-toolchain.toml）
-        uses: dtolnay/rust-toolchain@stable
+      # 与 ci.yml / rust-toolchain.toml 用同一版本：@stable 是浮动的，会绕过
+      # rust-toolchain.toml（且新 stable 引入新 lint/行为时，发布构建会无预警变化）。
+      # 升级工具链时三处一起改。
+      - name: 安装 Rust 工具链（版本与 rust-toolchain.toml 一致，不用浮动的 stable）
+        uses: dtolnay/rust-toolchain@1.98.1
 
       - uses: Swatinem/rust-cache@v2
 
