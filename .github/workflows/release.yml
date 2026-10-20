@@ -1,9 +1,9 @@
 name: Release
 
 # 仅在打 tag（v*）或手动触发时运行，不影响 main 的 CI。
-# 产物：三平台 dosword-cli 二进制（未签名）+ 校验和。
-# 说明：桌面安装包（msi/dmg/AppImage）需要各平台签名与打包依赖，
-# 目前只发布 CLI——它与桌面端同 crate、同服务层、同数据目录。
+# 产物：三平台 dosword-cli 二进制（未签名）+ 三平台桌面安装包（未签名）。
+# 签名：配置 TAURI_SIGNING_PRIVATE_KEY / _PASSWORD 后 tauri-action 会自动签名，
+#       未配置则产出未签名包（内部评估可用，不要对外分发）。
 on:
   push:
     tags:
@@ -11,11 +11,25 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  # 版本守卫先行：tag 与代码版本不一致时，后续 job 全部不跑，避免产出
+  # 「tag 说 0.2.0、二进制里是 0.1.0」的包。
+  guard:
+    name: 版本守卫
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: 校验 tag 与 package.json / Cargo.toml / tauri.conf.json 一致
+        run: node scripts/check-version.mjs
+
   cli:
     name: 构建 dosword-cli（${{ matrix.artifact }}）
+    needs: guard
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -39,11 +53,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      # 与 ci.yml / rust-toolchain.toml 用同一版本：@stable 是浮动的，会绕过
-      # rust-toolchain.toml（且新 stable 引入新 lint/行为时，发布构建会无预警变化）。
-      # 升级工具链时三处一起改。
-      - name: 安装 Rust 工具链（版本与 rust-toolchain.toml 一致，不用浮动的 stable）
-        uses: dtolnay/rust-toolchain@1.98.1
+      - name: 安装 Rust 工具链（版本来自 rust-toolchain.toml）
+        uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
@@ -70,3 +81,68 @@ jobs:
             target/release/${{ matrix.bin }}
             target/release/${{ matrix.bin }}.sha256
           if-no-files-found: error
+
+  desktop:
+    name: 桌面安装包（${{ matrix.platform }}）
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            os: ubuntu-22.04
+          - platform: windows-x64
+            os: windows-latest
+          - platform: macos-arm64
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Linux 系统依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: pnpm/action-setup@v4
+        with:
+          # 版本取自 package.json 的 packageManager 字段（pnpm@11.21.0）
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: 安装 Rust 工具链（版本来自 rust-toolchain.toml）
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      # beforeBuildCommand（pnpm build）由 tauri 自己执行，这里不重复构建
+      - name: 构建安装包
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # tag 触发时创建草稿 Release；手动触发只产 artifact，不碰 Release
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseDraft: true
+
+      - name: 上传安装包 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dosword-desktop-${{ matrix.platform }}
+          path: |
+            src-tauri/target/release/bundle/**
+            src-tauri/target/**/release/bundle/**
+          if-no-files-found: warn

@@ -112,7 +112,10 @@
     三个只读资源（经脱敏层、审计详情截断）与提示词 `dosword_guidance`
     （授权边界、三级权限、执行级确认流程、安全用法）；`get_info` 已宣告 resources/prompts 能力
   - 明确不暴露：Workspace/Shell 增删改、插件安装、改设置、本地文件读写、`http_send`、PTY
-  - 工程化（P4 续）：新增 `deny.toml` 与 CI `cargo-deny`（许可白名单 / 来源限制 / 重复版本 /
+  - 发布（S3）：`release.yml` 增 `desktop` job（tauri-action，三平台安装包，未签名可直接产出；
+  配置 `TAURI_SIGNING_PRIVATE_KEY` 后自动签名）+ `guard` job（tag 与版本不一致时后续
+  job 全部不跑），CLI job 改为 `needs: guard`。手动触发只产 artifact、不碰 Release，
+  tag 触发创建草稿 Release- 工程化（P4 续）：新增 `deny.toml` 与 CI `cargo-deny`（许可白名单 / 来源限制 / 重复版本 /
   yanked 依赖），首次运行即发现 wasmtime 49.0.3 的两条公告——因 crates.io 尚无修复版本
   （49.0.4 / 48.0.7 未发布稳定版），暂以带原因的 `ignore` 记录，解除条件写在配置里；
   新增 `scripts/check-version.mjs` 与 CI 版本一致性检查（package.json / Cargo.toml /
