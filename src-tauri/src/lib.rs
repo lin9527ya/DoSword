@@ -24,6 +24,23 @@ use storage::Database;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
+/// 应用全局状态。
+///
+/// # 锁序约定（务必遵守）
+///
+/// `database` 与 `sessions` 是两把**全局**锁，任何时刻都不得同时持有 ——
+/// 需要「先改库再刷会话缓存」的，把库操作放进自己的作用域、出了作用域再取会话锁；
+/// 需要「先读会话再写审计」的，短锁取出参数、释放后再写库。
+///
+/// 为什么约定「干脆不嵌套」而不是「固定一个先后顺序」：
+/// - `sessions` 是全局的，任何一次嵌套都会让一次库访问（含 fsync）挡住**所有**会话的操作；
+/// - `database` 的调用点极多，靠「顺序」约束很容易被后续改动破坏。
+///
+/// 参考实现：`commands::session_ctx` / `commands::with_session`（短锁取 `Arc` 克隆，
+/// 网络调用在锁外执行）。
+///
+/// 历史：`connect_shell_impl`（锁内读库取授权快照）、`disconnect_shell_impl` 与
+/// `run_feature_plugin`（锁内写审计）三处曾违反该约定，已修。
 pub struct AppState {
     database: Mutex<Database>,
     sessions: Mutex<SessionManager>,

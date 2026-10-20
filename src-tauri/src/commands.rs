@@ -1304,9 +1304,14 @@ pub async fn run_feature_plugin(
                     .join("&")
             })
             .unwrap_or_default();
-        if let Ok(mut sessions) = state.sessions.lock()
-            && let Ok(session) = sessions.get_mut(&session_id)
-        {
+        // 审计：短锁取出目标标识后**释放会话锁**再写库（锁序约定见 AppState 文档）
+        let audit_target = state.sessions.lock().ok().and_then(|mut sessions| {
+            sessions
+                .get_mut(&session_id)
+                .ok()
+                .map(|session| (session.workspace_id.clone(), session.profile_id.clone()))
+        });
+        if let Some((workspace_id, profile_id)) = audit_target {
             let _ = state
                 .database
                 .lock()
@@ -1314,8 +1319,8 @@ pub async fn run_feature_plugin(
                 .and_then(|database| {
                     database
                         .record_audit(
-                            Some(&session.workspace_id),
-                            Some(&session.profile_id),
+                            Some(&workspace_id),
+                            Some(&profile_id),
                             "plugin.run",
                             "success",
                             &format!("插件：{plugin_id}（{summary}）"),
@@ -1916,6 +1921,19 @@ pub fn connect_shell_impl(
         .connect(&shell, &settings)
         .map_err(|error| audit_fail(state, &shell, "shell.connect", error))?;
 
+    // P5：授权过期时间快照。**必须在取会话锁之前读库** —— 会话锁是全局的，
+    // 锁内再取库锁会让一次库访问挡住所有会话的操作（锁序约定见 AppState 文档）。
+    let expires_snapshot = {
+        let database = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?;
+        database
+            .workspace(&shell.workspace_id)
+            .ok()
+            .flatten()
+            .and_then(|workspace| workspace.expires_at)
+    };
     let session_id = {
         let mut sessions = state
             .sessions
@@ -1932,18 +1950,7 @@ pub fn connect_shell_impl(
             Arc::from(session_state),
             probe.clone(),
         );
-        // P6：连接时缓存上下文（避免每命令重复查库）；P5：快照授权过期时间
-        let expires_snapshot = {
-            let database = state
-                .database
-                .lock()
-                .map_err(|_| "数据库锁异常".to_string())?;
-            database
-                .workspace(&shell.workspace_id)
-                .ok()
-                .flatten()
-                .and_then(|workspace| workspace.expires_at)
-        };
+        // P6：连接时缓存上下文（避免每命令重复查库）
         if let Ok(session) = sessions.get_mut(&session_id) {
             session.profile = Some(shell.clone());
             session.settings = Some(settings.clone());
@@ -2215,23 +2222,29 @@ pub async fn disconnect_shell(session_id: String, app: AppHandle) -> Result<(), 
 
 /// 断开会话的内部实现（命令层与 Playbook 共用）。
 pub fn disconnect_shell_impl(state: &AppState, session_id: &str) -> Result<(), String> {
-    if let Some(session) = state
-        .sessions
-        .lock()
-        .map_err(|_| "会话锁异常".to_string())?
-        .remove(session_id)
-    {
-        // F2：断开会话时级联清理其全部 PTY 流
-        state.ptys.close_for_session(session_id);
-        audit(
-            state,
-            &session.workspace_id,
-            Some(&session.profile_id),
-            "shell.disconnect",
-            "success",
-            "断开连接",
-        );
-    }
+    // 先把会话取出来并**释放会话锁**：`if let Some(x) = state.sessions.lock()?.remove(..)`
+    // 的临时守卫会活到整个 if-let 结束，于是下面的 audit（写库 + fsync）全程持全局会话锁，
+    // 挡住其他会话的一切操作（锁序约定见 AppState 文档）。
+    let removed = {
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "会话锁异常".to_string())?;
+        sessions.remove(session_id)
+    };
+    let Some(session) = removed else {
+        return Ok(());
+    };
+    // F2：断开会话时级联清理其全部 PTY 流
+    state.ptys.close_for_session(session_id);
+    audit(
+        state,
+        &session.workspace_id,
+        Some(&session.profile_id),
+        "shell.disconnect",
+        "success",
+        "断开连接",
+    );
     Ok(())
 }
 
@@ -4910,6 +4923,66 @@ mod tests {
             Arc::from(session),
             probe,
         )
+    }
+
+    /// P5：连接时把 Workspace 授权过期时间快照进会话（此后复查免查库）。
+    /// 该读取在**会话锁之外** —— 锁序约定见 `AppState` 文档。
+    #[test]
+    fn connect_shell_snapshots_workspace_expiry() {
+        let state = app_state();
+        let expires = "2030-01-01T00:00:00+08:00".to_string();
+        let workspace_id = add_workspace(
+            &mut state.database.lock().unwrap(),
+            "localhost",
+            Some(expires.clone()),
+        );
+        let shell = add_shell(&state, &workspace_id, MOCK_PROTOCOL_ID);
+        let (_result, session_id) = connect_shell_impl(&state, &shell.id).expect("连接应成功");
+        let snapshot = state
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&session_id)
+            .expect("会话应存在")
+            .workspace_expires_at
+            .clone();
+        assert_eq!(snapshot, Some(expires), "连接时应快照授权过期时间");
+    }
+
+    /// 断开会话：会话被移除 + 写 `shell.disconnect` 审计。
+    /// 审计在**会话锁之外**执行（此前临时守卫会活到 if-let 结束，把一次写库+fsync
+    /// 全程压在全局会话锁上）。
+    #[test]
+    fn disconnect_shell_removes_session_and_audits() {
+        let state = app_state();
+        let workspace_id = add_workspace(&mut state.database.lock().unwrap(), "localhost", None);
+        let shell = add_shell(&state, &workspace_id, MOCK_PROTOCOL_ID);
+        let session_id = register_session(&state, &shell);
+
+        disconnect_shell_impl(&state, &session_id).expect("断开应成功");
+        assert!(
+            state.sessions.lock().unwrap().get_mut(&session_id).is_err(),
+            "会话应已被移除"
+        );
+        let (_, events) = state
+            .database
+            .lock()
+            .unwrap()
+            .query_audit(&AuditFilter {
+                workspace_id: None,
+                shell_id: Some(shell.id.clone()),
+                action: None,
+                outcome: None,
+                limit: None,
+                offset: None,
+            })
+            .expect("审计查询应成功");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "shell.disconnect"),
+            "应写入 shell.disconnect 审计：{events:?}"
+        );
     }
 
     /// W6 CLI：运行期设置覆盖只影响 effective_settings，不写回数据库。
