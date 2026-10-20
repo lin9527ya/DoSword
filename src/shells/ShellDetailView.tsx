@@ -107,12 +107,13 @@ export function ShellDetailView({
 
   // 拉取 Shell 档案与协议能力：只依赖 shellId。
   // 此前依赖 ensureConnected（随 sessionId/info 变化），导致每次会话状态更新
-  // 都重新拉一次 dashboard + listProtocols（打开一个 Shell 会发 3 次 dashboard）。
+  // 都重新拉一次 dashboard + listProtocols（打开一个 Shell 会发 3 次 dashboard）；
+  // 且为了定位**一个** Shell 要拉回整个看板（含全量 Shell 与明文密码）——
+  // 现在直接按 id 取单个。
   useEffect(() => {
     void api
-      .dashboard()
-      .then((data) => {
-        const profile = data.shells.find((item) => item.id === shellId);
+      .getShell(shellId)
+      .then((profile) => {
         if (!profile) return;
         setShell(profile);
         void api

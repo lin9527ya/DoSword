@@ -70,8 +70,95 @@ pub struct AuditPage {
 #[serde(rename_all = "camelCase")]
 pub struct Dashboard {
     pub workspaces: Vec<Workspace>,
-    pub shells: Vec<ShellProfile>,
+    /// Shell 库聚合：分页后前端不再持有全量列表，卡片计数/指标改由这里提供。
+    pub shell_stats: ShellStats,
     pub audit_events: Vec<AuditEvent>,
+}
+
+/// Shell 列表的精简视图：**不含连接密码**。
+///
+/// 列表展示与选择器用这个（需要完整配置去编辑时用 `get_shell`）——
+/// 既减小载荷，也避免把明文密码散进前端各处状态。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellSummary {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub endpoint: String,
+    pub runtime: String,
+    pub protocol_id: String,
+    pub status: String,
+    pub last_connected_at: Option<String>,
+    pub tags: Vec<String>,
+    /// 是否已配置连接密码（只暴露「有没有」，不暴露内容）
+    pub has_password: bool,
+}
+
+impl From<&ShellProfile> for ShellSummary {
+    fn from(profile: &ShellProfile) -> Self {
+        Self {
+            id: profile.id.clone(),
+            workspace_id: profile.workspace_id.clone(),
+            name: profile.name.clone(),
+            endpoint: profile.endpoint.clone(),
+            runtime: profile.runtime.clone(),
+            protocol_id: profile.protocol_id.clone(),
+            status: profile.status.clone(),
+            last_connected_at: profile.last_connected_at.clone(),
+            tags: profile.tags.clone(),
+            has_password: !profile.password.is_empty(),
+        }
+    }
+}
+
+/// Shell 库聚合（供看板卡片与指标）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellStats {
+    #[ts(type = "number")]
+    pub total: u64,
+    #[ts(type = "number")]
+    pub online: u64,
+    /// 全库最近一次连接时间（卡片「最近连接」用）
+    pub last_connected_at: Option<String>,
+    /// 全库已用标签（筛选项数据源）
+    pub tags: Vec<String>,
+    pub by_workspace: Vec<WorkspaceShellCount>,
+}
+
+/// 单个 Workspace 下的 Shell 数量。
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceShellCount {
+    pub workspace_id: String,
+    #[ts(type = "number")]
+    pub count: u64,
+}
+
+/// Shell 分页查询条件（服务端过滤 + 分页）。
+#[derive(Debug, Default, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellQuery {
+    /// 关键字：匹配 name / endpoint / runtime / tags
+    pub query: Option<String>,
+    pub workspace_id: Option<String>,
+    /// 标签精确匹配（按 JSON 数组元素匹配，不做子串）
+    pub tag: Option<String>,
+    pub status: Option<String>,
+    #[ts(type = "number | null")]
+    pub offset: Option<u64>,
+    #[ts(type = "number | null")]
+    pub limit: Option<u64>,
+}
+
+/// Shell 分页结果。
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellPage {
+    pub items: Vec<ShellSummary>,
+    #[ts(type = "number")]
+    pub total: u64,
 }
 
 #[derive(Debug, Deserialize, TS)]
@@ -719,6 +806,11 @@ mod ts_bindings {
         let types: Vec<(&str, String)> = vec![
             ("Workspace", Workspace::decl()),
             ("ShellProfile", ShellProfile::decl()),
+            ("ShellSummary", ShellSummary::decl()),
+            ("ShellStats", ShellStats::decl()),
+            ("WorkspaceShellCount", WorkspaceShellCount::decl()),
+            ("ShellQuery", ShellQuery::decl()),
+            ("ShellPage", ShellPage::decl()),
             ("AuditEvent", AuditEvent::decl()),
             ("AuditFilter", AuditFilter::decl()),
             ("AuditPage", AuditPage::decl()),

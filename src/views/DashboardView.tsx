@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   CirclePlus,
@@ -27,14 +27,28 @@ import {
   parseProtocolParams,
   supportsSessionMode,
 } from "../shells/encoders";
-import type { Dashboard, ProtocolMeta, ShellProfile, Workspace } from "../api";
+import type {
+  Dashboard,
+  ProtocolMeta,
+  ShellPage,
+  ShellProfile,
+  ShellSummary,
+  Workspace,
+} from "../api";
 import { Dialog } from "../components/Dialog";
 import { Empty, ErrorBanner, Metric, Panel } from "../components/common";
 import { GenerateShellDialog } from "../widgets/GenerateShellDialog";
 import { useToast } from "../components/Toast";
 import type { View } from "./types";
 
-const EMPTY_DASHBOARD: Dashboard = { workspaces: [], shells: [], auditEvents: [] };
+const EMPTY_DASHBOARD: Dashboard = {
+  workspaces: [],
+  shellStats: { total: 0, online: 0, lastConnectedAt: null, tags: [], byWorkspace: [] },
+  auditEvents: [],
+};
+
+/** 列表单页条数：与服务端 `query_shells` 的上限一致。 */
+const SHELL_PAGE_SIZE = 50;
 
 /** 解析标签输入（逗号/空格/顿号分隔，去重去空）。 */
 function parseTags(value: string): string[] {
@@ -70,7 +84,10 @@ export function DashboardView({
   const [dialog, setDialog] = useState<"workspace" | "shell" | "generate" | null>(null);
   const [editingWorkspace, setEditingWorkspace] = useState<Workspace | null>(null);
   const [editingShell, setEditingShell] = useState<ShellProfile | null>(null);
+  const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
+  /** Shell 列表走服务端分页：这里只保留当页与总数 */
+  const [shellPage, setShellPage] = useState<ShellPage>({ items: [], total: 0 });
   const [selected, setSelected] = useState<string[]>([]);
   const [batchTags, setBatchTags] = useState("");
   const [batchBusy, setBatchBusy] = useState(false);
@@ -102,56 +119,75 @@ export function DashboardView({
     void loadDashboard();
   }, [loadDashboard]);
 
+  // Shell 列表：服务端过滤 + 分页（此前是把全量 Shell 拉回前端再过滤、再切页）
+  const loadShells = useCallback(async () => {
+    try {
+      setShellPage(
+        await api.queryShells({
+          query: search.trim() || null,
+          workspaceId: workspaceFilter || null,
+          tag: tagFilter || null,
+          status: statusFilter || null,
+          offset: page * SHELL_PAGE_SIZE,
+          limit: SHELL_PAGE_SIZE,
+        }),
+      );
+    } catch (cause) {
+      toast.error(errorText(cause), "加载 Shell 列表失败");
+    }
+  }, [search, workspaceFilter, tagFilter, statusFilter, page, toast]);
+
+  useEffect(() => {
+    void loadShells();
+  }, [loadShells]);
+
+  // 关键字防抖：避免每敲一个字打一次服务端
+  useEffect(() => {
+    const timer = setTimeout(() => setSearch(searchInput), 250);
+    return () => clearTimeout(timer);
+  }, [searchInput]);
+
+  // 筛选条件变化 → 回到第一页（否则可能停在越界页）
+  useEffect(() => {
+    setPage(0);
+  }, [search, tagFilter, workspaceFilter, statusFilter]);
+
+  /** 数据变更后同时刷新看板聚合与当前页列表 */
+  const reload = useCallback(async () => {
+    await Promise.all([loadDashboard(), loadShells()]);
+  }, [loadDashboard, loadShells]);
+
   useEffect(() => {
     void api.listFeaturePlugins().then((plugins) => setPluginCount(plugins.length)).catch(() => {});
   }, []);
 
-  const lastConnected = useMemo(() => {
-    const times = data.shells
-      .map((shell) => shell.lastConnectedAt)
-      .filter((value): value is string => Boolean(value))
-      .sort()
-      .reverse();
-    return times.length > 0 ? shortTime(times[0]) : "—";
-  }, [data.shells]);
+  // 最近连接时间由看板聚合提供（列表已分页，前端不再持有全量）
+  const lastConnected = data.shellStats.lastConnectedAt
+    ? shortTime(data.shellStats.lastConnectedAt)
+    : "—";
 
   // Shell 状态自动刷新（60s 轮询，仅更新在线/错误状态）
   useEffect(() => {
     const timer = setInterval(() => {
-      void api.refreshShellStatus().then(() => loadDashboard()).catch(() => {});
+      void api.refreshShellStatus().then(() => reload()).catch(() => {});
     }, 60_000);
     return () => clearInterval(timer);
-  }, [loadDashboard]);
+  }, [reload]);
 
-  const allTags = useMemo(() => {
-    const tags = new Set<string>();
-    for (const shell of data.shells) for (const tag of shell.tags) tags.add(tag);
-    return [...tags].sort();
-  }, [data.shells]);
+  const pageCount = Math.max(1, Math.ceil(shellPage.total / SHELL_PAGE_SIZE));
+  const pageShells = shellPage.items;
 
-  const filteredShells = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    return data.shells.filter((shell) => {
-      if (workspaceFilter && shell.workspaceId !== workspaceFilter) return false;
-      if (tagFilter && !shell.tags.includes(tagFilter)) return false;
-      if (statusFilter && shell.status !== statusFilter) return false;
-      if (!query) return true;
-      return [shell.name, shell.endpoint, shell.runtime, ...shell.tags].some((value) =>
-        value.toLowerCase().includes(query),
-      );
-    });
-  }, [data.shells, search, tagFilter, workspaceFilter, statusFilter]);
+  // 当前页可能因筛选变化或删除而越界：收敛到最后一页，避免停在空页
+  useEffect(() => {
+    if (page > 0 && page >= pageCount) setPage(pageCount - 1);
+  }, [page, pageCount]);
 
-  const PAGE_SIZE = 50;
-  const pageCount = Math.max(1, Math.ceil(filteredShells.length / PAGE_SIZE));
-  const pageShells = filteredShells.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-
-  async function probe(shell: ShellProfile) {
+  async function probe(shell: ShellSummary) {
     setProbing(shell.id);
     try {
       const res = await api.probeShell(shell.id);
       toast.success(`${shell.name} 在线 · ${res.runtime} · ${res.server}`, "探测成功");
-      await loadDashboard();
+      await reload();
     } catch (cause) {
       toast.error(errorText(cause), `探测 ${shell.name} 失败`);
     } finally {
@@ -159,9 +195,23 @@ export function DashboardView({
     }
   }
 
-  /** 批量探测当前筛选结果（逐个执行，完成后刷新）。 */
+  /** 批量探测当前筛选结果（服务端按同一组条件取回，逐个执行，完成后刷新）。 */
   async function probeAll() {
-    const targets = filteredShells;
+    let targets: ShellSummary[];
+    try {
+      const matched = await api.queryShells({
+        query: search.trim() || null,
+        workspaceId: workspaceFilter || null,
+        tag: tagFilter || null,
+        status: statusFilter || null,
+        offset: null,
+        limit: 500,
+      });
+      targets = matched.items;
+    } catch (cause) {
+      toast.error(errorText(cause), "加载筛选结果失败");
+      return;
+    }
     if (targets.length === 0) return;
     setBatchProbing([]);
     const done: string[] = [];
@@ -175,8 +225,10 @@ export function DashboardView({
       setBatchProbing([...done]);
     }
     setBatchProbing(null);
-    toast.success(`完成 ${targets.length} 个端点的连通性探测`, "批量探测完成");
-    await loadDashboard();
+    const capped =
+      shellPage.total > targets.length ? `（筛选共 ${shellPage.total} 个，单次上限 500）` : "";
+    toast.success(`完成 ${targets.length} 个端点的连通性探测${capped}`, "批量探测完成");
+    await reload();
   }
 
   function toggleSelect(id: string) {
@@ -196,20 +248,25 @@ export function DashboardView({
   async function batchConnect() {
     setBatchBusy(true);
     let connected = 0;
+    // 选择集可能跨页，名字从精简列表取（不含密码）
+    const names = new Map<string, string>();
+    try {
+      for (const summary of await api.listShellSummaries()) names.set(summary.id, summary.name);
+    } catch {
+      // 取不到名字不影响连接，退化为显示 id
+    }
     for (const id of selected) {
-      const shell = data.shells.find((item) => item.id === id);
-      if (!shell) continue;
       try {
-        await api.connectShell(shell.id);
+        await api.connectShell(id);
         connected += 1;
       } catch (cause) {
-        toast.error(`连接 ${shell.name} 失败：${errorText(cause)}`);
+        toast.error(`连接 ${names.get(id) ?? id} 失败：${errorText(cause)}`);
         break;
       }
     }
     setBatchBusy(false);
     setSelected([]);
-    await loadDashboard();
+    await reload();
     if (connected > 0) {
       toast.success(`已建立 ${connected} 个活跃会话，可在「终端会话」中切换使用`, "批量连接成功");
     }
@@ -226,7 +283,7 @@ export function DashboardView({
       toast.success(`已为 ${count} 个 Shell 应用新标签`, "标签更新成功");
       setBatchTags("");
       setSelected([]);
-      await loadDashboard();
+      await reload();
     } catch (cause) {
       toast.error(errorText(cause), "批量标签失败");
     } finally {
@@ -256,7 +313,7 @@ export function DashboardView({
     setBatchBusy(false);
     setSelected([]);
     toast.success(`已删除 ${deleted} 个 Shell 配置`, "批量删除完成");
-    await loadDashboard();
+    await reload();
   }
 
   async function exportShells() {
@@ -269,7 +326,7 @@ export function DashboardView({
       if (!localPath) return;
       const bytes = new TextEncoder().encode(json);
       await api.writeLocalFile(localPath, b64.encodeBytes(bytes));
-      toast.success(`已成功导出 ${data.shells.length} 个 Shell 配置`, "导出完成");
+      toast.success(`已成功导出 ${data.shellStats.total} 个 Shell 配置`, "导出完成");
     } catch (cause) {
       toast.error(errorText(cause), "导出失败");
     }
@@ -294,7 +351,7 @@ export function DashboardView({
         : csvToJson(text);
       const result = await api.importShells(payload, workspaceId);
       toast.success(`导入完成：新增 ${result.imported} 个，跳过 ${result.skipped} 个`, "导入成功");
-      await loadDashboard();
+      await reload();
     } catch (cause) {
       toast.error(errorText(cause), "导入失败");
     }
@@ -320,7 +377,7 @@ export function DashboardView({
     return JSON.stringify(items);
   }
 
-  async function connect(shell: ShellProfile) {
+  async function connect(shell: ShellSummary) {
     setConnecting(shell.id);
     try {
       const result = await api.connectShell(shell.id);
@@ -332,7 +389,25 @@ export function DashboardView({
     }
   }
 
-  async function removeShell(shell: ShellProfile) {
+  /**
+   * 打开编辑对话框：列表里只有**无密码的精简视图**，
+   * 这里按 id 取回完整配置（也顺带避免用到已被别处改过的旧配置）。
+   */
+  async function openShellEdit(shell: ShellSummary) {
+    try {
+      const full = await api.getShell(shell.id);
+      if (!full) {
+        toast.error("Shell 配置不存在（可能已被删除）");
+        return;
+      }
+      setEditingShell(full);
+      setDialog("shell");
+    } catch (cause) {
+      toast.error(errorText(cause), "读取配置失败");
+    }
+  }
+
+  async function removeShell(shell: ShellSummary) {
     const confirmed = await ask(`确定删除 Shell「${shell.name}」（${shell.endpoint}）？`, {
       title: "删除确认",
       kind: "warning",
@@ -343,14 +418,15 @@ export function DashboardView({
     try {
       await api.deleteShell(shell.id);
       toast.success(`已删除 ${shell.name}`, "删除成功");
-      await loadDashboard();
+      await reload();
     } catch (cause) {
       toast.error(errorText(cause), "删除失败");
     }
   }
 
   async function removeWorkspace(workspace: Workspace) {
-    const count = data.shells.filter((shell) => shell.workspaceId === workspace.id).length;
+    const count =
+      data.shellStats.byWorkspace.find((item) => item.workspaceId === workspace.id)?.count ?? 0;
     const confirmed = await ask(
       `确定删除 Workspace「${workspace.name}」？${count > 0 ? `其中 ${count} 个 Shell 配置将一并删除。` : ""}`,
       { title: "删除确认", kind: "warning", okLabel: "删除", cancelLabel: "取消" },
@@ -359,7 +435,7 @@ export function DashboardView({
     try {
       await api.deleteWorkspace(workspace.id);
       toast.success(`已删除工作区 ${workspace.name}`, "删除成功");
-      await loadDashboard();
+      await reload();
     } catch (cause) {
       toast.error(errorText(cause), "删除失败");
     }
@@ -385,8 +461,8 @@ export function DashboardView({
           <label className="search">
             <Search size={15} />
             <input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
+              value={searchInput}
+              onChange={(event) => setSearchInput(event.target.value)}
               placeholder="搜索 Shell 名称 / 端点 / 标签…"
             />
           </label>
@@ -408,7 +484,7 @@ export function DashboardView({
             onChange={(event) => setTagFilter(event.target.value)}
           >
             <option value="">全部标签</option>
-            {allTags.map((tag) => (
+            {data.shellStats.tags.map((tag) => (
               <option key={tag} value={tag}>
                 #{tag}
               </option>
@@ -428,7 +504,7 @@ export function DashboardView({
           <button
             className="button secondary"
             onClick={() => void probeAll()}
-            disabled={batchProbing !== null || filteredShells.length === 0}
+            disabled={batchProbing !== null || shellPage.total === 0}
             title="一键测试所有筛选出的 Shell 连通性"
           >
             {batchProbing !== null ? (
@@ -437,10 +513,10 @@ export function DashboardView({
               <PlugZap size={15} />
             )}
             {batchProbing !== null
-              ? `探测中 ${batchProbing.length}/${filteredShells.length}`
-              : `探测全部 (${filteredShells.length})`}
+              ? `探测中 ${batchProbing.length}/${shellPage.total}`
+              : `探测全部 (${shellPage.total})`}
           </button>
-          <button className="button secondary" onClick={() => void loadDashboard()} title="刷新数据">
+          <button className="button secondary" onClick={() => void reload()} title="刷新数据">
             <RefreshCw size={15} />
             刷新
           </button>
@@ -466,13 +542,16 @@ export function DashboardView({
         />
         <Metric
           label="Shell 配置"
-          value={data.shells.length}
+          value={data.shellStats.total}
           detail="已登记端点"
-          onClick={() => { setStatusFilter(""); setSearch(""); }}
+          onClick={() => {
+            setStatusFilter("");
+            setSearchInput("");
+          }}
         />
         <Metric
           label="在线端点"
-          value={data.shells.filter((item) => item.status === "online").length}
+          value={data.shellStats.online}
           detail="最新探测可用"
           accent
           onClick={() => setStatusFilter(statusFilter === "online" ? "" : "online")}
@@ -498,7 +577,7 @@ export function DashboardView({
         <Panel
           className="shell-panel"
           eyebrow="SHELL REGISTRY"
-          title={`Shell 列表 (${filteredShells.length})`}
+          title={`Shell 列表 (${shellPage.total})`}
           actions={
             <>
               <div className="view-mode-toggle">
@@ -538,7 +617,7 @@ export function DashboardView({
         >
           {loading ? (
             <Empty icon={<LoaderCircle className="spin" size={24} />} title="正在读取本地数据…" />
-          ) : filteredShells.length === 0 ? (
+          ) : shellPage.total === 0 ? (
             <Empty
               icon={<PlugZap size={28} />}
               title="暂无匹配的 Shell 配置"
@@ -647,10 +726,7 @@ export function DashboardView({
                       <button
                         className="icon-button"
                         title="编辑配置"
-                        onClick={() => {
-                          setEditingShell(shell);
-                          setDialog("shell");
-                        }}
+                        onClick={() => void openShellEdit(shell)}
                       >
                         <FilePenLine size={15} />
                       </button>
@@ -752,10 +828,7 @@ export function DashboardView({
                           <button
                             className="icon-button"
                             title="编辑"
-                            onClick={() => {
-                              setEditingShell(shell);
-                              setDialog("shell");
-                            }}
+                            onClick={() => void openShellEdit(shell)}
                           >
                             <FilePenLine size={14} />
                           </button>
@@ -774,7 +847,7 @@ export function DashboardView({
                 </div>
               )}
 
-              {filteredShells.length > PAGE_SIZE && (
+              {shellPage.total > SHELL_PAGE_SIZE && (
                 <div className="pagination">
                   <button
                     className="button compact"
@@ -784,7 +857,7 @@ export function DashboardView({
                     上一页
                   </button>
                   <span className="pagination-info">
-                    第 {page + 1} / {pageCount} 页（共 {filteredShells.length} 项）
+                    第 {page + 1} / {pageCount} 页（共 {shellPage.total} 项）
                   </span>
                   <button
                     className="button compact"
@@ -833,7 +906,8 @@ export function DashboardView({
         <div className="workspace-cards">
           {data.workspaces.map((workspace) => {
             const expiry = expiryInfo(workspace);
-            const shellCount = data.shells.filter((shell) => shell.workspaceId === workspace.id).length;
+            const shellCount =
+              data.shellStats.byWorkspace.find((item) => item.workspaceId === workspace.id)?.count ?? 0;
             return (
               <article key={workspace.id} className="workspace-card">
                 <div className="workspace-card-head">

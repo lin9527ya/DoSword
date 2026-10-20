@@ -7,7 +7,7 @@ import {
   TerminalSquare,
 } from "lucide-react";
 import { api, errorText } from "../api";
-import type { SessionInfo, ShellProfile } from "../api";
+import type { SessionInfo, ShellSummary } from "../api";
 import { Empty, ErrorBanner, Panel } from "../components/common";
 import { DatabaseManager } from "../widgets/DatabaseManager";
 import { useToast } from "../components/Toast";
@@ -16,7 +16,7 @@ import type { View } from "./types";
 export function GlobalDatabaseView({ onNavigate }: { onNavigate?: (view: View) => void }) {
   const toast = useToast();
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
-  const [shells, setShells] = useState<ShellProfile[]>([]);
+  const [shells, setShells] = useState<ShellSummary[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [connecting, setConnecting] = useState<string | null>(null);
@@ -26,12 +26,13 @@ export function GlobalDatabaseView({ onNavigate }: { onNavigate?: (view: View) =
     setLoading(true);
     setError("");
     try {
-      const [sessionList, dash] = await Promise.all([
+      // Shell 选择器只要精简列表（无密码），不再拉整个看板
+      const [sessionList, shellList] = await Promise.all([
         api.listSessions(),
-        api.dashboard(),
+        api.listShellSummaries(),
       ]);
       setSessions(sessionList);
-      setShells(dash.shells);
+      setShells(shellList);
 
       if (sessionList.length > 0) {
         setSelectedSessionId((prev) =>
@@ -53,7 +54,7 @@ export function GlobalDatabaseView({ onNavigate }: { onNavigate?: (view: View) =
     void load();
   }, [load]);
 
-  async function connectAndOpen(shell: ShellProfile) {
+  async function connectAndOpen(shell: ShellSummary) {
     setConnecting(shell.id);
     try {
       const res = await api.connectShell(shell.id);

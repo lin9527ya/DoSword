@@ -5,6 +5,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Workspace,
   ShellProfile,
+  ShellPage,
+  ShellQuery,
+  ShellSummary,
   AuditFilter,
   AuditPage,
   Dashboard,
@@ -182,6 +185,12 @@ export const api = {
   getSettings: () => invoke<AppSettings>("get_settings"),
   updateSettings: (input: AppSettings) => invoke<void>("update_settings", { input }),
   connectShell: (shellId: string) => invoke<ConnectResult>("connect_shell", { shellId }),
+  // 单个 Shell 的完整配置（含密码）：只有编辑表单需要，列表接口一律发精简视图
+  getShell: (shellId: string) => invoke<ShellProfile | null>("get_shell", { shellId }),
+  // 精简列表（无密码）：目标选择器用
+  listShellSummaries: () => invoke<ShellSummary[]>("list_shell_summaries"),
+  // 服务端分页 + 过滤查询
+  queryShells: (query: ShellQuery) => invoke<ShellPage>("query_shells", { query }),
   disconnectShell: (sessionId: string) => invoke<void>("disconnect_shell", { sessionId }),
   getSessionProbe: (sessionId: string) => invoke<ProbeResult>("get_session_probe", { sessionId }),
   startPty: (sessionId: string, callbackHost?: string | null) =>

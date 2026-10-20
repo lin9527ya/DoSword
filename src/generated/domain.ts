@@ -11,6 +11,31 @@ protocolParams: string, authorizationAck: boolean, status: string, lastConnected
  * 标签列表（DB 中存 JSON 数组字符串）。
  */
 tags: Array<string>, };
+export type ShellSummary = { id: string, workspaceId: string, name: string, endpoint: string, runtime: string, protocolId: string, status: string, lastConnectedAt: string | null, tags: Array<string>, 
+/**
+ * 是否已配置连接密码（只暴露「有没有」，不暴露内容）
+ */
+hasPassword: boolean, };
+export type ShellStats = { total: number, online: number, 
+/**
+ * 全库最近一次连接时间（卡片「最近连接」用）
+ */
+lastConnectedAt: string | null, 
+/**
+ * 全库已用标签（筛选项数据源）
+ */
+tags: Array<string>, byWorkspace: Array<WorkspaceShellCount>, };
+export type WorkspaceShellCount = { workspaceId: string, count: number, };
+export type ShellQuery = { 
+/**
+ * 关键字：匹配 name / endpoint / runtime / tags
+ */
+query: string | null, workspaceId: string | null, 
+/**
+ * 标签精确匹配（按 JSON 数组元素匹配，不做子串）
+ */
+tag: string | null, status: string | null, offset: number | null, limit: number | null, };
+export type ShellPage = { items: Array<ShellSummary>, total: number, };
 export type AuditEvent = { id: number, workspaceId: string, shellId: string | null, action: string, outcome: string, detail: string, createdAt: string, };
 export type AuditFilter = { workspaceId: string | null, 
 /**
@@ -18,7 +43,11 @@ export type AuditFilter = { workspaceId: string | null,
  */
 shellId: string | null, action: string | null, outcome: string | null, limit: number | null, offset: number | null, };
 export type AuditPage = { total: number, events: Array<AuditEvent>, };
-export type Dashboard = { workspaces: Array<Workspace>, shells: Array<ShellProfile>, auditEvents: Array<AuditEvent>, };
+export type Dashboard = { workspaces: Array<Workspace>, 
+/**
+ * Shell 库聚合：分页后前端不再持有全量列表，卡片计数/指标改由这里提供。
+ */
+shellStats: ShellStats, auditEvents: Array<AuditEvent>, };
 export type CreateWorkspace = { name: string, authorizationScope: string, expiresAt: string | null, };
 export type CreateShell = { workspaceId: string, name: string, endpoint: string, runtime: string, protocolId: string, password: string | null, protocolParams: string | null, 
 /**

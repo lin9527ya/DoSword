@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Copy, LoaderCircle, Network, Plus, Trash2 } from "lucide-react";
 import { api, errorText } from "../api";
-import type { ProxyChainInfo, ShellProfile } from "../api";
+import type { ProxyChainInfo, ShellSummary } from "../api";
 import { useToast } from "../components/Toast";
 
 type HopDraft = {
@@ -14,7 +14,7 @@ type HopDraft = {
 
 export function ProxyChainView() {
   const toast = useToast();
-  const [shells, setShells] = useState<ShellProfile[]>([]);
+  const [shells, setShells] = useState<ShellSummary[]>([]);
   const [hops, setHops] = useState<HopDraft[]>([]);
   const [localPort, setLocalPort] = useState(0);
   const [targetHost, setTargetHost] = useState("");
@@ -32,17 +32,18 @@ export function ProxyChainView() {
   }, []);
 
   useEffect(() => {
+    // Shell 选择器只要精简列表（无密码），不再拉整个看板
     void api
-      .dashboard()
-      .then((dashboard) => {
-        setShells(dashboard.shells);
+      .listShellSummaries()
+      .then((shellList) => {
+        setShells(shellList);
         setHops((current) =>
           current.length > 0
             ? current
             : [
                 {
-                  shellId: dashboard.shells[0]?.id ?? "",
-                  host: hostOf(dashboard.shells[0]?.endpoint ?? ""),
+                  shellId: shellList[0]?.id ?? "",
+                  host: hostOf(shellList[0]?.endpoint ?? ""),
                   port: 1080,
                   username: "",
                   password: "",

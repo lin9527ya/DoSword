@@ -1,47 +1,18 @@
 //! MCP 输出脱敏与裁剪。
 //!
-//! 这里是「不把凭据交给模型」的最后一道闸门：`dashboard()` / `list_shells()`
-//! 返回的 `ShellProfile` **带明文密码**，`AppSettings` **带 MCP 令牌**，
+//! 这里是「不把凭据交给模型」的最后一道闸门：`ShellProfile`（`list_shells()` /
+//! `get_shell()` 返回）**带明文密码**，`AppSettings` **带 MCP 令牌**，
 //! 任何直接透传都会让令牌/密码进入模型上下文与客户端日志。
+//!
+//! 注：看板（`dashboard()`）自 2026-10-20 起不再返回全量 Shell —— 列表走
+//! `query_shells`（`ShellSummary`，无密码），单个走 `get_shell`。
 
-use dosword_sdk::domain::{AppSettings, ShellProfile};
+use dosword_sdk::domain::AppSettings;
+// Shell 摘要已上移到 SDK：前端选择器与 MCP 工具共用同一份「无密码」视图实现
+pub use dosword_sdk::domain::ShellSummary;
 
 /// 单次工具结果的文本上限（字符安全截断）
 pub const MAX_TEXT_BYTES: usize = 256 * 1024;
-
-/// 面向 AI 客户端的 Shell 摘要：**不含密码**。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ShellSummary {
-    pub id: String,
-    pub workspace_id: String,
-    pub name: String,
-    pub endpoint: String,
-    pub runtime: String,
-    pub protocol_id: String,
-    pub status: String,
-    pub last_connected_at: Option<String>,
-    pub tags: Vec<String>,
-    /// 是否已配置连接密码（只暴露「有没有」，不暴露内容）
-    pub has_password: bool,
-}
-
-impl From<&ShellProfile> for ShellSummary {
-    fn from(profile: &ShellProfile) -> Self {
-        Self {
-            id: profile.id.clone(),
-            workspace_id: profile.workspace_id.clone(),
-            name: profile.name.clone(),
-            endpoint: profile.endpoint.clone(),
-            runtime: profile.runtime.clone(),
-            protocol_id: profile.protocol_id.clone(),
-            status: profile.status.clone(),
-            last_connected_at: profile.last_connected_at.clone(),
-            tags: profile.tags.clone(),
-            has_password: !profile.password.is_empty(),
-        }
-    }
-}
 
 /// 面向 AI 客户端的设置视图：清空令牌、掩码代理地址（可能含账号密码）。
 pub fn redact_settings(settings: &AppSettings) -> serde_json::Value {
@@ -78,6 +49,7 @@ pub fn truncate_text(text: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dosword_sdk::domain::ShellProfile;
 
     fn profile_with_password(password: &str) -> ShellProfile {
         ShellProfile {

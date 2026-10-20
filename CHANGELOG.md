@@ -42,6 +42,23 @@
 - JSP / ASPX 的 `separator` 字段转义错误，产出**非法 JSON**（探针响应解析失败）
 - ASPX 的 GCM 计数器从 0 起算（应为 J0+1），导致 tag 校验通过但明文是乱码
 
+### 性能与规模化（2026-10-20）
+
+- **Shell 库改为服务端分页 + 过滤**（此前每次打开看板/详情都拉全量 Shell，含明文密码）：
+  - `dashboard()` 不再返回全量 `shells`，改为 `shellStats` 聚合（总数 / 在线数 /
+    最近连接时间 / 全部标签 / 各 Workspace 计数）；迁移 v8 补
+    `idx_shell_workspace_created` 支撑「按 Workspace 过滤 + 按创建时间倒序翻页」
+  - 新增 `query_shells`（关键字匹配 name/endpoint/runtime/tags + Workspace/标签/状态过滤，
+    排序 `created_at DESC, id` 保证翻页不重不漏；通配符按字面量转义），返回**无密码**的
+    `ShellSummary` 分页结果
+  - 新增 `get_shell`（编辑表单按 id 取完整配置）、`list_shell_summaries`（目标选择器）
+  - 前端：看板列表改服务端分页（关键字 250ms 防抖、筛选变化回第一页、越界页自动收敛、
+    批量探测按同一组条件从服务端取回并说明 500 上限）；4 个选择器视图与 Shell 详情页
+    不再拉看板
+- **锁序修正**：`connect_shell_impl` / `disconnect_shell_impl` / `run_feature_plugin`
+  三处曾在持全局会话锁期间访问数据库（`disconnect` 与 `plugin.run` 更是在锁内写审计 +
+  fsync）。改为短锁取参、锁外写库，并把「两把锁不得同时持有」写进 `AppState` 文档。
+
 ### 工程化（2026-10-20）
 
 - **前端接入 vitest**（此前零测试）：`vitest.config.ts`（jsdom 环境，与生产构建配置分离）+
@@ -371,6 +388,10 @@ PHP 侧此前是「三条通道、三套能力」：同一个目标换个编码�
 
 - Shell 连接密码以明文存储于本地 SQLite（工具惯例，keyring 加密待后续版本），
   导出的 Shell JSON 与备份文件同样含明文密码
+- Shell 列表单次最多 500 条（`query_shells` 上限）；批量探测同样以 500 为上限并在
+  超过时于提示中说明
+- 导入/导出仍是同步路径（`import_shells` 全程持库锁逐条事务；`export_shells` /
+  `get_settings` 为同步命令）
 - 前端测试覆盖有限：vitest 已接入，当前覆盖编码器/协议参数、主题、共享组件；
   各视图与 `FileManager` / `Terminal` 等大组件仍无测试
 

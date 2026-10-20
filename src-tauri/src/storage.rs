@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use dosword_sdk::domain::{
     AppSettings, AuditEvent, AuditFilter, CreateShell, CreateWorkspace, Dashboard, MemoryShell,
-    ShellProfile, UpdateShell, UpdateWorkspace, Workspace,
+    ShellProfile, ShellQuery, ShellStats, UpdateShell, UpdateWorkspace, Workspace,
+    WorkspaceShellCount,
 };
 
 fn memory_shell_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryShell> {
@@ -118,6 +119,10 @@ const MIGRATIONS: &[&str] = &[
     // v7：审计按 Shell 过滤（"这个目标上做过什么"是最常用的排查方式）。
     // 既有 idx_audit_* 覆盖 workspace/action/outcome/created_at，缺 shell_id。
     "CREATE INDEX IF NOT EXISTS idx_audit_shell ON audit_events(shell_id);",
+    // v8：Shell 库改为服务端分页 + 过滤（按 created_at DESC 排序、可按 workspace 过滤）。
+    // 既有 idx_shell_workspace 只覆盖 workspace_id，翻页排序仍要临时排序。
+    "CREATE INDEX IF NOT EXISTS idx_shell_workspace_created
+       ON shell_profiles(workspace_id, created_at DESC);",
 ];
 
 const SETTINGS_KEY: &str = "app";
@@ -161,12 +166,130 @@ impl Database {
         Ok(Self { connection })
     }
 
+    /// 看板数据：Workspace 列表 + Shell 库**聚合** + 最近审计。
+    ///
+    /// 不再返回全量 Shell（历史上每次打开看板/详情都要拉全部 Shell，含明文密码）：
+    /// 列表走 [`Self::query_shells`] 分页，单个 Shell 走 `commands::get_shell`，
+    /// 卡片计数/指标由 [`Self::shell_stats`] 提供。
     pub fn dashboard(&self) -> rusqlite::Result<Dashboard> {
         Ok(Dashboard {
             workspaces: self.list_workspaces()?,
-            shells: self.list_shells()?,
+            shell_stats: self.shell_stats()?,
             audit_events: self.list_audit_events()?,
         })
+    }
+
+    /// Shell 库聚合统计（总数 / 在线数 / 最近连接 / 全部标签 / 各 Workspace 计数）。
+    pub fn shell_stats(&self) -> rusqlite::Result<ShellStats> {
+        let total: u64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM shell_profiles", [], |row| row.get(0))?;
+        let online: u64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM shell_profiles WHERE status = 'online'",
+            [],
+            |row| row.get(0),
+        )?;
+        // ISO8601 字符串按字典序即时间序
+        let last_connected_at: Option<String> = self.connection.query_row(
+            "SELECT MAX(last_connected_at) FROM shell_profiles",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut by_workspace = Vec::new();
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT workspace_id, COUNT(*) FROM shell_profiles GROUP BY workspace_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(WorkspaceShellCount {
+                    workspace_id: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })?;
+            for row in rows {
+                by_workspace.push(row?);
+            }
+        }
+        let mut tags = std::collections::BTreeSet::new();
+        {
+            let mut statement = self.connection.prepare("SELECT tags FROM shell_profiles")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let raw = row?;
+                tags.extend(serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default());
+            }
+        }
+        Ok(ShellStats {
+            total,
+            online,
+            last_connected_at,
+            tags: tags.into_iter().collect(),
+            by_workspace,
+        })
+    }
+
+    /// 服务端分页 + 过滤查询 Shell。返回 `(总数, 当页)`。
+    ///
+    /// 排序 `created_at DESC, id`：只按 `created_at` 排会在批量导入（同一时间戳）时并列，
+    /// 翻页可能重复或漏行，`id` 作为稳定次序保证分页自洽。
+    pub fn query_shells(&self, query: &ShellQuery) -> rusqlite::Result<(u64, Vec<ShellProfile>)> {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(workspace_id) = query.workspace_id.as_deref().filter(|v| !v.is_empty()) {
+            clauses.push("workspace_id = ?".into());
+            params.push(Box::new(workspace_id.to_string()));
+        }
+        if let Some(status) = query.status.as_deref().filter(|v| !v.is_empty()) {
+            clauses.push("status = ?".into());
+            params.push(Box::new(status.to_string()));
+        }
+        // 标签按 JSON 数组元素精确匹配（`"tag"` 连引号一起匹配，避免 prod 命中 production）
+        if let Some(tag) = query.tag.as_deref().filter(|v| !v.is_empty()) {
+            clauses.push("tags LIKE ? ESCAPE '\\'".into());
+            params.push(Box::new(format!("%\"{}\"%", escape_like(tag))));
+        }
+        if let Some(keyword) = query
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            let pattern = format!("%{}%", escape_like(keyword));
+            clauses.push(
+                "(name LIKE ? ESCAPE '\\' OR endpoint LIKE ? ESCAPE '\\' \
+                  OR runtime LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')"
+                    .into(),
+            );
+            for _ in 0..4 {
+                params.push(Box::new(pattern.clone()));
+            }
+        }
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        let total: u64 = self.connection.query_row(
+            &format!("SELECT COUNT(*) FROM shell_profiles{where_sql}"),
+            rusqlite::params_from_iter(params.iter().map(|value| value.as_ref())),
+            |row| row.get(0),
+        )?;
+        let limit = query.limit.unwrap_or(50).min(500);
+        let offset = query.offset.unwrap_or(0);
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {SHELL_COLUMNS} FROM shell_profiles{where_sql} \
+             ORDER BY created_at DESC, id LIMIT ? OFFSET ?"
+        ))?;
+        let mut bind: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|value| value.as_ref()).collect();
+        let limit_param = limit as i64;
+        let offset_param = offset as i64;
+        bind.push(&limit_param);
+        bind.push(&offset_param);
+        let items = statement
+            .query_map(rusqlite::params_from_iter(bind), map_shell)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((total, items))
     }
 
     pub fn create_workspace(&mut self, input: CreateWorkspace) -> rusqlite::Result<Workspace> {
@@ -632,12 +755,9 @@ impl Database {
     }
 
     pub fn list_shells(&self) -> rusqlite::Result<Vec<ShellProfile>> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, workspace_id, name, endpoint, runtime, protocol_id, password,
-                    protocol_params, authorization_ack, status, last_connected_at, created_at,
-                    tags
-             FROM shell_profiles ORDER BY created_at DESC",
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {SHELL_COLUMNS} FROM shell_profiles ORDER BY created_at DESC"
+        ))?;
         statement.query_map([], map_shell)?.collect()
     }
 
@@ -742,6 +862,18 @@ fn migrate(connection: &mut Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// `shell_profiles` 的列清单（顺序必须与 [`map_shell`] 一致）。
+const SHELL_COLUMNS: &str = "id, workspace_id, name, endpoint, runtime, protocol_id, password, \
+     protocol_params, authorization_ack, status, last_connected_at, created_at, tags";
+
+/// 转义 LIKE 模式里的通配符（标签/关键字是用户输入，`%` `_` 不该当通配符用）。
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn map_shell(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShellProfile> {
     let tags_json: String = row.get(12)?;
     Ok(ShellProfile {
@@ -836,11 +968,187 @@ mod tests {
             .unwrap();
         let dashboard = db.dashboard().unwrap();
         assert_eq!(dashboard.workspaces.len(), 1);
-        assert_eq!(dashboard.shells.len(), 1);
         assert_eq!(dashboard.audit_events.len(), 2);
-        let shell = &dashboard.shells[0];
-        assert_eq!(shell.password, "secret");
-        assert!(shell.authorization_ack);
+        // Shell 列表改为分页查询；看板只带聚合
+        assert_eq!(dashboard.shell_stats.total, 1);
+        assert_eq!(dashboard.shell_stats.by_workspace.len(), 1);
+        let (total, shells) = db.query_shells(&ShellQuery::default()).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(shells.len(), 1);
+        assert_eq!(shells[0].password, "secret");
+        assert!(shells[0].authorization_ack);
+    }
+
+    /// Shell 分页查询：总数与分页无关、翻页不重不漏、各过滤器按预期生效。
+    #[test]
+    fn query_shells_pages_filters_and_searches() {
+        let mut db = Database::open(":memory:").unwrap();
+        let lab = db.create_workspace(sample_workspace()).unwrap();
+        let other = db
+            .create_workspace(CreateWorkspace {
+                name: "Prod".into(),
+                authorization_scope: "example.com".into(),
+                expires_at: None,
+            })
+            .unwrap();
+        let rows = [
+            (
+                lab.id.clone(),
+                "web-01",
+                "http://10.0.0.1/a.php",
+                ["prod", "web"],
+            ),
+            (
+                lab.id.clone(),
+                "web-02",
+                "http://10.0.0.2/a.php",
+                ["prod", "web"],
+            ),
+            (
+                lab.id.clone(),
+                "db-01",
+                "http://10.0.0.3/a.php",
+                ["db", "db"],
+            ),
+            (
+                lab.id.clone(),
+                "internal",
+                "http://10.0.0.4/a.php",
+                ["production", "production"],
+            ),
+            (
+                other.id.clone(),
+                "web-03",
+                "http://10.0.0.5/a.php",
+                ["prod", "prod"],
+            ),
+        ];
+        let mut ids = Vec::new();
+        for (workspace_id, name, endpoint, tags) in rows {
+            let mut input = sample_shell(workspace_id);
+            input.name = name.into();
+            input.endpoint = endpoint.into();
+            input.tags = Some(tags.iter().map(|tag| (*tag).to_string()).collect());
+            ids.push(db.create_shell(input, "builtin.mock.v1").unwrap().id);
+        }
+        db.update_shell_status(&ids[0], "online").unwrap();
+
+        let first = db
+            .query_shells(&ShellQuery {
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(first.0, 5, "total 与分页无关");
+        assert_eq!(first.1.len(), 2);
+        let second = db
+            .query_shells(&ShellQuery {
+                limit: Some(2),
+                offset: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(second.0, 5);
+        let seen: std::collections::HashSet<_> = first
+            .1
+            .iter()
+            .chain(second.1.iter())
+            .map(|shell| shell.id.clone())
+            .collect();
+        assert_eq!(seen.len(), 4, "两页之间不得重复");
+        // 稳定排序：同一 created_at（同批创建）下顺序必须可重复，否则翻页会漏行
+        let again = db
+            .query_shells(&ShellQuery {
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            again.1.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            first.1.iter().map(|s| s.id.clone()).collect::<Vec<_>>()
+        );
+
+        // workspace 过滤
+        let (total, items) = db
+            .query_shells(&ShellQuery {
+                workspace_id: Some(lab.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!((total, items.len()), (4, 4));
+        // status 过滤
+        let (total, _) = db
+            .query_shells(&ShellQuery {
+                status: Some("online".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        // 标签精确匹配：prod 不得命中 production
+        let (total, _) = db
+            .query_shells(&ShellQuery {
+                tag: Some("prod".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 3);
+        let (total, _) = db
+            .query_shells(&ShellQuery {
+                tag: Some("production".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        // 关键字：name / endpoint / tags 都覆盖
+        let (total, _) = db
+            .query_shells(&ShellQuery {
+                query: Some("web-0".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 3);
+        let (total, _) = db
+            .query_shells(&ShellQuery {
+                query: Some("10.0.0.3".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 1);
+        // 用户输入的通配符必须被转义（否则 `%` 会匹配整库）
+        let (total, _) = db
+            .query_shells(&ShellQuery {
+                query: Some("%".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(total, 0, "`%` 应转义为字面量");
+    }
+
+    /// 看板聚合：总数 / 在线 / 标签去重 / 各 Workspace 计数。
+    #[test]
+    fn shell_stats_aggregates_library() {
+        let mut db = Database::open(":memory:").unwrap();
+        let lab = db.create_workspace(sample_workspace()).unwrap();
+        let a = db
+            .create_shell(sample_shell(lab.id.clone()), "builtin.mock.v1")
+            .unwrap();
+        let mut second = sample_shell(lab.id.clone());
+        second.tags = Some(vec!["prod".into()]);
+        db.create_shell(second, "builtin.mock.v1").unwrap();
+        db.update_shell_status(&a.id, "online").unwrap();
+        db.record_probe(&a, "online", "连接成功").unwrap();
+
+        let stats = db.shell_stats().unwrap();
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.online, 1);
+        assert_eq!(stats.tags, vec!["prod".to_string(), "test".to_string()]);
+        assert_eq!(stats.by_workspace.len(), 1);
+        assert_eq!(stats.by_workspace[0].workspace_id, lab.id);
+        assert_eq!(stats.by_workspace[0].count, 2);
+        assert!(stats.last_connected_at.is_some());
+
+        let dashboard = db.dashboard().unwrap();
+        assert_eq!(dashboard.shell_stats.total, 2);
     }
 
     #[test]

@@ -217,14 +217,18 @@ fn run(cli: Cli) -> Result<(), String> {
 
     match &cli.command {
         Command::Shells => {
-            let dashboard = state
+            // Shell 列表已从看板移到分页查询：CLI 一次取满（上限 500）
+            let page = state
                 .database()
                 .lock()
                 .map_err(|_| "数据库锁异常".to_string())?
-                .dashboard()
+                .query_shells(&dosword_sdk::domain::ShellQuery {
+                    limit: Some(500),
+                    ..Default::default()
+                })
                 .map_err(|error| error.to_string())?;
-            let shells: Vec<Value> = dashboard
-                .shells
+            let shells: Vec<Value> = page
+                .1
                 .iter()
                 .map(|shell| {
                     json!({

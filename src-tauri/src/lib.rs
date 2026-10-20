@@ -338,6 +338,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::dashboard,
+            // Shell 库：分页查询 + 单取 + 精简列表（看板不再返回全量 Shell）
+            commands::query_shells,
+            commands::get_shell,
+            commands::list_shell_summaries,
             commands::create_workspace,
             commands::update_workspace,
             commands::delete_workspace,

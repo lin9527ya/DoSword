@@ -9,7 +9,8 @@ use dosword_sdk::domain::{
     CreateWorkspace, Dashboard, DbConnection, DbProbeResult, DbQueryResult, DirListing, FileChunk,
     FileContent, GenerateShellResult, HttpSendResult, ImportResult, MemoryShell,
     MemshellCapability, PlaybookReport, ProbeResult, ProtocolMeta, ProxyTestResult, RequestRecord,
-    SessionInfo, ShellProfile, TransferOutcome, UpdateShell, UpdateWorkspace, Workspace,
+    SessionInfo, ShellPage, ShellProfile, ShellQuery, ShellSummary, TransferOutcome, UpdateShell,
+    UpdateWorkspace, Workspace,
 };
 use dosword_sdk::encoder::{EncoderRegistry, STUB_LANGUAGES};
 use dosword_sdk::plugin::FeaturePlugin;
@@ -174,6 +175,56 @@ pub async fn dashboard(app: AppHandle) -> Result<Dashboard, String> {
             .map_err(|_| "数据库锁异常".to_string())?
             .dashboard()
             .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+/// 取单个 Shell 的完整配置（含连接密码）——编辑表单用。
+///
+/// 列表接口只发精简视图（[`ShellSummary`]，无密码），需要完整配置时按 id 取单个：
+/// 看板、选择器都不再为了「编辑一个 Shell」或「渲染一行」拉全量配置。
+#[tauri::command]
+pub async fn get_shell(shell_id: String, app: AppHandle) -> Result<Option<ShellProfile>, String> {
+    blocking(app, move |state| {
+        state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .shell(&shell_id)
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+/// Shell 精简列表（不含密码）：目标选择器用。
+#[tauri::command]
+pub async fn list_shell_summaries(app: AppHandle) -> Result<Vec<ShellSummary>, String> {
+    blocking(app, move |state| {
+        let shells = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .list_shells()
+            .map_err(|error| error.to_string())?;
+        Ok(shells.iter().map(ShellSummary::from).collect())
+    })
+    .await
+}
+
+/// Shell 库分页查询（服务端过滤 + 稳定排序）。返回当页精简视图与总数。
+#[tauri::command]
+pub async fn query_shells(query: ShellQuery, app: AppHandle) -> Result<ShellPage, String> {
+    blocking(app, move |state| {
+        let (total, shells) = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?
+            .query_shells(&query)
+            .map_err(|error| error.to_string())?;
+        Ok(ShellPage {
+            items: shells.iter().map(ShellSummary::from).collect(),
+            total,
+        })
     })
     .await
 }

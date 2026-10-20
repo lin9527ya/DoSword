@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CheckCircle2, LoaderCircle, Play, Search, XCircle } from "lucide-react";
 import { api, errorText } from "../api";
-import type { FeatureManifest, OrchestrationReport, ShellProfile } from "../api";
+import type { FeatureManifest, OrchestrationReport, ShellSummary } from "../api";
 import { useToast } from "../components/Toast";
 
 const CONCURRENCY_OPTIONS = [1, 2, 4, 8];
 
 export function OrchestrationView() {
   const toast = useToast();
-  const [shells, setShells] = useState<ShellProfile[]>([]);
+  const [shells, setShells] = useState<ShellSummary[]>([]);
   const [plugins, setPlugins] = useState<FeatureManifest[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
@@ -28,11 +28,12 @@ export function OrchestrationView() {
 
   const load = useCallback(async () => {
     try {
-      const [dashboard, pluginList] = await Promise.all([
-        api.dashboard(),
+      // Shell 选择器只要精简列表（无密码），不再拉整个看板
+      const [shellList, pluginList] = await Promise.all([
+        api.listShellSummaries(),
         api.listFeaturePlugins(),
       ]);
-      setShells(dashboard.shells);
+      setShells(shellList);
       setPlugins(pluginList);
       setPluginId((current) => current || pluginList[0]?.id || "");
     } catch (cause) {
