@@ -1,0 +1,31 @@
+# Java 内存马验证靶场（S4 用）
+#
+# 用途：给「StandardContext 注册/卸载 Filter 内存马」提供真实 Tomcat 环境。
+# 启动：docker compose -f docker-compose.tomcat.yml up -d
+# 访问：http://127.0.0.1:8080/   （靶场 JSP：http://127.0.0.1:8080/hello.jsp）
+#
+# 说明：
+# - 两个版本并存，用来验证 filter 注册 API 在 8.5 与 9 上的差异
+# - 只用官方镜像，不装任何额外组件；靶场页面由本文件内的 JSP 生成
+# - 仅监听 127.0.0.1，不要改成 0.0.0.0
+
+services:
+  tomcat8:
+    image: tomcat:8.5-jdk8-temurin
+    container_name: dsw-tomcat8
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./scripts/tomcat-lab/hello.jsp:/usr/local/tomcat/webapps/ROOT/hello.jsp:ro
+    environment:
+      JAVA_OPTS: "-Dfile.encoding=UTF-8"
+
+  tomcat9:
+    image: tomcat:9-jdk17-temurin
+    container_name: dsw-tomcat9
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - ./scripts/tomcat-lab/hello.jsp:/usr/local/tomcat/webapps/ROOT/hello.jsp:ro
+    environment:
+      JAVA_OPTS: "-Dfile.encoding=UTF-8"
