@@ -42,6 +42,16 @@
 - JSP / ASPX 的 `separator` 字段转义错误，产出**非法 JSON**（探针响应解析失败）
 - ASPX 的 GCM 计数器从 0 起算（应为 J0+1），导致 tag 校验通过但明文是乱码
 
+### 依赖（2026-10-21）
+
+- **rustls-webpki 0.103.15 → 0.103.16**（RUSTSEC-2026-0382）：证书校验可能接受本应被
+  拒绝的中间证书
+- **webpki-roots 1.0.9 → 1.0.10**（RUSTSEC-2026-0381）：内置根证书信任了被吊销的
+  emSign 中间 CA
+- **lru 0.12.5 → 0.19.0**（RUSTSEC-2026-0253 / RUSTSEC-2026-0002）：`pop()` 的 panic
+  安全性与 `IterMut` 的 Stacked Borrows 违规。本项目只用 `new/get/put/iter`，且 release
+  档 `panic = "abort"`，实际风险很低，但升级无 API 变化，顺手消掉
+
 ### 安全（2026-10-21）
 
 - **连接密码与 MCP 令牌加密落库**（AES-256-GCM，`enc:v1:` 前缀，AAD 绑定字段名）：
