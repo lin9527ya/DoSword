@@ -9,6 +9,7 @@ pub mod playbook;
 mod protocol;
 mod proxy_chain;
 mod pty;
+mod secrets;
 mod session;
 pub mod storage;
 #[cfg(feature = "wasm")]

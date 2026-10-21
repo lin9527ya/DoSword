@@ -4,6 +4,7 @@ use chrono::{Local, NaiveDate, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+use crate::secrets::SecretStore;
 use dosword_sdk::domain::{
     AppSettings, AuditEvent, AuditFilter, CreateShell, CreateWorkspace, Dashboard, MemoryShell,
     ShellProfile, ShellQuery, ShellStats, UpdateShell, UpdateWorkspace, Workspace,
@@ -147,10 +148,43 @@ fn normalize_expiry(expires_at: Option<String>) -> Option<String> {
 
 pub struct Database {
     connection: Connection,
+    /// 敏感字段加密（连接密码 / MCP 令牌）。`:memory:` 与测试库为 `None`。
+    secrets: Option<SecretStore>,
+}
+
+/// 加密字段值（无密钥保管时原样返回）。
+fn seal(secrets: Option<&SecretStore>, field: &'static str, value: &str) -> String {
+    match secrets {
+        Some(store) => store.encrypt(field, value),
+        None => value.to_string(),
+    }
+}
+
+/// 解密字段值；解密失败（换机器 / 丢钥匙 / 密文损坏）返回空串并告警。
+fn unseal(secrets: Option<&SecretStore>, field: &'static str, stored: &str) -> String {
+    match secrets {
+        Some(store) => match store.decrypt(field, stored) {
+            Some(value) => value,
+            None => {
+                eprintln!(
+                    "[secrets] 字段 {field} 解密失败（密钥已更换或密文损坏），按空值处理；请重新录入"
+                );
+                String::new()
+            }
+        },
+        None => stored.to_string(),
+    }
+}
+
+/// 解密 Shell 的连接密码（其余字段原样）。
+fn unseal_shell(secrets: Option<&SecretStore>, mut profile: ShellProfile) -> ShellProfile {
+    profile.password = unseal(secrets, "shell.password", &profile.password);
+    profile
 }
 
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        let path = path.as_ref();
         let mut connection = Connection::open(path)?;
         // busy_timeout：桌面端与 dosword-cli 共用同一数据目录 / 同一 SQLite 文件，
         // 并发写（CLI 跑 playbook 时 GUI 记审计）会瞬时拿到 SQLITE_BUSY。
@@ -163,7 +197,62 @@ impl Database {
              PRAGMA synchronous = NORMAL;",
         )?;
         migrate(&mut connection)?;
-        Ok(Self { connection })
+        // 密钥保管：钥匙串优先，其次数据目录内的 0600 密钥文件。
+        // `:memory:`（测试）不加密 —— 没有可落盘的密钥位置。
+        let secrets = if path.to_string_lossy() == ":memory:" {
+            None
+        } else {
+            path.parent().and_then(SecretStore::load)
+        };
+        let mut database = Self {
+            connection,
+            secrets,
+        };
+        database.encrypt_legacy_secrets()?;
+        Ok(database)
+    }
+
+    /// 把库里尚未加密的密码与 MCP 令牌就地加密（旧版本升级上来的明文）。
+    fn encrypt_legacy_secrets(&mut self) -> rusqlite::Result<()> {
+        if self.secrets.is_none() {
+            return Ok(());
+        }
+        let secrets = self.secrets.as_ref();
+        let transaction = self.connection.transaction()?;
+        let rows: Vec<(String, String)> = {
+            let mut statement = transaction.prepare("SELECT id, password FROM shell_profiles")?;
+            let mapped = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, password) in rows {
+            if !password.is_empty() && !SecretStore::is_encrypted(&password) {
+                transaction.execute(
+                    "UPDATE shell_profiles SET password = ?1 WHERE id = ?2",
+                    params![seal(secrets, "shell.password", &password), id],
+                )?;
+            }
+        }
+        let raw: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                [SETTINGS_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(raw) = raw
+            && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw)
+            && let Some(token) = value.get("mcpToken").and_then(|v| v.as_str())
+            && !token.is_empty()
+            && !SecretStore::is_encrypted(token)
+        {
+            let sealed = seal(secrets, "mcp.token", token);
+            value["mcpToken"] = serde_json::json!(sealed);
+            transaction.execute(
+                "UPDATE app_settings SET value = ?1 WHERE key = ?2",
+                params![value.to_string(), SETTINGS_KEY],
+            )?;
+        }
+        transaction.commit()
     }
 
     /// 看板数据：Workspace 列表 + Shell 库**聚合** + 最近审计。
@@ -289,7 +378,13 @@ impl Database {
         let items = statement
             .query_map(rusqlite::params_from_iter(bind), map_shell)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((total, items))
+        Ok((
+            total,
+            items
+                .into_iter()
+                .map(|profile| unseal_shell(self.secrets.as_ref(), profile))
+                .collect(),
+        ))
     }
 
     pub fn create_workspace(&mut self, input: CreateWorkspace) -> rusqlite::Result<Workspace> {
@@ -354,7 +449,7 @@ impl Database {
                 profile.endpoint,
                 profile.runtime,
                 profile.protocol_id,
-                profile.password,
+                seal(self.secrets.as_ref(), "shell.password", &profile.password),
                 profile.protocol_params,
                 profile.authorization_ack,
                 profile.status,
@@ -372,6 +467,12 @@ impl Database {
     }
 
     pub fn shell(&self, id: &str) -> rusqlite::Result<Option<ShellProfile>> {
+        let profile = self.shell_raw(id)?;
+        Ok(profile.map(|profile| unseal_shell(self.secrets.as_ref(), profile)))
+    }
+
+    /// 原始读取（密码保持库中形态）。仅供 `shell` 与批量更新内部使用。
+    fn shell_raw(&self, id: &str) -> rusqlite::Result<Option<ShellProfile>> {
         self.connection
             .query_row(
                 "SELECT id, workspace_id, name, endpoint, runtime, protocol_id, password,
@@ -428,7 +529,7 @@ impl Database {
             params![
                 input.name,
                 input.endpoint,
-                password,
+                seal(self.secrets.as_ref(), "shell.password", &password),
                 tags,
                 protocol_params,
                 input.id
@@ -475,7 +576,11 @@ impl Database {
                 )
                 .optional()?;
             if let Some(shell) = shell {
-                let new_password = password.unwrap_or(&shell.password).to_string();
+                // 未提供新密码时保留库中的原值（已是密文，不能再加密一次）
+                let new_password = match password {
+                    Some(new) => seal(self.secrets.as_ref(), "shell.password", new),
+                    None => shell.password.clone(),
+                };
                 let new_tags = tags.cloned().unwrap_or(shell.tags);
                 let tags_json = serde_json::to_string(&new_tags).unwrap_or_else(|_| "[]".into());
                 tx.execute(
@@ -613,14 +718,34 @@ impl Database {
             )
             .optional()?;
         match value {
-            Some(json) => serde_json::from_str(&json)
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error))),
+            Some(json) => {
+                // MCP 令牌加密存放：读出后先解密再反序列化
+                let mut value: serde_json::Value = serde_json::from_str(&json)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                if let Some(token) = value.get("mcpToken").and_then(|item| item.as_str())
+                    && !token.is_empty()
+                {
+                    let plain = unseal(self.secrets.as_ref(), "mcp.token", token);
+                    value["mcpToken"] = serde_json::json!(plain);
+                }
+                serde_json::from_value(value)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            }
             None => Ok(AppSettings::default()),
         }
     }
 
     pub fn update_settings(&self, settings: &AppSettings) -> rusqlite::Result<()> {
-        let json = serde_json::to_string(settings)
+        // MCP 令牌加密后再整体落盘
+        let mut value = serde_json::to_value(settings)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        if let Some(token) = value.get("mcpToken").and_then(|item| item.as_str())
+            && !token.is_empty()
+        {
+            let sealed = seal(self.secrets.as_ref(), "mcp.token", token);
+            value["mcpToken"] = serde_json::json!(sealed);
+        }
+        let json = serde_json::to_string(&value)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         self.connection.execute(
             "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
@@ -758,7 +883,13 @@ impl Database {
         let mut statement = self.connection.prepare(&format!(
             "SELECT {SHELL_COLUMNS} FROM shell_profiles ORDER BY created_at DESC"
         ))?;
-        statement.query_map([], map_shell)?.collect()
+        let profiles = statement
+            .query_map([], map_shell)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(profiles
+            .into_iter()
+            .map(|profile| unseal_shell(self.secrets.as_ref(), profile))
+            .collect())
     }
 
     fn list_audit_events(&self) -> rusqlite::Result<Vec<AuditEvent>> {
@@ -1149,6 +1280,109 @@ mod tests {
 
         let dashboard = db.dashboard().unwrap();
         assert_eq!(dashboard.shell_stats.total, 2);
+    }
+
+    /// 敏感字段落库必须是密文，读取时还原；`update_shell` 不改密码时不得二次加密。
+    #[test]
+    fn secrets_are_encrypted_at_rest() {
+        let dir = std::env::temp_dir().join(format!("dosword-sec-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.sqlite");
+        let mut db = Database::open(&path).unwrap();
+        assert!(db.secrets.is_some(), "真实文件库应启用密钥保管");
+        let workspace = db.create_workspace(sample_workspace()).unwrap();
+        let profile = db
+            .create_shell(sample_shell(workspace.id.clone()), "builtin.mock.v1")
+            .unwrap();
+
+        let raw: String = db
+            .connection
+            .query_row(
+                "SELECT password FROM shell_profiles WHERE id = ?1",
+                [&profile.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(SecretStore::is_encrypted(&raw), "库里应是密文：{raw}");
+        assert!(!raw.contains("secret"), "密文里不得出现明文密码：{raw}");
+        // 读取路径还原为明文
+        assert_eq!(db.shell(&profile.id).unwrap().unwrap().password, "secret");
+
+        // 只改名字、不改密码：库里不得变成「密文的密文」
+        db.update_shell(&UpdateShell {
+            id: profile.id.clone(),
+            name: "renamed".into(),
+            endpoint: "mock://local".into(),
+            password: None,
+            tags: None,
+            protocol_params: None,
+        })
+        .unwrap();
+        let raw_after: String = db
+            .connection
+            .query_row(
+                "SELECT password FROM shell_profiles WHERE id = ?1",
+                [&profile.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            db.shell(&profile.id).unwrap().unwrap().password,
+            "secret",
+            "不改密码时不得二次加密：{raw_after}"
+        );
+
+        // MCP 令牌同样加密落盘
+        let mut settings = db.get_settings().unwrap();
+        settings.mcp_token = "tok-123456".into();
+        db.update_settings(&settings).unwrap();
+        let raw_settings: String = db
+            .connection
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = 'app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // settings 是整段 JSON：断言 token 字段被加密、明文不出现
+        assert!(raw_settings.contains("enc:v1:"), "{raw_settings}");
+        assert!(!raw_settings.contains("tok-123456"), "{raw_settings}");
+        assert_eq!(db.get_settings().unwrap().mcp_token, "tok-123456");
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧版本留下的明文密码在下次打开时被就地迁移为密文（且仍可正常读取）。
+    #[test]
+    fn legacy_plaintext_password_is_migrated_on_open() {
+        let dir = std::env::temp_dir().join(format!("dosword-sec-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.sqlite");
+        {
+            let mut db = Database::open(&path).unwrap();
+            let workspace = db.create_workspace(sample_workspace()).unwrap();
+            let mut input = sample_shell(workspace.id);
+            input.password = Some("legacy-pw".into());
+            db.create_shell(input, "builtin.mock.v1").unwrap();
+            // 模拟旧版本：把密码写回明文
+            db.connection
+                .execute("UPDATE shell_profiles SET password = 'legacy-pw'", [])
+                .unwrap();
+        }
+        // 重新打开 → 迁移
+        let db = Database::open(&path).unwrap();
+        let raw: String = db
+            .connection
+            .query_row("SELECT password FROM shell_profiles LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(SecretStore::is_encrypted(&raw), "旧明文应被迁移：{raw}");
+        let shells = db.list_shells().unwrap();
+        assert_eq!(shells[0].password, "legacy-pw");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
