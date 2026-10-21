@@ -410,6 +410,11 @@ fn run_step(state: &AppState, action: &str, args: &Value) -> Result<Value, Strin
             let session_id = arg_str(args, "session_id")?;
             let plugin_id = arg_str(args, "plugin_id")?;
             let params = args.get("params").cloned().unwrap_or(Value::Null);
+            // 与 run_feature_plugin 同源门禁：被禁用的插件在剧本里也拒绝执行
+            crate::commands::ensure_plugin_enabled(
+                &crate::commands::current_settings(state)?,
+                plugin_id,
+            )?;
             let ctx = crate::commands::session_ctx(state, session_id)?;
             // 与 run_feature_plugin 命令一致：短锁克隆会话状态后在锁外执行
             let session = {
@@ -582,6 +587,24 @@ fn json_subset(actual: &Value, expected: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 被禁用的插件在剧本里也必须被拒绝 —— 且门禁先于会话解析，
+    /// 所以这里不建会话也能拿到「已禁用」而不是「会话不存在」。
+    #[test]
+    fn playbook_rejects_disabled_plugin_before_touching_session() {
+        let db = crate::storage::Database::open(":memory:").unwrap();
+        let mut settings = db.get_settings().unwrap();
+        settings.disabled_plugins = vec!["sysinfo".into()];
+        db.update_settings(&settings).unwrap();
+        let state = crate::build_app_state(db, dosword_sdk::FeaturePluginRegistry::builtin());
+        let error = run_step(
+            &state,
+            "plugin",
+            &serde_json::json!({"session_id": "no-such-session", "plugin_id": "sysinfo"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("已在设置中禁用"), "{error}");
+    }
 
     #[test]
     fn parses_playbook_and_resolves_variables() {

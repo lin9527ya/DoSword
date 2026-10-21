@@ -189,6 +189,11 @@ tlsVerify: boolean,
  */
 allowArbitraryLocalPaths: boolean, 
 /**
+ * 已禁用的功能插件 id。**后端强制执行**：GUI 调用、MCP 工具、Playbook 三条路径
+ * 都会拒绝执行被禁用的插件（此前「禁用」只在前端把插件从列表里过滤掉，后端仍可调用）。
+ */
+disabledPlugins: Array<string>, 
+/**
  * MCP 总开关（默认关闭）。关闭时不监听任何端口。
  */
 mcpEnabled: boolean, 

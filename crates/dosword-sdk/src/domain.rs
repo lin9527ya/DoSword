@@ -384,6 +384,10 @@ pub struct AppSettings {
     /// 影响导入导出、下载保存与备份目录；敏感系统目录始终拒绝。
     #[serde(default = "default_allow_any_path")]
     pub allow_arbitrary_local_paths: bool,
+    /// 已禁用的功能插件 id。**后端强制执行**：GUI 调用、MCP 工具、Playbook 三条路径
+    /// 都会拒绝执行被禁用的插件（此前「禁用」只在前端把插件从列表里过滤掉，后端仍可调用）。
+    #[serde(default)]
+    pub disabled_plugins: Vec<String>,
 
     // —— MCP 服务端（把能力暴露给 AI 客户端） ——
     /// MCP 总开关（默认关闭）。关闭时不监听任何端口。
@@ -509,6 +513,7 @@ impl Default for AppSettings {
             gzip_enabled: true,
             tls_verify: false,
             allow_arbitrary_local_paths: false,
+            disabled_plugins: Vec::new(),
             mcp_enabled: false,
             mcp_port: 7317,
             mcp_token: String::new(),

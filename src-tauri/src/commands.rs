@@ -19,6 +19,30 @@ use dosword_sdk::{PluginManifest, Protocol, ProtocolError, SessionState};
 use crate::auth;
 use crate::{AppState, DownloadCheckpoint, UploadCheckpoint};
 
+/// 读取当前生效设置（含 CLI `--proxy` 等运行期覆盖）。
+pub(crate) fn current_settings(state: &AppState) -> Result<AppSettings, String> {
+    let stored = state
+        .database
+        .lock()
+        .map_err(|_| "数据库锁异常".to_string())?
+        .get_settings()
+        .map_err(|error| error.to_string())?;
+    Ok(state.effective_settings(stored))
+}
+
+/// 插件启用/禁用门禁：**GUI / MCP / Playbook 三条执行路径同源判定**。
+///
+/// 此前「禁用」只在前端把插件从列表里过滤掉，后端没有任何概念 —— MCP 工具与
+/// Playbook 照样能调用被禁用的插件，等于没禁。现在三处都过这一道。
+pub(crate) fn ensure_plugin_enabled(settings: &AppSettings, plugin_id: &str) -> Result<(), String> {
+    if settings.disabled_plugins.iter().any(|id| id == plugin_id) {
+        return Err(format!(
+            "功能插件 {plugin_id} 已在设置中禁用（设置 → 插件）；启用后才能执行"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_text(value: &str, field: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         Err(format!("{field} 不能为空"))
@@ -1325,6 +1349,8 @@ pub async fn run_feature_plugin(
     app: AppHandle,
 ) -> Result<serde_json::Value, String> {
     blocking(app, move |state| {
+        // 先过禁用门禁（不依赖会话是否存活），再解析会话上下文
+        ensure_plugin_enabled(&current_settings(state)?, &plugin_id)?;
         let ctx = session_ctx(state, &session_id)?;
         let session = {
             let mut sessions = state
@@ -5062,6 +5088,27 @@ mod tests {
             Arc::from(session),
             probe,
         )
+    }
+
+    /// 插件禁用门禁：禁用后拒绝执行；未禁用 / 空名单放行；只禁一个不影响其他。
+    #[test]
+    fn disabled_plugin_is_rejected() {
+        let mut settings = AppSettings::default();
+        assert!(ensure_plugin_enabled(&settings, "sysinfo").is_ok());
+        settings.disabled_plugins = vec!["sysinfo".into()];
+        let error = ensure_plugin_enabled(&settings, "sysinfo").unwrap_err();
+        assert!(error.contains("已在设置中禁用"), "{error}");
+        assert!(ensure_plugin_enabled(&settings, "zip").is_ok());
+    }
+
+    /// 旧版设置的 JSON 没有 `disabledPlugins` 字段：必须能反序列化（默认空）。
+    #[test]
+    fn legacy_settings_json_defaults_disabled_plugins() {
+        let settings = AppSettings::default();
+        let mut value = serde_json::to_value(&settings).unwrap();
+        value.as_object_mut().unwrap().remove("disabledPlugins");
+        let parsed: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(parsed.disabled_plugins.is_empty());
     }
 
     /// P5：连接时把 Workspace 授权过期时间快照进会话（此后复查免查库）。

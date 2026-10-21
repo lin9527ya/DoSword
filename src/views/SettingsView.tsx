@@ -120,14 +120,28 @@ export function SettingsView() {
   const [pluginPageSize, setPluginPageSize] = useState(10);
   const [jumpPageStr, setJumpPageStr] = useState("");
 
-  function togglePluginStatus(id: string, name: string) {
-    setDisabledPlugins((prev) => {
-      const isCurrentlyDisabled = prev.includes(id);
-      const next = isCurrentlyDisabled ? prev.filter((x) => x !== id) : [...prev, id];
-      localStorage.setItem(DISABLED_PLUGINS_KEY, JSON.stringify(next));
-      toast.info(isCurrentlyDisabled ? `已启用插件「${name}」` : `已禁用插件「${name}」`);
-      return next;
-    });
+  async function togglePluginStatus(id: string, name: string) {
+    if (!settings) return;
+    const isCurrentlyDisabled = disabledPlugins.includes(id);
+    const next = isCurrentlyDisabled
+      ? disabledPlugins.filter((item) => item !== id)
+      : [...disabledPlugins, id];
+    setDisabledPlugins(next);
+    setSettings({ ...settings, disabledPlugins: next });
+    try {
+      // **立即落库**：后端门禁（GUI / MCP / Playbook）读的是设置，
+      // 不能等用户再点「保存」—— 否则界面显示已禁用、后端仍可执行。
+      await api.updateSettings({ ...settings, disabledPlugins: next });
+      toast.info(
+        isCurrentlyDisabled
+          ? `已启用插件「${name}」`
+          : `已禁用插件「${name}」（后端同样拒绝执行）`,
+      );
+    } catch (cause) {
+      setDisabledPlugins(disabledPlugins);
+      setSettings({ ...settings, disabledPlugins });
+      toast.error(errorText(cause), "保存插件状态失败");
+    }
   }
 
   const allPluginsList = useMemo(() => {
@@ -330,7 +344,25 @@ export function SettingsView() {
     loadFeaturePlugins();
     void (async () => {
       try {
-        setSettings(await api.getSettings());
+        const loaded = await api.getSettings();
+        setSettings(loaded);
+        if (loaded.disabledPlugins.length > 0) {
+          setDisabledPlugins(loaded.disabledPlugins);
+        } else {
+          // 一次性迁移：旧版本的禁用名单只存在 localStorage 里，后端看不到。
+          // 迁移后清掉 localStorage 键，避免用户日后全部启用又被重新迁回来。
+          let legacy: string[] = [];
+          try {
+            legacy = JSON.parse(localStorage.getItem(DISABLED_PLUGINS_KEY) ?? "[]") as string[];
+          } catch {
+            legacy = [];
+          }
+          if (legacy.length > 0) {
+            setDisabledPlugins(legacy);
+            await api.updateSettings({ ...loaded, disabledPlugins: legacy });
+            localStorage.removeItem(DISABLED_PLUGINS_KEY);
+          }
+        }
       } catch (cause) {
         setError(errorText(cause));
       }

@@ -576,11 +576,16 @@ impl super::DoswordMcp {
             Err(denied) => return Ok(denied),
         };
         let result = with_state(&self.app, |state| {
+            // 禁用插件不列给 AI 客户端：调用会被后端拒绝，列出来只会诱使模型白白尝试
+            let disabled = crate::commands::current_settings(state)?.disabled_plugins;
             let plugins = state
                 .feature_plugins
                 .lock()
                 .map(|registry| registry.list())
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|manifest| !disabled.contains(&manifest.id))
+                .collect::<Vec<_>>();
             Ok(plugins)
         })
         .await;

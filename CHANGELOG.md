@@ -42,6 +42,16 @@
 - JSP / ASPX 的 `separator` 字段转义错误，产出**非法 JSON**（探针响应解析失败）
 - ASPX 的 GCM 计数器从 0 起算（应为 J0+1），导致 tag 校验通过但明文是乱码
 
+### 安全（2026-10-21）
+
+- **插件「禁用」改为后端强制执行**：此前禁用只在前端把插件从列表里过滤掉，
+  MCP 工具与 Playbook 照样能调用被禁用的插件 —— 等于没禁。
+  - 禁用名单进 `AppSettings.disabled_plugins`（旧版 localStorage 名单在设置页一次性迁移）
+  - GUI / MCP / Playbook 三条执行路径统一过 `ensure_plugin_enabled` 门禁
+  - MCP 的 `dosword_plugins_list` 不再列出禁用插件（调用了也会被拒，列出来只会诱使模型尝试）
+  - 设置页的开关**立即落库**（不能等「保存」，否则界面显示已禁用、后端仍可执行）
+  - 测试：门禁单测、Playbook 路径（不建会话也能先拿到「已禁用」）、旧设置 JSON 兼容
+
 ### 依赖（2026-10-21）
 
 - **rustls-webpki 0.103.15 → 0.103.16**（RUSTSEC-2026-0382）：证书校验可能接受本应被

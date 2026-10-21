@@ -48,23 +48,22 @@ export function PluginPanel({ sessionId }: { sessionId: string }) {
   const [error, setError] = useState("");
   const [filterQuery, setFilterQuery] = useState("");
 
-  const DISABLED_PLUGINS_KEY = "dosword:disabled-plugins";
-
   const load = useCallback(() => {
-    void api.listFeaturePlugins().then((items) => {
-      let disabledList: string[] = [];
-      try {
-        disabledList = JSON.parse(localStorage.getItem(DISABLED_PLUGINS_KEY) ?? "[]") as string[];
-      } catch {
-        disabledList = [];
-      }
-      const enabled = items.filter((p) => !disabledList.includes(p.id));
-      setPlugins(enabled);
-      if (!selected && enabled.length > 0) {
-        setSelected(enabled[0]);
-        setValues(defaults(enabled[0]));
-      }
-    });
+    // 禁用名单以后端设置为准（后端会真正拒绝执行；localStorage 只在设置页做一次性迁移）
+    void Promise.all([api.listFeaturePlugins(), api.getSettings()])
+      .then(([items, current]) => {
+        const disabled = new Set(current.disabledPlugins);
+        const enabled = items.filter((p) => !disabled.has(p.id));
+        setPlugins(enabled);
+        if (!selected && enabled.length > 0) {
+          setSelected(enabled[0]);
+          setValues(defaults(enabled[0]));
+        }
+      })
+      .catch(() => {
+        // 设置读取失败时退回「只列插件」：后端门禁仍在，显示的名单可能偏旧
+        void api.listFeaturePlugins().then((items) => setPlugins(items));
+      });
   }, [selected]);
 
   useEffect(() => {
