@@ -146,7 +146,10 @@ build_binary_one() {
     linux)
       log "==> 编译 Linux 可执行程序（release，内嵌前端资源）"
       pnpm tauri build --no-bundle
-      cp target/release/dosword "$ARTIFACT_DIR/dosword-linux-x86_64"
+      # 先拷临时文件再 rename：目标二进制**正在运行**时 cp 会报 ETXTBSY（文本文件忙），
+      # 而 rename 只替换目录项，运行中的进程继续持有旧 inode，不受影响。
+      cp target/release/dosword "$ARTIFACT_DIR/.dosword-linux-x86_64.new"
+      mv -f "$ARTIFACT_DIR/.dosword-linux-x86_64.new" "$ARTIFACT_DIR/dosword-linux-x86_64"
       log "==> Linux 可执行程序："
       ls -lh "$ARTIFACT_DIR/dosword-linux-x86_64" | awk '{print "  " $5 "  " $9}'
       ;;
@@ -156,7 +159,8 @@ build_binary_one() {
       ensure_windows_target
       log "==> 交叉编译 Windows 可执行程序（release, target: $WINDOWS_TARGET）"
       pnpm tauri build --no-bundle --target "$WINDOWS_TARGET"
-      cp "target/$WINDOWS_TARGET/release/dosword.exe" "$ARTIFACT_DIR/dosword-windows-x86_64.exe"
+      cp "target/$WINDOWS_TARGET/release/dosword.exe" "$ARTIFACT_DIR/.dosword-windows-x86_64.exe.new"
+      mv -f "$ARTIFACT_DIR/.dosword-windows-x86_64.exe.new" "$ARTIFACT_DIR/dosword-windows-x86_64.exe"
       log "==> Windows 可执行程序："
       ls -lh "$ARTIFACT_DIR/dosword-windows-x86_64.exe" | awk '{print "  " $5 "  " $9}'
       ;;
