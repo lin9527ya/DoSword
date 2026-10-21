@@ -421,49 +421,41 @@ impl Database {
         input: CreateShell,
         protocol_id: &str,
     ) -> rusqlite::Result<ShellProfile> {
-        let profile = ShellProfile {
-            id: Uuid::new_v4().to_string(),
-            workspace_id: input.workspace_id,
-            name: input.name,
-            endpoint: input.endpoint,
-            runtime: input.runtime,
-            protocol_id: protocol_id.into(),
-            password: input.password.unwrap_or_default(),
-            protocol_params: input.protocol_params.unwrap_or_else(|| "{}".into()),
-            authorization_ack: input.confirm_network,
-            status: "unknown".into(),
-            last_connected_at: None,
-            created_at: Utc::now().to_rfc3339(),
-            tags: input.tags.unwrap_or_default(),
-        };
+        let profile = shell_profile_from(input, protocol_id);
+        let secrets = self.secrets.as_ref();
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO shell_profiles
-             (id, workspace_id, name, endpoint, runtime, protocol_id, password, protocol_params,
-              authorization_ack, status, created_at, tags)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                profile.id,
-                profile.workspace_id,
-                profile.name,
-                profile.endpoint,
-                profile.runtime,
-                profile.protocol_id,
-                seal(self.secrets.as_ref(), "shell.password", &profile.password),
-                profile.protocol_params,
-                profile.authorization_ack,
-                profile.status,
-                profile.created_at,
-                serde_json::to_string(&profile.tags).unwrap_or_else(|_| "[]".into()),
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO audit_events (workspace_id, shell_id, action, outcome, detail, created_at)
-             VALUES (?1, ?2, 'shell.create', 'success', 'Shell profile created', ?3)",
-            params![profile.workspace_id, profile.id, Utc::now().to_rfc3339()],
-        )?;
+        insert_shell_row(&transaction, secrets, &profile)?;
         transaction.commit()?;
         Ok(profile)
+    }
+
+    /// 批量创建 Shell：**单事务**（N 条插入 + N 条审计只 fsync 一次）。
+    ///
+    /// 与逐条 `create_shell` 的语义差异：任一条失败则**整批回滚**。导入场景要么全成、
+    /// 要么全不成 —— 半截导入会让用户重试时整批被判重复。
+    pub fn create_shells_batch(
+        &mut self,
+        inputs: Vec<(CreateShell, String)>,
+    ) -> rusqlite::Result<Vec<ShellProfile>> {
+        let profiles: Vec<ShellProfile> = inputs
+            .into_iter()
+            .map(|(input, protocol_id)| shell_profile_from(input, &protocol_id))
+            .collect();
+        let secrets = self.secrets.as_ref();
+        let transaction = self.connection.transaction()?;
+        for profile in &profiles {
+            insert_shell_row(&transaction, secrets, profile)?;
+        }
+        transaction.commit()?;
+        Ok(profiles)
+    }
+
+    /// 全部已用端点（导入去重用）。不读密码，避免为去重解密整库。
+    pub fn existing_endpoints(&self) -> rusqlite::Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT endpoint FROM shell_profiles")?;
+        statement.query_map([], |row| row.get(0))?.collect()
     }
 
     pub fn shell(&self, id: &str) -> rusqlite::Result<Option<ShellProfile>> {
@@ -1005,6 +997,59 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// 由输入构造 Shell 档案（创建与批量导入共用）。
+fn shell_profile_from(input: CreateShell, protocol_id: &str) -> ShellProfile {
+    ShellProfile {
+        id: Uuid::new_v4().to_string(),
+        workspace_id: input.workspace_id,
+        name: input.name,
+        endpoint: input.endpoint,
+        runtime: input.runtime,
+        protocol_id: protocol_id.into(),
+        password: input.password.unwrap_or_default(),
+        protocol_params: input.protocol_params.unwrap_or_else(|| "{}".into()),
+        authorization_ack: input.confirm_network,
+        status: "unknown".into(),
+        last_connected_at: None,
+        created_at: Utc::now().to_rfc3339(),
+        tags: input.tags.unwrap_or_default(),
+    }
+}
+
+/// 插入一条 Shell + 一条创建审计（调用方负责事务边界）。
+fn insert_shell_row(
+    transaction: &rusqlite::Transaction<'_>,
+    secrets: Option<&SecretStore>,
+    profile: &ShellProfile,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT INTO shell_profiles
+         (id, workspace_id, name, endpoint, runtime, protocol_id, password, protocol_params,
+          authorization_ack, status, created_at, tags)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            profile.id,
+            profile.workspace_id,
+            profile.name,
+            profile.endpoint,
+            profile.runtime,
+            profile.protocol_id,
+            seal(secrets, "shell.password", &profile.password),
+            profile.protocol_params,
+            profile.authorization_ack,
+            profile.status,
+            profile.created_at,
+            serde_json::to_string(&profile.tags).unwrap_or_else(|_| "[]".into()),
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO audit_events (workspace_id, shell_id, action, outcome, detail, created_at)
+         VALUES (?1, ?2, 'shell.create', 'success', 'Shell profile created', ?3)",
+        params![profile.workspace_id, profile.id, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
 fn map_shell(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShellProfile> {
     let tags_json: String = row.get(12)?;
     Ok(ShellProfile {
@@ -1280,6 +1325,34 @@ mod tests {
 
         let dashboard = db.dashboard().unwrap();
         assert_eq!(dashboard.shell_stats.total, 2);
+    }
+
+    /// 批量导入是单事务：任一条失败整批回滚（不留半截导入，也不留半截审计）。
+    #[test]
+    fn create_shells_batch_rolls_back_on_failure() {
+        let mut db = Database::open(":memory:").unwrap();
+        let workspace = db.create_workspace(sample_workspace()).unwrap();
+        let good = sample_shell(workspace.id.clone());
+        // 指向不存在的 Workspace：外键约束会失败
+        let bad = sample_shell("missing-workspace".into());
+        let result = db.create_shells_batch(vec![
+            (good, "builtin.mock.v1".into()),
+            (bad, "builtin.mock.v1".into()),
+        ]);
+        assert!(result.is_err(), "坏行应让整批失败");
+        let (total, _) = db.query_shells(&ShellQuery::default()).unwrap();
+        assert_eq!(total, 0, "整批回滚：不得留下半截导入");
+        let (audit_total, _) = db
+            .query_audit(&AuditFilter {
+                workspace_id: None,
+                shell_id: None,
+                action: Some("shell.create".into()),
+                outcome: None,
+                limit: None,
+                offset: None,
+            })
+            .unwrap();
+        assert_eq!(audit_total, 0, "回滚后不得留下 shell.create 审计");
     }
 
     /// 敏感字段落库必须是密文，读取时还原；`update_shell` 不改密码时不得二次加密。

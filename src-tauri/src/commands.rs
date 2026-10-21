@@ -988,12 +988,14 @@ fn import_shells_impl(
     payload: &str,
     workspace_id: &str,
 ) -> Result<ImportResult, String> {
-    {
-        let items: Vec<serde_json::Value> = serde_json::from_str(payload)
-            .map_err(|error| format!("导入文件不是合法 JSON：{error}"))?;
-        let mut imported = 0usize;
-        let mut skipped = 0usize;
-        let mut database = state
+    let items: Vec<serde_json::Value> =
+        serde_json::from_str(payload).map_err(|error| format!("导入文件不是合法 JSON：{error}"))?;
+
+    // 一、短锁读依赖：Workspace（授权范围）+ 已用端点（去重）。
+    //    此前整段导入都持着库锁，逐条 create_shell 各自开事务（每条一次 fsync），
+    //    导入 100 个 Shell = 100 次提交且全程挡住其他命令。
+    let (workspace, mut seen) = {
+        let database = state
             .database
             .lock()
             .map_err(|_| "数据库锁异常".to_string())?;
@@ -1001,100 +1003,119 @@ fn import_shells_impl(
             .workspace(workspace_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "目标 Workspace 不存在".to_string())?;
-        let existing: Vec<String> = database
-            .list_shells()
+        let seen: std::collections::HashSet<String> = database
+            .existing_endpoints()
             .map_err(|error| error.to_string())?
             .into_iter()
-            .map(|shell| shell.endpoint)
             .collect();
-        for item in items {
-            let endpoint = item
-                .get("endpoint")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let protocol_id = item
-                .get("protocol_id")
-                .or_else(|| item.get("protocolId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if endpoint.trim().is_empty()
-                || existing.contains(&endpoint)
-                || state.protocols.get(&protocol_id).is_none()
-            {
-                skipped += 1;
-                continue;
-            }
-            // S2：真实网络协议的导入项同样受授权范围约束（与 create_shell 门一致）
-            let protocol = state.protocols.get(&protocol_id).expect("已确认协议存在");
-            if protocol.requires_network() {
-                let parsed = match url::Url::parse(&endpoint) {
-                    Ok(parsed) => parsed,
-                    Err(_) => {
-                        skipped += 1;
-                        continue;
-                    }
-                };
-                let (allowed, _reason) =
-                    auth::scope_allows(&workspace.authorization_scope, &parsed);
-                if !allowed {
+        (workspace, seen)
+    };
+
+    // 二、**锁外**逐条校验（协议存在 / 网络授权范围 / 去重，含批内重复）
+    let mut skipped = 0usize;
+    let mut accepted: Vec<(CreateShell, String)> = Vec::new();
+    for item in items {
+        let endpoint = item
+            .get("endpoint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let protocol_id = item
+            .get("protocol_id")
+            .or_else(|| item.get("protocolId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if endpoint.trim().is_empty()
+            || state.protocols.get(&protocol_id).is_none()
+            // 同一批里重复出现的 endpoint 也只导入第一个
+            || !seen.insert(endpoint.clone())
+        {
+            skipped += 1;
+            continue;
+        }
+        // S2：真实网络协议的导入项同样受授权范围约束（与 create_shell 门一致）
+        let protocol = state.protocols.get(&protocol_id).expect("已确认协议存在");
+        if protocol.requires_network() {
+            let parsed = match url::Url::parse(&endpoint) {
+                Ok(parsed) => parsed,
+                Err(_) => {
                     skipped += 1;
                     continue;
                 }
-            }
-            let name = item
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let runtime = item
-                .get("runtime")
-                .and_then(|v| v.as_str())
-                .unwrap_or("php")
-                .to_string();
-            let password = item
-                .get("password")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let protocol_params = item
-                .get("protocol_params")
-                .or_else(|| item.get("protocolParams"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}")
-                .to_string();
-            let tags: Vec<String> = item
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|tag| tag.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let create = CreateShell {
-                workspace_id: workspace_id.to_string(),
-                name: if name.trim().is_empty() {
-                    endpoint.clone()
-                } else {
-                    name
-                },
-                endpoint: endpoint.clone(),
-                runtime,
-                protocol_id: protocol_id.clone(),
-                password: Some(password),
-                protocol_params: Some(protocol_params),
-                confirm_network: false,
-                tags: Some(tags),
             };
-            match database.create_shell(create, &protocol_id) {
-                Ok(_) => imported += 1,
-                Err(_) => skipped += 1,
+            let (allowed, _reason) = auth::scope_allows(&workspace.authorization_scope, &parsed);
+            if !allowed {
+                skipped += 1;
+                continue;
             }
         }
-        Ok(ImportResult { imported, skipped })
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let runtime = item
+            .get("runtime")
+            .and_then(|v| v.as_str())
+            .unwrap_or("php")
+            .to_string();
+        let password = item
+            .get("password")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let protocol_params = item
+            .get("protocol_params")
+            .or_else(|| item.get("protocolParams"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}")
+            .to_string();
+        let tags: Vec<String> = item
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|tag| tag.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let create = CreateShell {
+            workspace_id: workspace_id.to_string(),
+            name: if name.trim().is_empty() {
+                endpoint.clone()
+            } else {
+                name
+            },
+            endpoint,
+            runtime,
+            protocol_id: protocol_id.clone(),
+            password: Some(password),
+            protocol_params: Some(protocol_params),
+            confirm_network: false,
+            tags: Some(tags),
+        };
+        accepted.push((create, protocol_id));
     }
+    if accepted.is_empty() {
+        return Ok(ImportResult {
+            imported: 0,
+            skipped,
+        });
+    }
+
+    // 三、单事务批量写入（N 条插入 + N 条审计一次 fsync；任一条失败整批回滚）
+    let imported = {
+        let mut database = state
+            .database
+            .lock()
+            .map_err(|_| "数据库锁异常".to_string())?;
+        database
+            .create_shells_batch(accepted)
+            .map_err(|error| error.to_string())?
+            .len()
+    };
+    Ok(ImportResult { imported, skipped })
 }
 
 #[tauri::command]
@@ -4905,6 +4926,36 @@ mod tests {
         let items: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
         assert_eq!(items.len(), 1);
         assert!(items[0]["endpoint"].as_str().is_some());
+    }
+
+    /// 同一批里重复出现的 endpoint 只导入第一个（此前只与库内已有端点比对）。
+    #[test]
+    fn import_shells_dedupes_within_batch() {
+        let state = app_state();
+        let wid = add_workspace(&mut state.database.lock().unwrap(), "scope-a", None);
+        let item = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "endpoint": "mock://same",
+                "runtime": "php",
+                "protocol_id": MOCK_PROTOCOL_ID,
+                "password": "x",
+                "protocol_params": "{}",
+                "tags": []
+            })
+        };
+        let payload = serde_json::json!([item("first"), item("second")]).to_string();
+        let result = import_shells_impl(&state, &payload, &wid).expect("导入应成功");
+        assert_eq!(result.imported, 1, "批内重复只导入一个");
+        assert_eq!(result.skipped, 1);
+        let (total, shells) = state
+            .database
+            .lock()
+            .unwrap()
+            .query_shells(&dosword_sdk::domain::ShellQuery::default())
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(shells[0].name, "first", "保留先出现的那个");
     }
 
     #[test]
