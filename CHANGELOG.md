@@ -51,6 +51,9 @@
 - **lru 0.12.5 → 0.19.0**（RUSTSEC-2026-0253 / RUSTSEC-2026-0002）：`pop()` 的 panic
   安全性与 `IterMut` 的 Stacked Borrows 违规。本项目只用 `new/get/put/iter`，且 release
   档 `panic = "abort"`，实际风险很低，但升级无 API 变化，顺手消掉
+- **CI action 全部按提交 SHA 固定**（9 个 action）：tag 可被上游移动，SHA 不可 ——
+  供应链加固。升级步骤写在两个 workflow 文件头部。顺带把 `release.yml` 里两处
+  `dtolnay/rust-toolchain@stable` 改回 `1.98.1`（远端重写 release.yml 时把之前的钉版本丢了）
 
 ### 安全（2026-10-21）
 

@@ -1,5 +1,12 @@
 name: CI
 
+# 供应链加固：所有 action 按**提交 SHA** 固定（tag 可被上游移动，SHA 不可）。
+# 升级步骤：`gh api repos/<owner>/<repo>/commits/<tag> --jq .sha` 取 SHA →
+#           替换下方 `uses:` 的 SHA，并把行尾注释改成新 tag。
+# 注意 dtolnay/rust-toolchain 的版本在**分支内容**里（分支 action.yml 内嵌工具链名），
+# 所以只能固定在对应版本分支的提交上；升级工具链 = 改这里的 SHA，且与
+# rust-toolchain.toml 保持一致。
+
 on:
   push:
     branches: [main, master]
@@ -12,7 +19,7 @@ jobs:
     name: Rust 检查与测试
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: 安装 Linux 系统依赖（Tauri）
         run: |
@@ -24,11 +31,11 @@ jobs:
         # 钉死版本：clippy -D warnings 门禁下，stable 引入新 lint 会让 CI 无预警变红。
         # 升级工具链时同步改 rust-toolchain.toml 与本行的版本号。
         # .github/workflows/ci.yml
-        uses: dtolnay/rust-toolchain@1.98.1
+        uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
         with:
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Clippy（零警告门禁）
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -45,13 +52,13 @@ jobs:
     name: 前端类型与构建
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # 不指定 version：pnpm 版本以 package.json 的 packageManager 字段为准，
       # 避免本地与 CI 版本漂移（pnpm 10+ 已把配置从 package.json 迁到 pnpm-workspace.yaml）
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           # Node 24：pnpm 11 要求 Node >= 22.13（依赖 node:sqlite 内置模块），
           # 且与本地开发环境（v24）保持一致
@@ -82,7 +89,7 @@ jobs:
     name: 密钥与依赖扫描
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # gitleaks 需要完整历史才能扫出历史提交里的密钥
           fetch-depth: 0
@@ -94,9 +101,9 @@ jobs:
             | sudo tar -xz -C /usr/local/bin gitleaks
           gitleaks detect --source . --redact --no-banner --exit-code 1
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: pnpm
@@ -107,7 +114,7 @@ jobs:
           pnpm audit --audit-level=high
 
       - name: 安装 cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-audit
 
@@ -122,6 +129,6 @@ jobs:
           --ignore RUSTSEC-2026-0379
 
       - name: 依赖策略（cargo-deny：许可 / 来源 / 重复版本 / yanked）
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
