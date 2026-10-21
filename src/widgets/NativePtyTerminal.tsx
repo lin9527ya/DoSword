@@ -5,6 +5,7 @@ import "@xterm/xterm/css/xterm.css";
 import { Eraser, LoaderCircle, Play, Square, Terminal as TermIcon } from "lucide-react";
 import { api, b64, errorText } from "../api";
 import { useToast } from "../components/Toast";
+import { TERM_THEME } from "../lib/termTheme";
 
 /**
  * 本地 PTY 终端：后端在操作机监听随机端口、让目标反弹一个 PTY 回来，
@@ -165,11 +166,7 @@ export function NativePtyTerminal({
       convertEol: true,
       cursorBlink: true,
       cursorStyle: "block",
-      theme: {
-        background: "#080a0c",
-        foreground: "#d4d4d4",
-        cursor: "#22c55e",
-      },
+      theme: TERM_THEME,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);

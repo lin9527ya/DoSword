@@ -52,6 +52,13 @@
   - 设置页的开关**立即落库**（不能等「保存」，否则界面显示已禁用、后端仍可执行）
   - 测试：门禁单测、Playbook 路径（不建会话也能先拿到「已禁用」）、旧设置 JSON 兼容
 
+### 工程化（2026-10-21）
+
+- **终端配色收敛到 `lib/termTheme.ts`**：`Terminal` / `ForwardTerminal` /
+  `NativePtyTerminal` 此前各写一份主题；其中 `NativePtyTerminal` 只写了
+  background / foreground / cursor 三色，同一个应用里 ANSI 输出配色不一致。
+  现在三处共用同一份 18 色主题。
+
 ### 依赖（2026-10-21）
 
 - **rustls-webpki 0.103.15 → 0.103.16**（RUSTSEC-2026-0382）：证书校验可能接受本应被

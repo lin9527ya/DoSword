@@ -5,6 +5,7 @@ import "@xterm/xterm/css/xterm.css";
 import { Eraser, LoaderCircle, Play, Square, Terminal as TermIcon } from "lucide-react";
 import { api, b64, errorText } from "../api";
 import { useToast } from "../components/Toast";
+import { TERM_THEME } from "../lib/termTheme";
 
 export function ForwardTerminal({
   sessionId,
@@ -202,27 +203,7 @@ export function ForwardTerminal({
       convertEol: true,
       cursorBlink: true,
       cursorStyle: "block",
-      theme: {
-        background: "#080a0c",
-        foreground: "#d4d4d4",
-        cursor: "#22c55e",
-        black: "#000000",
-        red: "#ef4444",
-        green: "#22c55e",
-        yellow: "#eab308",
-        blue: "#3b82f6",
-        magenta: "#a855f7",
-        cyan: "#06b6d4",
-        white: "#f3f4f6",
-        brightBlack: "#4b5563",
-        brightRed: "#f87171",
-        brightGreen: "#4ade80",
-        brightYellow: "#fde047",
-        brightBlue: "#60a5fa",
-        brightMagenta: "#c084fc",
-        brightCyan: "#22d3ee",
-        brightWhite: "#ffffff",
-      },
+      theme: TERM_THEME,
     });
 
     const fit = new FitAddon();
