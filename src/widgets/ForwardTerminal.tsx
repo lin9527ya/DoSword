@@ -35,16 +35,18 @@ export function ForwardTerminal({
   const [running, setRunning] = useState(false);
   const [starting, setStarting] = useState(false);
 
-  const safeFit = useCallback(() => {
+  /**
+   * 按容器尺寸重排终端。`force` 跳过「尺寸没变就跳过」的短路 ——
+   * 字体加载完成、从隐藏标签切回等场景下容器尺寸不变，但终端仍需要重排。
+   */
+  const safeFit = useCallback((force = false) => {
     const container = containerRef.current;
     const fit = fitRef.current;
     if (!container || !fit) return;
     const w = container.clientWidth;
     const h = container.clientHeight;
     if (w <= 100 || h <= 100) return;
-    if (Math.abs(w - lastSizeRef.current.w) < 4 && Math.abs(h - lastSizeRef.current.h) < 4) {
-      return;
-    }
+    if (!force && Math.abs(w - lastSizeRef.current.w) < 4 && Math.abs(h - lastSizeRef.current.h) < 4) return;
     lastSizeRef.current = { w, h };
     try {
       fit.fit();
@@ -187,7 +189,8 @@ export function ForwardTerminal({
 
   useEffect(() => {
     if (active) {
-      const timer = setTimeout(safeFit, 50);
+      // 从隐藏标签 / 其他终端模式切回：强制重排（容器尺寸可能没变）
+      const timer = setTimeout(() => safeFit(true), 50);
       return () => clearTimeout(timer);
     }
   }, [active, safeFit]);
@@ -212,6 +215,19 @@ export function ForwardTerminal({
     termRef.current = term;
     fitRef.current = fit;
 
+    // 打开后立即按当前布局排一次（不要只依赖 ResizeObserver 的首次通知：
+    // 首帧字体/布局未定，量出来的行列数可能偏小，表现为「终端只占一部分」）
+    let cancelled = false;
+    const rafFit = requestAnimationFrame(() => {
+      if (!cancelled) safeFit(true);
+    });
+    // Web 字体异步加载会改变字符宽高；就绪后再强制重排一次
+    if (typeof document !== "undefined" && document.fonts?.ready) {
+      void document.fonts.ready.then(() => {
+        if (!cancelled) safeFit(true);
+      });
+    }
+
     term.write(
       `\x1b[32mDoSword 交互式终端 (Godzilla SuperTerminal / PTY)\x1b[0m\r\n\x1b[90m点击上方「启动交互终端」建立会话，支持 sudo 密码输入、su 切换、Tab 补全与 PTY 交互控制\x1b[0m\r\n\r\n`,
     );
@@ -219,7 +235,7 @@ export function ForwardTerminal({
     let rafId: number | null = null;
     const resizeObserver = new ResizeObserver(() => {
       if (rafId) cancelAnimationFrame(rafId);
-      rafId = requestAnimationFrame(safeFit);
+      rafId = requestAnimationFrame(() => safeFit());
     });
     resizeObserver.observe(container);
 
@@ -240,6 +256,8 @@ export function ForwardTerminal({
 
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
+      cancelled = true;
+      cancelAnimationFrame(rafFit);
       resizeObserver.disconnect();
       if (pollTimerRef.current !== null) {
         window.clearTimeout(pollTimerRef.current);
@@ -294,15 +312,9 @@ export function ForwardTerminal({
         </div>
       </div>
 
-      <div
-        className="terminal-box"
-        style={{
-          height: "calc(100vh - 470px)",
-          minHeight: "260px",
-          maxHeight: "440px",
-        }}
-        ref={containerRef}
-      />
+      {/* 与命令终端共用 .terminal-box 的高度策略；
+          此前这里写死 maxHeight: 440px，高屏上终端只占一半、下方大片空白 */}
+      <div className="terminal-box" ref={containerRef} />
     </div>
   );
 }

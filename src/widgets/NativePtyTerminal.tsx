@@ -37,14 +37,18 @@ export function NativePtyTerminal({
   const [starting, setStarting] = useState(false);
   const [listenPort, setListenPort] = useState<number | null>(null);
 
-  const safeFit = useCallback(() => {
+  /**
+   * 按容器尺寸重排终端。`force` 跳过「尺寸没变就跳过」的短路 ——
+   * 字体加载完成、从隐藏标签切回等场景下容器尺寸不变，但终端仍需要重排。
+   */
+  const safeFit = useCallback((force = false) => {
     const container = containerRef.current;
     const fit = fitRef.current;
     if (!container || !fit) return;
     const w = container.clientWidth;
     const h = container.clientHeight;
     if (w <= 100 || h <= 100) return;
-    if (Math.abs(w - lastSizeRef.current.w) < 4 && Math.abs(h - lastSizeRef.current.h) < 4) return;
+    if (!force && Math.abs(w - lastSizeRef.current.w) < 4 && Math.abs(h - lastSizeRef.current.h) < 4) return;
     lastSizeRef.current = { w, h };
     try {
       fit.fit();
@@ -151,7 +155,8 @@ export function NativePtyTerminal({
 
   useEffect(() => {
     if (active) {
-      const timer = setTimeout(safeFit, 50);
+      // 从隐藏标签 / 其他终端模式切回：强制重排（容器尺寸可能没变）
+      const timer = setTimeout(() => safeFit(true), 50);
       return () => clearTimeout(timer);
     }
   }, [active, safeFit]);
@@ -174,6 +179,19 @@ export function NativePtyTerminal({
     termRef.current = term;
     fitRef.current = fit;
 
+    // 打开后立即按当前布局排一次（不要只依赖 ResizeObserver 的首次通知：
+    // 首帧字体/布局未定，量出来的行列数可能偏小，表现为「终端只占一部分」）
+    let cancelled = false;
+    const rafFit = requestAnimationFrame(() => {
+      if (!cancelled) safeFit(true);
+    });
+    // Web 字体异步加载会改变字符宽高；就绪后再强制重排一次
+    if (typeof document !== "undefined" && document.fonts?.ready) {
+      void document.fonts.ready.then(() => {
+        if (!cancelled) safeFit(true);
+      });
+    }
+
     term.write(
       `\x1b[32mDoSword 本地 PTY（目标反弹接收）\x1b[0m\r\n` +
         `\x1b[90m后端在操作机监听随机端口，目标主动回连；适用于目标可直连本机或已做端口转发的场景。\x1b[0m\r\n\r\n`,
@@ -182,7 +200,7 @@ export function NativePtyTerminal({
     let rafId: number | null = null;
     const observer = new ResizeObserver(() => {
       if (rafId) cancelAnimationFrame(rafId);
-      rafId = requestAnimationFrame(safeFit);
+      rafId = requestAnimationFrame(() => safeFit());
     });
     observer.observe(container);
 
@@ -192,6 +210,8 @@ export function NativePtyTerminal({
     });
 
     return () => {
+      cancelled = true;
+      cancelAnimationFrame(rafFit);
       observer.disconnect();
       if (rafId) cancelAnimationFrame(rafId);
       if (pollTimerRef.current !== null) window.clearTimeout(pollTimerRef.current);
@@ -241,15 +261,9 @@ export function NativePtyTerminal({
           <Eraser size={13} /> 清屏
         </button>
       </div>
-      <div
-        ref={containerRef}
-        style={{
-          height: 420,
-          borderRadius: "var(--radius-md)",
-          overflow: "hidden",
-          background: "#080a0c",
-        }}
-      />
+      {/* 与命令终端共用 .terminal-box：高度、边框与 xterm 的绝对定位样式都来自它；
+          此前是固定 420px 的裸容器，xterm 布局规则不生效，呈现为「只占部分界面」 */}
+      <div className="terminal-box" ref={containerRef} />
       <div className="form-note">
         回调地址默认 127.0.0.1，仅适用于本机目标或已做端口转发；跨网段需填目标可达的本机地址。
       </div>
