@@ -21,6 +21,10 @@ export function ForwardTerminal({
   const pollInFlightRef = useRef(false);
   const failCountRef = useRef(0);
   const offsetRef = useRef<number>(0);
+  // 标签隐藏时暂停轮询（见 App.tsx）：输出留在套接字 / 服务端缓冲里，
+  // 切回来继续读 —— 既不丢数据，也避免后台标签持续向目标发包
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const isRunningRef = useRef<boolean>(false);
   const lastSizeRef = useRef({ w: 0, h: 0 });
 
@@ -84,11 +88,22 @@ export function ForwardTerminal({
       }
     } finally {
       pollInFlightRef.current = false;
-      if (isRunningRef.current) {
+      if (isRunningRef.current && activeRef.current) {
         pollTimerRef.current = window.setTimeout(() => void pollRead(), 80);
+      } else {
+        // 隐藏：停掉轮询链；重新可见时由下面的 effect 拉起
+        pollTimerRef.current = null;
       }
     }
   }, []);
+
+  // 从隐藏标签切回：恢复轮询（隐藏期间的输出仍在缓冲区里）
+  useEffect(() => {
+    if (!active || !isRunningRef.current) return;
+    if (pollTimerRef.current === null && !pollInFlightRef.current) {
+      void pollRead();
+    }
+  }, [active, pollRead]);
 
   const sendRawData = useCallback(async (data: string) => {
     if (!isRunningRef.current) return;

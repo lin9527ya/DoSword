@@ -33,10 +33,13 @@ export function ShellDetailView({
   shellId,
   initialSessionId,
   onNavigate,
+  active = true,
 }: {
   shellId: string;
   initialSessionId?: string;
   onNavigate: (view: View) => void;
+  /** 该标签当前是否可见（隐藏标签暂停轮询，见 App.tsx） */
+  active?: boolean;
 }) {
   const toast = useToast();
   const [shell, setShell] = useState<ShellProfile | null>(null);
@@ -291,9 +294,9 @@ export function ShellDetailView({
               ))}
             </div>
             {terminalMode === "forward" ? (
-              <ForwardTerminal sessionId={sessionId} active={tab === "terminal"} />
+              <ForwardTerminal sessionId={sessionId} active={active && tab === "terminal"} />
             ) : terminalMode === "native" ? (
-              <NativePtyTerminal sessionId={sessionId} active={tab === "terminal"} />
+              <NativePtyTerminal sessionId={sessionId} active={active && tab === "terminal"} />
             ) : (
             <div className="panel detail-panel terminal-panel">
               <div className="terminal-tabs">
@@ -333,7 +336,7 @@ export function ShellDetailView({
                   <Terminal
                     sessionId={sessionId}
                     currentDir={terminal.dir}
-                    active={activeTerminal === terminal.id && tab === "terminal"}
+                    active={active && activeTerminal === terminal.id && tab === "terminal"}
                     onCwdChange={(cwd) => updateTerminalDir(terminal.id, cwd)}
                   />
                 </div>

@@ -99,34 +99,54 @@ function App() {
           onSelectTab={setActiveTab}
           onCloseTab={closeTab}
         >
-          {activeShell ? (
-            <ShellDetailView
-              key={activeShell.id}
-              shellId={activeShell.shellId}
-              initialSessionId={activeShell.sessionId}
-              onNavigate={navigate}
-            />
-          ) : mainView.kind === "dashboard" ? (
-            <DashboardView onNavigate={navigate} />
-          ) : mainView.kind === "sessions" ? (
-            <SessionsView onNavigate={navigate} />
-          ) : mainView.kind === "debug" ? (
-            <RequestDebugView />
-          ) : mainView.kind === "files" ? (
-            <GlobalFilesView onNavigate={navigate} />
-          ) : mainView.kind === "database" ? (
-            <GlobalDatabaseView onNavigate={navigate} />
-          ) : mainView.kind === "orchestrate" ? (
-            <OrchestrationView />
-          ) : mainView.kind === "proxyChain" ? (
-            <ProxyChainView />
-          ) : mainView.kind === "playbook" ? (
-            <PlaybookView />
-          ) : mainView.kind === "audit" ? (
-            <AuditView />
-          ) : (
-            <SettingsView />
-          )}
+          {/*
+            已打开的 Shell 标签**全部常驻挂载**：切 Tab 只切显隐、不重挂载 —— 终端的
+            回滚缓冲与视图状态因此保留（此前 `key={activeShell.id}` 会让整树重挂载，
+            切回来就只剩一个空终端）。关闭标签时才真正卸载。
+
+            非活动标签把 `active={false}` 传下去，轮询类子组件据此**暂停轮询**：
+            隐藏期间的输出留在 socket / 服务端缓冲里，切回来继续读 —— 既不丢数据，
+            也不会让后台标签持续向目标发包。
+          */}
+          {shellTabs.map((tab) => {
+            const isActive = activeShell?.id === tab.id;
+            return (
+              <div
+                key={tab.id}
+                style={{ display: isActive ? "contents" : "none" }}
+                aria-hidden={!isActive}
+              >
+                <ShellDetailView
+                  shellId={tab.shellId}
+                  initialSessionId={tab.sessionId}
+                  onNavigate={navigate}
+                  active={isActive}
+                />
+              </div>
+            );
+          })}
+          {!activeShell &&
+            (mainView.kind === "dashboard" ? (
+              <DashboardView onNavigate={navigate} />
+            ) : mainView.kind === "sessions" ? (
+              <SessionsView onNavigate={navigate} />
+            ) : mainView.kind === "debug" ? (
+              <RequestDebugView />
+            ) : mainView.kind === "files" ? (
+              <GlobalFilesView onNavigate={navigate} />
+            ) : mainView.kind === "database" ? (
+              <GlobalDatabaseView onNavigate={navigate} />
+            ) : mainView.kind === "orchestrate" ? (
+              <OrchestrationView />
+            ) : mainView.kind === "proxyChain" ? (
+              <ProxyChainView />
+            ) : mainView.kind === "playbook" ? (
+              <PlaybookView />
+            ) : mainView.kind === "audit" ? (
+              <AuditView />
+            ) : (
+              <SettingsView />
+            ))}
         </Layout>
       </ErrorBoundary>
     </ToastProvider>

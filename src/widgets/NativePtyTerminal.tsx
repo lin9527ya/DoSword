@@ -24,6 +24,10 @@ export function NativePtyTerminal({
   const ptyIdRef = useRef<string>("");
   const pollTimerRef = useRef<number | null>(null);
   const pollInFlightRef = useRef(false);
+  // 标签隐藏时暂停轮询（见 App.tsx）：输出留在套接字 / 服务端缓冲里，
+  // 切回来继续读 —— 既不丢数据，也避免后台标签持续向目标发包
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const runningRef = useRef(false);
   const lastSizeRef = useRef({ w: 0, h: 0 });
 
@@ -69,11 +73,22 @@ export function NativePtyTerminal({
       termRef.current?.write(`\r\n\x1b[33m[!] 读取失败：${errorText(cause)}\x1b[0m\r\n`);
     } finally {
       pollInFlightRef.current = false;
-      if (runningRef.current) {
+      if (runningRef.current && activeRef.current) {
         pollTimerRef.current = window.setTimeout(() => void pollRead(), 80);
+      } else {
+        // 隐藏：停掉轮询链；重新可见时由下面的 effect 拉起
+        pollTimerRef.current = null;
       }
     }
   }, []);
+
+  // 从隐藏标签切回：恢复轮询（隐藏期间的输出仍在缓冲区里）
+  useEffect(() => {
+    if (!active || !runningRef.current) return;
+    if (pollTimerRef.current === null && !pollInFlightRef.current) {
+      void pollRead();
+    }
+  }, [active, pollRead]);
 
   const sendData = useCallback(async (data: string) => {
     if (!runningRef.current || !ptyIdRef.current) return;
